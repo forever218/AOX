@@ -1,0 +1,22 @@
+[package]
+name = "aox-gui"
+version = "0.1.0"
+edition = "2021"
+description = "AOX GUI — 极简图形界面前端，复用 aox 核心库（Agent 循环 / 插件宿主 / Ui 抽象）"
+
+[[bin]]
+name = "aox-gui"
+path = "src/main.rs"
+
+[dependencies]
+# 复用 CLI 版本同一套核心库，GUI 不改动、不复制 Agent 逻辑
+aox = { path = ".." }
+
+# 立即模式 GUI（glow/OpenGL 后端），纯 Rust、单文件分发、无需 WebView/Node
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.33"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+async-trait = "0.1"
+anyhow = "1"
+serde_json = "1"

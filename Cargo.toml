@@ -1,0 +1,43 @@
+[workspace]
+# 根 crate 仍是 CLI 主体；gui/ 是独立的图形界面 crate，二者共用 src/lib.rs 暴露的核心库。
+# default-members 保持为 ["."]，这样 `cargo build` / `cargo run` 的行为与加 GUI 之前完全一致。
+members = [".", "gui"]
+default-members = ["."]
+resolver = "2"
+
+[package]
+name = "aox"
+version = "0.1.0"
+edition = "2021"
+description = "AOX — a self-growing AI agent: starts with no tools, breeds its own plugins"
+
+[lib]
+name = "aox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aox"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+toml = "0.8"
+anyhow = "1"
+async-trait = "0.1"
+# 终端 Markdown 渲染（标题/代码块/列表/表格）
+termimad = "0.34"
+
+[target.'cfg(windows)'.dependencies]
+# 让传统 conhost 也支持 ANSI 颜色（VT 处理 + UTF-8 输出代码页）
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,43 @@
+# AOX — 自我增长的 AI 编程代理
+# 复制本文件为 config.toml 并填写你的配置
+
+[provider]
+# OpenAI 兼容协议端点（DeepSeek / Kimi / OpenAI / vLLM / Ollama 均可）
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+# 二选一：直接写 key，或指定环境变量名（推荐）
+# api_key = "sk-..."
+api_key_env = "DEEPSEEK_API_KEY"
+# 单次回复的最大输出 token。
+# ⚠️ 思考模式模型（如 deepseek-flash / deepseek-reasoner）的「推理 token」也计入此额度，
+#    给太小会导致正文为空、表现成「任务莫名中断」，建议 ≥ 8192。
+#    注意各家服务端有上限（DeepSeek 为 393216），填超了会被直接 400 拒绝。
+max_tokens = 8192
+temperature = 0.3
+# 是否以 SSE 流式方式请求（默认 true）。
+# 开启后，思考模式模型的推理过程会在等待时实时滚动显示（响应结束即消失）。
+# 若某个端点不接受 stream / stream_options 参数，设为 false 回退为等完整响应。
+stream = true
+
+[auth]
+# 元工具（create_plugin / remove_plugin 等改变系统自身的操作）：ask | auto | deny
+meta_tools = "ask"
+# 模型自己造出来的插件工具：ask | auto | deny
+plugin_tools = "auto"
+# 按工具名或插件名单独覆盖：
+# [auth.overrides]
+# shell_exec = "ask"
+
+[agent]
+# 项目规则文件，存在则注入系统提示
+rules_file = "RULES.md"
+# 单次工具调用超时（秒）
+tool_timeout_secs = 120
+# 送回模型的工具结果最大字符数（超出截断）
+max_result_chars = 20000
+
+[runtimes]
+# 插件运行时命令（python 插件 / node 插件 / rust 插件编译器）
+python = "python"
+node = "node"
+rustc = "rustc"

@@ -1,0 +1,261 @@
+use std::sync::Arc;
+
+use anyhow::{bail, Result};
+use serde_json::{json, Value};
+
+use crate::auth::AuthLevel;
+use crate::llm::LlmProvider;
+use crate::message::Message;
+use crate::runtime::Runtime;
+use crate::tool::{ToolKind, ToolOutput};
+use crate::ui::{AgentEvent, AuthDecision, Ui};
+
+/// 系统提示：告诉模型「你什么都没有，需要自己造工具」。
+pub const SYSTEM_PROMPT: &str = r#"你是 AOX，一个「自我增长」的 AI 代理，运行在用户本地的 Rust 宿主程序中。
+
+# 核心事实
+- 你初始没有任何实际工具，只有三个元工具：create_plugin、list_plugins、remove_plugin。
+- 当任务需要某种能力（读写文件、执行命令、网络请求、数据处理……）时，你必须先用 create_plugin 自己编写一个插件来提供该能力，然后调用插件提供的工具完成任务。
+- 插件持久保存在 plugins/ 目录，重启后自动加载。动手创建新插件前，先 list_plugins 检查是否已有可复用的能力。
+
+# 插件协议
+插件是独立进程，宿主通过 stdio 与之通信：每条消息是「一行 JSON」。stdout 只允许协议消息，日志一律写 stderr。
+1. 启动后宿主发送: {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+   插件回复一行: {"jsonrpc":"2.0","id":1,"result":{"name":"<插件名>","tools":[{"name":"<工具名>","description":"<说明>","parameters":<JSON Schema>}]}}
+2. 工具调用: {"jsonrpc":"2.0","id":N,"method":"tools/call","params":{"name":"<工具名>","arguments":{...}}}
+   插件回复: {"jsonrpc":"2.0","id":N,"result":{"content":"<字符串结果>","is_error":false}}
+3. 结束: 宿主发送 {"jsonrpc":"2.0","method":"shutdown"}（无 id），插件应退出。
+
+# Python 插件模板（强烈推荐直接使用宿主提供的 SDK）
+宿主已在 plugins/sdk/plugin_sdk.py 提供 SDK，插件源码这样写：
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sdk"))
+from plugin_sdk import serve
+
+def my_tool(args):
+    # args 是 dict，返回任意可 str() 的结果
+    return "结果字符串"
+
+serve("<插件名>", {
+    "my_tool": ("工具说明", {"type": "object", "properties": {"x": {"type": "string"}}}, my_tool),
+})
+
+# 规则
+- 工具名全局唯一，必须用「插件名_功能」命名（例如 fs_read_file），避免与其他插件冲突。
+- parameters 必须是合法的 JSON Schema object。
+- 结果 content 必须是字符串；长结果尽量精炼。
+- 每个插件保持单一职责；需要新能力就造新插件，也可以复用已有插件。
+- 语言优先选 python；node 次之；rust 仅在没有依赖需求时使用（只能 std 单文件）。
+- 插件禁止调用 input() 或任何等待人工输入的操作；除协议消息（单行 JSON）外不得向 stdout 写任何内容，调试信息一律写 stderr；每次写 stdout 后必须 flush（使用 SDK 则自动处理）。
+- 插件 handler 必须快速返回；禁止死循环或长时间阻塞，否则会被判定超时并重启。
+- 重建同名插件时直接用原名字即可（宿主的 create_plugin 会自动清理同名残留目录），不要为了绕开报错而改用 sysinfo2、sysinfo_pro 这类新名字。
+- 插件工具默认自动执行；create_plugin / remove_plugin 等改变系统自身的元工具需要用户授权。
+- 不要在只抛出一句「我先看看……」之类的计划后就结束回复。要么在同一条回复里直接发起工具调用，
+  要么给出完整的最终结论；信息不足时明确说明还缺什么，而不是沉默结束。
+- 任务完成后用自然语言向用户总结结果（不再调用任何工具即表示任务结束）。"#;
+
+/// 把宿主的真实路径与运行约定写进系统提示，避免模型靠猜导致路径错乱。
+fn env_section(rt: &Runtime) -> String {
+    format!(
+        "\n\n# 运行环境（由宿主确定，直接使用，勿猜测）\n\
+         - 应用根目录（＝插件进程的工作目录）: {root}\n\
+         - 插件目录: {plugins}\n\
+         - 插件源码路径形如: {plugins}\\<插件名>\\main.py\n\
+         - 平台: {os}\n\
+         - 所有相对路径都相对「应用根目录」。涉及本项目文件时，直接用上面这些绝对路径最稳妥。\n\
+         - 插件子进程由宿主以「应用根目录」为工作目录启动，因此插件内的相对路径与你在宿主机上看到的一致。\n\
+         - Python 插件已由宿主强制 UTF-8（PYTHONUTF8=1，PYTHONIOENCODING=utf-8），你无需再写编码兼容代码。\n\
+         - 你的插件目录里只会有一个 plugins/（就是上面这个），不要再去 target/ 等构建产物目录里找。",
+        root = rt.root.display(),
+        plugins = rt.plugins_dir.display(),
+        os = std::env::consts::OS,
+    )
+}
+
+pub struct Agent {
+    llm: Arc<dyn LlmProvider>,
+    rt: Arc<Runtime>,
+    messages: Vec<Message>,
+}
+
+impl Agent {
+    pub fn new(llm: Arc<dyn LlmProvider>, rt: Arc<Runtime>, rules: Option<&str>) -> Self {
+        let mut sys = SYSTEM_PROMPT.to_string();
+        sys.push_str(&env_section(&rt));
+        if let Some(r) = rules {
+            let r = r.trim();
+            if !r.is_empty() {
+                sys.push_str("\n\n# 项目规则\n");
+                sys.push_str(r);
+            }
+        }
+        Self { llm, rt, messages: vec![Message::system(sys)] }
+    }
+
+    /// 当前对话历史长度（用于中断时回滚）
+    pub fn messages_len(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// 中断当前任务后回滚对话历史，避免遗留「有 tool_calls 但无结果」的半截消息。
+    pub fn truncate_messages(&mut self, len: usize) {
+        self.messages.truncate(len);
+    }
+
+    /// 处理一轮用户输入：循环「问模型 → 执行工具 → 回填结果」直到模型不再调用工具。
+    pub async fn run_turn(&mut self, ui: &mut dyn Ui, input: &str) -> Result<()> {
+        self.messages.push(Message::user(input));
+        // 包住整轮：UI 借此显示等待动画，并在结束时把中间过程折叠成一行
+        ui.turn_start().await;
+        let result = self.run_loop(ui).await;
+        ui.turn_end().await;
+        result
+    }
+
+    async fn run_loop(&mut self, ui: &mut dyn Ui) -> Result<()> {
+        /// 模型返回「空回复」（无正文、无工具调用）时的重试上限。
+        /// 思考模型偶发会返回空 content（推理把输出额度吃光、上游抖动等），
+        /// 直接当成「任务结束」会让任务静默中断，所以先重试并明确报错。
+        const MAX_EMPTY_RETRY: u32 = 2;
+
+        let mut empty_retries = 0u32;
+        loop {
+            let schemas = self.rt.tool_schemas().await;
+            ui.set_status("思考中").await;
+            // 把流式接收端交给 Provider：思考模型的推理过程会在等待期间实时回显
+            let reply = {
+                let sink = ui.stream_sink();
+                self.llm.chat(&self.messages, &schemas, sink.as_deref()).await?
+            };
+            let msg = reply.message.clone();
+            let calls = msg.tool_calls.clone().unwrap_or_default();
+
+            // 模型什么都没给（既无正文也无工具调用）——绝不能当成「任务正常结束」，
+            // 否则表现就是「任务静默中断、模型没有任何返回」。先重试，再明确报错。
+            if reply.is_empty() {
+                if reply.truncated() {
+                    ui.emit(AgentEvent::Warn(format!(
+                        "模型输出被 max_tokens={} 截断且正文为空（推理 token 占满了输出额度）。",
+                        self.rt.config.provider.max_tokens.unwrap_or(0)
+                    )));
+                }
+                if empty_retries < MAX_EMPTY_RETRY {
+                    empty_retries += 1;
+                    ui.emit(AgentEvent::Warn(format!(
+                        "模型返回空回复（第 {empty_retries} 次），正在重试…"
+                    )));
+                    self.messages.push(Message::user(
+                        "（宿主提示）你上一条回复是空的。若任务尚未完成，请继续调用工具；\
+                         若已完成，请用自然语言给出最终总结。",
+                    ));
+                    continue;
+                }
+                bail!(
+                    "模型连续 {} 次返回空回复，本轮任务已停止。\n\
+                     诊断：{}。可执行 `AOX_DEBUG_LLM=1 aox` 复现，原始响应会写入 logs/llm.jsonl。\n\
+                     常见原因：① 模型是思考模式但 max_tokens 太小（推理 token 也算额度）；\
+                     ② 上游限流/超时；③ 该模型不支持工具调用。",
+                    MAX_EMPTY_RETRY + 1,
+                    reply.diag(),
+                );
+            }
+            empty_retries = 0;
+
+            if reply.truncated() {
+                ui.emit(AgentEvent::Warn(format!(
+                    "模型输出被 max_tokens={} 截断（{}），本轮内容可能不完整。\
+                     建议调大 config.toml 的 max_tokens（思考模型的推理 token 也计入额度）。",
+                    self.rt.config.provider.max_tokens.unwrap_or(0),
+                    reply.diag(),
+                )));
+            }
+
+            // 有工具调用 → 这段文字只是过程说明；没有工具调用 → 才是最终答复
+            if let Some(text) = msg.text().map(str::to_string) {
+                if calls.is_empty() {
+                    ui.emit(AgentEvent::AssistantText(text));
+                } else {
+                    ui.emit(AgentEvent::InterimText(text));
+                }
+            }
+            self.messages.push(msg);
+            if calls.is_empty() {
+                break; // 任务结束
+            }
+
+            for call in calls {
+                let name = call.function.name.clone();
+                let args: Value = match serde_json::from_str(&call.function.arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let out = ToolOutput::err(format!("工具参数不是合法 JSON: {e}"));
+                        ui.emit(AgentEvent::ToolCall { name: name.clone(), args: json!({}) });
+                        ui.emit(AgentEvent::ToolResult { name: name.clone(), is_error: true, preview: out.content.clone() });
+                        self.messages.push(Message::tool_result(&call.id, &name, out.content));
+                        continue;
+                    }
+                };
+                ui.emit(AgentEvent::ToolCall { name: name.clone(), args: args.clone() });
+                let output = self.authorize_and_execute(ui, &name, args).await;
+                ui.emit(AgentEvent::ToolResult {
+                    name: name.clone(),
+                    is_error: output.is_error,
+                    preview: truncate(&output.content, 300),
+                });
+                let content = cap_chars(&output.content, self.rt.config.agent.max_result_chars);
+                self.messages.push(Message::tool_result(&call.id, &name, content));
+            }
+        }
+        Ok(())
+    }
+
+    async fn authorize_and_execute(&mut self, ui: &mut dyn Ui, name: &str, args: Value) -> ToolOutput {
+        let kind = self.rt.tool_kind(name).await.unwrap_or(ToolKind::Meta);
+        let level = self.rt.auth.level_for(&kind, name);
+        let allowed = match level {
+            AuthLevel::Auto => true,
+            AuthLevel::Deny => false,
+            AuthLevel::Ask => {
+                if self.rt.session_allowed.read().await.contains(name) {
+                    true
+                } else {
+                    match ui.authorize(name, &args).await {
+                        AuthDecision::Allow => true,
+                        AuthDecision::AllowSession => {
+                            self.rt.session_allowed.write().await.insert(name.to_string());
+                            true
+                        }
+                        AuthDecision::Deny => false,
+                    }
+                }
+            }
+        };
+        if allowed {
+            ui.emit(AgentEvent::ToolRunning {
+                name: name.to_string(),
+                timeout_secs: self.rt.config.agent.tool_timeout_secs,
+            });
+            self.rt.execute(name, args).await
+        } else {
+            ToolOutput::err("用户拒绝了这次工具调用。请改用其他方式完成任务，或向用户说明原因。")
+        }
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+fn cap_chars(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        s.to_string()
+    } else {
+        let total = s.chars().count();
+        format!("{}…\n[结果过长已截断，原长度 {total} 字符]", s.chars().take(cap).collect::<String>())
+    }
+}
