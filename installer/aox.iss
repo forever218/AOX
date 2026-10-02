@@ -16,7 +16,9 @@
 ;      写 config.toml 和 plugins/，装在 Program Files 会因无写权限而失效。
 ;    * 不打包 config.toml（避免把个人 API key 装进去），由程序首次运行自动生成。
 ;    * 不打包 plugins/：宿主启动时会自动创建 plugins/sdk。
-;    * 卸载不删除 plugins/，保留模型积累的能力。
+;    * 卸载不删除 plugins/ 与 history/：前者是模型积累的能力，后者是用户的对话记录。
+;    * 也不预建 history/：目录由程序在第一次真正对话时自己创建，
+;      只跑 /help 的会话不会留下空文件。
 ;    * 主包不带任何运行时；需要 python 能力时，用户可以 /runtime install python
 ;      按需装配（离线包或下载），或用上面那个 -with-python 变体一次装好。
 ; ============================================================================
@@ -120,7 +122,8 @@ Source: "{#ProjectRoot}\runtime\python\*"; DestDir: "{app}\runtime\python"; \
 
 [UninstallDelete]
 ; 运行时是「机器相关、可随时重新装配」的数据（约 21 MB），卸载时清掉；
-; 而 plugins\ 是模型积累的能力，必须保留（见文件头的设计要点）。
+; 而 plugins\ 是模型积累的能力、history\ 是用户的对话记录，两者都是用户数据，必须保留
+; （见文件头的设计要点）。这两个目录都不在这里列出，Inno 就不会碰它们。
 ; 该目录只在「捆绑版」或「用户自己 /runtime install 过」时才存在。
 Type: filesandordirs; Name: "{app}\runtime"
 

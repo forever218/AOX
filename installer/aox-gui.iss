@@ -120,7 +120,9 @@ Source: "{#ProjectRoot}\runtime\python\*"; DestDir: "{app}\runtime\python"; \
 
 [UninstallDelete]
 ; 运行时是「机器相关、可随时重新装配」的数据（约 21 MB），卸载时清掉；
-; 而 plugins\ 是模型积累的能力，必须保留。该目录只在捆绑版或用户主动装配过时才存在。
+; 而 plugins\ 是模型积累的能力、history\ 是用户的对话记录，两者都是用户数据，必须保留。
+; 这两个目录都不在这里列出，Inno 就不会碰它们。
+; 该目录只在捆绑版或用户主动装配过时才存在。
 Type: filesandordirs; Name: "{app}\runtime"
 
 [Icons]

@@ -1,11 +1,15 @@
 #!/usr/bin/env python
-"""在窗口内按「相对右边距」点击一次（开发期验证弹窗用）。
+"""在窗口内点一次（开发期验证界面用）。
 
-    python tools/gui_click.py --title AOX --right 146 --y 25
+    python tools/gui_click.py --title AOX --right 146 --y 25     # 距右边 146
+    python tools/gui_click.py --title AOX --left 38  --y 25      # 距左边 38
 
-坐标以窗口**逻辑像素**给出（左上角为原点），脚本会按 DPI 换算成物理像素，
+坐标以窗口**逻辑像素**给出（以客户区左上角为原点），脚本会按 DPI 换算成物理像素，
 所以不受显示器缩放影响。与 gui_shot.py 一样用 ctypes 直连 Win32，
 避免 Add-Type 被安全策略拦掉。
+
+左 / 右二选一：界面右侧的元素（顶栏图标、弹窗按钮）按右边量最稳，
+左侧的元素（历史侧边栏、左侧行）按左边量最直观。
 """
 
 import argparse
@@ -50,9 +54,13 @@ def find_window(title_substr):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--title", default="AOX")
-    ap.add_argument("--right", type=float, required=True, help="距窗口右边多少逻辑像素")
-    ap.add_argument("--y", type=float, default=25.0, help="距窗口顶部多少逻辑像素")
+    ap.add_argument("--right", type=float, help="距客户区右边多少逻辑像素")
+    ap.add_argument("--left", type=float, help="距客户区左边多少逻辑像素")
+    ap.add_argument("--y", type=float, default=25.0, help="距客户区顶部多少逻辑像素")
     a = ap.parse_args()
+    if a.left is None and a.right is None:
+        print("必须给出 --left 或 --right", file=sys.stderr)
+        return 2
 
     win = find_window(a.title)
     if not win:
@@ -77,12 +85,19 @@ def main() -> int:
         print("BADPOINT", file=sys.stderr)
         return 3
     cw = cr.right - cr.left
+    ch = cr.bottom - cr.top
+    logical_w = cw / scale
 
-    x = pt.x + cw - int(a.right * scale)
+    if a.left is not None:
+        x = pt.x + int(a.left * scale)
+        where = f"距左 {a.left:.0f}"
+    else:
+        x = pt.x + cw - int(a.right * scale)
+        where = f"距右 {a.right:.0f}"
     y = pt.y + int(a.y * scale)
     print(
-        f"窗口 {title!r} 客户区 {cw}x{cr.bottom - cr.top}px @({pt.x},{pt.y}) "
-        f"scale={scale:.2f} -> 点击 ({x},{y})＝距客户区右边 {a.right:.0f}、顶 {a.y:.0f} 逻辑像素"
+        f"窗口 {title!r} 客户区 {cw}x{ch}px（逻辑 {logical_w:.0f}x{ch / scale:.0f}）"
+        f"scale={scale:.2f} -> 点击 ({x},{y})＝{where}、顶 {a.y:.0f} 逻辑像素"
     )
 
     user32.SetCursorPos(x, y)
@@ -96,3 +111,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

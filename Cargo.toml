@@ -31,8 +31,14 @@ async-trait = "0.1"
 termimad = "0.34"
 
 [target.'cfg(windows)'.dependencies]
-# 让传统 conhost 也支持 ANSI 颜色（VT 处理 + UTF-8 输出代码页）
-windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+# 让传统 conhost 也支持 ANSI 颜色（VT 处理 + UTF-8 输出代码页）；
+# 另外用 GetLocalTime 给历史记录生成「本地时间」文件名与显示串 ——
+# 这样就不必为了一个时间戳引入 chrono / time。
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Console",
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+] }
 
 
 [profile.release]

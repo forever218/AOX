@@ -21,6 +21,7 @@ config.*.toml
 /logs/
 /plugins/*
 !/plugins/.gitkeep
+/history/
 **/stderr.log
 
 # 按需装配的插件运行时（约 21 MB，机器相关；由 /runtime install python

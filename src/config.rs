@@ -12,6 +12,8 @@ pub struct Config {
     pub agent: AgentConfig,
     #[serde(default)]
     pub runtimes: RuntimesConfig,
+    #[serde(default)]
+    pub history: HistoryConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,6 +121,29 @@ impl Default for RuntimesConfig {
     }
 }
 
+/// 对话历史落盘。
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryConfig {
+    /// 是否把对话写入 `<应用根>/history/`。关掉后不再新开文件，
+    /// 但已有的历史仍然可读可查看（`/history`、GUI 侧边栏照常工作）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 最多保留多少个对话（按时间，新的优先）；0 = 不限制。
+    /// 只在新建对话时裁剪，所以不会删掉正在写的那个。
+    #[serde(default = "default_history_keep")]
+    pub keep: usize,
+}
+
+fn default_history_keep() -> usize {
+    200
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self { enabled: true, keep: default_history_keep() }
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| {
@@ -146,6 +171,7 @@ impl Config {
             auth: AuthConfig::default(),
             agent: AgentConfig::default(),
             runtimes: RuntimesConfig::default(),
+            history: HistoryConfig::default(),
         }
     }
 }

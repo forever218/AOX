@@ -81,6 +81,13 @@ pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     rt: Arc<Runtime>,
     messages: Vec<Message>,
+    /// 本次对话的落盘器。
+    ///
+    /// 惰性创建：只有真正产生了用户消息才建文件，所以「启动 → /help → 退出」
+    /// 这种会话不会在 history/ 里留下一堆空文件。
+    log: Option<crate::history::Log>,
+    /// 落盘过程中的错误只报一次，避免每轮都刷同一句警告。
+    log_error_reported: bool,
 }
 
 impl Agent {
@@ -94,7 +101,61 @@ impl Agent {
                 sys.push_str(r);
             }
         }
-        Self { llm, rt, messages: vec![Message::system(sys)] }
+        Self {
+            llm,
+            rt,
+            messages: vec![Message::system(sys)],
+            log: None,
+            log_error_reported: false,
+        }
+    }
+
+    /// 本次对话的历史文件 id（还没开始对话时为 None）。
+    /// 文件名主干就是 id，所以不需要单独存一份。
+    pub fn history_id(&self) -> Option<&str> {
+        self.log
+            .as_ref()
+            .and_then(|l| l.path().file_stem())
+            .and_then(|s| s.to_str())
+    }
+
+    /// 确保本次对话已有落盘文件。失败只警告一次，不打断对话。
+    fn ensure_log(&mut self, ui: &mut dyn Ui) {
+        if self.log.is_some() {
+            return;
+        }
+        let cfg = &self.rt.config.history;
+        if !cfg.enabled {
+            return;
+        }
+        let dir = crate::history::dir(&self.rt.root);
+        match crate::history::Log::create(
+            &dir,
+            Some(&self.rt.config.provider.model),
+            &self.rt.root,
+            cfg.keep,
+        ) {
+            Ok(log) => self.log = Some(log),
+            Err(e) if !self.log_error_reported => {
+                self.log_error_reported = true;
+                ui.emit(AgentEvent::Warn(format!(
+                    "对话历史无法写入 {}（{e:#}）：本次对话不会被保存",
+                    dir.display()
+                )));
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// 推入一条消息，并同步落盘。
+    ///
+    /// 所有对 `messages` 的写入都必须走这里 —— 落盘与内存只要有一处不同步，
+    /// 历史文件就不再是这段对话的忠实记录。
+    fn push_message(&mut self, msg: Message, is_error: Option<bool>) {
+        if let Some(log) = self.log.as_mut() {
+            log.append(&msg, is_error);
+        }
+        self.messages.push(msg);
     }
 
     /// 当前对话历史长度（用于中断时回滚）
@@ -103,13 +164,20 @@ impl Agent {
     }
 
     /// 中断当前任务后回滚对话历史，避免遗留「有 tool_calls 但无结果」的半截消息。
+    ///
+    /// 落盘文件同步回滚：内存里丢掉了什么，文件里也必须跟着丢掉，
+    /// 否则会留下一段无法作为请求体回放的残记录。
     pub fn truncate_messages(&mut self, len: usize) {
         self.messages.truncate(len);
+        if let Some(log) = self.log.as_mut() {
+            log.rewrite(&self.messages);
+        }
     }
 
     /// 处理一轮用户输入：循环「问模型 → 执行工具 → 回填结果」直到模型不再调用工具。
     pub async fn run_turn(&mut self, ui: &mut dyn Ui, input: &str) -> Result<()> {
-        self.messages.push(Message::user(input));
+        self.ensure_log(ui);
+        self.push_message(Message::user(input), None);
         // 包住整轮：UI 借此显示等待动画，并在结束时把中间过程折叠成一行
         ui.turn_start().await;
         let result = self.run_loop(ui).await;
@@ -149,10 +217,13 @@ impl Agent {
                     ui.emit(AgentEvent::Warn(format!(
                         "模型返回空回复（第 {empty_retries} 次），正在重试…"
                     )));
-                    self.messages.push(Message::user(
-                        "（宿主提示）你上一条回复是空的。若任务尚未完成，请继续调用工具；\
-                         若已完成，请用自然语言给出最终总结。",
-                    ));
+                    self.push_message(
+                        Message::user(
+                            "（宿主提示）你上一条回复是空的。若任务尚未完成，请继续调用工具；\
+                             若已完成，请用自然语言给出最终总结。",
+                        ),
+                        None,
+                    );
                     continue;
                 }
                 bail!(
@@ -183,7 +254,7 @@ impl Agent {
                     ui.emit(AgentEvent::InterimText(text));
                 }
             }
-            self.messages.push(msg);
+            self.push_message(msg, None);
             if calls.is_empty() {
                 break; // 任务结束
             }
@@ -196,7 +267,7 @@ impl Agent {
                         let out = ToolOutput::err(format!("工具参数不是合法 JSON: {e}"));
                         ui.emit(AgentEvent::ToolCall { name: name.clone(), args: json!({}) });
                         ui.emit(AgentEvent::ToolResult { name: name.clone(), is_error: true, preview: out.content.clone() });
-                        self.messages.push(Message::tool_result(&call.id, &name, out.content));
+                        self.push_message(Message::tool_result(&call.id, &name, out.content), Some(true));
                         continue;
                     }
                 };
@@ -208,7 +279,10 @@ impl Agent {
                     preview: truncate(&output.content, 300),
                 });
                 let content = cap_chars(&output.content, self.rt.config.agent.max_result_chars);
-                self.messages.push(Message::tool_result(&call.id, &name, content));
+                self.push_message(
+                    Message::tool_result(&call.id, &name, content),
+                    Some(output.is_error),
+                );
             }
         }
         Ok(())

@@ -54,6 +54,11 @@ pub enum FromAgent {
     Snapshot(Snapshot),
     /// 插件运行时状态（供「关于」窗口展示）；装配完成后会重发
     Runtimes(RuntimeView),
+    /// 本次会话正在写的那个对话文件 id（还没开始对话时为 None）。
+    ///
+    /// 主线程据此在历史列表里标出「当前」，并在需要时重新扫描目录 ——
+    /// 历史文件本身由主线程直接读盘，不经过这条 channel（见 `aox::history`）。
+    HistoryCurrent(Option<String>),
     /// 本轮出现不可恢复错误
     Fatal(String),
 }
@@ -64,6 +69,8 @@ pub struct BootInfo {
     pub model: String,
     pub provider_ready: bool,
     pub note: Option<String>,
+    /// 应用根目录。历史记录落在 `<root>/history`，主线程需要它才能读盘。
+    pub root: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -237,13 +244,23 @@ fn boot(
     model: &str,
     ready: bool,
     note: Option<String>,
+    root: &std::path::Path,
 ) {
     let _ = tx.send(FromAgent::Boot(Box::new(BootInfo {
         config_path: config_path.display().to_string(),
         model: model.to_string(),
         provider_ready: ready,
         note,
+        root: root.display().to_string(),
     })));
+}
+
+/// 把「本次会话正在写的对话」告诉主线程。
+///
+/// 每轮结束后调一次：id 第一次出现时主线程会把新对话加进侧边栏，
+/// 之后同一 id 的重复通知则让主线程知道「这一条的内容变了，条数该刷新了」。
+fn send_history_current(tx: &mpsc::UnboundedSender<FromAgent>, agent: &Agent) {
+    let _ = tx.send(FromAgent::HistoryCurrent(agent.history_id().map(str::to_string)));
 }
 
 /// 在独立线程里启动：建 tokio 运行时 → 装载运行时 → 跑驱动循环。
@@ -296,7 +313,7 @@ async fn boot_and_run(
         Ok(c) => c,
         Err(e) => {
             // 配置缺失/无效：GUI 照常打开，展示引导信息，输入区会被禁用。
-            boot(&tx, &config_path, "", false, Some(format!("{e:#}")));
+            boot(&tx, &config_path, "", false, Some(format!("{e:#}")), &root);
             loop {
                 match rx.recv().await {
                     Some(ToAgent::Shutdown) | None => return Ok(()),
@@ -338,7 +355,7 @@ async fn boot_and_run(
             ui.emit(AgentEvent::Info(
                 "请在 config.toml 的 [provider] 填写 base_url 与 api_key（或 api_key_env）后重新启动。".into(),
             ));
-            boot(&tx, &config_path, &model, false, Some(format!("{e:#}")));
+            boot(&tx, &config_path, &model, false, Some(format!("{e:#}")), &root);
             loop {
                 match ui.rx.recv().await {
                     Some(ToAgent::Shutdown) | None => return Ok(()),
@@ -355,7 +372,8 @@ async fn boot_and_run(
     });
 
     let mut agent = Agent::new(llm, rt.clone(), rules.as_deref());
-    boot(&tx, &config_path, &model, true, None);
+    boot(&tx, &config_path, &model, true, None, &root);
+    send_history_current(&tx, &agent);
 
     // 周期性广播插件快照：模型每造出一个新插件，右侧面板立刻可见。
     // （工具名不再广播——顶栏的工具胶囊已去掉，没有消费方。）
@@ -412,6 +430,9 @@ async fn boot_and_run(
                 let _ = ui.tx.send(FromAgent::TurnAborted);
             }
         }
+        // 每轮结束后同步一次「当前对话」：第一轮会新建文件（侧边栏出现新条目），
+        // 之后同一 id 的重复通知让侧边栏刷新条数。
+        send_history_current(&tx, &agent);
     }
 
     snap_task.abort();

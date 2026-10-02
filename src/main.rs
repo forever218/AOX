@@ -1,6 +1,7 @@
 mod agent;
 mod auth;
 mod config;
+mod history;
 mod llm;
 mod message;
 mod plugin;
@@ -13,7 +14,7 @@ mod ui;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::agent::Agent;
 use crate::config::Config;
@@ -149,6 +150,33 @@ async fn runtimes_command(rt: &Arc<Runtime>, line: &str) -> Result<String> {
             runtimes::install(rt, lang, &mut sink).await
         }
     }
+}
+
+/// `/history` 子命令：查看 / 删除历史对话。
+///
+/// 解析与文案都在 `crate::history` 里，CLI 与 GUI 共用同一份实现。
+async fn history_command(current: Option<&str>, line: &str, dir: &Path) -> Result<String> {
+    Ok(match history::parse_cmd(line)? {
+        history::Cmd::List => history::list_text(dir, current),
+        history::Cmd::Dir => dir.display().to_string(),
+        history::Cmd::Show(key) => {
+            let s = history::resolve(dir, &key)?;
+            let items = history::load(&s.path)?;
+            format!(
+                "{}  {}（{} 条）\n{}",
+                s.time,
+                s.title,
+                s.messages,
+                history::transcript_text(&items)
+            )
+        }
+        history::Cmd::Remove(key) => {
+            let s = history::resolve(dir, &key)?;
+            std::fs::remove_file(&s.path)
+                .with_context(|| format!("无法删除 {}", s.path.display()))?;
+            format!("已删除: {}  {}", s.time, s.title)
+        }
+    })
 }
 
 #[tokio::main]
@@ -318,6 +346,12 @@ async fn main() -> Result<()> {
                     Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
                 }
             }
+            _ if history::is_cmd(line) => {
+                match history_command(agent.history_id(), line, &history::dir(&rt.root)).await {
+                    Ok(text) => ui.emit(AgentEvent::Info(text)),
+                    Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
+                }
+            }
             "/help" => {
                 println!();
                 for (cmd, desc) in [
@@ -325,6 +359,7 @@ async fn main() -> Result<()> {
                     ("/tools", "列出当前所有可用工具"),
                     ("/plugins", "列出已加载的插件"),
                     ("/runtime", "查看插件运行时状态；/runtime install python 装配内置运行时"),
+                    ("/history", "查看历史对话；/history show <序号> 看全文，/history dir 看目录"),
                     ("/demo", "预览终端排版与过程折叠效果"),
                     ("/expand", "展开上一次被折叠的工具调用过程"),
                     ("/quit", "退出程序（/exit 等价）"),

@@ -11,6 +11,7 @@
 pub mod agent;
 pub mod auth;
 pub mod config;
+pub mod history;
 pub mod llm;
 pub mod message;
 pub mod paths;
