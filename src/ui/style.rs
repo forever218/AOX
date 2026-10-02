@@ -56,6 +56,47 @@ pub fn bold_white(s: &str) -> String {
     paint(s, "1;97")
 }
 
+/// 项目主页（启动横幅里展示，终端支持时可点击跳转）
+pub const PROJECT_URL: &str = "https://github.com/forever218/AOX";
+
+/// 当前终端是否支持 OSC 8 超链接。
+///
+/// 传统 conhost 不认这个序列，会把转义字节当普通字符吐到屏幕上，
+/// 所以必须探测后再用；探测不准时宁可退回纯文本 URL。
+fn osc8_supported() -> bool {
+    if !enabled() {
+        return false; // 重定向到文件 / NO_COLOR
+    }
+    // 显式开关：AOX_HYPERLINK=0 关闭，=1 强制开启
+    match std::env::var("AOX_HYPERLINK").ok().as_deref() {
+        Some("0") | Some("false") => return false,
+        Some("1") | Some("true") => return true,
+        _ => {}
+    }
+    #[cfg(windows)]
+    {
+        // Windows Terminal 注入 WT_SESSION；VS Code / WezTerm 等注入 TERM_PROGRAM。
+        // 两者都没有 = 老 conhost（双击 exe，或 Git Bash 跑在传统控制台里）→ 降级。
+        std::env::var_os("WT_SESSION").is_some() || std::env::var_os("TERM_PROGRAM").is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("TERM").is_some()
+            || std::env::var_os("TERM_PROGRAM").is_some()
+            || std::env::var_os("VTE_VERSION").is_some()
+    }
+}
+
+/// OSC 8 超链接：终端支持时可点击跳转，否则原样返回纯文本。
+pub fn link(text: &str, url: &str) -> String {
+    if osc8_supported() {
+        // ST 用 ESC\ 而非 BEL，兼容性更好
+        format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+    } else {
+        text.to_string()
+    }
+}
+
 /// AOX 启动 logo（ANSI Shadow 风格）
 pub const LOGO: &str = r" █████╗  ██████╗ ██╗  ██╗
 ██╔══██╗██╔═══██╗╚██╗██╔╝

@@ -59,8 +59,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("AOX")
             .with_icon(window_icon())
-            .with_inner_size([1180.0, 780.0])
-            .with_min_inner_size([880.0, 560.0]),
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([1000.0, 640.0]),
         ..Default::default()
     };
 

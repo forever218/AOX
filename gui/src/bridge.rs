@@ -58,7 +58,6 @@ pub enum FromAgent {
 
 #[derive(Debug, Clone)]
 pub struct BootInfo {
-    pub root: String,
     pub config_path: String,
     pub model: String,
     pub provider_ready: bool,
@@ -67,7 +66,6 @@ pub struct BootInfo {
 
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
-    pub tools: Vec<String>,
     pub plugins: Vec<String>,
 }
 
@@ -168,14 +166,12 @@ impl Ui for GuiUi {
 
 fn boot(
     tx: &mpsc::UnboundedSender<FromAgent>,
-    root: &std::path::Path,
     config_path: &std::path::Path,
     model: &str,
     ready: bool,
     note: Option<String>,
 ) {
     let _ = tx.send(FromAgent::Boot(Box::new(BootInfo {
-        root: root.display().to_string(),
         config_path: config_path.display().to_string(),
         model: model.to_string(),
         provider_ready: ready,
@@ -233,7 +229,7 @@ async fn boot_and_run(
         Ok(c) => c,
         Err(e) => {
             // 配置缺失/无效：GUI 照常打开，展示引导信息，输入区会被禁用。
-            boot(&tx, &root, &config_path, "", false, Some(format!("{e:#}")));
+            boot(&tx, &config_path, "", false, Some(format!("{e:#}")));
             loop {
                 match rx.recv().await {
                     Some(ToAgent::Shutdown) | None => return Ok(()),
@@ -251,11 +247,12 @@ async fn boot_and_run(
 
     let mut ui = GuiUi { tx: tx.clone(), rx };
 
-    // 恢复持久化插件（与 CLI 同一路径）
+    // 恢复持久化插件（与 CLI 同一路径）。
+    // 成功保持静默——启动时不该往活动流里刷一屏「插件 xxx 已恢复」，
+    // 那会把真正要看的信息挤下去。只有失败才出声。
     for (name, result) in aox::plugin::load_all(&rt).await {
-        match result {
-            Ok(tools) => ui.emit(AgentEvent::Info(format!("插件 {name} 已恢复（{} 个工具）", tools.len()))),
-            Err(e) => ui.emit(AgentEvent::Warn(format!("插件 {name} 加载失败: {e:#}"))),
+        if let Err(e) = result {
+            ui.emit(AgentEvent::Warn(format!("插件 {name} 加载失败: {e:#}")));
         }
     }
 
@@ -266,7 +263,7 @@ async fn boot_and_run(
             ui.emit(AgentEvent::Info(
                 "请在 config.toml 的 [provider] 填写 base_url 与 api_key（或 api_key_env）后重新启动。".into(),
             ));
-            boot(&tx, &root, &config_path, &model, false, Some(format!("{e:#}")));
+            boot(&tx, &config_path, &model, false, Some(format!("{e:#}")));
             loop {
                 match ui.rx.recv().await {
                     Some(ToAgent::Shutdown) | None => return Ok(()),
@@ -283,21 +280,21 @@ async fn boot_and_run(
     });
 
     let mut agent = Agent::new(llm, rt.clone(), rules.as_deref());
-    boot(&tx, &root, &config_path, &model, true, None);
+    boot(&tx, &config_path, &model, true, None);
 
-    // 周期性广播工具/插件快照：模型每造出一个新插件，右侧面板立刻可见。
+    // 周期性广播插件快照：模型每造出一个新插件，右侧面板立刻可见。
+    // （工具名不再广播——顶栏的工具胶囊已去掉，没有消费方。）
     let snap_tx = tx.clone();
     let snap_rt = rt.clone();
     let snap_task = tokio::spawn(async move {
         loop {
-            let tools = snap_rt.tool_names().await;
             let plugins = {
                 let p = snap_rt.plugins.lock().await;
                 let mut v: Vec<String> = p.keys().cloned().collect();
                 v.sort();
                 v
             };
-            if snap_tx.send(FromAgent::Snapshot(Snapshot { tools, plugins })).is_err() {
+            if snap_tx.send(FromAgent::Snapshot(Snapshot { plugins })).is_err() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(1200)).await;

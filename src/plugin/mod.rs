@@ -25,6 +25,23 @@ use crate::runtime::Runtime;
 const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 const RUST_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// 抑制子进程在 Windows 上弹出控制台黑窗口。
+///
+/// 插件进程的 stdin/stdout 是管道、stderr 落到 `stderr.log`，**从不需要控制台**。
+/// 但在 GUI 版里宿主编译为 `windows` 子系统（自身没有控制台），此时启动
+/// `python.exe` / `node.exe` / `rustc.exe` 这类控制台程序，Windows 会专门为它
+/// 分配一个新控制台——用户看到的表现就是「动不动弹出几个黑色窗口」。
+/// 统一加上 `CREATE_NO_WINDOW` 后，CLI 与 GUI 两边行为一致，且不影响任何 I/O。
+#[cfg(windows)]
+fn hide_console(cmd: &mut Command) {
+    /// 不生成控制台窗口（`winbase.h`）。
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console(_cmd: &mut Command) {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub name: String,
@@ -240,6 +257,7 @@ fn spawn_command(
         "rust" => Command::new(&entry),
         other => bail!("未知插件语言: {other}"),
     };
+    hide_console(&mut cmd);
     cmd.current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -372,16 +390,13 @@ async fn create_plugin_inner(
 
     if language == "rust" {
         let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
-        let build = tokio::time::timeout(
-            RUST_BUILD_TIMEOUT,
-            Command::new(&rt.config.runtimes.rustc)
-                .args(["--edition=2021", "-O", "main.rs", "-o", &exe])
-                .current_dir(dir)
-                .output(),
-        )
-        .await
-        .map_err(|_| anyhow!("rustc 编译超时"))?
-        .context("无法启动 rustc（rust 插件需要 Rust 工具链在 PATH 中）")?;
+        let mut cmd = Command::new(&rt.config.runtimes.rustc);
+        cmd.args(["--edition=2021", "-O", "main.rs", "-o", &exe]).current_dir(dir);
+        hide_console(&mut cmd);
+        let build = tokio::time::timeout(RUST_BUILD_TIMEOUT, cmd.output())
+            .await
+            .map_err(|_| anyhow!("rustc 编译超时"))?
+            .context("无法启动 rustc（rust 插件需要 Rust 工具链在 PATH 中）")?;
         if !build.status.success() {
             bail!("rustc 编译失败:\n{}", String::from_utf8_lossy(&build.stderr));
         }

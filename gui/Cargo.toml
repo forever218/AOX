@@ -20,3 +20,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 async-trait = "0.1"
 anyhow = "1"
 serde_json = "1"
+
+# 只为拿到窗口句柄（Windows 上是 HWND），用于直接设 DWM 属性把原生标题栏染成界面同色。
+# 版本必须与 eframe 0.33 依赖的一致，否则 trait 对不上。
+raw-window-handle = "0.6"

@@ -56,14 +56,18 @@ INCLUDE = { value = "<MSVC>\\include;<WinSDK>\\Include\\<版本>\\um;<WinSDK>\\I
 
 | 命令 | 作用 |
 | --- | --- |
+| `/help` | 显示帮助（列出全部命令） |
 | `/tools` | 查看当前所有可用工具 |
 | `/plugins` | 查看已加载的插件 |
 | `/demo` | 预览终端排版与折叠效果 |
 | `/expand` | 展开上一次被折叠的工具调用过程 |
-| `/help` | 显示帮助 |
-| `/quit` | 退出 |
+| `/quit` | 退出（`/exit` 等价） |
 
 按 `Ctrl+C` 可中断正在进行的任务。
+
+启动横幅里的项目地址是可点击超链接（OSC 8）。Windows Terminal、VS Code 终端等会自动启用；
+传统 conhost（例如直接双击 exe）不认这个序列，会自动退回纯文本 URL。
+自动探测不灵时可用 `AOX_HYPERLINK=1` 强制开启、`AOX_HYPERLINK=0` 关闭。
 
 ## 等待动画与过程折叠
 
@@ -118,13 +122,17 @@ cargo build -p aox-gui --release          # 产出 target/release/aox-gui.exe
 
 | 区域 | 内容 |
 | --- | --- |
-| 顶栏 | 品牌与实时状态（`思考中 3.2s` / `执行 fs_read`）、模型、工具数、插件数、右侧面板开关 |
+| 顶栏 | 品牌与实时状态（`思考中 3.2s` / `执行 fs_read`）、模型、工具数、插件数、右侧面板开关、**明暗切换** |
 | 主区 | 对话流：用户气泡、助手 Markdown（标题/代码块/表格/引用/行内代码）、**自动折叠的过程块**（点击展开工具调用明细） |
 | 右侧活动流 | 可折叠、可拖宽。实时滚动展示：每轮状态与耗时、**流式思考过程**、每一次工具/插件调用与结果、授权请求与结果、插件加载与生长 |
 | 底部 | 多行输入（`Enter` 发送、`Shift+Enter` 换行）、发送 / 停止按钮 |
 
 其它细节：
 
+- 配色是**「纸与墨」的单色方案**，只有明度、没有色相：亮色是一张发暖的纸（`#F2EFE8`），
+  暗色是暖调的黑（`#141412`）。点顶栏最右的按钮即可切换（亮色显示月牙、暗色显示太阳），
+  原生标题栏会跟着一起变；偏好记在 `.aox-gui-theme`。
+  成功/警告/失败不靠颜色区分，而用明度层次与反白块表达。
 - 需要授权的元工具会弹出 Modal，快捷键与 CLI 完全一致：`y` 允许一次、`a` 本会话始终允许、`n` / `Esc` 拒绝。
 - 任务执行中可点右下角的停止按钮中断，对话历史会回滚到任务前状态（与 CLI 的 `Ctrl+C` 等价）。
 - 界面语言跟随系统：自动从 `C:\Windows\Fonts` 挑一个中文字体（等线 / 微软雅黑 / 黑体…），
@@ -151,6 +159,22 @@ cargo build -p aox-gui --release          # 产出 target/release/aox-gui.exe
 
 AOX 对「空回复」的处置是：先重试 2 次并提示，仍为空则明确报错说明原因，**不会**把
 一句「我先看看……」的前言当成最终答案。
+
+**图形界面里「一用插件 / 插件初始化就弹黑色 python 窗口」？**
+
+GUI 版编译为 `windows` 子系统，**自身没有控制台**。如果拉起插件子进程时不加
+`CREATE_NO_WINDOW`，Windows 会为 `python.exe` 新分配一块**带窗口**的控制台 —— 现象就是
+动不动弹出几个黑窗。宿主已修（`src/plugin/mod.rs::hide_console`，覆盖首次启动恢复插件、
+插件崩溃自愈重启、`rustc` 编译三条路径），装上最新构建的 `AOX-GUI-Setup` 即可。
+留了回归检查：
+
+```bash
+python tools/check_no_console_window.py --ab                                  # 机制自检，秒级
+python tools/check_no_console_window.py --app target/release/aox-gui.exe --cwd .
+```
+
+注意 `cargo run` 起来的 **debug 版本身就是控制台程序**，看到一个黑窗属于正常现象，
+不是这个 bug。
 
 ## 目录说明
 

@@ -288,9 +288,9 @@ fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool
             theme::body_font(size)
         };
         let col = if sp.code {
-            P::ACCENT
+            P::ink()
         } else if sp.link {
-            P::ACCENT
+            P::ink()
         } else if strong && !theme::bold_available() {
             Color32::from_rgb(0xFF, 0xFF, 0xFF)
         } else {
@@ -300,7 +300,7 @@ fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool
             font_id: font,
             color: col,
             italics: sp.italic,
-            background: if sp.code { P::CODE_BG } else { Color32::TRANSPARENT },
+            background: if sp.code { P::code_bg() } else { Color32::TRANSPARENT },
             ..Default::default()
         };
         job.append(&sp.text, 0.0, fmt);
@@ -316,8 +316,8 @@ fn code_job(code: &str, wrap: f32) -> LayoutJob {
         code,
         0.0,
         TextFormat {
-            font_id: theme::mono_font(12.0),
-            color: P::TEXT,
+            font_id: theme::mono_font(15.0),
+            color: P::text(),
             ..Default::default()
         },
     );
@@ -327,115 +327,225 @@ fn code_job(code: &str, wrap: f32) -> LayoutJob {
 /// 渲染整段 Markdown。
 ///
 /// `base` 是正文颜色（用户气泡里可以用更亮的色）；`width` 是可用的最大宽度。
+/// 统一的文本标签：把换行模式钉死成 `Wrap`。
+///
+/// 这是本项目最容易踩的 UI 坑：`Ui::wrap_mode()` 在「非换行的水平布局」
+/// （`ui.horizontal*`，其 `main_wrap == false`）里返回 `Extend`，
+/// 而 `Label` 默认 `wrap_mode = None` 会去继承它 —— 于是 epaint 把
+/// `LayoutJob::wrap::max_width` 当成 `f32::INFINITY`，长文本一行到底，
+/// 直接冲出栏位右边界、被 ScrollArea 裁掉（表现为「文字被切」）。
+/// 气泡、列表项、表格单元格里全是这种水平布局，所以这里逐个显式钉死。
+fn wrap_label(ui: &mut Ui, job: LayoutJob) -> egui::Response {
+    ui.add(
+        Label::new(job)
+            .selectable(true)
+            .wrap_mode(egui::TextWrapMode::Wrap),
+    )
+}
+
 pub fn render(ui: &mut Ui, md: &str, base: Color32) {
-    let width = ui.available_width().max(120.0);
+    // 右端边界：以进入本栏时的可用宽度为准，整段渲染期间不再变化。
+    let width = ui.available_width().max(160.0);
+    // 让这一栏里的所有后代 Ui（含 horizontal / Frame 内部）都默认换行，
+    // 而不是各自退化成 Extend。个别控件仍可自行覆盖。
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
     let blocks = parse(md);
 
     for block in blocks {
         match block {
             Block::Heading { level, text } => {
                 let size = match level {
-                    1 => 18.5,
-                    2 => 16.0,
-                    3 => 14.5,
-                    _ => 13.5,
+                    1 => 25.0,
+                    2 => 21.0,
+                    3 => 18.0,
+                    _ => 16.5,
                 };
-                ui.add_space(if level <= 2 { 6.0 } else { 3.0 });
-                let job = job_of(&inline(&text), size, P::TEXT, width, level <= 2);
-                ui.add(Label::new(job).selectable(true));
+                ui.add_space(if level <= 2 { 12.0 } else { 7.0 });
+                let job = job_of(&inline(&text), size, P::text(), width, level <= 2);
+                wrap_label(ui, job);
                 if level == 1 {
-                    ui.add_space(3.0);
+                    ui.add_space(6.0);
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
-                    ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, P::BORDER));
+                    ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, P::border()));
                 }
-                ui.add_space(3.0);
+                ui.add_space(5.0);
             }
 
             Block::Para(text) => {
-                let job = job_of(&inline(&text), 14.0, base, width, false);
-                ui.add(Label::new(job).selectable(true));
-                ui.add_space(7.0);
+                let job = job_of(&inline(&text), theme::BODY, base, width, false);
+                wrap_label(ui, job);
+                ui.add_space(11.0);
             }
 
             Block::Bullet { indent, marker, text } => {
-                let pad = (indent.min(3) as f32) * 14.0;
-                let inner_w = (width - pad - 22.0).max(60.0);
+                let pad = (indent.min(3) as f32) * 20.0;
+                let inner_w = (width - pad - 30.0).max(80.0);
                 ui.horizontal_top(|ui| {
                     ui.add_space(pad);
-                    ui.allocate_ui(egui::vec2(16.0, 0.0), |ui| {
-                        ui.set_min_width(16.0);
+                    ui.allocate_ui(egui::vec2(20.0, 0.0), |ui| {
+                        ui.set_min_width(20.0);
                         let m = marker.clone().unwrap_or_else(|| "•".to_string());
-                        ui.label(RichText::new(m).color(P::ACCENT).size(13.0));
+                        ui.label(RichText::new(m).color(P::ink()).size(17.5));
                     });
-                    let job = job_of(&inline(&text), 14.0, base, inner_w, false);
-                    ui.add(Label::new(job).selectable(true));
+                    let job = job_of(&inline(&text), theme::BODY, base, inner_w, false);
+                    wrap_label(ui, job);
                 });
-                ui.add_space(3.0);
+                ui.add_space(5.0);
             }
 
             Block::Quote(text) => {
-                let inner_w = (width - 26.0).max(60.0);
+                let inner_w = (width - 34.0).max(80.0);
                 ui.horizontal_top(|ui| {
                     ui.add_space(2.0);
-                    ui.label(RichText::new("▎").color(P::QUOTE_BAR).size(15.0));
-                    ui.add_space(2.0);
+                    ui.label(RichText::new("▎").color(P::quote_bar()).size(20.0));
+                    ui.add_space(4.0);
                     let spans = inline(&text);
-                    let job = job_of(&spans, 13.5, P::TEXT_DIM, inner_w, false);
-                    ui.add(Label::new(job).selectable(true));
+                    let job = job_of(&spans, theme::BODY, P::text_dim(), inner_w, false);
+                    wrap_label(ui, job);
                 });
-                ui.add_space(7.0);
+                ui.add_space(11.0);
             }
 
             Block::Code { lang, lines } => {
                 let code = lines.join("\n");
                 Frame::NONE
-                    .fill(P::CODE_BG)
-                    .corner_radius(CornerRadius::same(8))
-                    .stroke(Stroke::new(1.0, P::BORDER))
-                    .inner_margin(Margin::symmetric(11, 9))
+                    .fill(P::code_bg())
+                    .corner_radius(CornerRadius::same(12))
+                    .stroke(Stroke::new(1.0, P::border()))
+                    .inner_margin(Margin::symmetric(16, 14))
                     .show(ui, |ui| {
-                        ui.set_width((width - 4.0).max(80.0));
+                        // 卡片的宽度必须显式锁死，否则代码行的长行会把卡片顶宽、被面板裁掉
+                        let inner = (width - 34.0).max(100.0);
+                        ui.set_width(inner);
+                        ui.set_max_width(inner);
                         if !lang.is_empty() {
-                            ui.label(RichText::new(lang.to_lowercase()).color(P::TEXT_FAINT).size(10.5));
-                            ui.add_space(3.0);
+                            ui.label(RichText::new(lang.to_lowercase()).color(P::text_faint()).size(13.0));
+                            ui.add_space(6.0);
                         }
-                        ui.add(Label::new(code_job(&code, width - 26.0)).selectable(true));
+                        wrap_label(ui, code_job(&code, inner));
                     });
-                ui.add_space(8.0);
+                ui.add_space(12.0);
             }
 
             Block::Rule => {
-                ui.add_space(4.0);
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
-                ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, P::BORDER));
                 ui.add_space(6.0);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+                ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, P::border()));
+                ui.add_space(9.0);
             }
 
             Block::Table { header, rows } => {
                 let cols = header.len().max(1);
-                let cell_w = (width / cols as f32 - 18.0).max(50.0);
+                let gap = 18.0;
+                // 列宽要连列间距一起算进去，否则最后一列会超出可用宽度被裁掉
+                let cell_w = ((width - gap * (cols.saturating_sub(1)) as f32) / cols as f32 - 4.0)
+                    .max(60.0);
                 let id = ui.next_auto_id();
                 egui::Grid::new(id)
                     .num_columns(cols)
-                    .spacing(egui::vec2(14.0, 5.0))
+                    .spacing(egui::vec2(gap, 8.0))
                     .striped(false)
-                    .min_col_width(cell_w.min(180.0))
+                    .min_col_width(cell_w)
+                    .max_col_width(cell_w)
                     .show(ui, |ui| {
                         for cell in &header {
-                            let job = job_of(&inline(cell), 13.0, P::TEXT, cell_w, true);
-                            ui.add(Label::new(job).selectable(true));
+                            let job = job_of(&inline(cell), 15.0, P::text(), cell_w, true);
+                            wrap_label(ui, job);
                         }
                         ui.end_row();
                         for row in &rows {
                             for cell in row {
-                                let job = job_of(&inline(cell), 13.0, P::TEXT_DIM, cell_w, false);
-                                ui.add(Label::new(job).selectable(true));
+                                let job = job_of(&inline(cell), 15.0, P::text_dim(), cell_w, false);
+                                wrap_label(ui, job);
                             }
                             ui.end_row();
                         }
                     });
-                ui.add_space(8.0);
+                ui.add_space(12.0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{pos2, vec2, Rect};
+
+    /// 复刻 `App::transcript` 的版心骨架，量出：
+    /// - 进入 markdown 时 Ui 认为的可用宽度
+    /// - 渲染完之后内容实际占用的宽度（超出栏宽即被 ScrollArea 裁切）
+    fn probe(window_w: f32, md: &str) -> (f32, f32, f32) {
+        let ctx = egui::Context::default();
+        let mut avail = 0.0f32;
+        let mut used = 0.0f32;
+        let mut inner_w = 0.0f32;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(window_w, 760.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let a = ui.available_width();
+                let (inner, pad) = crate::app::column(a);
+                inner_w = inner;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_space(26.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(pad);
+                            ui.vertical(|ui| {
+                                ui.set_max_width(inner);
+                                ui.set_min_width(inner);
+                                avail = ui.available_width();
+                                render(ui, md, egui::Color32::BLACK);
+                                used = ui.min_rect().width();
+                            });
+                        });
+                    });
+            });
+        });
+        (avail, inner_w, used)
+    }
+
+    const MD: &str = "\
+### connection probe
+
+- `httpfetch_raw` -> requested bilibili.com and got HTTP 200, pulled the whole page (183539 chars, truncated) and pushed it through the plugin pipe correctly.
+
+- plain paragraph with a fairly long run of words so that any sane layout has to wrap it somewhere before it runs off the right edge of the column.
+
+Conclusion: nothing to build, nothing to repair; the current capability covers both the video-metadata path and the generic web-request path.
+
+| plugin | language | tools |
+| --- | --- | --- |
+| bilibili | python | bilibili_video_info, bilibili_danmaku, bilibili_comments, bilibili_subtitle, bilibili_related |
+| httpfetch | python | httpfetch_raw |
+
+> quoted line with enough words that it has to wrap instead of pushing the whole row past the right edge of the column.
+
+```text
+a code line long enough that it must wrap rather than widen the card beyond the column
+```
+";
+
+    #[test]
+    fn text_never_exceeds_the_column() {
+        for w in [1000.0f32, 1280.0, 1693.0, 2400.0] {
+            let (avail, inner, used) = probe(w, MD);
+            println!("window={w} avail={avail} inner={inner} used={used}");
+            assert!(
+                used <= inner + 0.5,
+                "window={w}: content used {used} > column {inner} (avail={avail})"
+            );
+        }
+    }
+
+    #[test]
+    fn long_unbreakable_token_is_clamped() {
+        let md = format!("- token {}", "x".repeat(400));
+        let (_avail, inner, used) = probe(1280.0, &md);
+        assert!(used <= inner + 0.5, "used {used} > column {inner}");
     }
 }

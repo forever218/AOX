@@ -195,11 +195,12 @@ async fn main() -> Result<()> {
     }
 
     let mut ui = CliUi::new();
+    // 恢复持久化插件。成功的静默（启动横幅保持干净），失败才出声。
+    // 想查看已加载的插件请用 /plugins。
     let load_results = plugin::load_all(&rt).await;
     for (name, result) in &load_results {
-        match result {
-            Ok(tools) => ui.emit(AgentEvent::Info(format!("插件 {name} 已恢复（{} 个工具）", tools.len()))),
-            Err(e) => ui.emit(AgentEvent::Warn(format!("插件 {name} 加载失败: {e:#}"))),
+        if let Err(e) = result {
+            ui.emit(AgentEvent::Warn(format!("插件 {name} 加载失败: {e:#}")));
         }
     }
 
@@ -227,20 +228,21 @@ async fn main() -> Result<()> {
 
     println!("\n{}", ui::style::logo());
     println!(
-        "  {}   {} {}   {} {}",
-        ui::style::dim("AOX · 自我增长的 AI 编程代理"),
+        "  {} {}",
         ui::style::dim("模型"),
-        ui::style::bold(&rt.config.provider.model),
-        ui::style::dim("工具"),
-        ui::style::dim(&rt.tool_names().await.join(", "))
+        ui::style::bold(&rt.config.provider.model)
     );
-    ui.emit(AgentEvent::Info(
-        "/tools 工具   /plugins 插件   /demo 预览   /expand 展开上次过程   /quit 退出".into(),
-    ));
     ui.emit(AgentEvent::Info(format!(
         "配置 {}   插件目录 {}",
         config_path.display(),
         rt.plugins_dir.display()
+    )));
+    ui.emit(AgentEvent::Info("输入 /help 查看所有命令".into()));
+    ui.emit(AgentEvent::Info(format!(
+        "项目主页 {}",
+        // OSC 8 超链接：Windows Terminal / VS Code 等可直接点击跳转；
+        // 老 conhost 不支持时会自动退回纯文本 URL
+        ui::style::link(ui::style::PROJECT_URL, ui::style::PROJECT_URL)
     )));
 
     // ---- REPL
@@ -289,9 +291,26 @@ async fn main() -> Result<()> {
             }
             "/expand" => ui.expand_last_turn(),
             "/help" => {
-                ui.emit(AgentEvent::Info(
-                    "命令: /tools /plugins /demo /expand /quit；其余输入直接发给模型".into(),
-                ));
+                println!();
+                for (cmd, desc) in [
+                    ("/help", "显示本帮助"),
+                    ("/tools", "列出当前所有可用工具"),
+                    ("/plugins", "列出已加载的插件"),
+                    ("/demo", "预览终端排版与过程折叠效果"),
+                    ("/expand", "展开上一次被折叠的工具调用过程"),
+                    ("/quit", "退出程序（/exit 等价）"),
+                ] {
+                    println!(
+                        "  {}  {}",
+                        ui::style::cyan(&format!("{cmd:<9}")),
+                        ui::style::dim(desc)
+                    );
+                }
+                println!(
+                    "  {}",
+                    ui::style::dim("其余输入直接发给模型；任务进行中按 Ctrl+C 可中断")
+                );
+                println!();
             }
             _ => {
                 let mark = agent.messages_len();
