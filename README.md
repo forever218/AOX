@@ -210,20 +210,78 @@ python tools/check_no_console_window.py --app target/release/aox-gui.exe --cwd .
 
 | 插件语言 | 运行已有插件 | 新建插件（`create_plugin`） |
 | --- | --- | --- |
-| python | 需要 `python`（3.8+）在 `PATH` | 同左 |
-| node | 需要 `node` 在 `PATH` | 同左 |
+| python | 需要能用的 `python`（3.8+） | 同左 |
+| node | 需要能用的 `node` | 同左 |
 | rust | **不需要任何环境** | 需要 `rustc`（编译完就不再需要） |
 
-- 也就是说，`plugins/` 里已有的插件只有 python / node 两类要求解释器在场；rust 插件是编译好的原生 exe，
-  宿主直接运行它，没装 Rust 工具链也能用。
-- 没有任何解释器时程序照常启动、能对话、能用 `/tools` `/plugins` 等本地命令，
-  但 `create_plugin` 会失败并提示「请检查 python 是否在 PATH 中」——等于没有实际能力。
-- 运行时路径可在 `config.toml` 的 `[runtimes] python / node / rustc` 指定完整路径。
-- 个别插件的**第三方 pip 依赖**要自己装，例如 `screen` / `imgstat` 需要 `pip install pillow`。
+也就是说，`plugins/` 里已有的插件只有 python / node 两类要求解释器在场；rust 插件是编译好的原生 exe，
+宿主直接运行它，没装 Rust 工具链也能用。
+
+### 解释器从哪来：三档解析
+
+宿主启动时对每个语言（python / node / rustc）按下面的顺序解析一次，**取第一个命中的**：
+
+1. `config.toml` 的 `[runtimes]` 里写了**完整路径** → 直接用它，不做任何替换；
+2. 该字段是**裸命令**（默认值就是 `python` / `node` / `rustc`）且应用目录下存在内置运行时
+   `<应用根>/runtime/<语言>/<可执行文件>` → 用内置的那份；
+3. 仍然没有 → 用裸命令交给 `PATH`。
+
+第 2 档是重点：**把运行时放进应用目录就自动生效**，不用改配置，也不会往系统 `PATH`
+或用户环境变量里写任何东西（卸载即消失）。
+
+### 装配 Python 运行时
+
+没有任何解释器时程序照常启动、能对话、能用 `/tools` `/plugins` 等本地命令，
+但 python 插件会加载失败——此时启动横幅会明确提示一行。补上它的方式：
+
+```
+/runtime                      # 查看三种运行时的状态与来源（含版本号）
+/runtime install python       # 装配 Python 运行时到 <应用根>/runtime/python
+/runtime dir                  # 打印运行时目录
+```
+
+`install` 的顺序是：**已存在 → 本地离线包 → 下载**。
+
+- **离线包**：文件名固定为 `aox-python-runtime.zip`，放在 **exe 同目录**、应用根、
+  `<应用根>/runtime` 或 `%LOCALAPPDATA%\AOX` 下都会被自动发现。用
+  `bash tools/build_installer.sh pack` 可以产出这个包（约 10 MB），适合内网 / 离线分发。
+- **下载**：默认取 CPython 官方嵌入式发行版（约 10 MB），并用内置的官方 SHA-256 校验。
+  可换成自建镜像：
+
+  ```toml
+  [runtimes]
+  python_url    = "https://your-mirror.example.com/python-3.13.7-embed-amd64.zip"
+  python_sha256 = "<官方或自建包的 SHA-256>"
+  ```
+
+- 装配完成后**立即生效**（内部会重新解析一次）：之后新建的 python 插件直接用它；
+  此前因缺少 python 而加载失败的插件，重启程序即可恢复。
+- 整个过程只用系统已有能力：下载走 `reqwest`，解压走系统 `tar.exe`（Win10 1803+），
+  校验走 `certutil`。宿主**没有为此增加任何第三方依赖**。
+- Node 单文件就超过 80 MB，不适合自动装配。`/runtime install node` 会直接说明这一点，
+  请自行安装并保证 `node` 在 `PATH` 中。
+- 个别插件的**第三方 pip 依赖**要自己装。注意官方「嵌入式发行版」**不含 `pip`**：
+  确实需要 `pip` 时请装完整 Python，并在 `[runtimes] python` 指向它。
+
+### 安装包的两个变体
+
+`installer/*.iss` 是同一份脚本，靠条件编译产出两种包（不维护第二份脚本）：
+
+| 产物 | 内容 | 体积 |
+| --- | --- | --- |
+| `AOX-Setup-<版本>.exe` | 只有宿主 | 约 3 MB |
+| `AOX-Setup-<版本>-with-python.exe` | 宿主 + Python 运行时（离线可用） | 约 13.5 MB |
+
+```bash
+bash tools/build_installer.sh                    # 主包
+bash tools/build_installer.sh all with-python    # 额外产出捆绑变体
+bash tools/build_installer.sh pack               # 只产出运行时组件包
+```
 
 ## 卸载
 
-通过「设置 → 应用」或开始菜单里的卸载项即可。**卸载不会删除 `plugins/` 目录**，
+通过「设置 → 应用」或开始菜单里的卸载项即可。卸载会删除 `<安装目录>/runtime`
+（按需装配或捆绑进来的运行时，机器相关、可随时重建），但**不会删除 `plugins/` 目录**，
 如果你不再需要模型积累的插件，请手动删除安装目录。
 
 ---

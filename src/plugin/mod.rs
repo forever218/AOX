@@ -32,15 +32,43 @@ const RUST_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 /// `python.exe` / `node.exe` / `rustc.exe` 这类控制台程序，Windows 会专门为它
 /// 分配一个新控制台——用户看到的表现就是「动不动弹出几个黑色窗口」。
 /// 统一加上 `CREATE_NO_WINDOW` 后，CLI 与 GUI 两边行为一致，且不影响任何 I/O。
+///
+/// 有**两种** `Command`：插件子进程用 `tokio::process::Command`（异步），
+/// 而运行时装配链（certutil / tar / powershell）用 `std::process::Command`（同步）。
+/// 两者都实现了 `creation_flags`，所以这里用一个小 trait 统一，避免在每个调用点
+/// 各自复制一遍平台细节。
+pub(crate) trait HideConsole {
+    fn hide_console(&mut self);
+}
+
+/// 不生成控制台窗口（`winbase.h`）。
 #[cfg(windows)]
-fn hide_console(cmd: &mut Command) {
-    /// 不生成控制台窗口（`winbase.h`）。
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+impl HideConsole for Command {
+    fn hide_console(&mut self) {
+        self.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+#[cfg(windows)]
+impl HideConsole for std::process::Command {
+    fn hide_console(&mut self) {
+        use std::os::windows::process::CommandExt as _;
+        self.creation_flags(CREATE_NO_WINDOW);
+    }
 }
 
 #[cfg(not(windows))]
-fn hide_console(_cmd: &mut Command) {}
+impl HideConsole for Command {
+    fn hide_console(&mut self) {}
+}
+
+#[cfg(not(windows))]
+impl HideConsole for std::process::Command {
+    fn hide_console(&mut self) {}
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -257,7 +285,7 @@ fn spawn_command(
         "rust" => Command::new(&entry),
         other => bail!("未知插件语言: {other}"),
     };
-    hide_console(&mut cmd);
+    cmd.hide_console();
     cmd.current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -390,7 +418,9 @@ async fn create_plugin_inner(
 
     if language == "rust" {
         let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
-        let mut cmd = Command::new(&rt.config.runtimes.rustc);
+        // 用解析后的 rustc（可能是应用目录内置的），而不是 config 里的原始值
+        let runtimes = rt.runtimes();
+        let mut cmd = Command::new(&runtimes.rustc);
         cmd.arg("--edition=2021").arg("-O");
         // 静态链接 CRT，与宿主自身的构建保持一致（见 .cargo/config.toml）。
         // 只加在 windows 上：其他平台 +crt-static 语义不同（会牵动 libc 的静态/动态链接），
@@ -399,7 +429,7 @@ async fn create_plugin_inner(
             cmd.args(["-C", "target-feature=+crt-static"]);
         }
         cmd.arg("main.rs").arg("-o").arg(&exe).current_dir(dir);
-        hide_console(&mut cmd);
+        cmd.hide_console();
         let build = tokio::time::timeout(RUST_BUILD_TIMEOUT, cmd.output())
             .await
             .map_err(|_| anyhow!("rustc 编译超时"))?
@@ -418,7 +448,8 @@ async fn create_plugin_inner(
     };
     manifest.save(dir)?;
 
-    let handle = spawn_and_init(&rt.config.runtimes, &rt.root, dir, &manifest).await?;
+    let runtimes = rt.runtimes();
+    let handle = spawn_and_init(&runtimes, &rt.root, dir, &manifest).await?;
     activate(rt, handle).await
 }
 
@@ -456,6 +487,8 @@ pub async fn load_all(rt: &Arc<Runtime>) -> Vec<(String, Result<Vec<String>>)> {
     let Ok(entries) = std::fs::read_dir(&rt.plugins_dir) else {
         return out;
     };
+    // 解析后的解释器配置，整轮扫描共用一份（中途不会被改写）
+    let runtimes = rt.runtimes();
     for entry in entries.flatten() {
         let dir = entry.path();
         if !dir.is_dir() || dir.file_name().map(|n| n == "sdk").unwrap_or(false) {
@@ -472,7 +505,7 @@ pub async fn load_all(rt: &Arc<Runtime>) -> Vec<(String, Result<Vec<String>>)> {
             }
         };
         let name = manifest.name.clone();
-        let result = match spawn_and_init(&rt.config.runtimes, &rt.root, &dir, &manifest).await {
+        let result = match spawn_and_init(&runtimes, &rt.root, &dir, &manifest).await {
             Ok(handle) => activate(rt, handle).await,
             Err(e) => Err(e),
         };

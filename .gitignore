@@ -23,6 +23,10 @@ config.*.toml
 !/plugins/.gitkeep
 **/stderr.log
 
+# 按需装配的插件运行时（约 21 MB，机器相关；由 /runtime install python
+# 或 tools/build_installer.sh 的 ensure_runtime 生成，可随时重建）
+/runtime/
+
 # ── 本机工具链配置 ────────────────────────────────────────
 # .cargo/config.toml 里硬编码了本机 VS2022（14.44.35207）与 Win SDK
 # （10.0.26100.0）的绝对路径，提交后会让别的机器 clone 下来直接构建失败。

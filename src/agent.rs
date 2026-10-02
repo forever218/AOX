@@ -57,7 +57,7 @@ serve("<插件名>", {
 
 /// 把宿主的真实路径与运行约定写进系统提示，避免模型靠猜导致路径错乱。
 fn env_section(rt: &Runtime) -> String {
-    format!(
+    let mut s = format!(
         "\n\n# 运行环境（由宿主确定，直接使用，勿猜测）\n\
          - 应用根目录（＝插件进程的工作目录）: {root}\n\
          - 插件目录: {plugins}\n\
@@ -70,7 +70,11 @@ fn env_section(rt: &Runtime) -> String {
         root = rt.root.display(),
         plugins = rt.plugins_dir.display(),
         os = std::env::consts::OS,
-    )
+    );
+    // 把「本机到底有没有 python / node / rustc」如实告诉模型。
+    // 否则它会在裸机上反复创建注定失败的 python 插件，把整轮任务耗光。
+    s.push_str(&crate::runtimes::prompt_section(&rt.root, &rt.config.runtimes));
+    s
 }
 
 pub struct Agent {

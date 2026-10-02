@@ -7,7 +7,7 @@ use anyhow::Result;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::auth::AuthPolicy;
-use crate::config::Config;
+use crate::config::{Config, RuntimesConfig};
 use crate::plugin::PluginHandle;
 use crate::tool::{Tool, ToolKind, ToolOutput};
 
@@ -19,6 +19,15 @@ pub struct Runtime {
     /// 应用根目录。插件子进程以此为工作目录，保证插件内的相对路径与宿主视图一致。
     pub root: PathBuf,
     pub plugins_dir: PathBuf,
+    /// 解释器解析结果（`config.runtimes` 经过三档解析后的快照）。
+    ///
+    /// 单独放一份而不是直接读 `config.runtimes`，是为了让「装配完运行时立刻生效」成为可能：
+    /// 安装完成后原地刷新这里，插件子进程下一次 spawn 就用上新解释器，无需重启进程。
+    /// 极小的结构，克隆开销可忽略。
+    ///
+    /// 用 `std::sync::RwLock` 而不是 tokio 的：这里只在同步上下文里读写，
+    /// 且从不跨 `await` 持锁——`spawn_command` 是同步函数，必须能直接拿。
+    runtimes: std::sync::RwLock<RuntimesConfig>,
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
     pub plugins: Mutex<HashMap<String, Arc<PluginHandle>>>,
     /// 用户在本会话中选择「总是允许」的工具名
@@ -27,16 +36,40 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(config: Config, root: PathBuf, plugins_dir: PathBuf) -> Arc<Self> {
+        // 三档解释器解析：config 显式路径 > 应用目录内置运行时 > PATH。
+        // 放在这里而不是各自的入口，是为了让 CLI / GUI / selftest 走同一条路径，
+        // 不出现「GUI 能跑 CLI 不能跑」这类逻辑分叉。
+        //
+        // 注意：`config` 本身**保持原样**不动。解析结果只存进 `runtimes` 字段——
+        // 展示层（/runtime 报告、系统提示）需要拿原始值才能说清「解释器是从哪来的」，
+        // 一旦把绝对路径写回 config，所有来源都会被误报成「config.toml 指定」。
+        let mut resolved = config.runtimes.clone();
+        crate::runtimes::resolve(&mut resolved, &root);
         let auth = AuthPolicy::from_config(&config.auth);
         Arc::new(Self {
             config,
             auth,
             root,
             plugins_dir,
+            runtimes: std::sync::RwLock::new(resolved),
             tools: RwLock::new(HashMap::new()),
             plugins: Mutex::new(HashMap::new()),
             session_allowed: RwLock::new(HashSet::new()),
         })
+    }
+
+    /// 当前生效的解释器配置（克隆）。
+    pub fn runtimes(&self) -> RuntimesConfig {
+        self.runtimes.read().unwrap().clone()
+    }
+
+    /// 重新做一次三档解析。
+    /// 装配运行时、或用户手改 `config.runtimes` 之后调用，让改动立即生效。
+    pub fn refresh_runtimes(&self) {
+        let mut g = self.runtimes.write().unwrap();
+        *g = self.config.runtimes.clone();
+        let root = self.root.clone();
+        crate::runtimes::resolve(&mut g, &root);
     }
 
     pub async fn register(&self, tool: Arc<dyn Tool>) -> Result<()> {

@@ -38,6 +38,16 @@
 #define AppExeName     "aox-gui.exe"
 #define ProjectRoot    ".."
 
+; ── 可选变体：把 Python 运行时装进安装包 ──────────────────────────────────
+;      ISCC /DAppVersion=1.2.3 /DBUNDLE_PYTHON=1 installer\aox-gui.iss
+;   产出 AOX-GUI-Setup-<版本>-with-python.exe，装完即可用 python 插件（离线可用）。
+;   与命令行版完全同构：主包不捆绑，需要时才装配或用 -with-python 变体。
+#ifdef BUNDLE_PYTHON
+  #define OutputSuffix "-with-python"
+#else
+  #define OutputSuffix ""
+#endif
+
 [Setup]
 ; 与命令行版的 AppId 必须不同，否则两个包会互相覆盖
 AppId={{7D4E1B92-3A5C-4F8E-9B26-5C1A7E3D82F4}
@@ -64,7 +74,7 @@ AllowNoIcons=yes
 PrivilegesRequired=lowest
 
 OutputDir={#ProjectRoot}\dist
-OutputBaseFilename={#AppSlug}-Setup-{#AppVersion}
+OutputBaseFilename={#AppSlug}-Setup-{#AppVersion}{#OutputSuffix}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -96,6 +106,18 @@ Source: "{#ProjectRoot}\assets\aox.ico";               DestDir: "{app}"; Flags: 
 Source: "{#ProjectRoot}\config.example.toml";          DestDir: "{app}"; Flags: ignoreversion
 Source: "{#ProjectRoot}\README.md";                    DestDir: "{app}"; Flags: ignoreversion isreadme
 Source: "{#ProjectRoot}\LICENSE";                      DestDir: "{app}"; Flags: ignoreversion
+#ifdef BUNDLE_PYTHON
+; 捆绑变体：Python 运行时直接装进应用目录，宿主启动时自动发现
+; <应用根>\runtime\python\python.exe（三档解析的第 2 档）。
+; 运行时由 tools/build_installer.sh 的 ensure_runtime 下载并解压到 runtime\python\。
+Source: "{#ProjectRoot}\runtime\python\*"; DestDir: "{app}\runtime\python"; \
+    Flags: ignoreversion recursesubdirs createallsubdirs
+#endif
+
+[UninstallDelete]
+; 运行时是「机器相关、可随时重新装配」的数据（约 21 MB），卸载时清掉；
+; 而 plugins\ 是模型积累的能力，必须保留。该目录只在捆绑版或用户主动装配过时才存在。
+Type: filesandordirs; Name: "{app}\runtime"
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\aox.ico"; WorkingDir: "{app}"; Comment: "{#AppName} - graphical front-end for the AOX agent"

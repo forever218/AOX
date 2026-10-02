@@ -37,7 +37,24 @@ tool_timeout_secs = 120
 max_result_chars = 20000
 
 [runtimes]
-# 插件运行时命令（python 插件 / node 插件 / rust 插件编译器）
+# 插件运行时命令（python 插件 / node 插件 / rust 插件编译器）。
+#
+# 值有两种写法，语义不同：
+#   * 裸命令（下面这种）→ 宿主按「应用目录内置运行时 → PATH」的顺序查找。
+#     内置运行时指 <应用根>/runtime/python/python.exe；把运行时解压到那里就自动生效，
+#     无需改这一行。用 /runtime install python 可自动装配（约 10 MB）。
+#   * 完整路径（如 'C:\Python313\python.exe'）→ 直接采用，绝不被内置运行时顶替。
+#     路径里有反斜杠时建议用 TOML 字面量字符串（单引号），免得 \n 之类被当转义。
 python = "python"
 node = "node"
 rustc = "rustc"
+
+# 可选：覆盖 Python 运行时的下载源。留空用 CPython 官方嵌入式发行版。
+# 需要内网 / 加速时指向自建镜像；`bash tools/build_installer.sh pack` 产出的
+# dist/aox-python-runtime.zip 上传到自己的 CDN 即可。
+# python_url = "https://your-mirror.example.com/python-3.13.7-embed-amd64.zip"
+
+# 可选：期望的 SHA-256。
+#   * 留空时：默认官方源套用内置的官方校验值；自定义源则不校验。
+#   * 自己托管时必须填（否则不会校验），可用 `certutil -hashfile <包> SHA256` 取。
+# python_sha256 = "f6cca216a359be84797cabb54149ce5e062afb16cc7567eb7fc51cacb2d86b65"

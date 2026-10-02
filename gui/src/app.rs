@@ -28,7 +28,7 @@ use tokio::sync::oneshot;
 
 use aox::ui::{AgentEvent, AuthDecision};
 
-use crate::bridge::{BootInfo, FromAgent, SessionFlags, Snapshot, ToAgent};
+use crate::bridge::{BootInfo, FromAgent, RuntimeView, SessionFlags, Snapshot, ToAgent};
 use crate::markdown;
 use crate::theme::{self, P};
 
@@ -174,6 +174,9 @@ pub struct App {
     model: String,
     config_path: String,
     plugins: Vec<String>,
+    /// 插件运行时状态（每语言一行，由 bridge 发来）。
+    /// 放在「关于」窗口里——这类「看一眼就够」的诊断数据不该占用主界面。
+    runtimes: RuntimeView,
     /// 上一次写进窗口标题的模型名。原生标题栏与界面融为一体后，
     /// 「AOX · <模型>」放这里最自然，也就不必在顶栏再堆一个模型胶囊。
     title_model: String,
@@ -237,6 +240,7 @@ impl App {
             model: String::new(),
             config_path: String::new(),
             plugins: Vec::new(),
+            runtimes: RuntimeView::default(),
             title_model: String::new(),
             show_activity: true,
             follow: true,
@@ -372,6 +376,7 @@ impl App {
                     }
                 }
                 FromAgent::Snapshot(s) => self.apply_snapshot(s),
+                FromAgent::Runtimes(v) => self.runtimes = v,
                 FromAgent::TurnStart => {
                     self.live = Some(Live {
                         status: "思考中".into(),
@@ -1088,6 +1093,43 @@ impl App {
                 if link.clicked() {
                     ui.ctx()
                         .open_url(egui::OpenUrl::new_tab(aox::ui::style::PROJECT_URL));
+                }
+
+                // 插件运行时：这类「看一眼就够」的诊断信息放在关于窗口里，
+                // 主界面不额外加胶囊。缺 Python 时才多出一个安装入口。
+                if !self.runtimes.lines.is_empty() {
+                    ui.add_space(18.0);
+                    let (rule, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 1.0),
+                        Sense::hover(),
+                    );
+                    ui.painter()
+                        .hline(rule.x_range(), rule.center().y, Stroke::new(1.0, P::border()));
+
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("插件运行时").color(P::text_dim()).size(14.0));
+                    ui.add_space(6.0);
+                    for l in &self.runtimes.lines {
+                        ui.label(
+                            RichText::new(l)
+                                .font(theme::mono_font(12.5))
+                                .color(P::text_faint()),
+                        );
+                    }
+                    if self.runtimes.python_missing {
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new("本机没有 Python，文件读写、系统信息等能力不可用。")
+                                .color(P::text_dim())
+                                .size(13.5),
+                        );
+                        ui.add_space(8.0);
+                        if primary_button(ui, "安装 Python 运行时（约 10 MB）").clicked() {
+                            // 走与 CLI 完全相同的命令路径（宿主自己处理，不发给模型）
+                            let _ = self.tx.send(ToAgent::Input("/runtime install python".into()));
+                            open = false;
+                        }
+                    }
                 }
 
                 ui.add_space(20.0);

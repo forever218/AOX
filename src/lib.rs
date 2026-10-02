@@ -16,6 +16,7 @@ pub mod message;
 pub mod paths;
 pub mod plugin;
 pub mod runtime;
+pub mod runtimes;
 pub mod selftest;
 pub mod tool;
 pub mod ui;

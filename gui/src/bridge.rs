@@ -52,6 +52,8 @@ pub enum FromAgent {
     AuthRequest { tool: String, args: String, reply: oneshot::Sender<AuthDecision> },
     /// 工具 / 插件快照（周期性刷新，用于右侧面板实时展示「自我增长」）
     Snapshot(Snapshot),
+    /// 插件运行时状态（供「关于」窗口展示）；装配完成后会重发
+    Runtimes(RuntimeView),
     /// 本轮出现不可恢复错误
     Fatal(String),
 }
@@ -67,6 +69,18 @@ pub struct BootInfo {
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub plugins: Vec<String>,
+}
+
+/// 运行时状态视图。
+///
+/// 刻意做成结构体而不是几行字符串：界面要据此决定「要不要给安装按钮」，
+/// 靠解析 `✗ python` 这种文本判断太脆（文案一改就静默失效）。
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeView {
+    /// 每个语言一行的状态文本
+    pub lines: Vec<String>,
+    /// Python 是否缺失——决定「关于」窗口是否显示一键安装入口
+    pub python_missing: bool,
 }
 
 /// 跨线程的中断标志。用轮询而不是 Notify，避免「通知早于等待」导致的陈旧许可问题。
@@ -164,6 +178,59 @@ impl Ui for GuiUi {
     }
 }
 
+/// 把运行时状态发给「关于」窗口。
+///
+/// 传**原始** `config.runtimes`（而不是解析后的快照），否则「来源」会被误判成
+/// 「config.toml 指定」——见 `aox::runtimes::status` 的说明。
+fn send_runtime_status(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
+    let st = aox::runtimes::status(&rt.root, &rt.config.runtimes);
+    let view = RuntimeView {
+        lines: st.iter().map(aox::runtimes::one_line).collect(),
+        python_missing: st
+            .iter()
+            .any(|s| s.lang == aox::runtimes::Lang::Python && !s.ok()),
+    };
+    let _ = tx.send(FromAgent::Runtimes(view));
+}
+
+/// `/runtime` 的 GUI 实现。
+///
+/// 解析、装配、文案全部复用 `aox::runtimes`，与 CLI 同源；这里只决定「写到哪」：
+/// 进度与结果都进活动流，这样 10 MB 的下载过程不会让界面看起来卡死。
+async fn runtime_command(ui: &mut GuiUi, rt: &Arc<Runtime>, line: &str) {
+    let parsed = match aox::runtimes::parse_cmd(line) {
+        Ok(c) => c,
+        Err(e) => {
+            ui.emit(AgentEvent::Error(format!("{e:#}")));
+            return;
+        }
+    };
+    match parsed {
+        aox::runtimes::Cmd::Status => {
+            ui.emit(AgentEvent::Info(aox::runtimes::status_report(
+                &rt.root,
+                &rt.config.runtimes,
+            )));
+        }
+        aox::runtimes::Cmd::Dir => {
+            ui.emit(AgentEvent::Info(rt.root.join("runtime").display().to_string()));
+        }
+        aox::runtimes::Cmd::Install(lang) => {
+            let tx = ui.tx.clone();
+            let mut sink = |m: &str| {
+                let _ = tx.send(FromAgent::Event(AgentEvent::Info(m.to_string())));
+            };
+            match aox::runtimes::install(rt, lang, &mut sink).await {
+                Ok(msg) => {
+                    ui.emit(AgentEvent::Info(msg));
+                    send_runtime_status(&ui.tx, rt);
+                }
+                Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
+            }
+        }
+    }
+}
+
 fn boot(
     tx: &mpsc::UnboundedSender<FromAgent>,
     config_path: &std::path::Path,
@@ -247,6 +314,14 @@ async fn boot_and_run(
 
     let mut ui = GuiUi { tx: tx.clone(), rx };
 
+    // 运行时状态：一条给「关于」窗口，一条缺失提示进活动流（与 CLI 同一份文案）。
+    // 这样用户在 GUI 里也能立刻知道「本机缺 python、该点哪里装」，而不是等到
+    // 模型建插件失败才发现。
+    send_runtime_status(&tx, &rt);
+    if let Some(hint) = aox::runtimes::missing_hint(&rt.root, &rt.config.runtimes) {
+        ui.emit(AgentEvent::Warn(hint));
+    }
+
     // 恢复持久化插件（与 CLI 同一路径）。
     // 成功保持静默——启动时不该往活动流里刷一屏「插件 xxx 已恢复」，
     // 那会把真正要看的信息挤下去。只有失败才出声。
@@ -306,6 +381,11 @@ async fn boot_and_run(
         let Some(input) = ui.read_user_input().await? else { break };
         let line = input.trim().to_string();
         if line.is_empty() {
+            continue;
+        }
+        // 本地命令：/runtime 由宿主自己处理，不发给模型（与 CLI 一致）
+        if aox::runtimes::is_cmd(&line) {
+            runtime_command(&mut ui, &rt, &line).await;
             continue;
         }
         flags.clear();

@@ -5,6 +5,7 @@ mod llm;
 mod message;
 mod plugin;
 mod runtime;
+mod runtimes;
 mod selftest;
 mod tool;
 mod ui;
@@ -134,6 +135,22 @@ fn ensure_writable_root(root: PathBuf) -> PathBuf {
     }
 }
 
+/// `/runtime` 子命令：查看状态 / 装配运行时。
+///
+/// 解析与装配都在 `crate::runtimes` 里，CLI 与 GUI 共用同一份逻辑与文案，
+/// 这里只负责决定「进度和结果打印到哪」。
+async fn runtimes_command(rt: &Arc<Runtime>, line: &str) -> Result<String> {
+    match runtimes::parse_cmd(line)? {
+        runtimes::Cmd::Status => Ok(runtimes::status_report(&rt.root, &rt.config.runtimes)),
+        runtimes::Cmd::Dir => Ok(rt.root.join("runtime").display().to_string()),
+        runtimes::Cmd::Install(lang) => {
+            // 进度直接打屏（装配可能要下载 10 MB，不能一声不吭）
+            let mut sink = |m: &str| println!("  {}", ui::style::dim(m));
+            runtimes::install(rt, lang, &mut sink).await
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -245,6 +262,11 @@ async fn main() -> Result<()> {
         ui::style::link(ui::style::PROJECT_URL, ui::style::PROJECT_URL)
     )));
 
+    // 运行时提示：只在 Python 缺失时多出一行，运行时齐备时启动输出保持干净。
+    if let Some(hint) = runtimes::missing_hint(&rt.root, &rt.config.runtimes) {
+        ui.emit(AgentEvent::Warn(hint));
+    }
+
     // ---- REPL
     loop {
         let Some(line) = ui.read_user_input().await? else { break };
@@ -290,12 +312,19 @@ async fn main() -> Result<()> {
                 ui.turn_end().await;
             }
             "/expand" => ui.expand_last_turn(),
+            _ if runtimes::is_cmd(line) => {
+                match runtimes_command(&rt, line).await {
+                    Ok(text) => ui.emit(AgentEvent::Info(text)),
+                    Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
+                }
+            }
             "/help" => {
                 println!();
                 for (cmd, desc) in [
                     ("/help", "显示本帮助"),
                     ("/tools", "列出当前所有可用工具"),
                     ("/plugins", "列出已加载的插件"),
+                    ("/runtime", "查看插件运行时状态；/runtime install python 装配内置运行时"),
                     ("/demo", "预览终端排版与过程折叠效果"),
                     ("/expand", "展开上一次被折叠的工具调用过程"),
                     ("/quit", "退出程序（/exit 等价）"),

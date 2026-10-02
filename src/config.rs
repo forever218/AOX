@@ -93,14 +93,29 @@ impl Default for AgentConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RuntimesConfig {
+    /// 值写成**裸命令**（`python` / `node` / `rustc`）时，宿主会依次尝试
+    /// 「应用目录内置运行时 `<app_root>/runtime/<lang>/<exe>`」→「PATH」；
+    /// 写成**完整路径**则直接采用，不做任何替换。
     pub python: String,
     pub node: String,
     pub rustc: String,
+    /// 覆盖 Python 运行时下载源（默认 CPython 官方嵌入式包，见 `runtimes::DEFAULT_PYTHON_URL`）。
+    #[serde(default)]
+    pub python_url: Option<String>,
+    /// 期望的 SHA-256。留空时：默认源用内置的官方校验值，自定义源则不校验。
+    #[serde(default)]
+    pub python_sha256: Option<String>,
 }
 
 impl Default for RuntimesConfig {
     fn default() -> Self {
-        Self { python: "python".into(), node: "node".into(), rustc: "rustc".into() }
+        Self {
+            python: "python".into(),
+            node: "node".into(),
+            rustc: "rustc".into(),
+            python_url: None,
+            python_sha256: None,
+        }
     }
 }
 

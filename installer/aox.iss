@@ -4,7 +4,8 @@
 ;  编译：
 ;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" installer\aox.iss
 ;  产物：
-;      dist\AOX-Setup-<版本>.exe
+;      dist\AOX-Setup-<版本>.exe                 （主包，不捆绑运行时，约 3 MB）
+;      dist\AOX-Setup-<版本>-with-python.exe     （加 /DBUNDLE_PYTHON=1，约 13.5 MB）
 ;
 ;  设计要点：
 ;    * 采用「当前用户」安装（PrivilegesRequired=lowest），装到
@@ -13,6 +14,8 @@
 ;    * 不打包 config.toml（避免把个人 API key 装进去），由程序首次运行自动生成。
 ;    * 不打包 plugins/：宿主启动时会自动创建 plugins/sdk。
 ;    * 卸载不删除 plugins/，保留模型积累的能力。
+;    * 主包不带任何运行时；需要 python 能力时，用户可以 /runtime install python
+;      按需装配（离线包或下载），或用上面那个 -with-python 变体一次装好。
 ; ============================================================================
 
 #define AppName        "AOX"
@@ -28,6 +31,19 @@
 #define AppURL         "https://2am.top"
 #define AppExeName     "aox.exe"
 #define ProjectRoot    ".."
+
+; ── 可选变体：把 Python 运行时装进安装包 ──────────────────────────────────
+;      ISCC /DAppVersion=1.2.3 /DBUNDLE_PYTHON=1 installer\aox.iss
+;   产出 AOX-Setup-<版本>-with-python.exe，装完即可用 python 插件（离线可用）。
+;   体积：不捆绑约 3 MB；捆绑后约 13.5 MB（运行时解压后约 21 MB）。
+;
+;   两种变体共用这一个脚本，靠条件编译区分——不维护第二份 .iss，
+;   否则「改了一处忘了另一处」是迟早的事。
+#ifdef BUNDLE_PYTHON
+  #define OutputSuffix "-with-python"
+#else
+  #define OutputSuffix ""
+#endif
 
 [Setup]
 AppId={{9F2C4A17-6B3E-4D5A-8C71-2E9B0D4F1A63}
@@ -55,7 +71,7 @@ PrivilegesRequired=lowest
 ChangesEnvironment=yes
 
 OutputDir={#ProjectRoot}\dist
-OutputBaseFilename={#AppName}-Setup-{#AppVersion}
+OutputBaseFilename={#AppName}-Setup-{#AppVersion}{#OutputSuffix}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -90,6 +106,20 @@ Source: "{#ProjectRoot}\assets\aox.ico";               DestDir: "{app}"; Flags: 
 Source: "{#ProjectRoot}\config.example.toml";          DestDir: "{app}"; Flags: ignoreversion
 Source: "{#ProjectRoot}\README.md";                    DestDir: "{app}"; Flags: ignoreversion isreadme
 Source: "{#ProjectRoot}\LICENSE";                      DestDir: "{app}"; Flags: ignoreversion
+#ifdef BUNDLE_PYTHON
+; 捆绑变体：Python 运行时直接装进应用目录。宿主启动时会自动发现
+; <应用根>\runtime\python\python.exe（三档解析的第 2 档），无需改任何配置，
+; 也不会往系统 PATH 或用户环境变量里写东西。
+; 运行时由 tools/build_installer.sh 的 ensure_runtime 下载并解压到 runtime\python\。
+Source: "{#ProjectRoot}\runtime\python\*"; DestDir: "{app}\runtime\python"; \
+    Flags: ignoreversion recursesubdirs createallsubdirs
+#endif
+
+[UninstallDelete]
+; 运行时是「机器相关、可随时重新装配」的数据（约 21 MB），卸载时清掉；
+; 而 plugins\ 是模型积累的能力，必须保留（见文件头的设计要点）。
+; 该目录只在「捆绑版」或「用户自己 /runtime install 过」时才存在。
+Type: filesandordirs; Name: "{app}\runtime"
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\aox.ico"; WorkingDir: "{app}"; Comment: "{#AppName} - self-growing AI agent"
