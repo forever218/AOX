@@ -159,6 +159,12 @@ struct Palette {
     ink_soft: Color32,
     user_bg: Color32,
     code_bg: Color32,
+    /// 行内代码的「芯片」底色。
+    ///
+    /// 必须明显偏离 `bg` / `surface`，否则行内代码就是一片糊过去的浅色，
+    /// 读者完全看不出这是代码。围栏代码块另有 `code_bg`（一整块底色），
+    /// 两者刻意用不同深浅，好让「块」与「行内」一眼分得开。
+    code_chip: Color32,
     quote_bar: Color32,
     /// 反白块的底色（错误提示用：亮色=墨黑底，暗色=近白底）
     reverse_bg: Color32,
@@ -183,6 +189,7 @@ const LIGHT: Palette = Palette {
     ink_soft: Color32::from_rgb(0x6B, 0x65, 0x5A),
     user_bg: Color32::from_rgb(0xE7, 0xE2, 0xD6),
     code_bg: Color32::from_rgb(0xEC, 0xE8, 0xDE),
+    code_chip: Color32::from_rgb(0xE0, 0xD9, 0xC7),
     quote_bar: Color32::from_rgb(0xC2, 0xBA, 0xA8),
     reverse_bg: Color32::from_rgb(0x1A, 0x19, 0x16),
     on_reverse: Color32::from_rgb(0xF7, 0xF5, 0xF0),
@@ -204,6 +211,7 @@ const DARK: Palette = Palette {
     ink_soft: Color32::from_rgb(0x9A, 0x96, 0x8D),
     user_bg: Color32::from_rgb(0x25, 0x25, 0x21),
     code_bg: Color32::from_rgb(0x10, 0x10, 0x0E),
+    code_chip: Color32::from_rgb(0x39, 0x39, 0x32),
     quote_bar: Color32::from_rgb(0x4C, 0x4C, 0x45),
     reverse_bg: Color32::from_rgb(0xEC, 0xE9, 0xE1),
     on_reverse: Color32::from_rgb(0x14, 0x14, 0x12),
@@ -261,6 +269,10 @@ impl P {
     }
     pub fn code_bg() -> Color32 {
         pal().code_bg
+    }
+    /// 行内代码的芯片底色（比 `code_bg` 更跳一档）。
+    pub fn code_chip() -> Color32 {
+        pal().code_chip
     }
     pub fn quote_bar() -> Color32 {
         pal().quote_bar

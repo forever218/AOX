@@ -8,6 +8,7 @@ use egui::{
     TextFormat, Ui,
 };
 
+use crate::syntax;
 use crate::theme::{self, P};
 
 #[derive(Debug, Clone, Default)]
@@ -274,6 +275,17 @@ fn inline(s: &str) -> Vec<Span> {
     out
 }
 
+/// 行高系数。
+///
+/// 字号只管"字有多大"，行与行之间留多少由 `TextFormat::line_height` 决定。
+/// 中文正文用 1.3 倍行高偏挤 —— 满行时上下几乎黏住，所以这里给到 1.5。
+/// 附带好处：行内代码的芯片底色是按字形矩形画的，行距一松，芯片之间也就
+/// 再不会上下粘连。
+const LEADING: f32 = 1.5;
+
+/// 块与块之间的呼吸。默认 11 太小，两段话几乎贴在一起。
+const BLOCK_GAP: f32 = 15.0;
+
 fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap.max(40.0);
@@ -299,28 +311,65 @@ fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool
         let fmt = TextFormat {
             font_id: font,
             color: col,
+            line_height: Some(size * LEADING),
             italics: sp.italic,
-            background: if sp.code { P::code_bg() } else { Color32::TRANSPARENT },
+            background: if sp.code { P::code_chip() } else { Color32::TRANSPARENT },
+            // 链接加一道下划线：正文里它和普通文字同色，光靠颜色分不出来
+            // （单色方案里「更黑」并不显眼）。代码芯片绝不能加下划线。
+            underline: if sp.link && !sp.code {
+                Stroke::new(1.0, P::ink_soft())
+            } else {
+                Stroke::NONE
+            },
             ..Default::default()
         };
-        job.append(&sp.text, 0.0, fmt);
+        if sp.code {
+            // 行内代码做成「芯片」：底色只按字形矩形绘制，代码贴边时会糊成一条高亮，
+            // 所以两侧各补一格空格。空格与代码**同字体同字号** —— 底色是按每段
+            // 字形自己的矩形合并的，字号一旦不同就会断成三块、边缘出现台阶。
+            let pad = TextFormat { background: P::code_chip(), ..fmt.clone() };
+            job.append(" ", 0.0, pad.clone());
+            job.append(&sp.text, 0.0, fmt);
+            job.append(" ", 0.0, pad);
+        } else {
+            job.append(&sp.text, 0.0, fmt);
+        }
     }
     job
 }
 
-fn code_job(code: &str, wrap: f32) -> LayoutJob {
+/// 围栏代码块：一行一个 LayoutJob section，逐 token 上色。
+///
+/// 必须**逐 token 切成多个 section** —— `TextFormat` 是按 section 存的，
+/// 一整段代码塞进一个 section 就只能有一个颜色。空行也要 append 一个 `"\n"`，
+/// 否则那一行的高度会塌掉。
+fn code_job(code: &str, wrap: f32, lang: &str) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap.max(60.0);
     job.wrap.break_anywhere = true;
-    job.append(
-        code,
-        0.0,
-        TextFormat {
-            font_id: theme::mono_font(15.0),
-            color: P::text(),
-            ..Default::default()
-        },
-    );
+    let base = TextFormat {
+        font_id: theme::mono_font(15.0),
+        // 代码的行高比正文再紧一点：1.35 是代码的惯例（VS Code 默认同值），
+        // 再松就该改叫"文档"而不是"代码块"了。
+        line_height: Some(15.0 * 1.35),
+        ..Default::default()
+    };
+    let lines = syntax::highlight(code, lang);
+    for (i, toks) in lines.iter().enumerate() {
+        for (text, tok) in toks {
+            let mut fmt = base.clone();
+            if *tok != syntax::Tok::Plain {
+                fmt.color = syntax::color(*tok);
+            }
+            if *tok == syntax::Tok::Comment {
+                fmt.italics = true;
+            }
+            job.append(text, 0.0, fmt);
+        }
+        if i + 1 < lines.len() {
+            job.append("\n", 0.0, base.clone());
+        }
+    }
     job
 }
 
@@ -360,21 +409,24 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                     3 => 18.0,
                     _ => 16.5,
                 };
-                ui.add_space(if level <= 2 { 12.0 } else { 7.0 });
+                ui.add_space(if level <= 2 { 15.0 } else { 9.0 });
                 let job = job_of(&inline(&text), size, P::text(), width, level <= 2);
                 wrap_label(ui, job);
-                if level == 1 {
+                // 一、二级标题各带一条细线：单色方案里「更大更粗」还不够，
+                // 靠一道线把标题与正文分开，扫读时的层次立刻就出来了。
+                if level <= 2 {
                     ui.add_space(6.0);
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
-                    ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, P::border()));
+                    let col = if level == 1 { P::border_strong() } else { P::border() };
+                    ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, col));
                 }
-                ui.add_space(5.0);
+                ui.add_space(7.0);
             }
 
             Block::Para(text) => {
                 let job = job_of(&inline(&text), theme::BODY, base, width, false);
                 wrap_label(ui, job);
-                ui.add_space(11.0);
+                ui.add_space(BLOCK_GAP);
             }
 
             Block::Bullet { indent, marker, text } => {
@@ -390,7 +442,7 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                     let job = job_of(&inline(&text), theme::BODY, base, inner_w, false);
                     wrap_label(ui, job);
                 });
-                ui.add_space(5.0);
+                ui.add_space(6.0);
             }
 
             Block::Quote(text) => {
@@ -403,7 +455,7 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                     let job = job_of(&spans, theme::BODY, P::text_dim(), inner_w, false);
                     wrap_label(ui, job);
                 });
-                ui.add_space(11.0);
+                ui.add_space(BLOCK_GAP);
             }
 
             Block::Code { lang, lines } => {
@@ -420,50 +472,159 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                         ui.set_max_width(inner);
                         if !lang.is_empty() {
                             ui.label(RichText::new(lang.to_lowercase()).color(P::text_faint()).size(13.0));
-                            ui.add_space(6.0);
+                            ui.add_space(7.0);
                         }
-                        wrap_label(ui, code_job(&code, inner));
+                        wrap_label(ui, code_job(&code, inner, &lang));
                     });
-                ui.add_space(12.0);
+                ui.add_space(BLOCK_GAP);
             }
 
             Block::Rule => {
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
                 ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, P::border()));
-                ui.add_space(9.0);
+                ui.add_space(11.0);
             }
 
             Block::Table { header, rows } => {
-                let cols = header.len().max(1);
-                let gap = 18.0;
-                // 列宽要连列间距一起算进去，否则最后一列会超出可用宽度被裁掉
-                let cell_w = ((width - gap * (cols.saturating_sub(1)) as f32) / cols as f32 - 4.0)
-                    .max(60.0);
-                let id = ui.next_auto_id();
-                egui::Grid::new(id)
-                    .num_columns(cols)
-                    .spacing(egui::vec2(gap, 8.0))
-                    .striped(false)
-                    .min_col_width(cell_w)
-                    .max_col_width(cell_w)
-                    .show(ui, |ui| {
-                        for cell in &header {
-                            let job = job_of(&inline(cell), 15.0, P::text(), cell_w, true);
-                            wrap_label(ui, job);
-                        }
-                        ui.end_row();
-                        for row in &rows {
-                            for cell in row {
-                                let job = job_of(&inline(cell), 15.0, P::text_dim(), cell_w, false);
-                                wrap_label(ui, job);
-                            }
-                            ui.end_row();
-                        }
-                    });
-                ui.add_space(12.0);
+                table(ui, width, &header, &rows, base);
             }
         }
+    }
+}
+
+// ────────────────────────────── 表格 ──────────────────────────────
+
+/// 单元格左右内边距、上下内边距、列间距、外框圆角。
+const CELL_PAD_X: f32 = 11.0;
+const CELL_PAD_Y: f32 = 8.0;
+const COL_GAP: f32 = 16.0;
+const TABLE_R: u8 = 10;
+
+/// 显示宽度：ASCII 记 1 格，中日韩与全角标点记 2 格。
+fn disp_width(s: &str) -> f32 {
+    s.chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| if c.is_ascii() { 1.0 } else { 2.0 })
+        .sum()
+}
+
+/// 列宽分配。
+///
+/// 均分列宽最省事也最难看：内容短的列空一大片，内容长的列被挤成竖条。这里先按
+/// 「该列最长的一格」算理想宽度，再按可用宽度等比缩放；最后用下限兜底 ——
+/// 实在放不下就整体一起缩，宁可让文字换行也不越界。
+fn column_widths(header: &[String], rows: &[Vec<String>], avail: f32) -> Vec<f32> {
+    const MIN: f32 = 68.0;
+    const CH: f32 = 7.4; // 15px 正文下 ASCII 的近似步进
+    const PAD: f32 = CELL_PAD_X * 2.0 + 8.0;
+    let cols = header.len().max(1);
+    let ideal: Vec<f32> = (0..cols)
+        .map(|c| {
+            let mut w = disp_width(&header[c]) * CH + PAD;
+            for r in rows {
+                w = w.max(disp_width(r.get(c).map(|s| s.as_str()).unwrap_or("")) * CH + PAD);
+            }
+            // 单列最多吃「两列的份」，免得某一列拿走整行、其余挤成一条缝
+            w.min(avail / cols as f32 * 2.0)
+        })
+        .collect();
+    let sum: f32 = ideal.iter().sum();
+    let mut out: Vec<f32> = if sum > 0.0 {
+        ideal.iter().map(|w| avail * w / sum).collect()
+    } else {
+        vec![avail / cols as f32; cols]
+    };
+    for w in out.iter_mut() {
+        *w = w.max(MIN);
+    }
+    let over: f32 = out.iter().sum();
+    if over > avail {
+        let k = avail / over;
+        for w in out.iter_mut() {
+            *w *= k;
+        }
+    }
+    out
+}
+
+/// 表格：完整外框 + 表头色带 + 行分隔线，列宽按内容长度分配。
+///
+/// 之前只是一张 `Grid`，没有框、没有表头、没有分行线，读起来像几段文字凑在
+/// 一起 —— 表格的全部信息都压在「对齐」上，一旦某格换行就彻底散了。
+fn table(ui: &mut Ui, width: f32, header: &[String], rows: &[Vec<String>], base: Color32) {
+    // 2 = 外框描边占掉的宽度（egui 的 stroke 宽度算在 Frame 的 margin 里）
+    let inner = (width - 2.0).max(160.0);
+    let avail = (inner - COL_GAP * header.len().saturating_sub(1) as f32).max(80.0);
+    let widths = column_widths(header, rows, avail);
+
+    // 行分隔线的位置：每行底部（最后一行不画，交给外框收口）
+    let mut edges: Vec<f32> = Vec::new();
+    let total = rows.len() + 1;
+
+    Frame::NONE
+        .fill(P::surface())
+        .stroke(Stroke::new(1.0, P::border_strong()))
+        .corner_radius(CornerRadius::same(TABLE_R))
+        .show(ui, |ui| {
+            ui.set_width(inner);
+            ui.set_max_width(inner);
+            // 列间距自己用 add_space 控制。`horizontal` 还会额外插入 style 的
+            // item_spacing.x，不清零整表就会比预算多出 (列数-1) 个间距、撑出栏位。
+            ui.style_mut().spacing.item_spacing.x = 0.0;
+
+            for (ri, row) in std::iter::once(header)
+                .chain(rows.iter().map(|r| r.as_slice()))
+                .enumerate()
+            {
+                let head = ri == 0;
+                if head {
+                    // 表头色带：整行一条、只有上圆角，正好贴住外框
+                    Frame::NONE
+                        .fill(P::surface_hi())
+                        .corner_radius(CornerRadius { nw: TABLE_R, ne: TABLE_R, sw: 0, se: 0 })
+                        .show(ui, |ui| {
+                            ui.set_width(inner);
+                            ui.set_max_width(inner);
+                            ui.horizontal_top(|ui| cells(ui, &widths, row, true, P::text()));
+                        });
+                } else {
+                    ui.horizontal_top(|ui| cells(ui, &widths, row, false, base));
+                }
+                if ri + 1 < total {
+                    edges.push(ui.cursor().min.y);
+                }
+            }
+
+            // 线只落在行与行之间的空隙里，压不到任何文字
+            let content = ui.min_rect();
+            for (i, y) in edges.iter().enumerate() {
+                let col = if i == 0 { P::border_strong() } else { P::border() };
+                ui.painter().hline(content.x_range(), *y, Stroke::new(1.0, col));
+            }
+        });
+    ui.add_space(BLOCK_GAP);
+}
+
+/// 一行单元格。`widths` 里存的是每列**盒子**的宽度（含左右内边距）。
+fn cells(ui: &mut Ui, widths: &[f32], row: &[String], head: bool, color: Color32) {
+    for (ci, cw) in widths.iter().enumerate() {
+        if ci > 0 {
+            ui.add_space(COL_GAP);
+        }
+        let txt = row.get(ci).map(|s| s.as_str()).unwrap_or("");
+        // 极窄的列（多列表格撞上窄栏位）连内边距一起让位：「内容 + 内边距」一旦
+        // 超过分配到的列宽，整张表就会撑出栏位、被 ScrollArea 裁掉。
+        let pad = CELL_PAD_X.min(cw * 0.22);
+        let w = (cw - pad * 2.0).max(12.0);
+        Frame::NONE
+            .inner_margin(Margin::symmetric(pad as i8, CELL_PAD_Y as i8))
+            .show(ui, |ui| {
+                ui.set_width(w);
+                ui.set_max_width(w);
+                let job = job_of(&inline(txt), 15.0, color, w, head);
+                wrap_label(ui, job);
+            });
     }
 }
 

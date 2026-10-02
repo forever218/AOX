@@ -18,6 +18,7 @@
 mod app;
 mod bridge;
 mod markdown;
+mod syntax;
 mod theme;
 
 use tokio::sync::mpsc;
