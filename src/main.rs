@@ -152,12 +152,14 @@ async fn runtimes_command(rt: &Arc<Runtime>, line: &str) -> Result<String> {
     }
 }
 
-/// `/history` 子命令：查看 / 删除历史对话。
+/// `/history` 子命令：查看 / 切换 / 删除历史对话。
 ///
 /// 解析与文案都在 `crate::history` 里，CLI 与 GUI 共用同一份实现。
-async fn history_command(current: Option<&str>, line: &str, dir: &Path) -> Result<String> {
+/// 只有 `open` 需要拿到 Agent —— 它要就地换掉上下文，这是唯一一个
+/// 「不是纯查询」的子命令。
+fn history_command(agent: &mut Agent, line: &str, dir: &Path) -> Result<String> {
     Ok(match history::parse_cmd(line)? {
-        history::Cmd::List => history::list_text(dir, current),
+        history::Cmd::List => history::list_text(dir, agent.history_id()),
         history::Cmd::Dir => dir.display().to_string(),
         history::Cmd::Show(key) => {
             let s = history::resolve(dir, &key)?;
@@ -168,6 +170,16 @@ async fn history_command(current: Option<&str>, line: &str, dir: &Path) -> Resul
                 s.title,
                 s.messages,
                 history::transcript_text(&items)
+            )
+        }
+        history::Cmd::Open(key) => {
+            let s = history::resolve(dir, &key)?;
+            let n = agent.resume(&s.path)?;
+            format!(
+                "已切换到「{}」（{} 条消息）。接下来的发言会继续追加到同一个文件。\n  {}",
+                s.title,
+                n,
+                s.path.display()
             )
         }
         history::Cmd::Remove(key) => {
@@ -340,6 +352,14 @@ async fn main() -> Result<()> {
                 ui.turn_end().await;
             }
             "/expand" => ui.expand_last_turn(),
+            "/new" => {
+                // 与 GUI 顶栏那枚「+」同一条路径。旧对话不需要保存动作 ——
+                // 它一直是边聊边追加的，此刻已经在 history/ 里躺好了。
+                agent.new_conversation();
+                ui.emit(AgentEvent::Info(
+                    "已开一段新对话。上一段已经保存在 history/ 里（/history 可查）。".into(),
+                ));
+            }
             _ if runtimes::is_cmd(line) => {
                 match runtimes_command(&rt, line).await {
                     Ok(text) => ui.emit(AgentEvent::Info(text)),
@@ -347,7 +367,7 @@ async fn main() -> Result<()> {
                 }
             }
             _ if history::is_cmd(line) => {
-                match history_command(agent.history_id(), line, &history::dir(&rt.root)).await {
+                match history_command(&mut agent, line, &history::dir(&rt.root)) {
                     Ok(text) => ui.emit(AgentEvent::Info(text)),
                     Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
                 }
@@ -359,7 +379,11 @@ async fn main() -> Result<()> {
                     ("/tools", "列出当前所有可用工具"),
                     ("/plugins", "列出已加载的插件"),
                     ("/runtime", "查看插件运行时状态；/runtime install python 装配内置运行时"),
-                    ("/history", "查看历史对话；/history show <序号> 看全文，/history dir 看目录"),
+                    (
+                        "/history",
+                        "历史对话；list 列表，show <序号> 看全文，open <序号> 接着聊，rm <序号> 删除",
+                    ),
+                    ("/new", "开一段新对话（当前这段已自动保存进历史）"),
                     ("/demo", "预览终端排版与过程折叠效果"),
                     ("/expand", "展开上一次被折叠的工具调用过程"),
                     ("/quit", "退出程序（/exit 等价）"),

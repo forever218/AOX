@@ -148,7 +148,13 @@ if [ -z "$ISCC" ]; then
 fi
 
 # ---- 3. 编译安装包
-# 注意：ISCC 会把以 / 开头的参数当成选项，脚本文件必须用相对路径或 Windows 风格路径
+# 定义一律用长式 `--define=`，**不要**用旧式的 `/D名字=值`：
+# ISCC 把以 / 开头的参数当选项，而 Git Bash（MSYS）在启动原生程序前会把这类参数
+# 当成 Unix 路径改写一遍 —— `/DAppVersion=0.1.0` 会被改写成
+# `<Git 安装目录>/DAppVersion=0.1.0`，ISCC 认不出这是个选项，就把它和脚本文件
+# 一起算成两个「script filename」，报 “You may not specify more than one script
+# filename.”。`--define=` 不以 / 开头，不受这条规则影响（本机实测两种写法展开结果
+# 完全一致，见 README「发行产物」一节）。
 #
 # 为什么要重试：ISCC 收尾时会给刚写出的 Setup.exe 写图标资源
 # （Updating icons (Setup.exe)），这一步偶尔会撞上杀软实时扫描或索引器持有文件，
@@ -156,9 +162,9 @@ fi
 # 所以这里退避重试，连续 3 次失败才真的报错。
 compile() {
   local iss="$1" variant="$2" try=1 out=""
-  local -a args=("/DAppVersion=$VERSION")
+  local -a args=("--define=AppVersion=$VERSION")
   if [ "$variant" = "with-python" ]; then
-    args+=("/DBUNDLE_PYTHON=1")
+    args+=("--define=BUNDLE_PYTHON=1")
   fi
   args+=("$iss")
   while :; do

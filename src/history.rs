@@ -54,6 +54,15 @@ pub fn dir(root: &Path) -> PathBuf {
     root.join(DIR_NAME)
 }
 
+/// 某个对话 id 对应的文件路径。
+///
+/// 「id ↔ 文件名」这条映射被四个地方用到（新建、查重、扫目录、按 id 切回），
+/// 所以只留这一个写法 —— 它俩对不上的表现是「找不到刚存下的对话」，
+/// 而不是编译错误。
+pub fn file_of(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.{EXT}"))
+}
+
 // ─────────────────────────── 本地时间 ───────────────────────────
 
 struct Local {
@@ -126,26 +135,92 @@ pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// 由 `YYYYMMDD-HHMMSS` 生成「10-02 15:39」这样的显示串。
+/// 拼出「10-02 15:39」。往年的补上年份，否则「10-02」会让人误以为是今年。
+fn display_parts(y: u16, mo: u16, d: u16, hh: u16, mm: u16, this_year: u16) -> String {
+    if y == this_year {
+        format!("{mo:02}-{d:02} {hh:02}:{mm:02}")
+    } else {
+        format!("{y:04}-{mo:02}-{d:02} {hh:02}:{mm:02}")
+    }
+}
+
+/// 由文件名主干 `YYYYMMDD-HHMMSS` 解析出显示时间（= 这段对话**开始**的时间）。
 ///
 /// 时间直接从文件名解析，不做任何时区换算 —— 文件名本来就是本地时间，
 /// 这比存一个 UTC 时间戳再想办法转回来简单得多，也不会算错。
+/// 现在只在拿不到文件 mtime 时兜底（见 `display_mtime`）。
 fn display_time(id: &str, this_year: u16) -> String {
     let b = id.as_bytes();
     if b.len() < 15 || b[8] != b'-' {
         return id.to_string();
     }
-    let s = |a: usize, z: usize| id.get(a..z).unwrap_or("");
-    let (y, mo, d, hh, mm) = (s(0, 4), s(4, 6), s(6, 8), s(9, 11), s(11, 13));
-    if [y, mo, d, hh, mm].iter().any(|p| p.len() < 2 || !p.bytes().all(|c| c.is_ascii_digit())) {
-        return id.to_string();
+    // 逐段解析而不是直接切字符串：非 ASCII 的 id 切出来的可能不是字符边界
+    let num = |a: usize, z: usize| {
+        let s = id.get(a..z)?;
+        if !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()) {
+            s.parse::<u16>().ok()
+        } else {
+            None
+        }
+    };
+    match (num(0, 4), num(4, 6), num(6, 8), num(9, 11), num(11, 13)) {
+        (Some(y), Some(mo), Some(d), Some(hh), Some(mm)) => display_parts(y, mo, d, hh, mm, this_year),
+        _ => id.to_string(),
     }
-    if y == this_year.to_string() {
-        format!("{mo}-{d} {hh}:{mm}")
-    } else {
-        // 往年的补上年份，否则「10-02」会让人误以为是今年
-        format!("{y}-{mo}-{d} {hh}:{mm}")
+}
+
+/// 系统时间 → 本地时间。
+///
+/// Windows 交给 `FileTimeToLocalFileTime` 去算时区与夏令时；自己拿
+/// 「当前本地时间 − 当前 UTC」推偏移，会在夏令时切换的那一小时里错一小时。
+/// 非 Windows 平台没有等价物，退回 UTC（显示上差一个时区，不值得为它引依赖）。
+#[cfg(windows)]
+fn local_from_system(t: SystemTime) -> Option<Local> {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    use windows_sys::Win32::System::Time::FileTimeToSystemTime;
+
+    // Unix 秒 → FILETIME：单位 100ns，起点是 1601-01-01
+    let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let ticks = (secs + 11_644_473_600) * 10_000_000;
+    let utc = FILETIME {
+        dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut local = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe {
+        if FileTimeToLocalFileTime(&utc, &mut local) == 0 {
+            return None;
+        }
+        if FileTimeToSystemTime(&local, &mut st) == 0 {
+            return None;
+        }
     }
+    Some(Local {
+        year: st.wYear,
+        month: st.wMonth,
+        day: st.wDay,
+        hour: st.wHour,
+        minute: st.wMinute,
+        second: st.wSecond,
+    })
+}
+
+#[cfg(not(windows))]
+fn local_from_system(t: SystemTime) -> Option<Local> {
+    let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let (year, month, day, hour, minute, second) = civil_from_unix(secs);
+    Some(Local { year, month, day, hour, minute, second })
+}
+
+/// 文件 mtime → 「最后一次对话时间」显示串。
+///
+/// 列表按最后一次对话时间排序，显示的就必须是同一个时间 —— 否则一段三天前的
+/// 对话被顶到最上面、旁边仍写着三天前，看着就像排错了。
+fn display_mtime(t: SystemTime, this_year: u16) -> Option<String> {
+    let l = local_from_system(t)?;
+    Some(display_parts(l.year, l.month, l.day, l.hour, l.minute, this_year))
 }
 
 // ─────────────────────────── 记录 ───────────────────────────
@@ -222,7 +297,7 @@ impl Log {
             root: Some(root.display().to_string()),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
         };
-        let path = dir.join(format!("{}.{EXT}", meta.id));
+        let path = file_of(dir, &meta.id);
         let file = OpenOptions::new().create(true).write(true).append(true).open(&path)?;
         let mut log = Self { path, file, meta };
         let head = meta_line(&log.meta);
@@ -235,6 +310,30 @@ impl Log {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 接上一段已经存在的对话（继续往里写）。
+    ///
+    /// 与 `create` 的区别：不新建文件、不生成新 id、也不做裁剪。meta 行是从
+    /// 文件里读回来的 —— 关键是要留住**原来那个 id**，否则「继续这段对话」
+    /// 会写出第二个文件，历史里就会出现两条并行的记录。
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("无法打开 {}", path.display()))?;
+        let first = BufReader::new(file).lines().next();
+        let meta = first
+            .and_then(|l| l.ok())
+            .and_then(|l| serde_json::from_str::<Meta>(l.trim()).ok())
+            // 首行不是 meta（手改过 / 早期版本写的文件）：退回用文件名当 id，
+            // 至少还能继续写，而不是整段对话都打不开
+            .unwrap_or_else(|| Meta {
+                id: path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string(),
+                created: 0,
+                model: None,
+                root: None,
+                version: None,
+            });
+        let file = OpenOptions::new().write(true).append(true).open(path)?;
+        Ok(Self { path: path.to_path_buf(), file, meta })
     }
 
     /// 追加一条消息。写入失败不返回错误 —— 历史记录不该让对话中断。
@@ -298,7 +397,7 @@ fn new_id(dir: &Path) -> String {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
         let salt = nanos ^ std::process::id().wrapping_mul(2_654_435_761) ^ attempt.wrapping_mul(0x9E37_79B9);
         let id = format!("{stamp}-{:04x}", (salt & 0xffff) as u16);
-        if !dir.join(format!("{id}.{EXT}")).exists() {
+        if !file_of(dir, &id).exists() {
             return id;
         }
     }
@@ -317,28 +416,47 @@ pub struct Summary {
     pub title: String,
     /// 消息条数（不含 meta）
     pub messages: usize,
-    /// 「10-02 15:39」这样的显示时间（直接取自文件名，不做时区换算）
+    /// 「最后一次对话时间」的显示串（「10-02 15:39」）。与列表排序用的是同一个
+    /// 时间 —— 排序键和显示的时间一旦不是同一个，列表看着就像排错了。
     pub time: String,
 }
 
-fn collect(dir: &Path) -> Vec<(String, PathBuf)> {
+/// 目录里的一个历史文件。
+struct Entry {
+    id: String,
+    path: PathBuf,
+    /// 最后一次写入的时间（文件 mtime），也就是「最后一次对话时间」
+    mtime: Option<SystemTime>,
+}
+
+/// 扫目录，**按最后一次对话时间从新到旧**排列。
+///
+/// 用 mtime 而不是文件名里的时间戳：文件名记的是「这段对话什么时候开始」，
+/// 而列表要回答的是「最近在跟哪段对话说话」。接着聊一段三天前的对话，
+/// 它就该浮到最上面 —— 这正是用户找「我刚刚在聊什么」时的预期顺序。
+fn collect(dir: &Path) -> Vec<Entry> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut files: Vec<(String, PathBuf)> = entries
+    let mut files: Vec<Entry> = entries
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
             let id = name.strip_suffix(&format!(".{EXT}"))?.to_string();
-            Some((id, e.path()))
+            Some(Entry {
+                path: file_of(dir, &id),
+                mtime: e.metadata().ok().and_then(|m| m.modified().ok()),
+                id,
+            })
         })
         .collect();
-    // 文件名以时间戳开头 → 字典序即时间序
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    // mtime 相同时（同一秒内建了两个文件）退回文件名：文件名以时间戳开头，
+    // 字典序即时间序。这条兜底让顺序在任何情况下都是确定的。
+    files.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| b.id.cmp(&a.id)));
     files
 }
 
-/// 列出历史对话，**最新的在前**。
+/// 列出历史对话，**最近聊过的在前**。
 ///
 /// 只读前几行就能拿到标题（首条用户消息永远是第 2 行），条数靠数行数得出 ——
 /// 不解析全文，几百个文件也只是顺序读磁盘。
@@ -347,11 +465,12 @@ pub fn list(dir: &Path, limit: usize) -> Vec<Summary> {
     collect(dir)
         .into_iter()
         .take(limit)
-        .filter_map(|(id, path)| read_summary(id, path, this_year))
+        .filter_map(|e| read_summary(e, this_year))
         .collect()
 }
 
-fn read_summary(id: String, path: PathBuf, this_year: u16) -> Option<Summary> {
+fn read_summary(e: Entry, this_year: u16) -> Option<Summary> {
+    let Entry { id, path, mtime } = e;
     let file = File::open(&path).ok()?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
@@ -390,7 +509,11 @@ fn read_summary(id: String, path: PathBuf, this_year: u16) -> Option<Summary> {
     }
 
     Some(Summary {
-        time: display_time(&id, this_year),
+        // 显示「最后一次对话时间」（列表排序用的就是它）；mtime 拿不到时退回
+        // 文件名里的开始时间，宁可显示得旧一点，也不要留一格空白。
+        time: mtime
+            .and_then(|t| display_mtime(t, this_year))
+            .unwrap_or_else(|| display_time(&id, this_year)),
         id,
         path,
         title: title.unwrap_or_else(|| "（空对话）".into()),
@@ -429,14 +552,16 @@ pub fn load(path: &Path) -> Result<Vec<Loaded>> {
 
 /// 只保留最新的 `keep` 个对话，多出来的删掉。`keep == 0` 表示不限制。
 ///
+/// 「最新」= 最后一次对话时间，所以裁剪淘汰的是**最久没聊过**的那些 ——
+/// 刚接着聊过的旧对话会被保住，哪怕它是几个月前开的。
 /// 返回被删除的文件数。
 pub fn prune(dir: &Path, keep: usize) -> usize {
     if keep == 0 {
         return 0;
     }
     let mut n = 0;
-    for (_, path) in collect(dir).into_iter().skip(keep) {
-        if std::fs::remove_file(&path).is_ok() {
+    for e in collect(dir).into_iter().skip(keep) {
+        if std::fs::remove_file(&e.path).is_ok() {
             n += 1;
         }
     }
@@ -462,6 +587,8 @@ pub enum Cmd {
     List,
     /// 打印某个对话全文
     Show(String),
+    /// 切换到某个对话（读回上下文，之后的发言继续写进同一个文件）
+    Open(String),
     /// 打印历史目录
     Dir,
     /// 删除某个对话
@@ -483,6 +610,10 @@ pub fn parse_cmd(line: &str) -> Result<Cmd> {
             Some(id) => Ok(Cmd::Show(id.to_string())),
             None => bail!("用法: /history show <序号|文件名>"),
         },
+        Some("open") | Some("use") => match parts.next() {
+            Some(id) => Ok(Cmd::Open(id.to_string())),
+            None => bail!("用法: /history open <序号|文件名>"),
+        },
         Some("rm") | Some("remove") => match parts.next() {
             Some(id) => Ok(Cmd::Remove(id.to_string())),
             None => bail!("用法: /history rm <序号|文件名>"),
@@ -490,7 +621,7 @@ pub fn parse_cmd(line: &str) -> Result<Cmd> {
         Some(other) => bail!(
             "未知的 /history 子命令: {other}\n\
              用法: /history [list] | /history show <序号|文件名> | \
-             /history rm <序号|文件名> | /history dir"
+             /history open <序号|文件名> | /history rm <序号|文件名> | /history dir"
         ),
     }
 }
@@ -522,7 +653,7 @@ pub fn list_text(dir: &Path, current: Option<&str>) -> String {
     if items.is_empty() {
         return format!("（还没有历史记录）\n  目录: {}", dir.display());
     }
-    let mut s = format!("历史记录（{} 个对话，最新在前）  {}", items.len(), dir.display());
+    let mut s = format!("历史记录（{} 个对话，最近聊过的在前）  {}", items.len(), dir.display());
     for (i, it) in items.iter().enumerate() {
         let cur = if Some(it.id.as_str()) == current { "  ← 当前" } else { "" };
         s.push_str(&format!(
@@ -534,7 +665,10 @@ pub fn list_text(dir: &Path, current: Option<&str>) -> String {
             cur
         ));
     }
-    s.push_str("\n  用法: /history show <序号> | /history rm <序号> | /history dir");
+    s.push_str(
+        "\n  用法: /history show <序号> 看全文 | /history open <序号> 接着聊 | \
+         /history rm <序号> | /history dir",
+    );
     s
 }
 
@@ -652,7 +786,7 @@ mod tests {
         log.append(&Message::assistant(Some("完成了。".into()), None, vec![]), None);
         drop(log);
 
-        let items = load(&d.path().join(format!("{id}.{EXT}"))).unwrap();
+        let items = load(&file_of(d.path(), &id)).unwrap();
         assert_eq!(items.len(), 6, "system 不入档，6 条消息应全部读到");
         assert_eq!(items[0].msg.role, "user");
         assert_eq!(items[0].msg.content.as_deref(), Some("第一行\n第二行 \"引号\" 与中文"));
@@ -783,6 +917,92 @@ mod tests {
         assert_eq!(resolve(d.path(), &id[..13]).unwrap().id, id, "支持只写时间戳前缀");
         assert!(resolve(d.path(), "9").is_err());
         assert!(resolve(d.path(), "0").is_err());
+    }
+
+    /// 「接着上次聊」必须写回**原文件**，而不是另起一个。
+    ///
+    /// 这是切换会话最容易出的错：id 是从 meta 读回来的，一旦读错（或干脆
+    /// 重新生成一个），历史里就会出现两条并行的记录，用户还会以为消息丢了。
+    #[test]
+    fn open_continues_the_same_file() {
+        let d = Tmp::new("reopen");
+        let mut log = Log::create(d.path(), Some("m"), Path::new("C:/root"), 0).unwrap();
+        let id = id_of(&log);
+        log.append(&Message::user("第一句"), None);
+        drop(log); // 关掉句柄，模拟「这次会话结束」
+
+        let mut again = Log::open(&file_of(d.path(), &id)).unwrap();
+        again.append(&Message::user("第二句"), None);
+        drop(again);
+
+        assert_eq!(list(d.path(), 10).len(), 1, "不能多出第二个文件");
+        let items = load(&file_of(d.path(), &id)).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].msg.content.as_deref(), Some("第二句"));
+    }
+
+    /// 首行不是 meta（手改过 / 早期版本写的文件）也要能接上：`open` 退回用文件名
+    /// 当 id，消息照旧追加在原文件末尾，不会另起一个。
+    ///
+    /// 这类文件在列表里是**看不见**的（`list` 拿首行 meta 当格式校验，免得把
+    /// 误放进 `history/` 的其它文件也列出来），所以这里只断言写入行为。
+    #[test]
+    fn open_tolerates_a_file_without_meta() {
+        let d = Tmp::new("nometa");
+        std::fs::create_dir_all(d.path()).unwrap();
+        let path = file_of(d.path(), "20260101-000000-abcd");
+        std::fs::write(&path, "{\"role\":\"user\",\"content\":\"只有消息\"}\n").unwrap();
+
+        let mut log = Log::open(&path).unwrap();
+        assert_eq!(log.path(), path.as_path(), "写回原文件");
+        log.append(&Message::user("接着写"), None);
+        drop(log);
+
+        let lines = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert_eq!(lines, 2, "新消息追加在原文件末尾");
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1, "没有另起文件");
+    }
+
+    /// 列表按**最后一次对话时间**排，而不是文件名里的开始时间：
+    /// 接着聊一段早先开的旧对话，它就该浮到最上面。
+    #[test]
+    fn list_orders_by_last_activity() {
+        let d = Tmp::new("order");
+        std::fs::create_dir_all(d.path()).unwrap();
+        let write = |id: &str, text: &str| {
+            let meta = Meta {
+                id: id.to_string(),
+                created: 0,
+                model: None,
+                root: None,
+                version: None,
+            };
+            let body =
+                format!("{}\n{}\n", meta_line(&meta), message_line(&Message::user(text), None));
+            std::fs::write(file_of(d.path(), id), body).unwrap();
+        };
+
+        // 名字早的那段后写：这样「按文件名排」与「按 mtime 排」结论相反，
+        // 断言才分得开是哪种排序在起作用。（NTFS 的 mtime 精度是 100ns，
+        // 30ms 足够拉开；文件系统粒度粗到秒的话这条测试会不可靠。）
+        write("20260102-100000-bbbb", "先开的对话");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        write("20260101-100000-aaaa", "后开的对话");
+        assert_eq!(list(d.path(), 10)[0].id, "20260101-100000-aaaa", "后写的文件在前");
+
+        // 回到那段旧对话里再说一句 —— 它应该立刻跳到最前面
+        let mut log = Log::open(&file_of(d.path(), "20260102-100000-bbbb")).unwrap();
+        log.append(&Message::user("又聊了一句"), None);
+        drop(log);
+
+        let items = list(d.path(), 10);
+        assert_eq!(items[0].id, "20260102-100000-bbbb", "刚聊过的那段排最前");
+        assert_eq!(items[0].messages, 2);
+        assert!(items[0].time.contains(':'), "显示时间取自 mtime，不该为空: {}", items[0].time);
     }
 }
 

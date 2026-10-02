@@ -38,6 +38,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Console",
     "Win32_Foundation",
     "Win32_System_SystemInformation",
+    # 历史列表要显示「最后一次对话时间」：FileTimeToLocalFileTime 在 Storage::FileSystem，
+    # FileTimeToSystemTime 在 System::Time，两个都得开。
+    "Win32_Storage_FileSystem",
+    "Win32_System_Time",
 ] }
 
 

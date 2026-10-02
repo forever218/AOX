@@ -24,10 +24,13 @@ pub const CARD_RADIUS: u8 = 14;
 
 /// 自定义粗体字族名。
 const BOLD_FAMILY: &str = "aox-strong";
-/// 自定义衬线字族名（品牌字与内嵌引用用，找不到就退回普通字体）。
+/// 自定义衬线字族名（内嵌引用等次级标题用，找不到就退回普通字体）。
 const SERIF_FAMILY: &str = "aox-serif";
+/// 自定义品牌字族名（首屏那句大招呼用，找不到就退到衬线）。
+const BRAND_FAMILY: &str = "aox-brand";
 static BOLD_OK: AtomicBool = AtomicBool::new(false);
 static SERIF_OK: AtomicBool = AtomicBool::new(false);
+static BRAND_OK: AtomicBool = AtomicBool::new(false);
 
 /// 系统里是否找到了真正的粗体字体。
 pub fn bold_available() -> bool {
@@ -43,12 +46,24 @@ pub fn bold_font(size: f32) -> FontId {
     }
 }
 
-/// 衬线 FontId（品牌字用；找不到衬线字体时退回粗体）。
+/// 衬线 FontId（次级标题用；找不到衬线字体时退回粗体）。
 pub fn serif_font(size: f32) -> FontId {
     if SERIF_OK.load(Ordering::Relaxed) {
         FontId::new(size, FontFamily::Name(SERIF_FAMILY.into()))
     } else {
         bold_font(size)
+    }
+}
+
+/// 品牌字 FontId（首屏那句大招呼用）。
+///
+/// 比衬线松、带点手写的笔意，免得一行问候看起来像文件抬头；
+/// 找不到艺术体时逐级退回衬线 → 粗体，所以调它总是安全的。
+pub fn brand_font(size: f32) -> FontId {
+    if BRAND_OK.load(Ordering::Relaxed) {
+        FontId::new(size, FontFamily::Name(BRAND_FAMILY.into()))
+    } else {
+        serif_font(size)
     }
 }
 
@@ -328,7 +343,7 @@ const BOLD_CANDIDATES: &[&str] = &[
     "NotoSansSC-Bold.otf",
 ];
 
-/// 衬线候选（品牌字用）。
+/// 衬线候选（次级标题用）。
 const SERIF_CANDIDATES: &[&str] = &[
     "georgia.ttf",
     "times.ttf",
@@ -336,6 +351,17 @@ const SERIF_CANDIDATES: &[&str] = &[
     "cambria.ttc",
     "georgiab.ttf",
     "Times New Roman.ttf",
+];
+
+/// 品牌字候选（首屏大招呼用）。
+///
+/// 按「笔势从强到弱」排，全部是 Windows 自带字体（Gabriola / Inkfree 从 Win10 起
+/// 随系统提供）；一个都没有就退到衬线，界面不会因此缺字。
+const BRAND_CANDIDATES: &[&str] = &[
+    "Gabriola.ttf",  // 花体，笔画带书法连带，笔势最足
+    "Inkfree.ttf",   // 钢笔手写，细而松弛
+    "Candara.ttf",   // 人文无衬线，笔尾微翘
+    "georgia.ttf",
 ];
 
 /// 等宽字体候选（代码块）。
@@ -347,7 +373,8 @@ const MONO_CANDIDATES: &[&str] = &[
     "SourceCodePro-Regular.otf",
 ];
 
-/// 从环境变量读取自定义字体路径（AOX_GUI_FONT / AOX_GUI_FONT_BOLD / AOX_GUI_FONT_MONO）。
+/// 从环境变量读取自定义字体路径（AOX_GUI_FONT / AOX_GUI_FONT_BOLD /
+/// AOX_GUI_FONT_SERIF / AOX_GUI_FONT_BRAND / AOX_GUI_FONT_MONO）。
 fn read_env(key: &str) -> Option<(String, Vec<u8>)> {
     let path = std::env::var(key).ok()?;
     let bytes = std::fs::read(&path).ok()?;
@@ -382,7 +409,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         BOLD_OK.store(true, Ordering::Relaxed);
     }
 
-    // 衬线：品牌字用。找不到就退回粗体（serif_font 内部处理）。
+    // 衬线：次级标题用。找不到就退回粗体（serif_font 内部处理）。
     let serif = read_env("AOX_GUI_FONT_SERIF").or_else(|| read_first(SERIF_CANDIDATES));
     if let Some((_, bytes)) = serif {
         fonts.font_data.insert("serif".to_owned(), Arc::new(FontData::from_owned(bytes)));
@@ -393,6 +420,19 @@ pub fn install_fonts(ctx: &egui::Context) {
         fam.push("Ubuntu-Light".to_owned());
         fonts.families.insert(FontFamily::Name(SERIF_FAMILY.into()), fam);
         SERIF_OK.store(true, Ordering::Relaxed);
+    }
+
+    // 品牌字：首屏大招呼用。找不到就退回衬线（brand_font 内部处理）。
+    let brand = read_env("AOX_GUI_FONT_BRAND").or_else(|| read_first(BRAND_CANDIDATES));
+    if let Some((_, bytes)) = brand {
+        fonts.font_data.insert("brand".to_owned(), Arc::new(FontData::from_owned(bytes)));
+        let mut fam: Vec<String> = vec!["brand".to_owned()];
+        if !cjk_name.is_empty() {
+            fam.push(cjk_name.clone());
+        }
+        fam.push("Ubuntu-Light".to_owned());
+        fonts.families.insert(FontFamily::Name(BRAND_FAMILY.into()), fam);
+        BRAND_OK.store(true, Ordering::Relaxed);
     }
 
     let mono = read_env("AOX_GUI_FONT_MONO").or_else(|| read_first(MONO_CANDIDATES));

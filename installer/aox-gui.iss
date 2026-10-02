@@ -4,8 +4,12 @@
 ;  编译（推荐用构建脚本，它会自动编译两遍产出两种变体）：
 ;      bash tools/build_installer.sh
 ;  手动编译单个变体：
-;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" installer\aox-gui.iss                      -> 主包
-;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" /DBUNDLE_PYTHON=1 installer\aox-gui.iss     -> 捆绑变体
+;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" installer\aox-gui.iss                            -> 主包
+;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" --define=BUNDLE_PYTHON=1 installer\aox-gui.iss   -> 捆绑变体
+;
+;  定义一律写长式 --define=。旧式的 /D名字=值 在 Git Bash 里会被 MSYS 当成 Unix 路径
+;  改写（/DAppVersion=0.1.0 -> <Git 安装目录>/DAppVersion=0.1.0），ISCC 于是把它算成
+;  第二个 script filename，报 “You may not specify more than one script filename.”
 ;  产物：
 ;      dist\AOX-GUI-Setup-<版本>.exe                 （主包，约 4 MB）
 ;      dist\AOX-GUI-Setup-<版本>-with-python.exe     （捆绑变体，约 12.5 MB）
@@ -30,7 +34,7 @@
 #define AppSlug        "AOX-GUI"
 
 ; 版本号可由命令行覆盖，避免与 Cargo.toml 脱节：
-;     ISCC /DAppVersion=1.2.3 installer\aox-gui.iss
+;     ISCC --define=AppVersion=1.2.3 installer\aox-gui.iss
 ; tools/build_installer.sh 会自动从 Cargo.toml 读取并传入。
 #ifndef AppVersion
   #define AppVersion "0.1.0"
@@ -43,7 +47,7 @@
 #define ProjectRoot    ".."
 
 ; ── 可选变体：把 Python 运行时装进安装包 ──────────────────────────────────
-;      ISCC /DAppVersion=1.2.3 /DBUNDLE_PYTHON=1 installer\aox-gui.iss
+;      ISCC --define=AppVersion=1.2.3 --define=BUNDLE_PYTHON=1 installer\aox-gui.iss
 ;   产出 AOX-GUI-Setup-<版本>-with-python.exe，装完即可用 python 插件（离线可用）。
 ;   与命令行版完全同构：主包不捆绑，需要时才装配或用 -with-python 变体。
 #ifdef BUNDLE_PYTHON

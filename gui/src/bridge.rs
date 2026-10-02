@@ -26,6 +26,13 @@ use aox::ui::{AgentEvent, AuthDecision, Ui};
 pub enum ToAgent {
     /// 一条用户指令
     Input(String),
+    /// 切换到某段历史对话（`id` 即文件名主干）。
+    ///
+    /// 切换是「就地换掉上下文」，所以必须回到 Agent 所在的线程做，
+    /// 不能由主线程自己读了文件再塞过来。
+    Resume(String),
+    /// 开一段新对话。旧对话不需要任何收尾动作 —— 它已经边聊边写进 `history/` 了。
+    NewConversation,
     /// 退出：关闭插件子进程并结束驱动线程
     Shutdown,
 }
@@ -59,6 +66,13 @@ pub enum FromAgent {
     /// 主线程据此在历史列表里标出「当前」，并在需要时重新扫描目录 ——
     /// 历史文件本身由主线程直接读盘，不经过这条 channel（见 `aox::history`）。
     HistoryCurrent(Option<String>),
+    /// 会话已切换（打开历史对话 / 新建对话）。
+    ///
+    /// `opened` 是切换后的对话 id（新建对话时为 `None`）；`error` 非空表示
+    /// 载入失败 —— 此时 Agent 的上下文**没有被动过**，主线程应当什么都不改。
+    ///
+    /// 只带 id 不带消息：载入后的内容由主线程自己读盘重建（见上一条说明）。
+    Switched { opened: Option<String>, error: Option<String> },
     /// 本轮出现不可恢复错误
     Fatal(String),
 }
@@ -141,11 +155,14 @@ pub struct GuiUi {
 
 #[async_trait]
 impl Ui for GuiUi {
+    /// GUI 的取指令路径是 `next_command`（它还要就地处理「切换会话」），
+    /// 所以这里实际上不会被调到；保留实现只为满足 trait。
     async fn read_user_input(&mut self) -> Result<Option<String>> {
         loop {
             match self.rx.recv().await {
                 Some(ToAgent::Input(s)) => return Ok(Some(s)),
                 Some(ToAgent::Shutdown) | None => return Ok(None),
+                Some(ToAgent::Resume(_)) | Some(ToAgent::NewConversation) => continue,
             }
         }
     }
@@ -263,6 +280,63 @@ fn send_history_current(tx: &mpsc::UnboundedSender<FromAgent>, agent: &Agent) {
     let _ = tx.send(FromAgent::HistoryCurrent(agent.history_id().map(str::to_string)));
 }
 
+/// 启动受挫时（配置读不出来 / 模型没就绪）的「只等退出」循环。
+///
+/// 必须回应切换会话的请求：主线程发出请求后会先把列表锁灰、等回执解锁，
+/// 而这几条消息在这个状态下注定做不成事 —— 沉默就等于把侧边栏永久冻住。
+async fn idle_until_shutdown(
+    rx: &mut mpsc::UnboundedReceiver<ToAgent>,
+    tx: &mpsc::UnboundedSender<FromAgent>,
+) {
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            ToAgent::Shutdown => break,
+            ToAgent::Resume(_) | ToAgent::NewConversation => {
+                let _ = tx.send(FromAgent::Switched {
+                    opened: None,
+                    error: Some("模型未就绪，暂时无法切换对话".into()),
+                });
+            }
+            ToAgent::Input(_) => {
+                let _ = tx.send(FromAgent::Event(AgentEvent::Warn(
+                    "模型未就绪，这条指令没有发出。".into(),
+                )));
+            }
+        }
+    }
+}
+
+/// 取下一个用户指令，期间顺手处理「切换会话」这类控制消息。
+///
+/// 这里没有走 `Ui::read_user_input()`：那个方法只能吐回用户文本，而切换会话
+/// 必须**就地**改动 `agent`，只有这个线程拿得到它。通道还是同一条，
+/// 顺序自然也就和用户的操作顺序一致。
+async fn next_command(
+    ui: &mut GuiUi,
+    agent: &mut Agent,
+    rt: &Arc<Runtime>,
+    tx: &mpsc::UnboundedSender<FromAgent>,
+) -> Result<Option<String>> {
+    loop {
+        match ui.rx.recv().await {
+            Some(ToAgent::Input(s)) => return Ok(Some(s)),
+            Some(ToAgent::Resume(id)) => {
+                let path = aox::history::file_of(&aox::history::dir(&rt.root), &id);
+                let msg = match agent.resume(&path) {
+                    Ok(_) => FromAgent::Switched { opened: Some(id), error: None },
+                    Err(e) => FromAgent::Switched { opened: None, error: Some(format!("{e:#}")) },
+                };
+                let _ = tx.send(msg);
+            }
+            Some(ToAgent::NewConversation) => {
+                agent.new_conversation();
+                let _ = tx.send(FromAgent::Switched { opened: None, error: None });
+            }
+            Some(ToAgent::Shutdown) | None => return Ok(None),
+        }
+    }
+}
+
 /// 在独立线程里启动：建 tokio 运行时 → 装载运行时 → 跑驱动循环。
 pub fn spawn(
     tx: mpsc::UnboundedSender<FromAgent>,
@@ -314,12 +388,8 @@ async fn boot_and_run(
         Err(e) => {
             // 配置缺失/无效：GUI 照常打开，展示引导信息，输入区会被禁用。
             boot(&tx, &config_path, "", false, Some(format!("{e:#}")), &root);
-            loop {
-                match rx.recv().await {
-                    Some(ToAgent::Shutdown) | None => return Ok(()),
-                    _ => {}
-                }
-            }
+            idle_until_shutdown(&mut rx, &tx).await;
+            return Ok(());
         }
     };
 
@@ -356,12 +426,8 @@ async fn boot_and_run(
                 "请在 config.toml 的 [provider] 填写 base_url 与 api_key（或 api_key_env）后重新启动。".into(),
             ));
             boot(&tx, &config_path, &model, false, Some(format!("{e:#}")), &root);
-            loop {
-                match ui.rx.recv().await {
-                    Some(ToAgent::Shutdown) | None => return Ok(()),
-                    _ => {}
-                }
-            }
+            idle_until_shutdown(&mut ui.rx, &tx).await;
+            return Ok(());
         }
     };
 
@@ -396,7 +462,7 @@ async fn boot_and_run(
 
     // ---- 驱动循环：与 CLI 的 REPL 一一对应
     loop {
-        let Some(input) = ui.read_user_input().await? else { break };
+        let Some(input) = next_command(&mut ui, &mut agent, &rt, &tx).await? else { break };
         let line = input.trim().to_string();
         if line.is_empty() {
             continue;

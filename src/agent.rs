@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -161,6 +162,36 @@ impl Agent {
     /// 当前对话历史长度（用于中断时回滚）
     pub fn messages_len(&self) -> usize {
         self.messages.len()
+    }
+
+    /// 切换到一段已存档的对话：读回消息载入上下文，并把落盘器接回那个文件。
+    ///
+    /// 返回载入的消息条数（不含系统提示）。载入失败时上下文**保持原样** ——
+    /// 半途清空再报错，用户会既丢了眼前的对话、又没拿到想要的那段。
+    ///
+    /// 载入的是全部历史。这让「接着上次聊」是真的接着聊，代价是对话越长
+    /// 上下文越大；想开新话题就按「+」，那是另一条路径。
+    pub fn resume(&mut self, path: &Path) -> Result<usize> {
+        let items = crate::history::load(path)?;
+        let log = crate::history::Log::open(path)?;
+        // 只保留系统提示（第 0 条），其余全部换成存档里的消息。
+        // 系统提示不入档是有意的（每轮都在变），所以它只能由这里保住。
+        self.messages.truncate(1);
+        self.messages.extend(items.iter().map(|i| i.msg.clone()));
+        self.log = Some(log);
+        self.log_error_reported = false;
+        Ok(items.len())
+    }
+
+    /// 开始一段新对话。
+    ///
+    /// 旧对话**不需要任何「保存」动作**：它是边聊边追加的，此刻已经完整地
+    /// 躺在 `history/` 里了。这里只把落盘器置空 —— 下一轮会惰性新建一个文件，
+    /// 于是「上一段对话」自然就归入历史。
+    pub fn new_conversation(&mut self) {
+        self.messages.truncate(1);
+        self.log = None;
+        self.log_error_reported = false;
     }
 
     /// 中断当前任务后回滚对话历史，避免遗留「有 tool_calls 但无结果」的半截消息。

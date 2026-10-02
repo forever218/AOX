@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, Frame, Label, Layout, Margin, Pos2, Rect, RichText,
-    ScrollArea, Sense, Stroke, TextEdit, Ui, Vec2,
+    Align, Align2, Color32, CornerRadius, FontId, Frame, Label, Layout, Margin, Pos2, Rect,
+    RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, Vec2,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -149,16 +149,6 @@ struct AuthCard {
     args: String,
 }
 
-/// 正在查看的历史对话（只读）。
-///
-/// 刻意不在主对话流里「就地插入」历史内容：历史是另一段对话，混进当前上下文
-/// 会让人分不清哪句是自己刚说的。所以做成独立的视图，看完点「返回」即可。
-struct Viewing {
-    id: String,
-    title: String,
-    items: Vec<Item>,
-}
-
 // ─────────────────────────── App ───────────────────────────
 
 pub struct App {
@@ -189,26 +179,21 @@ pub struct App {
     /// 插件运行时状态（每语言一行，由 bridge 发来）。
     /// 放在「关于」窗口里——这类「看一眼就够」的诊断数据不该占用主界面。
     runtimes: RuntimeView,
-    /// 上一次写进窗口标题的模型名。原生标题栏与界面融为一体后，
-    /// 「AOX · <模型>」放这里最自然，也就不必在顶栏再堆一个模型胶囊。
-    title_model: String,
 
     /// 历史目录（`<应用根>/history`）。GUI 直接读盘，不经过 agent 线程 ——
     /// 读历史是纯文件操作，没有并发问题，也就不必为它再开一条 channel。
     history_dir: PathBuf,
     /// 历史对话列表（最新的在前）。只在展开侧边栏、或本轮结束后刷新。
     history: Vec<aox::history::Summary>,
-    /// 本次会话正在写的那个对话 id，用于在列表里标出「当前」
+    /// 当前所在的这段对话的 id（尚未落盘的新对话为 None）。
+    ///
+    /// 侧边栏据此标「当前」—— 侧边栏是**会话切换器**：点某一条就切过去接着聊，
+    /// 这条自然也就跟着变了。
     current_history: Option<String>,
+    /// 正在等 Agent 回执的切换请求（切换前先灰掉列表，避免连点造成来回跳）
+    switching: bool,
     /// 左侧历史侧边栏是否展开
     show_history: bool,
-    /// 正在查看的历史对话（`Some` 时主区切到只读视图）
-    viewing: Option<Viewing>,
-    /// 切进历史视图的那一帧，把滚动位置顶回最上面。
-    ///
-    /// 历史视图与实时对话各用各的 ScrollArea id，两边的滚动位置互不干扰；
-    /// 但「换了一段历史」必须在下一帧把偏移清零，否则会停在上一次的阅读位置。
-    history_scroll_top: bool,
 
     show_activity: bool,
     /// 演示模式（--demo）：不连 LLM，只展示界面与事件流的排布
@@ -270,14 +255,13 @@ impl App {
             config_path: String::new(),
             plugins: Vec::new(),
             runtimes: RuntimeView::default(),
-            title_model: String::new(),
             history_dir: PathBuf::new(),
             history: Vec::new(),
             current_history: None,
+            switching: false,
             show_history: false,
-            viewing: None,
-            history_scroll_top: false,
-            show_activity: true,
+            // 左右两个侧栏默认都收起：主区宽度全部让给对话，需要时再点顶栏那两枚图标。
+            show_activity: false,
             follow: true,
             force_follow: true,
             follow_acts: true,
@@ -423,6 +407,18 @@ impl App {
                         self.refresh_history();
                     }
                 }
+                FromAgent::Switched { opened, error } => {
+                    self.switching = false;
+                    if let Some(e) = error {
+                        // 载入失败时 Agent 的上下文没被动过，所以这里也什么都不改，
+                        // 免得界面已经「跳」过去了、模型却还在原来那段对话里。
+                        self.push_act(ActKind::Error, "切换对话失败", e, true);
+                        continue;
+                    }
+                    self.current_history = opened.clone();
+                    self.adopt_conversation(opened.as_deref());
+                    self.refresh_history();
+                }
                 FromAgent::TurnStart => {
                     self.live = Some(Live {
                         status: "思考中".into(),
@@ -518,78 +514,78 @@ impl App {
         if self.history_dir.as_os_str().is_empty() {
             return;
         }
-        self.history = aox::history::list(&self.history_dir, HISTORY_LIST_LIMIT);
+        let mut items = aox::history::list(&self.history_dir, HISTORY_LIST_LIMIT);
+        // 正在聊的这一段永远置顶。
+        //
+        // 盘上的排序键是「最后一次说话的时间」，而刚切进来的这段对话可能三天没动过，
+        // 于是会排在很下面 —— 可人此刻要找的就是它。置顶是纯展示层的调整，
+        // 不改动文件时间，也不影响 `list()` 给 CLI 的顺序。
+        if let Some(cur) = self.current_history.as_deref() {
+            if let Some(i) = items.iter().position(|s| s.id == cur) {
+                let it = items.remove(i);
+                items.insert(0, it);
+            }
+        }
+        self.history = items;
     }
 
-    /// 打开一个历史对话（只读视图）。
+    /// 切换到某段历史对话。
     ///
-    /// 「当前」那一条不对应任何历史内容 —— 它就是眼前这段对话，所以点它
-    /// 直接退回实时视图，而不是给实时对话拍一张只读快照（那只会让人困惑）。
-    fn open_history(&mut self, id: &str) {
-        if Some(id) == self.current_history.as_deref() {
-            self.close_history_view();
+    /// 只发请求就返回：真正换上下文发生在 Agent 那个线程里，等
+    /// `FromAgent::Switched` 回来再动界面 —— 这样「切换失败」时界面不会
+    /// 抢先跳过去，留下「界面在这段、模型在那段」的错位。
+    fn switch_history(&mut self, id: &str) {
+        if self.busy || self.switching || Some(id) == self.current_history.as_deref() {
             return;
         }
-        let Some(s) = self.history.iter().find(|s| s.id == id) else { return };
-        let (id, title, path) = (s.id.clone(), s.title.clone(), s.path.clone());
-        match aox::history::load(&path) {
-            Ok(loaded) => {
-                self.viewing = Some(Viewing { id, title, items: items_from_history(&loaded) });
-                // 历史是「从头读」的，所以这一帧把滚动位置顶到最上面
-                self.history_scroll_top = true;
-                self.status = "查看历史对话".into();
-            }
-            Err(e) => {
-                self.push_act(ActKind::Error, "历史记录读取失败", format!("{e:#}"), true);
-                self.status = "历史记录读取失败".into();
-            }
-        }
+        self.switching = true;
+        let _ = self.tx.send(ToAgent::Resume(id.to_string()));
     }
 
-    fn close_history_view(&mut self) {
-        if self.viewing.take().is_some() {
-            self.status = "就绪".into();
+    /// 开一段新对话。
+    ///
+    /// 旧对话**不需要任何收尾动作**：它是边聊边追加的，此刻已经完整地躺在
+    /// `history/` 里了。所以这里只是让 Agent 松手，界面跟着清空。
+    fn new_conversation(&mut self) {
+        if self.busy || self.switching || (self.current_history.is_none() && self.items.is_empty()) {
+            return;
         }
+        self.switching = true;
+        let _ = self.tx.send(ToAgent::NewConversation);
     }
 
-    /// 只读历史视图的顶栏条：说明在看哪一段 + 返回入口。
-    fn history_banner(&mut self, ui: &mut Ui) {
-        let Some(v) = self.viewing.as_ref() else { return };
-        let title = clamp_str(&v.title, 70);
-        let id = v.id.clone();
-        let mut back = false;
-        Frame::NONE
-            .fill(P::surface())
-            .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
-            .stroke(Stroke::new(1.0, P::border()))
-            .inner_margin(Margin::symmetric(16, 11))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("历史对话").color(P::text_faint()).size(13.0));
-                    ui.add_space(10.0);
-                    ui.label(RichText::new(title).color(P::text()).size(14.0));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if flat_button(ui, "返回当前对话").clicked() {
-                            back = true;
-                        }
-                        ui.add_space(6.0);
-                        ui.label(RichText::new(id.as_str()).color(P::text_faint()).size(12.0));
-                    });
-                });
-            });
-        ui.add_space(16.0);
-        if back {
-            self.close_history_view();
-        }
+    /// 把界面切到 `id` 那段对话（`None` = 全新的空对话）。
+    ///
+    /// 内容自己读盘重建，而不是让 Agent 把消息发过来：历史文件本来就在本地，
+    /// 通道里只传 id 能让职责更干净（Agent 管上下文，界面管展示）。
+    fn adopt_conversation(&mut self, id: Option<&str>) {
+        self.items = match id {
+            Some(id) => aox::history::load(&aox::history::file_of(&self.history_dir, id))
+                .map(|l| items_from_history(&l))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        // 上一段对话的进行中状态与活动流一起换掉，否则右侧会一边显示新对话，
+        // 一边滚着旧对话的工具调用。
+        self.live = None;
+        self.waiting_auth = false;
+        self.auth = None;
+        self.auth_reply = None;
+        self.acts.clear();
+        self.follow = true;
+        self.force_follow = true;
     }
 
-    /// 左侧历史侧边栏。
+    /// 左侧历史侧边栏（会话切换器）。
     fn history_panel(&mut self, ctx: &egui::Context) {
         let frame = Frame::side_top_panel(&ctx.style())
             .fill(P::panel())
             .inner_margin(Margin::symmetric(16, 16));
         let mut want_refresh = false;
         let mut open: Option<String> = None;
+        // 切换请求在飞行中、或正在跑任务时不接受点击：这两段时间里发起切换，
+        // 结果会排在后面才生效，点的人只会看到界面「迟疑一下才跳」。
+        let locked = self.busy || self.switching;
         egui::SidePanel::left("aox-history")
             .resizable(true)
             .default_width(266.0)
@@ -626,10 +622,15 @@ impl App {
                             .size(13.0),
                     );
                     ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(clamp_str(&self.history_dir.display().to_string(), 200))
-                            .color(P::text_faint())
-                            .size(11.5),
+                    // 目录路径可能很长，用 truncate 让它在面板宽度内收口，
+                    // 而不是靠面板边界去切。
+                    ui.add(
+                        Label::new(
+                            RichText::new(self.history_dir.display().to_string())
+                                .color(P::text_faint())
+                                .size(11.5),
+                        )
+                        .truncate(),
                     );
                     return;
                 }
@@ -637,18 +638,20 @@ impl App {
                 ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     for s in &self.history {
                         let current = Some(s.id.as_str()) == self.current_history.as_deref();
-                        let viewing = self.viewing.as_ref().map(|v| v.id.as_str()) == Some(s.id.as_str());
-                        if history_row(ui, s, current, viewing, pw).clicked() {
+                        if history_row(ui, s, current, locked, pw).clicked() && !locked {
                             open = Some(s.id.clone());
                         }
                     }
+                    // 面板里**不放**「新建对话」：顶栏那枚「+」离侧边栏开关只有 38px，
+                    // 两处入口挨得太近，反而要停下来分辨该点哪个。列表就只做一件事 ——
+                    // 翻哪段对话。
                 });
             });
         if want_refresh {
             self.refresh_history();
         }
         if let Some(id) = open {
-            self.open_history(&id);
+            self.switch_history(&id);
         }
     }
 
@@ -800,22 +803,21 @@ impl App {
                             self.refresh_history();
                         }
                     }
-                    ui.add_space(4.0);
-                    // 品牌名交给原生标题栏（它本来就写着窗口标题），这里只留状态，
-                    // 否则同一个「AOX」会在紧挨着的两行里出现两次。
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(10.0, 10.0), Sense::hover());
-                    ui.painter().circle_filled(
-                        rect.center(),
-                        4.5,
-                        if self.busy { P::ink() } else { P::ink_soft() },
-                    );
-                    ui.add_space(9.0);
-                    ui.label(
-                        RichText::new(if self.status.is_empty() { "就绪" } else { &self.status })
-                            .color(if self.busy { P::text() } else { P::text_dim() })
-                            .size(15.0),
-                    );
+                    ui.add_space(2.0);
+                    // 「+」紧挨着列表图标：一个管「翻哪段」，一个管「开一段」，
+                    // 放在一起才是完整的一组。
+                    let locked = self.busy || self.switching;
+                    if plus_icon(ui, locked).clicked() && !locked {
+                        self.new_conversation();
+                    }
+                    // 左侧到这里为止 —— 原先那枚状态圆点与「就绪」字样都去掉了：
+                    // 空闲时它只是常驻噪音，忙碌时活动流里其实写得更细。
+                    // 唯一保留的是任务执行中的那几秒，那会儿进度确实值得一个位置。
+                    // （品牌名也不在这里：原生标题栏本来就写着「AOX · 模型」，
+                    // 紧挨着两行再写一次是重复。）
                     if self.busy {
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(&self.status).color(P::text()).size(14.0));
                         ui.add_space(7.0);
                         ui.label(
                             RichText::new(format!("{:.1}s", self.live.as_ref().map_or(0.0, |l| {
@@ -952,18 +954,9 @@ impl App {
     fn transcript(&mut self, ui: &mut Ui) {
         let avail = ui.available_width();
         let (inner, pad) = column(avail);
-        let viewing = self.viewing.is_some();
-        let mut area = ScrollArea::vertical().auto_shrink([false, false]);
-        // 两套内容各用各的 id：否则从对话流切到历史时，会继承对话流的滚动位置，
-        // 一进去就停在半空中。
-        if viewing {
-            area = area.id_salt("aox-history");
-        }
-        if self.history_scroll_top {
-            area = area.vertical_scroll_offset(0.0);
-        }
-        let out = area
-            .stick_to_bottom(!viewing && (self.follow || self.force_follow))
+        let out = ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .stick_to_bottom(self.follow || self.force_follow)
             .show(ui, |ui| {
                 ui.add_space(26.0);
                 ui.horizontal(|ui| {
@@ -978,28 +971,16 @@ impl App {
                         // 气泡 / 列表项 / 工具调用行内部全是这种水平布局，所以在栏根上一把锁死，
                         // 后代 Ui（含 Frame 内部）一律继承 `Wrap`。
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                        if viewing {
-                            self.history_banner(ui);
-                        } else {
-                            // 只要还没开始真正的对话，就先展示品牌区
-                            // （此时 items 里可能已有加载/错误提示）
-                            let started = self
-                                .items
-                                .iter()
-                                .any(|i| matches!(i, Item::User(_) | Item::Assistant(_)));
-                            if !started && self.live.is_none() {
-                                self.empty_state(ui);
-                            }
+                        // 只要还没开始真正的对话，就先展示品牌区
+                        // （此时 items 里可能已有加载/错误提示）
+                        let started = self
+                            .items
+                            .iter()
+                            .any(|i| matches!(i, Item::User(_) | Item::Assistant(_)));
+                        if !started && self.live.is_none() {
+                            self.empty_state(ui);
                         }
-                        let len = match &self.viewing {
-                            Some(v) => v.items.len(),
-                            None => self.items.len(),
-                        };
-                        for i in 0..len {
-                            let item = match self.viewing.as_mut() {
-                                Some(v) => &mut v.items[i],
-                                None => &mut self.items[i],
-                            };
+                        for item in &mut self.items {
                             match item {
                                 Item::User(t) => user_bubble(ui, t, inner * 0.80),
                                 Item::Assistant(t) => assistant_block(ui, t, inner),
@@ -1008,23 +989,15 @@ impl App {
                                 Item::Error(t) => error_card(ui, t, inner),
                             }
                         }
-                        if !viewing {
-                            if let Some(l) = &self.live {
-                                self.live_block(ui, l, inner);
-                            }
+                        if let Some(l) = &self.live {
+                            self.live_block(ui, l, inner);
                         }
                         // 末尾留出悬浮输入框的高度，最后一条消息才能滚到它上方，
-                        // 而不是永远被压住半截。（历史视图没有输入框，就不必留。）
-                        ui.add_space(if viewing { 22.0 } else { COMPOSER_RESERVE });
+                        // 而不是永远被压住半截。
+                        ui.add_space(COMPOSER_RESERVE);
                     });
                 });
             });
-        if self.history_scroll_top {
-            self.history_scroll_top = false;
-        }
-        if viewing {
-            return; // 只读视图不参与「对话流是否跟随到底」的判定
-        }
         let max = (out.content_size.y - out.inner_rect.height()).max(0.0);
         self.follow = out.state.offset.y >= max - 48.0;
         if self.force_follow {
@@ -1036,34 +1009,23 @@ impl App {
     fn empty_state(&mut self, ui: &mut Ui) {
         ui.add_space(52.0);
         ui.vertical_centered(|ui| {
-            // 品牌字：用衬线体，配一条细分隔线，像书页的刊头
+            // 首屏只有一句招呼：艺术体大字，不加分隔线、不加副标题。
             let (rect, _) = ui.allocate_exact_size(Vec2::new(320.0, 62.0), Sense::hover());
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                "AOX",
-                theme::serif_font(46.0),
+                "Hi there",
+                theme::brand_font(46.0),
                 P::text(),
             );
-            ui.add_space(4.0);
-            let (rule, _) = ui.allocate_exact_size(Vec2::new(230.0, 1.0), Sense::hover());
-            ui.painter().hline(
-                (rule.center().x - 115.0)..=(rule.center().x + 115.0),
-                rule.center().y,
-                Stroke::new(1.0, P::border_strong()),
-            );
-            ui.add_space(16.0);
-            ui.label(
-                RichText::new("自我增长的 AI 编程代理 · 初始无工具，自己造插件")
-                    .color(P::text_dim())
-                    .size(15.0),
-            );
-            ui.add_space(40.0);
+            // 原有「细横线 + 副标题」的位置整块留白（4 + 1 + 16 + 21 + 40），
+            // 行去掉了但高度照旧 —— 否则下面的预设会整体往上跳一截。
+            ui.add_space(82.0);
 
             let examples = [
                 "看看现在有哪些插件和工具",
                 "写一个插件，统计当前目录下各类文件的数量",
-                "写一个插件读取一个网页的标题并总结内容",
+                "在电脑桌面建一个.docx文档介绍一下你",
             ];
             for ex in examples {
                 if example_chip(ui, ex).clicked() {
@@ -1322,6 +1284,17 @@ impl App {
                 if link.clicked() {
                     ui.ctx()
                         .open_url(egui::OpenUrl::new_tab(aox::ui::style::PROJECT_URL));
+                }
+
+                // 当前模型：原先缀在窗口标题里，标题去掉「· xxx」之后挪到这儿，
+                // 和下面的运行时信息同属「看一眼就够」的诊断数据。
+                if !self.model.is_empty() {
+                    ui.add_space(18.0);
+                    ui.label(
+                        RichText::new(format!("模型  {}", self.model))
+                            .font(theme::mono_font(12.5))
+                            .color(P::text_faint()),
+                    );
                 }
 
                 // 插件运行时：这类「看一眼就够」的诊断信息放在关于窗口里，
@@ -1586,20 +1559,12 @@ impl eframe::App for App {
         self.fit_window(ctx);
         self.pump();
 
-        // 原生标题栏：底色与界面完全一致（DWM 属性），标题文字带上当前模型。
-        // 放在 top_bar 之后，这样刚点的明暗切换同一帧就能反映到标题栏上。
-        if self.title_model != self.model {
-            self.title_model = self.model.clone();
-            let title = if self.model.is_empty() {
-                "AOX".to_string()
-            } else {
-                format!("AOX · {}", self.model)
-            };
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
-        }
-
+        // 原生标题栏只留窗口标题本身：图标不设、标题里也不再缀模型名，
+        // 免得左上角挤着一行「AOX · xxx」。底色同步见下面 sync_native_theme。
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
-        if self.busy || self.waiting_auth || self.live.is_some() {
+        // `switching` 也要重绘：切换的回执从 agent 线程异步回来，空闲窗口
+        // 默认不会自己重画，少了这一条就会「点了没反应」，直到下次鼠标一动。
+        if self.busy || self.waiting_auth || self.live.is_some() || self.switching {
             self.spin += dt;
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -1618,22 +1583,11 @@ impl eframe::App for App {
         if self.show_activity {
             self.activity_panel(ctx);
         }
-        // Esc 退出只读历史视图（授权弹窗自己也用 Esc，它在前景时让给它）
-        if self.viewing.is_some() && self.auth.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape))
-        {
-            self.close_history_view();
-        }
         let frame = Frame::NONE.fill(P::bg());
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             let column_rect = ui.max_rect();
             // 对话区铺满整个中央面板，不再给输入框让出底栏
             self.transcript(ui);
-
-            // 只读历史视图里不显示输入框：此时输入没有去处，留着只会让人以为
-            // 消息发进了那段历史里。
-            if self.viewing.is_some() {
-                return;
-            }
 
             // 输入框改为一枚悬浮卡片（Foreground 层），直接压在对话内容之上。
             // 之所以不放在 TopBottomPanel::bottom 里：那会永久占掉一条底栏，
@@ -1742,47 +1696,113 @@ fn history_icon(ui: &mut Ui, on: bool) -> egui::Response {
     resp.on_hover_text(if on { "隐藏历史记录" } else { "显示历史记录" })
 }
 
-/// 侧边栏里的一行历史对话：标题 + 「时间 · 条数」。
+/// 「新建对话」按钮：一个「+」。
 ///
-/// `current` = 本次会话正在写的那一条，`viewing` = 正在看的这一条。
+/// 与紧挨着的历史图标同一套画法（36px 热区、单色描边、悬停换色），
+/// 两枚并排读作「翻哪段 / 开一段」。任务执行中压暗且不响应点击 ——
+/// 那会儿换对话会让回执排到任务后面才生效，点的人只会觉得界面卡住了。
+fn plus_icon(ui: &mut Ui, locked: bool) -> egui::Response {
+    let d = 36.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
+    let hov = pointer_if(ui, &resp) && !locked;
+    let fg = if locked {
+        P::text_faint()
+    } else if hov {
+        P::ink()
+    } else {
+        P::text_dim()
+    };
+
+    let painter = ui.painter();
+    if hov {
+        painter.circle_filled(rect.center(), d * 0.5, P::surface_hi());
+    }
+    let r = rect.shrink(13.0);
+    let c = r.center();
+    painter.line_segment(
+        [Pos2::new(c.x, r.top()), Pos2::new(c.x, r.bottom())],
+        Stroke::new(1.6, fg),
+    );
+    painter.line_segment(
+        [Pos2::new(r.left(), c.y), Pos2::new(r.right(), c.y)],
+        Stroke::new(1.6, fg),
+    );
+    if locked {
+        return resp.on_hover_text("正在执行任务，稍后再新建对话");
+    }
+    resp.on_hover_text("新建对话")
+}
+
+/// 单行文本，按**像素**收口：超出 `max_w` 就省略号截断。
+///
+/// 不能按字数截（`clamp_str`）：34 个汉字 ≈ 476px，比侧边栏还宽一倍，多出来的
+/// 部分会一路画到面板外面，被「侧边栏 / 主对话区」那条分界线硬切一刀 ——
+/// 看起来就是标题越了界。交给 `LayoutJob` 按实际渲染宽度决定截在哪，
+/// 面板拖宽拖窄都会自动跟着变。
+fn elide(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat { font_id: font, color, ..Default::default() },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: max_w,
+        max_rows: 1,
+        // 中文没有词边界，不开这个的话「整段放不下」时会直接不截
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ui.painter().layout_job(job)
+}
+
+/// 侧边栏里的一行历史对话：标题 + 「最后活动 · 条数」。
+///
+/// `current` = 眼下正在聊的这一段（右侧一个实心点），`locked` = 切换请求在飞行中
+/// 或任务正在执行，此时不接受点击，整行也压暗一档。
 fn history_row(
     ui: &mut Ui,
     s: &aox::history::Summary,
     current: bool,
-    viewing: bool,
+    locked: bool,
     width: f32,
 ) -> egui::Response {
     let w = (width - 6.0).max(60.0); // 给滚动条留一点
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 46.0), Sense::click());
-    let hov = pointer_if(ui, &resp);
-    let painter = ui.painter();
-    if hov || viewing {
-        painter.rect_filled(rect, CornerRadius::same(8), P::surface());
+    let hov = pointer_if(ui, &resp) && !locked;
+    if hov {
+        ui.painter().rect_filled(rect, CornerRadius::same(8), P::surface());
     }
     let x = rect.left() + 10.0;
-    let title_color = if hov || viewing { P::text() } else { P::text_dim() };
-    painter.text(
-        Pos2::new(x, rect.top() + 15.0),
-        Align2::LEFT_CENTER,
-        clamp_str(&s.title, 34),
-        theme::body_font(14.0),
-        title_color,
-    );
-    painter.text(
-        Pos2::new(x, rect.top() + 32.0),
-        Align2::LEFT_CENTER,
-        format!("{} · {} 条", s.time, s.messages),
+    let title_color = if locked {
+        P::text_faint()
+    } else if hov || current {
+        P::text()
+    } else {
+        P::text_dim()
+    };
+    // 文字右边界定在圆点左边再留 10px：右侧那枚「当前」圆点与安全边距都不占标题的
+    // 宽度，两行都按同一个宽度收口，标题就再也画不出这一行之外。
+    let dot_x = rect.right() - 10.0;
+    let max_w = (dot_x - 10.0 - x).max(24.0);
+    let title = elide(ui, &s.title, theme::body_font(14.0), title_color, max_w);
+    let sub = elide(
+        ui,
+        &format!("{} · {} 条", s.time, s.messages),
         theme::body_font(12.0),
         P::text_faint(),
+        max_w,
     );
+    let painter = ui.painter();
+    // galley 以左上角定位，这里减掉自身高度的一半换算成原来的「垂直居中」
+    painter.galley(Pos2::new(x, rect.top() + 15.0 - title.size().y * 0.5), title, title_color);
+    painter.galley(Pos2::new(x, rect.top() + 32.0 - sub.size().y * 0.5), sub, P::text_faint());
     if current {
         // 当前会话用一个实心点标出来，不占用标题宽度
-        painter.circle_filled(Pos2::new(rect.right() - 12.0, rect.top() + 15.0), 3.2, P::ink_soft());
+        painter.circle_filled(Pos2::new(dot_x, rect.top() + 15.0), 3.2, P::ink_soft());
     }
-    if hov {
+    if locked {
         return resp.on_hover_text(format!("{}\n{}", s.title, s.id));
     }
-    resp
+    resp.on_hover_text(format!("{}\n{}\n点击切换到这段对话", s.title, s.id))
 }
 
 /// 把读出来的历史消息摊成对话流里的一轮轮记录。

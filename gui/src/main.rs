@@ -24,19 +24,6 @@ use tokio::sync::mpsc;
 
 use bridge::{FromAgent, SessionFlags, ToAgent};
 
-/// 内嵌窗口图标：由 `assets/aox.ico` 预转换为 128×128 RGBA 原始数据，
-/// 这样无需引入 PNG/ICO 解码依赖。
-const ICON_RGBA: &[u8] = include_bytes!("../assets/icon.rgba");
-const ICON_SIZE: u32 = 128;
-
-fn window_icon() -> egui::IconData {
-    egui::IconData {
-        rgba: ICON_RGBA.to_vec(),
-        width: ICON_SIZE,
-        height: ICON_SIZE,
-    }
-}
-
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let demo = args.iter().any(|a| a == "--demo");
@@ -55,10 +42,12 @@ fn main() -> eframe::Result<()> {
         Some(bridge::spawn(from_agent_tx, to_agent_rx, flags.clone()))
     };
 
+    // 不给窗口单独设图标：标题栏左上角就只剩光秃秃的应用名。
+    // （exe 自身仍带着 build.rs 从 assets/aox.ico 写进资源段的图标，
+    //   任务栏与「设置 → 应用」里认得出是谁。）
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("AOX")
-            .with_icon(window_icon())
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([1000.0, 640.0]),
         ..Default::default()
