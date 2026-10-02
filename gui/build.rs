@@ -26,6 +26,18 @@ fn main() {
         return;
     }
 
+    // 分发安全闸门：Windows 上必须静态链接 CRT，理由与判据见根 crate 的 build.rs。
+    // 单独装 GUI 版的用户最多，这个包尤其不能依赖 VCRUNTIME140.dll。
+    if !target_features().iter().any(|f| f == "crt-static") {
+        println!(
+            "cargo:warning=AOX GUI 未启用静态 CRT：产物将依赖 VCRUNTIME140.dll，\
+             在未安装 VC++ 运行库的 Windows 上无法启动。\
+             请在 .cargo/config.toml 的 [target.x86_64-pc-windows-msvc] 下加 \
+             rustflags = [\"-C\", \"target-feature=+crt-static\"]，或改用工装环境变量 \
+             RUSTFLAGS=\"-C target-feature=+crt-static\" 重新构建。"
+        );
+    }
+
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
@@ -123,6 +135,18 @@ END
         ),
         Err(e) => println!("cargo:warning=无法运行 rc.exe（不影响功能）: {e}"),
     }
+}
+
+/// 目标平台当前启用的 rustc 特性列表。实现与根 crate 的 `build.rs` 保持一致。
+fn target_features() -> Vec<String> {
+    if let Ok(v) = std::env::var("CARGO_CFG_TARGET_FEATURE") {
+        return v.split(',').map(|s| s.trim().to_string()).collect();
+    }
+    let mut v = vec![];
+    if cfg!(target_feature = "crt-static") {
+        v.push("crt-static".to_string());
+    }
+    v
 }
 
 /// 定位 rc.exe：先查已知目录，再扫 Windows Kits（取最高版本）。

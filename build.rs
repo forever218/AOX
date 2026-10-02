@@ -19,6 +19,26 @@ fn main() {
     if !cfg!(windows) {
         return;
     }
+
+    // 分发安全闸门：Windows 上必须静态链接 CRT。
+    //
+    // 动态 CRT 会让 exe 的导入表带上 VCRUNTIME140.dll，而该 DLL **不是** Windows 自带组件
+    // （来自 VC++ 2015-2022 Redistributable），干净装机上会直接报「找不到 VCRUNTIME140.dll」
+    // 启动失败——这类问题本地永远复现不出来，只能在构建期拦。
+    //
+    // 判据用 CARGO_CFG_TARGET_FEATURE（cargo 为 build script 提供的目标特性列表，
+    // 已实测：加 flag 时含 crt-static、不加时不含），比 build script 自身的 cfg! 更贴近目标产物；
+    // 两者取或，避免 cargo 版本差异导致漏报。
+    if !target_features().iter().any(|f| f == "crt-static") {
+        println!(
+            "cargo:warning=AOX 未启用静态 CRT：产物将依赖 VCRUNTIME140.dll，\
+             在未安装 VC++ 运行库的 Windows 上无法启动。\
+             请在 .cargo/config.toml 的 [target.x86_64-pc-windows-msvc] 下加 \
+             rustflags = [\"-C\", \"target-feature=+crt-static\"]，或改用工装环境变量 \
+             RUSTFLAGS=\"-C target-feature=+crt-static\" 重新构建。"
+        );
+    }
+
     println!("cargo:rerun-if-changed=assets/aox.ico");
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -93,6 +113,21 @@ END
         ),
         Err(e) => println!("cargo:warning=无法运行 rc.exe（不影响功能）: {e}"),
     }
+}
+
+/// 目标平台当前启用的 rustc 特性列表。
+///
+/// 优先取 `CARGO_CFG_TARGET_FEATURE`（cargo 提供给 build script 的目标特性，逗号分隔）；
+/// 该变量缺失时退回 build script 自身的 `cfg!(target_feature=...)`。
+fn target_features() -> Vec<String> {
+    if let Ok(v) = std::env::var("CARGO_CFG_TARGET_FEATURE") {
+        return v.split(',').map(|s| s.trim().to_string()).collect();
+    }
+    let mut v = vec![];
+    if cfg!(target_feature = "crt-static") {
+        v.push("crt-static".to_string());
+    }
+    v
 }
 
 /// 定位 rc.exe：先查已知目录，再扫 Windows Kits（取最高版本）。

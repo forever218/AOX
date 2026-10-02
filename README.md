@@ -44,13 +44,22 @@ cargo run -p aox-gui             # 运行 GUI
 [target.x86_64-pc-windows-msvc]
 linker = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\<版本>\\bin\\Hostx64\\x64\\link.exe"
 
+# 静态链接 MSVC 运行库（/MT 等价），**发行必加**：
+# 否则 exe 会依赖 VCRUNTIME140.dll，而它不属于 Windows 自带组件
+# （来自 VC++ 2015-2022 Redistributable），干净装机上直接报「找不到 VCRUNTIME140.dll」。
+rustflags = ["-C", "target-feature=+crt-static"]
+
 [env]
 LIB     = { value = "<MSVC>\\lib\\x64;<WinSDK>\\Lib\\<版本>\\um\\x64;<WinSDK>\\Lib\\<版本>\\ucrt\\x64", force = true }
 INCLUDE = { value = "<MSVC>\\include;<WinSDK>\\Include\\<版本>\\um;<WinSDK>\\Include\\<版本>\\ucrt;<WinSDK>\\Include\\<版本>\\shared;<WinSDK>\\Include\\<版本>\\winrt", force = true }
 ```
 
 这个文件含本机绝对路径（对别人无效），已被 `.gitignore` 排除，**需要自建**。
-用 PowerShell / cmd 或已 `vcvars64` 的终端构建则不需要它。
+用 PowerShell / cmd 或已 `vcvars64` 的终端构建则不需要其中的 `linker` / `LIB` / `INCLUDE`，
+但 **`rustflags` 那行无论用哪个终端都要保留**。
+
+漏加 `rustflags` 时构建不会失败，但两个 `build.rs` 会打出显眼的 `cargo:warning` 提醒你产物
+在干净机器上起不来。
 
 ## 命令行
 
@@ -192,9 +201,25 @@ python tools/check_no_console_window.py --app target/release/aox-gui.exe --cwd .
 
 ## 系统要求
 
-- Windows 10 / 11（x64）
-- Python 3.8+ 需在 `PATH` 中（用于运行插件；也可在 `config.toml` 的 `[runtimes] python` 指定完整路径）
-- Node.js 可选（只有用到 node 插件时才需要）
+平台：Windows 10 / 11（x64）。
+
+宿主本体（`aox.exe` / `aox-gui.exe`）**不需要任何外部运行时**：发行版已静态链接 MSVC 运行库，
+既不要求 VC++ Redistributable（导入表里没有 `VCRUNTIME140.dll`），也不需要 Python / Node / Rust。
+
+外部运行时只影响**插件**，而且三种语言的要求不一样：
+
+| 插件语言 | 运行已有插件 | 新建插件（`create_plugin`） |
+| --- | --- | --- |
+| python | 需要 `python`（3.8+）在 `PATH` | 同左 |
+| node | 需要 `node` 在 `PATH` | 同左 |
+| rust | **不需要任何环境** | 需要 `rustc`（编译完就不再需要） |
+
+- 也就是说，`plugins/` 里已有的插件只有 python / node 两类要求解释器在场；rust 插件是编译好的原生 exe，
+  宿主直接运行它，没装 Rust 工具链也能用。
+- 没有任何解释器时程序照常启动、能对话、能用 `/tools` `/plugins` 等本地命令，
+  但 `create_plugin` 会失败并提示「请检查 python 是否在 PATH 中」——等于没有实际能力。
+- 运行时路径可在 `config.toml` 的 `[runtimes] python / node / rustc` 指定完整路径。
+- 个别插件的**第三方 pip 依赖**要自己装，例如 `screen` / `imgstat` 需要 `pip install pillow`。
 
 ## 卸载
 

@@ -391,7 +391,14 @@ async fn create_plugin_inner(
     if language == "rust" {
         let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
         let mut cmd = Command::new(&rt.config.runtimes.rustc);
-        cmd.args(["--edition=2021", "-O", "main.rs", "-o", &exe]).current_dir(dir);
+        cmd.arg("--edition=2021").arg("-O");
+        // 静态链接 CRT，与宿主自身的构建保持一致（见 .cargo/config.toml）。
+        // 只加在 windows 上：其他平台 +crt-static 语义不同（会牵动 libc 的静态/动态链接），
+        // 而这里的目标就是「让插件 exe 不再依赖 VCRUNTIME140.dll」这一件事。
+        if cfg!(windows) {
+            cmd.args(["-C", "target-feature=+crt-static"]);
+        }
+        cmd.arg("main.rs").arg("-o").arg(&exe).current_dir(dir);
         hide_console(&mut cmd);
         let build = tokio::time::timeout(RUST_BUILD_TIMEOUT, cmd.output())
             .await
