@@ -1,10 +1,14 @@
 ; ============================================================================
 ;  AOX GUI 安装脚本（Inno Setup）
 ;
-;  编译：
-;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" installer\aox-gui.iss
+;  编译（推荐用构建脚本，它会自动编译两遍产出两种变体）：
+;      bash tools/build_installer.sh
+;  手动编译单个变体：
+;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" installer\aox-gui.iss                      -> 主包
+;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" /DBUNDLE_PYTHON=1 installer\aox-gui.iss     -> 捆绑变体
 ;  产物：
-;      dist\AOX-GUI-Setup-<版本>.exe
+;      dist\AOX-GUI-Setup-<版本>.exe                 （主包，约 4 MB）
+;      dist\AOX-GUI-Setup-<版本>-with-python.exe     （捆绑变体，约 12.5 MB）
 ;
 ;  与 aox.iss（命令行版）的关系：两者是各自独立的安装包，AppId、安装目录、
 ;  开始菜单项都不共用，可以同时装在一台机器上互不干扰。

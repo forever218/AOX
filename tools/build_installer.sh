@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
-# 一键构建 AOX 发行安装包（命令行版 + 图形界面版）
+# 一键构建 AOX 发行安装包（命令行版 + 图形界面版，各含两种变体）
 #
 #   1) cargo build --release --workspace  —— 同时产出 aox.exe 与 aox-gui.exe
-#   2) Inno Setup 编译 installer/aox.iss      -> dist/AOX-Setup-<版本>.exe
-#                     installer/aox-gui.iss  -> dist/AOX-GUI-Setup-<版本>.exe
+#   2) Inno Setup 把 installer/aox.iss 与 installer/aox-gui.iss 各编译两遍：
+#        不带定义  -> dist/AOX[-GUI]-Setup-<版本>.exe               （主包，不捆绑运行时）
+#        带定义    -> dist/AOX[-GUI]-Setup-<版本>-with-python.exe   （装完即用，离线可用）
+#   3) 顺便把运行时组件包复制到 dist/（已经是上游压好的 zip，零成本）
 #
 # 用法：
-#   bash tools/build_installer.sh                      # 两个主包（不含运行时）
-#   bash tools/build_installer.sh cli                  # 只构建命令行版
-#   bash tools/build_installer.sh gui                  # 只构建图形界面版
-#   bash tools/build_installer.sh all with-python      # 额外产出捆绑运行时的变体
+#   bash tools/build_installer.sh                      # 默认：四种包全出 + 组件包
+#   bash tools/build_installer.sh cli                  # 只做命令行版（两种变体）
+#   bash tools/build_installer.sh gui                  # 只做图形界面版（两种变体）
+#   bash tools/build_installer.sh all none             # 只要两个主包（最快）
+#   bash tools/build_installer.sh all with-python      # 只要两个捆绑变体
 #   bash tools/build_installer.sh pack                 # 只产出运行时组件包（不打安装包）
 #
 # 关于运行时：主包**不捆绑**任何运行时（保持 3 MB 级体积）。需要 python 能力时有三条路，
 # 都靠宿主的三档解释器解析（config 显式路径 > 应用目录内置 > PATH）落地：
-#   1. 发行时附上 dist/aox-python-runtime.zip（`pack` 子命令产出），
-#      用户放到 exe 同目录后执行 /runtime install python —— 全程离线；
+#   1. 发行时附上 dist/aox-python-runtime.zip，用户放到 exe 同目录后执行
+#      /runtime install python —— 全程离线；
 #   2. 用户直接 /runtime install python，由宿主从上游下载并校验；
-#   3. 用 `with-python` 产出一次装好的变体。
+#   3. 直接用 -with-python 变体，一次装好。
 # 三条路都不写系统 PATH，也不碰用户环境变量。
 set -euo pipefail
 
@@ -26,20 +29,20 @@ ROOT="$(cd "$HERE/.." && pwd)"
 cd "$ROOT"
 
 TARGET="${1:-all}"
-BUNDLE="${2:-none}"
+BUNDLE="${2:-both}"
 case "$TARGET" in
   all|cli|gui|pack) ;;
-  *) echo "用法: bash tools/build_installer.sh [all|cli|gui|pack] [none|with-python]"; exit 1 ;;
+  *) echo "用法: bash tools/build_installer.sh [all|cli|gui|pack] [both|none|with-python]"; exit 1 ;;
 esac
 case "$BUNDLE" in
-  none|with-python) ;;
-  *) echo "第二个参数只能是 none 或 with-python"; exit 1 ;;
+  both|none|with-python) ;;
+  *) echo "第二个参数只能是 both / none / with-python"; exit 1 ;;
 esac
 
-# ---- 版本号以 Cargo.toml 为唯一来源
+# 版本号以 Cargo.toml 为唯一来源
 VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' Cargo.toml | head -1)"
 [ -n "$VERSION" ] || { echo "无法从 Cargo.toml 读取 version"; exit 1; }
-echo "==> AOX 版本: $VERSION（目标: $TARGET，运行时捆绑: $BUNDLE）"
+echo "==> AOX 版本: $VERSION（目标: $TARGET，变体: $BUNDLE）"
 
 # ---- Python 运行时来源（可由环境变量覆盖成自建镜像）
 PYTHON_URL="${AOX_PYTHON_URL:-https://www.python.org/ftp/python/3.13.7/python-3.13.7-embed-amd64.zip}"
@@ -151,19 +154,19 @@ fi
 # （Updating icons (Setup.exe)），这一步偶尔会撞上杀软实时扫描或索引器持有文件，
 # 报 "EndUpdateResource failed (110)" 并中断。实测同一脚本重跑一次即成功，
 # 所以这里退避重试，连续 3 次失败才真的报错。
-EXTRA_DEF=""
-if [ "$BUNDLE" = "with-python" ]; then
-  ensure_runtime
-  EXTRA_DEF="/DBUNDLE_PYTHON=1"
-fi
-
 compile() {
-  local iss="$1" try=1 out=""
+  local iss="$1" variant="$2" try=1 out=""
+  local -a args=("/DAppVersion=$VERSION")
+  if [ "$variant" = "with-python" ]; then
+    args+=("/DBUNDLE_PYTHON=1")
+  fi
+  args+=("$iss")
   while :; do
     echo
-    echo "==> $ISCC ($iss, AppVersion=$VERSION${EXTRA_DEF:+, $EXTRA_DEF})  第 $try 次"
-    if out="$("$ISCC" "/DAppVersion=$VERSION" ${EXTRA_DEF:+"$EXTRA_DEF"} "$iss" 2>&1)"; then
-      echo "$out" | tail -3
+    echo "==> $ISCC ($iss, 变体=$variant)  第 $try 次"
+    if out="$("$ISCC" "${args[@]}" 2>&1)"; then
+      # ISCC 的 "Resulting Setup program filename is:" 与文件名分两行，一起带出来
+      echo "$out" | grep -A1 -E "Successful compile" | sed 's/^/    /'
       return 0
     fi
     echo "$out" | tail -5
@@ -177,10 +180,31 @@ compile() {
 }
 
 case "$TARGET" in
-  all) compile "installer\\aox.iss"; compile "installer\\aox-gui.iss" ;;
-  cli) compile "installer\\aox.iss" ;;
-  gui) compile "installer\\aox-gui.iss" ;;
+  all) ISS_LIST=("installer\\aox.iss" "installer\\aox-gui.iss") ;;
+  cli) ISS_LIST=("installer\\aox.iss") ;;
+  gui) ISS_LIST=("installer\\aox-gui.iss") ;;
 esac
+
+case "$BUNDLE" in
+  none)        VARIANTS=("none") ;;
+  with-python) VARIANTS=("with-python") ;;
+  both)        VARIANTS=("none" "with-python") ;;
+esac
+
+for variant in "${VARIANTS[@]}"; do
+  if [ "$variant" = "with-python" ]; then
+    ensure_runtime
+  fi
+  for iss in "${ISS_LIST[@]}"; do
+    compile "$iss" "$variant"
+  done
+done
+
+# 顺带把组件包放进 dist/：捆绑流程已经把官方 zip 拿到本地，复制一份零成本，
+# 而离线装配这条路要的正是这个文件。
+if [ "$BUNDLE" != "none" ]; then
+  make_pack
+fi
 
 echo
 echo "==> 产物："

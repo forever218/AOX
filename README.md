@@ -263,20 +263,29 @@ python tools/check_no_console_window.py --app target/release/aox-gui.exe --cwd .
 - 个别插件的**第三方 pip 依赖**要自己装。注意官方「嵌入式发行版」**不含 `pip`**：
   确实需要 `pip` 时请装完整 Python，并在 `[runtimes] python` 指向它。
 
-### 安装包的两个变体
+### 发行产物（一次构建全部产出）
 
-`installer/*.iss` 是同一份脚本，靠条件编译产出两种包（不维护第二份脚本）：
+`installer/*.iss` 只有一份脚本，靠条件编译产出两种变体（不维护第二份脚本）。
+`bash tools/build_installer.sh` **不带参数时一次产出下面全部五种文件**：
 
 | 产物 | 内容 | 体积 |
 | --- | --- | --- |
-| `AOX-Setup-<版本>.exe` | 只有宿主 | 约 3 MB |
-| `AOX-Setup-<版本>-with-python.exe` | 宿主 + Python 运行时（离线可用） | 约 13.5 MB |
+| `AOX-Setup-<版本>.exe` | 命令行版，只有宿主 | 约 3 MB |
+| `AOX-GUI-Setup-<版本>.exe` | 图形界面版，只有宿主 | 约 4 MB |
+| `AOX-Setup-<版本>-with-python.exe` | 命令行版 + Python 运行时（离线可用） | 约 11.4 MB |
+| `AOX-GUI-Setup-<版本>-with-python.exe` | 图形界面版 + Python 运行时（离线可用） | 约 12.5 MB |
+| `aox-python-runtime.zip` | 运行时组件包，给主包用户离线装配用 | 约 10.4 MB |
 
 ```bash
-bash tools/build_installer.sh                    # 主包
-bash tools/build_installer.sh all with-python    # 额外产出捆绑变体
+bash tools/build_installer.sh                    # 默认：上面全部
+bash tools/build_installer.sh all none           # 只要两个主包（最快）
+bash tools/build_installer.sh all with-python    # 只要两个捆绑变体
+bash tools/build_installer.sh cli                # 只做命令行版（两种变体）
 bash tools/build_installer.sh pack               # 只产出运行时组件包
 ```
+
+两个 `-with-python` 变体与主包的**差别只在于是否把 `runtime/python` 一并装进应用目录**，
+宿主会自动发现它（三档解析的第 2 档）。
 
 ## 卸载
 

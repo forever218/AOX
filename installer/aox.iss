@@ -1,11 +1,14 @@
 ; ============================================================================
 ;  AOX 安装脚本（Inno Setup）
 ;
-;  编译：
-;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" installer\aox.iss
+;  编译（推荐用构建脚本，它会自动编译两遍产出两种变体）：
+;      bash tools/build_installer.sh
+;  手动编译单个变体：
+;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" installer\aox.iss                          -> 主包
+;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" /DBUNDLE_PYTHON=1 installer\aox.iss         -> 捆绑变体
 ;  产物：
 ;      dist\AOX-Setup-<版本>.exe                 （主包，不捆绑运行时，约 3 MB）
-;      dist\AOX-Setup-<版本>-with-python.exe     （加 /DBUNDLE_PYTHON=1，约 13.5 MB）
+;      dist\AOX-Setup-<版本>-with-python.exe     （捆绑变体，约 11.5 MB）
 ;
 ;  设计要点：
 ;    * 采用「当前用户」安装（PrivilegesRequired=lowest），装到
