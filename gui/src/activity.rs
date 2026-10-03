@@ -5,9 +5,17 @@
 //! [`Activity`] 里，用 `Arc<Mutex<_>>` 两边共享 —— 主窗口只管往里写，
 //! 子窗口只管读和渲染。
 //!
-//! 窗口是**带系统装饰的普通顶层窗口**（就是「小 AOX」，初始尺寸与主窗口一致）：
-//! Windows 11 自带的圆角、边缘拖拽缩放、任务栏入口都是现成的。窗口内另有一条自绘
-//! 顶栏，放「固定在最顶层 / 最小化 / 关闭」三枚按钮。
+//! 窗口是个**无系统装饰的顶层窗口**（就是「小 AOX」，初始尺寸与主窗口一致）。
+//! 也就是说 Windows 那条自带的白底（深色下是黑底）标题栏 —— 图标、标题、
+//! 最小化 / 最大化 / 关闭 —— 一律不显示，整条顶栏由这里自绘。
+//!
+//! 代价是系统那几样现成的东西也没了，得自己补：
+//! - **拖动**：顶栏按住即发 [`ViewportCommand::StartDrag`]。
+//! - **缩放**：四边四角各埋一条拖拽热区（[`resize_handles`]），按下时把方向交给 winit。
+//! - **最大化**：顶栏多一枚按钮（关掉系统栏后，双击标题栏、Win+↑ 这些也就没了）。
+//! - **边界**：无装饰窗口和桌面之间没有分界线，所以最后描一圈一像素的边。
+//! - **圆角**：不想自绘（透明视口会把系统阴影一起弄丢），而是让 DWM 裁 ——
+//!   见 [`set_round_corners`]。半径与主窗口一致。
 //!
 //! # 主体：一条横向时间轴（甘特图）
 //!
@@ -45,9 +53,9 @@ use std::time::{Duration, Instant};
 use std::collections::VecDeque;
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Frame, Galley, Layout, Margin, Pos2, Rect,
-    RichText, ScrollArea, Sense, Stroke, TextEdit, TextFormat, Ui, Vec2, ViewportBuilder,
-    ViewportCommand, ViewportId, WindowLevel,
+    Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Galley, Layout, Margin, Pos2,
+    Rect, ResizeDirection, RichText, ScrollArea, Sense, Stroke, TextEdit, TextFormat, Ui, Vec2,
+    ViewportBuilder, ViewportCommand, ViewportId, WindowLevel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -277,6 +285,8 @@ pub struct Activity {
     theme_mode: Option<theme::Mode>,
     /// 尺寸与位置是否已经摆过一次（见 `sync` 里那段注释）
     placed: bool,
+    /// 圆角是否已经交代过系统（同样是「一扇窗口只做一次」的事）
+    corners: bool,
     /// 呼吸圆点用的相位
     spin: f32,
 
@@ -591,11 +601,19 @@ impl Activity {
         self.open
     }
 
+    /// 「这扇窗口已经没了」。所有**一扇窗口只做一次**的初始化都要在这里作废，
+    /// 下次再开才会重做 —— 现在有两样：摆尺寸位置（`placed`）、
+    /// 交代系统画圆角（`corners`，圆角是挂在 HWND 上的，窗口没了就一起没了）。
+    fn forget_placement(&mut self) {
+        self.placed = false;
+        self.corners = false;
+    }
+
     /// 直接把窗口打开（演示模式预览用；正常路径走 [`toggle`]）。
     pub fn force_open(&mut self) {
         self.open = true;
         self.spin = 0.0;
-        self.placed = false;
+        self.forget_placement();
     }
 
     /// 当前被选中的那条；没选就取最新一条
@@ -675,6 +693,10 @@ fn act_id() -> ViewportId {
     ViewportId::from_hash_of("aox-activity")
 }
 
+/// 窗口标题。两处在用：建视口时上报，以及事后按标题把 HWND 找回来设圆角
+/// （见 [`set_round_corners`]），所以必须只有一份。
+const WINDOW_TITLE: &str = "AOX 活动流";
+
 // ─────────────────────────── 窗口的开关 ───────────────────────────
 
 const MIN_W: f32 = 860.0;
@@ -686,7 +708,7 @@ pub fn toggle(ctx: &egui::Context, a: &Shared) {
     st.open = !st.open;
     if st.open {
         st.spin = 0.0;
-        st.placed = false; // 重新开一个窗口要重新摆位
+        st.forget_placement(); // 重新开一个窗口要重新摆位
     }
     drop(st);
     ctx.request_repaint();
@@ -711,10 +733,12 @@ pub fn sync(ctx: &egui::Context, a: &Shared) {
     st.placed = true;
 
     let mut b = ViewportBuilder::default()
-        .with_title("AOX 活动流")
+        .with_title(WINDOW_TITLE)
         .with_resizable(true)
-        // 保留系统装饰：Windows 11 的圆角、边缘缩放、任务栏入口都靠它
-        .with_decorations(true);
+        // **不要系统装饰**：留着它就是顶上多一条 Windows 自带的标题栏
+        // （图标 + 标题 + 最小化/最大化/关闭），而我们顶栏里那套按钮是自绘的，
+        // 于是变成两条栏叠着。关掉之后拖动 / 缩放 / 最大化全部由 `window()` 自己接管。
+        .with_decorations(false);
 
     if fresh {
         let size = initial_size(ctx);
@@ -733,15 +757,26 @@ pub fn sync(ctx: &egui::Context, a: &Shared) {
 }
 
 /// 初始尺寸 = **主窗口的默认尺寸**（同一个公式，见 `app::default_window_size`）。
+///
+/// `default_window_size` 要减掉「装饰占掉的那点厚度」（标题栏 + 边框），
+/// 算出来的才是**内容区**的尺寸。而活动流窗口自己已经没有装饰了，
+/// 它的 `outer - inner` 恒等于 0 —— 拿它算会凭空多出 46 点高度。
+/// 所以这里必须去问**主窗口**要装饰厚度，两边的内容区才对得上。
 fn initial_size(ctx: &egui::Context) -> Vec2 {
-    let (mon, inner, outer) = ctx.input(|i| {
-        let v = i.viewport();
-        (v.monitor_size, v.inner_rect.map(|r| r.size()), v.outer_rect.map(|r| r.size()))
+    let (mon, chrome) = ctx.input(|i| {
+        // 所有视口的信息都在 `raw.viewports` 里（eframe 每帧把整张表灌进来）
+        let root = i.raw.viewports.get(&ViewportId::ROOT);
+        let mon = i.viewport().monitor_size.or_else(|| root.and_then(|v| v.monitor_size));
+        let chrome = root
+            .and_then(|v| Some(v.outer_rect?.size() - v.inner_rect?.size()))
+            .filter(|c| c.x > 0.0 && c.y > 0.0)
+            // 取不到（首帧、或平台不给）就用一个保守的估计值
+            .unwrap_or(Vec2::new(18.0, 46.0));
+        (mon, chrome)
     });
-    let (Some(mon), Some(inner), Some(outer)) = (mon, inner, outer) else {
+    let Some(mon) = mon else {
         return Vec2::new(1280.0, 800.0);
     };
-    let chrome = (outer - inner).max(Vec2::new(18.0, 46.0));
     default_window_size(mon, chrome)
 }
 
@@ -790,6 +825,15 @@ const LANE_MAX: f32 = 48.0;
 const LANE_MIN_USER: f32 = 16.0;
 const LANE_MAX_USER: f32 = 104.0;
 
+/// 边框缩放的抓取厚度（四边）。无装饰窗口没有原生边框，这几像素得自己留，
+/// 太窄不好抓、太宽又会把顶栏两端的拖动区吃掉。
+const RESIZE_BORDER: f32 = 5.0;
+/// 四角抓取区的边长。角上要能斜着拖，所以比边厚一截。
+///
+/// 上限由顶栏的按钮决定：关闭按钮左缘离右边 10 + 32 = 42 点，
+/// 上缘在 `HEADER_H/2 - BH/2 = 12` 点处，所以 12 点见方的角区碰不到它。
+const RESIZE_CORNER: f32 = 12.0;
+
 // ─────────────────────────── 子窗口的内容 ───────────────────────────
 
 fn window(ctx: &egui::Context, shared: &Shared) {
@@ -799,7 +843,7 @@ fn window(ctx: &egui::Context, shared: &Shared) {
     // 否则主窗口下一帧还会重新声明这个视口，窗口关不掉。
     if ctx.input(|i| i.viewport().close_requested()) {
         st.open = false;
-        st.placed = false;
+        st.forget_placement();
     }
     // 置顶状态变化时才下发命令，别每帧都发。
     if st.pinned != st.applied_top {
@@ -814,6 +858,13 @@ fn window(ctx: &egui::Context, shared: &Shared) {
     if st.theme_mode != Some(theme::mode()) {
         st.theme_mode = Some(theme::mode());
         theme::sync_native_theme(ctx);
+    }
+
+    // 圆角同理，也是「一扇窗口只做一次」的事。放在这里而不是建视口时做：
+    // 那会儿 HWND 还没被 winit 创建出来，按标题根本找不到它。
+    if !st.corners {
+        st.corners = true;
+        set_round_corners(WINDOW_TITLE);
     }
 
     let frame = Frame::NONE.fill(P::panel());
@@ -832,6 +883,10 @@ fn window(ctx: &egui::Context, shared: &Shared) {
 }
 
 fn body(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
+    // 整个窗口的矩形。**必须在往 ui 里放东西之前取**：`max_rect()` 会随着
+    // 逐个 allocate 一路收缩，到函数末尾就只剩底下一条缝了。
+    let full = ui.max_rect();
+
     header(ui, ctx, st);
 
     Frame::NONE.inner_margin(Margin { left: 18, right: 18, top: 12, bottom: 14 }).show(ui, |ui| {
@@ -849,13 +904,201 @@ fn body(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
         let natural = AXIS_H + ROUND_H + n * LANE_MAX + (n - 1.0).max(0.0) * LANE_GAP;
         let rest = ui.available_height();
         let chart_h = natural.min(rest - 170.0).max(170.0);
-        let detail_h = (rest - chart_h - 14.0).clamp(132.0, 420.0);
+        // 详情面板**吃掉剩下的全部高度**，不再封顶。
+        // 封顶（原来 clamp 到 420）会让它在窗口下半截留出一片空白 —— 时间轴明明
+        // 可以更高、详情明明可以更宽，却被一个写死的上限挡住。它内部本来就是
+        // 可滚动的，给多高都不会撑破。
+        let detail_h = (rest - chart_h - 14.0).max(132.0);
 
         timeline(ui, ctx, st, &rows, chart_h);
         ui.add_space(14.0);
         detail(ui, st, detail_h);
     });
+
+    // 最后再叠两样「窗口级」的东西：边框拖拽热区（要压过顶栏的拖动区，所以必须
+    // 最后声明）和最外圈那道 1px 的边。
+    resize_handles(ui, ctx, full);
+    outline(ui, full);
 }
+
+/// 无装饰窗口**没有原生边框缩放**了，这里自己补回来。
+///
+/// 做法和 egui 内置的 `Resize` 容器一样：四边四角各埋一块用 `Sense::drag` 的
+/// 透明热区，按下时只发一条 [`ViewportCommand::BeginResize`]，之后整个拖拽过程
+/// 由系统接管（不是我们每帧去改窗口尺寸 —— 那样既卡又会和系统打架）。
+///
+/// 顺序很关键：这些热区在 `body` 的**最后**声明，而 egui 的命中测试是
+/// 「同层里后声明的在上面」，所以窗口最外圈那几像素会判给缩放、而不是顶栏拖动。
+/// 重叠只发生在顶栏的边缘，按钮（关闭等）离边还有十来像素，不会被抢。
+fn resize_handles(ui: &mut Ui, ctx: &egui::Context, full: Rect) {
+    // 最大化的窗口不该能再拖边（Windows 自己也这样），顺手也避免了
+    // 「拖着拖着从最大化状态里掉出来」的怪相。
+    if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+        return;
+    }
+
+    let zones = resize_zones(full);
+    // 光标要在**悬停**时就变（不等按下），否则用户根本不知道这儿能拖
+    let hover = ctx.input(|i| i.pointer.hover_pos());
+    if let Some(p) = hover {
+        if let Some((_, _, d)) = zones.iter().find(|(_, r, _)| r.contains(p)) {
+            ctx.set_cursor_icon(resize_cursor(*d));
+        }
+    }
+
+    for (id, r, dir) in zones {
+        let resp = ui.interact(r, ui.id().with(id), Sense::drag());
+        if resp.hovered() {
+            ctx.set_cursor_icon(resize_cursor(dir));
+        }
+        if resp.drag_started() {
+            ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
+        }
+    }
+}
+
+/// 八块热区的几何。四边只取**去掉四角**的那一段，四角另给一块方形的
+/// —— 否则角上会同时命中两块，方向就没法确定。
+fn resize_zones(full: Rect) -> [(&'static str, Rect, ResizeDirection); 8] {
+    let (l, r, t, b) = (full.left(), full.right(), full.top(), full.bottom());
+    let d = RESIZE_BORDER;
+    let c = RESIZE_CORNER;
+    let rect = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1))
+    };
+    use ResizeDirection::*;
+    [
+        ("nw", rect(l, t, l + c, t + c), NorthWest),
+        ("ne", rect(r - c, t, r, t + c), NorthEast),
+        ("sw", rect(l, b - c, l + c, b), SouthWest),
+        ("se", rect(r - c, b - c, r, b), SouthEast),
+        ("n", rect(l + c, t, r - c, t + d), North),
+        ("s", rect(l + c, b - d, r - c, b), South),
+        ("w", rect(l, t + c, l + d, b - c), West),
+        ("e", rect(r - d, t + c, r, b - c), East),
+    ]
+}
+
+fn resize_cursor(d: ResizeDirection) -> CursorIcon {
+    use ResizeDirection::*;
+    match d {
+        North | South => CursorIcon::ResizeVertical,
+        East | West => CursorIcon::ResizeHorizontal,
+        NorthEast | SouthWest => CursorIcon::ResizeNeSw,
+        NorthWest | SouthEast => CursorIcon::ResizeNwSe,
+    }
+}
+
+/// 无装饰窗口和桌面之间没有任何分界线，浅色主题下几乎看不出窗口到哪儿为止。
+/// 描一圈一像素的边把它框出来（比顶栏那条分隔线重一点，才压得住底色）。
+///
+/// 圆角要跟着系统的来：窗口最后是被 DWM 按圆角裁掉的，这里若还画直角，
+/// 四角那几像素的边框会被裁掉、剩下一个方方正正的断口。
+fn outline(ui: &Ui, full: Rect) {
+    ui.painter().rect_stroke(
+        full.shrink(0.5),
+        CornerRadius::same(CORNER_RADIUS),
+        Stroke::new(1.0, P::border_strong()),
+        egui::StrokeKind::Inside,
+    );
+}
+
+// ───────────────────── 系统圆角（Windows 11） ─────────────────────
+
+/// DWM 的标准圆角半径，与主窗口一致。单位是 egui 点，会随缩放一起变大。
+const CORNER_RADIUS: u8 = 8;
+
+/// 让系统给这扇窗口画上圆角。
+///
+/// **为什么不自绘**（视口开 `with_transparent` + 自己画一个圆角矩形）：
+/// 圆角是画得出来，但边界以外必须真的透明，于是**系统阴影一起丢掉** ——
+/// 窗口会像一张贴纸糊在桌面上，而且透明窗口在拖拽缩放时容易闪。
+///
+/// 而 winit 的无装饰窗口并不是 `WS_POPUP`：它靠 `WM_NCCALCSIZE` 把非客户区
+/// 压成 0，`WS_BORDER` / `WS_SYSMENU` 都还留着 —— 在系统眼里这仍是一扇
+/// **普通的重叠窗口**，所以走 DWM 那条路既能拿到抗锯齿的圆角，又原样保留阴影，
+/// 半径还天然和主窗口一致（这正是我们刚把系统标题栏去掉时丢掉的那样东西）。
+///
+/// winit 其实自带这个开关（`WindowAttributesExtWindows::with_corner_preference`），
+/// 但 egui 的 `ViewportBuilder` 没有透传的口子，子视口更是连 hook 都没有
+/// （`ViewportBuilder` 只有 `has_shadow`、`taskbar` 这类，且 eframe 也没全用）。
+/// 所以这里直接喊一次系统 API：三个函数、十来行声明，不值得为它引入 windows-sys。
+///
+/// 只需要在建好窗口之后叫**一次** —— 圆角是挂在 HWND 上的状态，不是每帧的事。
+/// 窗口一重建（关掉再开）圆角就没了，所以调用方用 [`Activity::corners`] 记着。
+#[cfg(windows)]
+fn set_round_corners(title: &str) {
+    use std::ffi::c_void;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(cb: extern "system" fn(*mut c_void, isize) -> i32, param: isize) -> i32;
+        fn IsWindowVisible(h: *mut c_void) -> i32;
+        fn GetWindowTextLengthW(h: *mut c_void) -> i32;
+        fn GetWindowTextW(h: *mut c_void, buf: *mut u16, max: i32) -> i32;
+        fn GetWindowThreadProcessId(h: *mut c_void, pid: *mut u32) -> u32;
+    }
+
+    /// 枚举时用的上下文。回调只能是不捕获环境的普通 fn，所以东西得从 `param` 递进去。
+    struct Probe<'a> {
+        title: &'a str,
+        pid: u32,
+        hwnd: *mut c_void,
+    }
+
+    /// 是不是「本进程开的那扇标题对得上的窗口」。
+    ///
+    /// SAFETY: `h` 是 `EnumWindows` 递过来的句柄，在本次调用期间有效。
+    unsafe fn mine(h: *mut c_void, title: &str, pid: u32) -> bool {
+        if unsafe { IsWindowVisible(h) } == 0 {
+            return false;
+        }
+        // 光看标题不够：用户完全可以同时开着两个 AOX 实例（比如装了两个包），
+        // 那样可能摸到别人的窗口上去改圆角。
+        let mut owner = 0u32;
+        unsafe { GetWindowThreadProcessId(h, &mut owner) };
+        if owner != pid {
+            return false;
+        }
+        let n = unsafe { GetWindowTextLengthW(h) };
+        if n <= 0 {
+            return false;
+        }
+        let mut buf: Vec<u16> = vec![0; n as usize + 1];
+        let got = unsafe { GetWindowTextW(h, buf.as_mut_ptr(), n + 1) };
+        if got <= 0 {
+            return false;
+        }
+        String::from_utf16_lossy(&buf[..got as usize]).contains(title)
+    }
+
+    extern "system" fn probe(h: *mut c_void, param: isize) -> i32 {
+        // SAFETY: `param` 就是下面那个 `Probe` 的地址，生命周期覆盖整个 `EnumWindows`
+        let p = unsafe { &mut *(param as *mut Probe) };
+        if p.hwnd.is_null() && unsafe { mine(h, p.title, p.pid) } {
+            p.hwnd = h;
+            return 0; // 找到就停，别再枚举下去
+        }
+        1
+    }
+
+    let mut ctx = Probe { title, pid: std::process::id(), hwnd: std::ptr::null_mut() };
+    unsafe { EnumWindows(probe, &mut ctx as *mut Probe as isize) };
+    if ctx.hwnd.is_null() {
+        return; // 还没建出来（或平台不给），下次开窗口再试
+    }
+    // DWM 调用统一走 `theme`：同一个符号在整个 crate 里只声明一次。
+    // 失败（Win10 不认识这个属性）也无所谓 —— 那就维持方角，本来的样子。
+    theme::dwm_set_attribute(
+        ctx.hwnd as isize,
+        theme::DWMWA_CORNER_PREFERENCE,
+        &theme::DWMWCP_ROUND as *const i32 as *const c_void,
+        std::mem::size_of::<i32>() as u32,
+    );
+}
+
+#[cfg(not(windows))]
+fn set_round_corners(_title: &str) {}
 
 // ───────────────────────────── 顶栏 ─────────────────────────────
 
@@ -906,7 +1149,9 @@ fn header(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
         P::text_faint(),
     );
 
-    // 右侧自右向左排：关闭 / 最小化 / 固定。
+    // 右侧自右向左排：关闭 / 最大化 / 最小化 / 固定，落到屏幕上就是 Windows
+    // 那套「固定 · 最小化 · 最大化 · 关闭」。因为系统标题栏已经不要了，
+    // 这几枚自绘按钮就是窗口唯一的出口。
     //
     // 这里**不再有「清空」**：活动流已经随这段对话落进了同一个文件，删它只能
     // 通过删那段对话去做 —— 界面上一按就清空，文件里却还留着，下次打开这段
@@ -916,23 +1161,24 @@ fn header(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
     const GAP: f32 = 2.0;
     let y = rect.center().y - BH / 2.0;
     let mut x = rect.right() - 10.0 - BW;
-    if win_button(ui, Rect::from_min_size(Pos2::new(x, y), Vec2::new(BW, BH)), "close", Glyph::Close)
-    {
+    let btn = |x: f32| Rect::from_min_size(Pos2::new(x, y), Vec2::new(BW, BH));
+    if win_button(ui, btn(x), "close", Glyph::Close) {
         st.open = false;
-        st.placed = false;
+        st.forget_placement();
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
     x -= BW + GAP;
-    if win_button(ui, Rect::from_min_size(Pos2::new(x, y), Vec2::new(BW, BH)), "min", Glyph::Min) {
+    // 最大化状态得主动去问 —— 这台窗口现在是自己管的，没人替我们记着它是不是最大了
+    let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+    if win_button(ui, btn(x), "max", Glyph::Max { on: maxed }) {
+        ctx.send_viewport_cmd(ViewportCommand::Maximized(!maxed));
+    }
+    x -= BW + GAP;
+    if win_button(ui, btn(x), "min", Glyph::Min) {
         ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
     }
     x -= BW + GAP;
-    if win_button(
-        ui,
-        Rect::from_min_size(Pos2::new(x, y), Vec2::new(BW, BH)),
-        "pin",
-        Glyph::Pin { on: st.pinned },
-    ) {
+    if win_button(ui, btn(x), "pin", Glyph::Pin { on: st.pinned }) {
         st.pinned = !st.pinned;
     }
 
@@ -948,6 +1194,8 @@ fn header(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
 enum Glyph {
     Close,
     Min,
+    /// 最大化 / 还原。`on` = 当前已经是最大化（于是画成「还原」那个双框）
+    Max { on: bool },
     Pin { on: bool },
 }
 
@@ -968,6 +1216,27 @@ fn win_button(ui: &mut Ui, r: Rect, id: &str, glyph: Glyph) -> bool {
         }
         Glyph::Min => {
             p.line_segment([c + Vec2::new(-5.0, 2.4), c + Vec2::new(5.0, 2.4)], stroke);
+        }
+        Glyph::Max { on: false } => {
+            // 一个方框 —— 就是 Windows 的最大化
+            p.rect_stroke(
+                Rect::from_center_size(c, Vec2::splat(9.6)),
+                CornerRadius::ZERO,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        Glyph::Max { on: true } => {
+            // 「还原」：后面那个框被前面的挡住半截，所以只描它的上边与右边
+            let (b0, b1) = (c + Vec2::new(-2.4, -5.0), c + Vec2::new(5.0, 1.6));
+            p.line_segment([b0, Pos2::new(b1.x, b0.y)], stroke);
+            p.line_segment([Pos2::new(b1.x, b0.y), b1], stroke);
+            p.rect_stroke(
+                Rect::from_min_max(c + Vec2::new(-4.8, -2.0), c + Vec2::new(2.6, 5.4)),
+                CornerRadius::ZERO,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
         }
         Glyph::Pin { on } => {
             p.line_segment([c + Vec2::new(-4.6, -4.4), c + Vec2::new(4.6, -4.4)], stroke);

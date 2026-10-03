@@ -601,22 +601,21 @@ pub fn sync_native_theme(ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(t));
 }
 
-/// 把原生标题栏染成与界面**完全一致**的颜色，让它彻底融入窗口。
+/// 设一条 DWM 窗口属性（`DWMWA_*`）。
 ///
-/// `sync_native_theme` 只能让标题栏在「系统亮色 / 系统暗色」里二选一，拿到的是
-/// DWM 自己那套灰（亮色约 `#F3F3F3`、暗色约 `#202020`），和纸与墨的暖调对不上。
-/// 想真正严丝合缝，只能直接设 DWM 属性：
+/// Windows 11 (build 22000+) 才认识这类属性，旧系统上调用返回失败 ——
+/// **静默忽略即可**，效果只是退回系统默认，不是错误。
 ///
-/// - `DWMWA_CAPTION_COLOR`(35)：标题栏底色
-/// - `DWMWA_TEXT_COLOR`(36)：标题栏文字色
-/// - `DWMWA_BORDER_COLOR`(34)：窗口外框线
-///
-/// 这三个是 Windows 11 (build 22000+) 才有的，旧系统上调用返回失败——静默忽略即可，
-/// 效果只是退回系统默认色，不会出错。
+/// 单独抽出来是为了**全 crate 只有这一处 extern 声明**。同一个符号在两个文件里
+/// 各声明一遍，签名稍有出入编译器就报 `clashing_extern_declarations`
+/// （真踩过：`hwnd` 一边写 `isize`、一边写 `*mut c_void`）。
 #[cfg(windows)]
-pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
-    use raw_window_handle::RawWindowHandle;
-
+pub(crate) fn dwm_set_attribute(
+    hwnd: isize,
+    attr: u32,
+    value: *const core::ffi::c_void,
+    size: u32,
+) -> i32 {
     #[link(name = "dwmapi")]
     extern "system" {
         fn DwmSetWindowAttribute(
@@ -626,10 +625,42 @@ pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
             size: u32,
         ) -> i32;
     }
+    unsafe { DwmSetWindowAttribute(hwnd, attr, value, size) }
+}
 
-    const DWMWA_BORDER_COLOR: u32 = 34;
-    const DWMWA_CAPTION_COLOR: u32 = 35;
-    const DWMWA_TEXT_COLOR: u32 = 36;
+#[cfg(not(windows))]
+pub(crate) fn dwm_set_attribute(
+    _hwnd: isize,
+    _attr: u32,
+    _value: *const core::ffi::c_void,
+    _size: u32,
+) -> i32 {
+    -1
+}
+
+/// `DWMWA_BORDER_COLOR`
+pub(crate) const DWMWA_BORDER_COLOR: u32 = 34;
+/// `DWMWA_CAPTION_COLOR`
+pub(crate) const DWMWA_CAPTION_COLOR: u32 = 35;
+/// `DWMWA_TEXT_COLOR`
+pub(crate) const DWMWA_TEXT_COLOR: u32 = 36;
+/// `DWMWA_WINDOW_CORNER_PREFERENCE`（配合 `DWMWCP_*`）
+pub(crate) const DWMWA_CORNER_PREFERENCE: u32 = 33;
+/// `DWMWCP_ROUND`：系统的标准圆角。`DONOTROUND` = 1，`ROUND` = 2，`ROUNDSMALL` = 3。
+pub(crate) const DWMWCP_ROUND: i32 = 2;
+
+/// 把原生标题栏染成与界面**完全一致**的颜色，让它彻底融入窗口。
+///
+/// `sync_native_theme` 只能让标题栏在「系统亮色 / 系统暗色」里二选一，拿到的是
+/// DWM 自己那套灰（亮色约 `#F3F3F3`、暗色约 `#202020`），和纸与墨的暖调对不上。
+/// 想真正严丝合缝，只能直接设 DWM 属性：
+///
+/// - `DWMWA_CAPTION_COLOR`(35)：标题栏底色
+/// - `DWMWA_TEXT_COLOR`(36)：标题栏文字色
+/// - `DWMWA_BORDER_COLOR`(34)：窗口外框线
+#[cfg(windows)]
+pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
+    use raw_window_handle::RawWindowHandle;
 
     let Ok(h) = handle.window_handle() else { return };
     let RawWindowHandle::Win32(w) = h.as_raw() else {
@@ -646,11 +677,9 @@ pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
     let text = colorref(P::text_dim());
     let border = colorref(P::border());
     // 失败也无所谓（老系统不支持），所以返回值直接丢掉
-    unsafe {
-        DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, std::ptr::addr_of!(cap).cast(), 4);
-        DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, std::ptr::addr_of!(text).cast(), 4);
-        DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, std::ptr::addr_of!(border).cast(), 4);
-    }
+    dwm_set_attribute(hwnd, DWMWA_CAPTION_COLOR, std::ptr::addr_of!(cap).cast(), 4);
+    dwm_set_attribute(hwnd, DWMWA_TEXT_COLOR, std::ptr::addr_of!(text).cast(), 4);
+    dwm_set_attribute(hwnd, DWMWA_BORDER_COLOR, std::ptr::addr_of!(border).cast(), 4);
 }
 
 #[cfg(not(windows))]
