@@ -1204,7 +1204,10 @@ fn win_button(ui: &mut Ui, r: Rect, id: &str, glyph: Glyph) -> bool {
     if resp.hovered() {
         ui.painter().rect_filled(r, CornerRadius::same(7), P::surface_hi());
     }
-    let fg = if resp.hovered() { P::ink() } else { P::text_dim() };
+    // 「已固定」是个**持续状态**，得一直看得见：不悬停时也给它最深的前景色，
+    // 否则一枚灰图钉躺在灰底上，用户根本分不出自己到底钉没钉上。
+    let pinned = matches!(glyph, Glyph::Pin { on: true });
+    let fg = if resp.hovered() || pinned { P::ink() } else { P::text_dim() };
     let p = ui.painter();
     let c = r.center();
     let stroke = Stroke::new(1.4, fg);
@@ -1239,13 +1242,40 @@ fn win_button(ui: &mut Ui, r: Rect, id: &str, glyph: Glyph) -> bool {
             );
         }
         Glyph::Pin { on } => {
-            p.line_segment([c + Vec2::new(-4.6, -4.4), c + Vec2::new(4.6, -4.4)], stroke);
-            let tip = c + Vec2::new(0.0, 4.8);
-            p.line_segment([c + Vec2::new(-2.4, -4.4), tip], stroke);
-            p.line_segment([c + Vec2::new(2.4, -4.4), tip], stroke);
-            if on {
-                p.circle_filled(tip, 2.0, fg);
-            }
+            // 一枚图钉：扁平的帽 + 一根收成尖的针。
+            //
+            // 固定与不固定**共用同一个形状**，只差一个 90° 的朝向 ——
+            // 不固定时横躺着（针尖朝左下），固定时立起来（针尖朝下）。
+            // 这样两态之间不是「换了张图」，而是同一枚钉子躺下与站起，
+            // 用户不用重新认识一个图标就知道状态变了。
+            //
+            // 全部实心填色，不再用描边：细线条在这块深底上是真的看不清。
+            let rot = |v: Vec2| if on { v } else { Vec2::new(-v.y, v.x) };
+            // 矩形转过 90° 之后长宽对调，所以尺寸得单独换一次
+            let swap = |v: Vec2| if on { v } else { Vec2::new(v.y, v.x) };
+
+            // 帽
+            p.rect_filled(
+                Rect::from_center_size(c + rot(Vec2::new(0.0, -4.2)), swap(Vec2::new(10.0, 2.6))),
+                CornerRadius::same(1),
+                fg,
+            );
+            // 针杆
+            p.rect_filled(
+                Rect::from_center_size(c + rot(Vec2::new(0.0, -1.0)), swap(Vec2::new(3.2, 3.8))),
+                CornerRadius::ZERO,
+                fg,
+            );
+            // 针尖
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    c + rot(Vec2::new(0.0, 4.8)),
+                    c + rot(Vec2::new(-1.6, 0.9)),
+                    c + rot(Vec2::new(1.6, 0.9)),
+                ],
+                fg,
+                Stroke::NONE,
+            ));
         }
     }
     resp.clicked()
