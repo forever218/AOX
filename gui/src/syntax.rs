@@ -436,17 +436,23 @@ fn scan_line(cfg: &Cfg, state: &mut State, line: &str) -> Vec<(String, Tok)> {
                 }
                 continue;
             }
-            State::Triple(q) => match find3(&b, i, q) {
-                Some(k) => {
-                    cut!(i, k + 3, Tok::Str);
-                    i = k + 3;
-                    *state = State::Normal;
+            State::Triple(q) => {
+                match find3(&b, i, q) {
+                    Some(k) => {
+                        cut!(i, k + 3, Tok::Str);
+                        i = k + 3;
+                        *state = State::Normal;
+                    }
+                    None => {
+                        cut!(i, b.len(), Tok::Str);
+                        i = b.len();
+                    }
                 }
-                None => {
-                    cut!(i, b.len(), Tok::Str);
-                    i = b.len();
-                }
-            },
+                // 这一行整段属于那个三引号字符串，收完必须回到 `while` 重判。
+                // 少了这句，`i` 会正好停在行尾（`"""doc` 在行尾闭合时就是如此），
+                // 下面的 `b[i]` 直接越界 panic。
+                continue;
+            }
             State::Normal => {}
         }
 

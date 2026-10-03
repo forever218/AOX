@@ -15,6 +15,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod activity;
 mod app;
 mod bridge;
 mod markdown;

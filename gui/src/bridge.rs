@@ -33,6 +33,11 @@ pub enum ToAgent {
     Resume(String),
     /// 开一段新对话。旧对话不需要任何收尾动作 —— 它已经边聊边写进 `history/` 了。
     NewConversation,
+    /// 本轮产生的活动流记录，追加进同一个对话文件（`kind:"act"` 行）。
+    ///
+    /// 走这条队列而不是让主线程自己开文件：句柄在 Agent 线程手里，而且「新建对话」
+    /// 与「中断回滚」也在那个线程里发生 —— 队列天然保住了写入顺序。
+    Act(Vec<Value>),
     /// 退出：关闭插件子进程并结束驱动线程
     Shutdown,
 }
@@ -162,7 +167,9 @@ impl Ui for GuiUi {
             match self.rx.recv().await {
                 Some(ToAgent::Input(s)) => return Ok(Some(s)),
                 Some(ToAgent::Shutdown) | None => return Ok(None),
-                Some(ToAgent::Resume(_)) | Some(ToAgent::NewConversation) => continue,
+                Some(ToAgent::Resume(_)) | Some(ToAgent::NewConversation) | Some(ToAgent::Act(_)) => {
+                    continue
+                }
             }
         }
     }
@@ -302,6 +309,8 @@ async fn idle_until_shutdown(
                     "模型未就绪，这条指令没有发出。".into(),
                 )));
             }
+            // 这一段里没有 log 可写（Agent 根本没起来），如实丢掉
+            ToAgent::Act(_) => {}
         }
     }
 }
@@ -332,6 +341,9 @@ async fn next_command(
                 agent.new_conversation();
                 let _ = tx.send(FromAgent::Switched { opened: None, error: None });
             }
+            // 活动流落盘：就地进行，不进下一轮 —— 顺序与用户的操作完全一致，
+            // 所以「这一轮的时间轴」永远落在这一轮的对话文件里。
+            Some(ToAgent::Act(acts)) => agent.append_acts(&acts),
             Some(ToAgent::Shutdown) | None => return Ok(None),
         }
     }

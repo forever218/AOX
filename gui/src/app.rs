@@ -2,20 +2,21 @@
 //!
 //! 布局（参考主流 AI 编程软件）：
 //! ```text
-//! ┌───────────────────────────────────────────────┬──────────────┐
-//! │ 顶栏：AOX · 状态 · 模型 · [明暗] [活动流]      │  活动流面板   │
-//! ├───────────────────────────────────────────────┤ （可折叠）    │
-//! │ 对话流：用户气泡 / 助手 Markdown / 折叠的过程  │  状态 + 实时  │
-//! │                                                │  思考 + 工具  │
-//! │                  ┌──────────────────┐          │  调用记录     │
-//! │                  │ 悬浮输入框（覆盖）│          │              │
-//! └──────────────────┴──────────────────┴──────────┴──────────────┘
+//! ┌───────────────────────────────────────────────────────────┐
+//! │ 顶栏：状态 · [历史] [新建]              [活动流] [明暗] [关于] │
+//! ├───────────────────────────────────────────────────────────┤
+//! │ 对话流：用户气泡 / 助手 Markdown / 折叠的过程                 │
+//! │                  ┌──────────────────┐                      │
+//! │                  │ 悬浮输入框（覆盖）│                      │
+//! └──────────────────┴──────────────────┴──────────────────────┘
 //! ```
+//!
+//! 活动流**不在主窗口里**，点顶栏那枚图标会以独立窗口打开（见 `activity.rs`）；
+//! 左侧历史栏也默认折叠。所以主窗口只有一栏内容。
 //!
 //! 底部没有独立的「输入区」栏位：输入框是一枚浮在对话内容之上的卡片，
 //! 滚动时可以一直滑到它下面。
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,6 +30,7 @@ use tokio::sync::oneshot;
 
 use aox::ui::{AgentEvent, AuthDecision};
 
+use crate::activity::{self, ActKind};
 use crate::bridge::{BootInfo, FromAgent, RuntimeView, SessionFlags, Snapshot, ToAgent};
 use crate::markdown;
 use crate::theme::{self, P};
@@ -94,56 +96,6 @@ struct Live {
     started: Instant,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ActKind {
-    Turn,
-    Think,
-    Call,
-    Run,
-    Ok,
-    Err,
-    Info,
-    Warn,
-    Error,
-}
-
-impl ActKind {
-    /// 单色方案下不得不用明度分层，所以这里定义的是「强调程度」而不是颜色：
-    /// 关键节点（任务开始/工具调用/失败）用正文色，完成类用次要色，过程类最弱。
-    fn color(self) -> Color32 {
-        match self {
-            ActKind::Turn => P::text(),
-            ActKind::Call => P::text(),
-            ActKind::Err => P::text(),
-            ActKind::Error => P::text(),
-            ActKind::Ok => P::text_dim(),
-            ActKind::Info => P::text_dim(),
-            ActKind::Warn => P::text_dim(),
-            ActKind::Think => P::text_faint(),
-            ActKind::Run => P::text_faint(),
-        }
-    }
-
-    /// 失败类节点额外画一个叉，免得只靠明度差看不出来。
-    fn is_failure(self) -> bool {
-        matches!(self, ActKind::Err | ActKind::Error)
-    }
-
-    fn mono(self) -> bool {
-        matches!(self, ActKind::Call | ActKind::Run | ActKind::Ok | ActKind::Err | ActKind::Think)
-    }
-}
-
-/// 活动流中的一行。
-struct Act {
-    kind: ActKind,
-    at: f32,
-    title: String,
-    body: String,
-    live: bool,
-    detail: bool,
-}
-
 struct AuthCard {
     tool: String,
     args: String,
@@ -162,7 +114,8 @@ pub struct App {
 
     items: Vec<Item>,
     live: Option<Live>,
-    acts: VecDeque<Act>,
+    /// 活动流的共享状态。住在独立窗口里（`activity.rs`），主窗口只管往里写。
+    act: activity::Shared,
     auth: Option<AuthCard>,
     auth_reply: Option<oneshot::Sender<AuthDecision>>,
 
@@ -195,7 +148,6 @@ pub struct App {
     /// 左侧历史侧边栏是否展开
     show_history: bool,
 
-    show_activity: bool,
     /// 演示模式（--demo）：不连 LLM，只展示界面与事件流的排布
     demo: bool,
     /// 对话流是否自动跟随到底部
@@ -203,7 +155,6 @@ pub struct App {
     /// 本条消息强制滚到底（用户刚发指令时）
     force_follow: bool,
     /// 活动流是否自动跟随
-    follow_acts: bool,
     /// 关于窗口是否展开
     about_open: bool,
     log_error: Option<String>,
@@ -242,7 +193,7 @@ impl App {
             boot: None,
             items: Vec::new(),
             live: None,
-            acts: VecDeque::new(),
+            act: activity::new_shared(),
             auth: None,
             auth_reply: None,
             input: String::new(),
@@ -261,10 +212,8 @@ impl App {
             switching: false,
             show_history: false,
             // 左右两个侧栏默认都收起：主区宽度全部让给对话，需要时再点顶栏那两枚图标。
-            show_activity: false,
             follow: true,
             force_follow: true,
-            follow_acts: true,
             about_open: false,
             log_error: None,
             pending_prompt: if demo { None } else { prompt },
@@ -315,15 +264,7 @@ impl App {
         // 的下限兜底：标题栏约 30、边框约 8，46 足以覆盖 100%~200% 的缩放。
         let chrome = (outer - inner).max(Vec2::new(18.0, 46.0));
 
-        // 任务栏高度没有 API 可查，按显示器高度取一个保守比例（默认约 48 逻辑点）
-        let taskbar = (mon.y * 0.06).clamp(36.0, 72.0);
-        // 贴边留一点呼吸空间
-        let margin = Vec2::new(80.0, 28.0);
-
-        let want = Vec2::new(
-            (mon.x - margin.x - chrome.x).min(1380.0).max(1000.0),
-            (mon.y - taskbar - margin.y - chrome.y).min(900.0).max(620.0),
-        );
+        let want = default_window_size(mon, chrome);
 
         if (inner.x - want.x).abs() > 8.0 || (inner.y - want.y).abs() > 8.0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
@@ -331,6 +272,9 @@ impl App {
 
         // 居中摆放（外框 = 客户区 + 装饰），保证下沿不越过任务栏
         let outer_size = want + chrome;
+        // 可见高度（去掉任务栏）同样只在 default_window_size 里算过一次，
+        // 这里用「默认高度 + 装饰」反推，避免两处各算一遍任务栏高度。
+        let taskbar = (mon.y * 0.06).clamp(36.0, 72.0);
         let usable_h = (mon.y - taskbar).max(1.0);
         let pos = Vec2::new(
             ((mon.x - outer_size.x) * 0.5).max(6.0),
@@ -344,19 +288,15 @@ impl App {
         self.fit_tries = TRIES;
     }
 
-    fn push_act(&mut self, kind: ActKind, title: impl Into<String>, body: impl Into<String>, detail: bool) {
-        let at = self.now();
-        self.acts.push_back(Act {
-            kind,
-            at,
-            title: title.into(),
-            body: body.into(),
-            live: false,
-            detail,
-        });
-        while self.acts.len() > 500 {
-            self.acts.pop_front();
+    /// 往活动流里记一条系统事件（时间轴「系统」行上的一枚短色块）。
+    ///
+    /// **只有一轮任务执行期间才记**：活动流的语义是「这一轮是怎么跑的」，
+    /// 程序闲着的时候它上面不该多出任何东西。
+    fn note_act(&self, kind: ActKind, title: &str, body: &str) {
+        if self.live.is_none() {
+            return;
         }
+        activity::lock(&self.act).note(kind, title, body, self.now());
     }
 
     fn plugin_of(&self, tool: &str) -> Option<String> {
@@ -412,7 +352,7 @@ impl App {
                     if let Some(e) = error {
                         // 载入失败时 Agent 的上下文没被动过，所以这里也什么都不改，
                         // 免得界面已经「跳」过去了、模型却还在原来那段对话里。
-                        self.push_act(ActKind::Error, "切换对话失败", e, true);
+                        self.items.push(Item::Error(e));
                         continue;
                     }
                     self.current_history = opened.clone();
@@ -440,44 +380,29 @@ impl App {
                 }
                 FromAgent::Reasoning(d) => {
                     if let Some(l) = self.live.as_mut() {
+                        // 注意：这里不能用 `self.now()`（它借整个 self），
+                        // 而 `l` 正握着 `self.live` 的可变借用
+                        let at = self.started.elapsed().as_secs_f32();
                         if !l.reasoning_live {
                             l.reasoning_live = true;
-                            let at = self.started.elapsed().as_secs_f32();
-                            self.acts.push_back(Act {
-                                kind: ActKind::Think,
-                                at,
-                                title: "思考过程".into(),
-                                body: String::new(),
-                                live: true,
-                                detail: true,
-                            });
+                            activity::lock(&self.act).model_begin(at);
                         }
                         if l.reasoning.len() < 120_000 {
                             l.reasoning.push_str(&d);
                         }
-                        match self.acts.back_mut() {
-                            Some(a) if a.kind == ActKind::Think && a.live => {
-                                a.body.push_str(&d);
-                                clamp_tail(&mut a.body, 6000);
-                            }
-                            _ => {}
-                        }
+                        activity::lock(&self.act).model_push(&d);
                     }
                             }
                 FromAgent::ReasoningEnd => {
+                    // 思考结束不等于模型这一段结束：它可能接着吐正文、也可能去调工具，
+                    // 那两件事各自会把这一段收掉。
                     if let Some(l) = self.live.as_mut() {
                         l.reasoning_live = false;
-                    }
-                    if let Some(a) = self.acts.back_mut() {
-                        if a.kind == ActKind::Think && a.live {
-                            a.live = false;
-                        }
                     }
                 }
                 FromAgent::Event(ev) => self.on_event(ev),
                 FromAgent::TurnEnd => self.finish_turn(false),
                 FromAgent::TurnAborted => {
-                    self.push_act(ActKind::Err, "任务已中断", "", false);
                     self.finish_turn(true);
                 }
                 FromAgent::AuthRequest { tool, args, reply } => {
@@ -485,11 +410,17 @@ impl App {
                     self.auth_reply = Some(reply);
                     self.waiting_auth = true;
                     self.auth_shown_at = Instant::now();
-                    self.push_act(ActKind::Call, format!("请求授权 · {tool}"), args, true);
+                    let at = self.now();
+                    activity::lock(&self.act).note(
+                        ActKind::Auth,
+                        &format!("请求授权 · {tool}"),
+                        &args,
+                        at,
+                    );
                 }
                 FromAgent::Fatal(e) => {
                     self.items.push(Item::Error(e.clone()));
-                    self.push_act(ActKind::Error, "错误", e, true);
+                    self.note_act(ActKind::Error, "致命错误", &e);
                     if self.live.is_some() {
                         self.finish_turn(false);
                     }
@@ -571,7 +502,21 @@ impl App {
         self.waiting_auth = false;
         self.auth = None;
         self.auth_reply = None;
-        self.acts.clear();
+        // 活动流同样换掉。它和消息躺在**同一个文件**里，所以「打开这段对话」
+        // 就该看到它当时的那条时间轴；新建对话则清空。
+        //
+        // `now` 先算好再上锁：`self.now()` 借整个 `self`，读起来容易和锁守卫纠缠。
+        let now = self.now();
+        let mut act = activity::lock(&self.act);
+        match id {
+            Some(id) => {
+                let rows =
+                    aox::history::load_acts(&aox::history::file_of(&self.history_dir, id));
+                act.load_acts(&rows, now);
+            }
+            None => act.reset(),
+        }
+        drop(act);
         self.follow = true;
         self.force_follow = true;
     }
@@ -592,7 +537,7 @@ impl App {
             .width_range(206.0..=430.0)
             .frame(frame)
             .show(ctx, |ui| {
-                // 与活动流面板同样的理由：把内容宽度钉死在面板宽度上，
+                // 与活动流窗口同样的理由：把内容宽度钉死在面板宽度上，
                 // 否则内容比面板窄一点点，面板宽度会一帧帧缩到下限。
                 let pw = ui.available_width();
                 ui.set_min_width(pw);
@@ -656,10 +601,16 @@ impl App {
     }
 
     fn on_event(&mut self, ev: AgentEvent) {
+        // 活动流只记「一轮任务怎么跑的」：不在任务里的事件（切换对话、致命错误之后
+        // 残留的尾巴……）一律不进时间轴。
+        let live = self.live.is_some();
         match ev {
             AgentEvent::AssistantText(t) => {
                 match self.live.as_mut() {
                     Some(l) => {
+                        let at = self.started.elapsed().as_secs_f32();
+                        // 模型开始吐正文 = 「模型」那一段开始（若还没开）
+                        activity::lock(&self.act).model_begin(at);
                         if let Some(prev) = l.pending_final.replace(t) {
                             l.interim.push(prev);
                         }
@@ -669,6 +620,8 @@ impl App {
             }
             AgentEvent::InterimText(t) => {
                 if let Some(l) = self.live.as_mut() {
+                    let at = self.started.elapsed().as_secs_f32();
+                    activity::lock(&self.act).model_begin(at);
                     l.interim.push(t);
                 }
             }
@@ -683,15 +636,22 @@ impl App {
                         result: None,
                     });
                 }
-                let title = match &plugin {
-                    Some(p) if p != "meta" => format!("调用 {name}"),
-                    _ => format!("调用 {name}"),
-                };
-                self.push_act(ActKind::Call, title, args, true);
+                if live {
+                    // 活动流上只开一段色块：调用 → 执行 → 返回 是同一件事，
+                    // 拆成三条就看不出「这一步到底花了多久」。
+                    activity::lock(&self.act).tool_begin(
+                        &name,
+                        plugin.as_deref().filter(|p| *p != "meta"),
+                        &args,
+                        self.now(),
+                    );
+                }
             }
             AgentEvent::ToolRunning { name, timeout_secs } => {
                 self.status = format!("执行 {name}");
-                self.push_act(ActKind::Run, format!("执行中 {name}"), format!("超时 {timeout_secs}s"), false);
+                if live {
+                    activity::lock(&self.act).tool_note(&format!("超时上限 {timeout_secs}s"));
+                }
             }
             AgentEvent::ToolResult { name, is_error, preview } => {
                 if let Some(l) = self.live.as_mut() {
@@ -701,23 +661,24 @@ impl App {
                         st.result = Some((is_error, preview.clone()));
                     }
                 }
-                let kind = if is_error { ActKind::Err } else { ActKind::Ok };
-                self.push_act(kind, format!("{}{name}", if is_error { "失败 " } else { "完成 " }), preview, true);
+                if live {
+                    activity::lock(&self.act).tool_end(is_error, &preview, self.now());
+                }
             }
             AgentEvent::Info(m) => {
-                self.push_act(ActKind::Info, "信息", m.clone(), false);
+                self.note_act(ActKind::Info, "信息", &m);
                 if self.live.is_none() {
                     self.items.push(Item::Note(NoteKind::Info, m));
                 }
             }
             AgentEvent::Warn(m) => {
-                self.push_act(ActKind::Warn, "警告", m.clone(), false);
+                self.note_act(ActKind::Warn, "警告", &m);
                 if self.live.is_none() {
                     self.items.push(Item::Note(NoteKind::Warn, m));
                 }
             }
             AgentEvent::Error(m) => {
-                self.push_act(ActKind::Error, "错误", m.clone(), true);
+                self.note_act(ActKind::Error, "错误", &m);
                 if self.live.is_none() {
                     self.items.push(Item::Note(NoteKind::Error, m));
                 }
@@ -748,12 +709,23 @@ impl App {
         if let Some(f) = l.pending_final {
             self.items.push(Item::Assistant(f));
         }
-        self.push_act(
-            if aborted { ActKind::Err } else { ActKind::Turn },
-            if aborted { "任务中断" } else { "任务结束" },
-            format!("耗时 {elapsed:.1}s"),
-            false,
-        );
+        let at = self.now();
+        let pending = {
+            let mut act = activity::lock(&self.act);
+            // 一轮结束：把所有还开着的段收掉（不留下一条永远在长、越拖越长的色块）
+            act.end_round(at);
+            if aborted {
+                act.note(ActKind::Warn, "任务中断", &format!("已执行 {elapsed:.1}s"), at);
+            }
+            // 收完就取走这一轮新增的记录，交给 Agent 线程写进**这段对话的文件**。
+            // 交给它而不是界面自己开文件：句柄在它手里，而且「新建对话 / 中断回滚」
+            // 也在那个线程里发生；这条消息排在队尾，所以顺序天然是对的 ——
+            // 不会串到下一段对话里去。
+            act.export_acts()
+        };
+        if !pending.is_empty() {
+            let _ = self.tx.send(ToAgent::Act(pending));
+        }
         self.force_follow = true;
     }
 
@@ -772,7 +744,8 @@ impl App {
         self.items.push(Item::User(text.clone()));
         self.input.clear();
         self.force_follow = true;
-        self.push_act(ActKind::Turn, "新指令", text.clone(), true);
+        // 开一轮：时间轴上最上面那条「输入」从这一刻起
+        activity::lock(&self.act).round_begin(&text, self.now());
         let _ = self.tx.send(ToAgent::Input(text));
     }
 
@@ -836,8 +809,8 @@ impl App {
                             want_toggle = true;
                         }
                         ui.add_space(2.0);
-                        if flow_toggle(ui, self.show_activity).clicked() {
-                            self.show_activity = !self.show_activity;
+                        if flow_toggle(ui, activity::lock(&self.act).is_open()).clicked() {
+                            activity::toggle(ctx, &self.act);
                         }
                         ui.add_space(2.0);
                         if about_icon(ui).clicked() {
@@ -849,106 +822,6 @@ impl App {
         if want_toggle {
             theme::apply_mode(ctx, theme::toggle_mode());
         }
-    }
-
-    /// 右侧活动流：实时展示「信息流到哪了、调了什么工具」。
-    fn activity_panel(&mut self, ctx: &egui::Context) {
-        let frame = Frame::side_top_panel(&ctx.style())
-            .fill(P::panel())
-            .inner_margin(Margin::symmetric(20, 18));
-        egui::SidePanel::right("aox-activity")
-            .resizable(true)
-            .default_width(410.0)
-            .width_range(300.0..=700.0)
-            .frame(frame)
-            .show(ctx, |ui| {
-                // 把面板内容的宽度钉死在「当前面板宽度」上。
-                //
-                // 面板宽度并不是独立保存的：egui 每帧把「内容矩形」写回 PanelState，
-                // 下一帧再拿它当面板宽度。于是内容只要比面板窄一点点——滚动条预留的
-                // 几像素、某一帧 right_to_left 布局没吃满、或一行里漏算的 item_spacing——
-                // 宽度就会一帧帧缩水，直到 width_range 的下限；反过来则会一路涨到上限。
-                // 表现都是同一句话：「拖完自己弹回去」。
-                // 钉死之后，面板宽度只由「用户拖动 + default_width」决定。
-                let pw = ui.available_width();
-                ui.set_min_width(pw);
-                ui.set_max_width(pw);
-                // 面板标题
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(10.0, 10.0), Sense::hover());
-                    let pulsing = self.busy && ((self.spin * 2.0) as i32 % 2 == 0);
-                    ui.painter().circle_filled(
-                        rect.center(),
-                        4.0,
-                        if self.busy {
-                            if pulsing { P::ink() } else { P::ink_soft() }
-                        } else {
-                            P::text_faint()
-                        },
-                    );
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("活动流").color(P::text()).size(15.5).strong());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if flat_button(ui, "清空").clicked() {
-                            self.acts.clear();
-                        }
-                    });
-                });
-                ui.add_space(14.0);
-
-                // 当前状态
-                let (status, elapsed) = match self.live.as_ref() {
-                    Some(l) => (l.status.clone(), l.started.elapsed().as_secs_f32()),
-                    None => (self.status.clone(), 0.0),
-                };
-                Frame::NONE
-                    .fill(P::surface())
-                    .corner_radius(CornerRadius::same(12))
-                    .stroke(Stroke::new(1.0, P::border()))
-                    .inner_margin(Margin::symmetric(16, 13))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new(if status.is_empty() { "就绪" } else { &status })
-                                    .color(if self.busy { P::ink() } else { P::text_dim() })
-                                    .size(14.5),
-                            );
-                            if self.busy {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new(format!("{elapsed:.1}s"))
-                                        .color(P::text_faint())
-                                        .size(13.0),
-                                );
-                            }
-                        });
-                    });
-                ui.add_space(14.0);
-
-                let out = ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(self.follow_acts)
-                    .show(ui, |ui| {
-                        // 锁死内容宽度 = 面板宽度。否则内部卡片会按「文本理想宽度」撑开，
-                        // 超出部分被面板裁掉——这就是之前卡片看起来被切的原因。
-                        let w = ui.available_width();
-                        ui.set_width(w);
-                        ui.set_max_width(w);
-                        // 同上：活动流里的标题/正文也都在水平布局内，统一强制换行
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                        if self.acts.is_empty() {
-                            ui.add_space(16.0);
-                            ui.label(RichText::new("等待指令…").color(P::text_faint()).size(14.5));
-                        }
-                        for a in &self.acts {
-                            act_row(ui, a, w);
-                        }
-                    });
-                // 「贴近底部才自动跟随」：用户往上翻历史时不会被新事件拽回去
-                let max = (out.content_size.y - out.inner_rect.height()).max(0.0);
-                self.follow_acts = out.state.offset.y >= max - 32.0;
-            });
     }
 
     fn transcript(&mut self, ui: &mut Ui) {
@@ -1430,7 +1303,7 @@ impl App {
                     let _ = tx.send(d);
                 }
                 self.waiting_auth = false;
-                self.push_act(
+                self.note_act(
                     ActKind::Info,
                     "授权结果",
                     match d {
@@ -1438,7 +1311,6 @@ impl App {
                         AuthDecision::AllowSession => "本会话始终允许",
                         AuthDecision::Deny => "拒绝",
                     },
-                    false,
                 );
             }
             None => self.auth = Some(card),
@@ -1528,30 +1400,62 @@ fn seed_demo(app: &mut App) {
         "插件 filestat 已恢复（1 个工具）".into(),
     ));
 
-    // 活动流：按时间顺序铺一遍典型信息流
-    let rows: &[(ActKind, f32, &str, &str, bool)] = &[
-        (ActKind::Turn, 0.0, "新指令", "做一个插件，统计当前目录下各类文件的数量", true),
-        (ActKind::Think, 0.3, "思考过程", "需要先确认宿主已有能力，再决定是否造插件。", true),
-        (ActKind::Call, 1.1, "调用 list_plugins", "{}", true),
-        (ActKind::Ok, 1.4, "完成 list_plugins", "已加载插件: probe_screen, fs", true),
-        (ActKind::Call, 2.0, "调用 create_plugin", r#"{"name":"filestat","language":"python"}"#, true),
-        (ActKind::Info, 4.6, "授权结果", "允许一次", false),
-        (ActKind::Ok, 6.2, "完成 create_plugin", "插件 filestat 已创建、注册并持久化（1 个工具）", true),
-        (ActKind::Call, 6.5, "调用 filestat_count", r#"{"path":".","ext":null}"#, true),
-        (ActKind::Run, 6.5, "执行中 filestat_count", "超时 120s", false),
-        (ActKind::Ok, 7.3, "完成 filestat_count", ".rs 14 · .py 9 · .toml 4 · .md 2 · .lock 1", true),
-        (ActKind::Turn, 7.4, "任务结束", "耗时 7.4s", false),
-    ];
-    for (kind, at, title, body, detail) in rows {
-        app.acts.push_back(Act {
-            kind: *kind,
-            at: *at,
-            title: (*title).to_string(),
-            body: (*body).to_string(),
-            live: false,
-            detail: *detail,
-        });
+    // 活动流：按时间顺序铺一遍典型信息流（横向时间轴：色块宽度 = 真实耗时）。
+    // 演示模式把活动流窗口一并打开 —— 它已经是界面的一大块，预览就该看到它。
+    {
+        let mut a = activity::lock(&app.act);
+        a.force_open();
+        a.round_begin("做一个插件，统计当前目录下各类文件的数量", 0.0);
+        a.model_begin(0.5);
+        a.model_push("用户要统计文件数量：可以读目录 + 按后缀聚合。宿主里没有这个能力，");
+        a.model_push("需要先 create_plugin 造一个 filestat 插件，再调用它。");
+        a.tool_begin("list_plugins", Some("meta"), "{}", 1.7);
+        a.tool_end(false, "已加载插件: probe_screen, fs", 2.0);
+        a.model_begin(2.1);
+        a.model_push("先看看有没有现成的能力可以复用。");
+        a.tool_begin(
+            "create_plugin",
+            Some("meta"),
+            r#"{"name":"filestat","language":"python"}"#,
+            2.8,
+        );
+        a.tool_note("超时上限 120s");
+        a.note(ActKind::Auth, "请求授权 · create_plugin", "{\"name\":\"filestat\"}", 3.6);
+        a.note(ActKind::Info, "授权结果", "允许一次", 5.8);
+        a.tool_end(false, "插件 filestat 已创建、注册并持久化（1 个工具）", 6.4);
+        a.model_begin(6.5);
+        a.tool_begin("filestat_count", Some("filestat"), r#"{"path":".","ext":null}"#, 7.4);
+        a.tool_end(false, ".rs 14 · .py 9 · .toml 4 · .md 2 · .lock 1", 8.6);
+        a.model_begin(8.7);
+        a.model_push("结果已经拿到，整理成一张表给用户。");
+        a.end_round(11.9);
+        a.tick(11.9, "就绪", false);
+
+        // 第二轮：跨轮次、跨插件的连线效果也一并演示
+        a.round_begin("把刚才那个插件的用法写进 README", 13.2);
+        a.model_begin(13.8);
+        a.model_push("README 里加一节「filestat 用法」即可。");
+        a.tool_begin("fs_write", Some("fs"), r#"{"path":"README.md"}"#, 14.6);
+        a.tool_end(false, "已写入 1.2 KB", 15.4);
+        a.model_begin(15.5);
+        a.model_push("写完了。");
+        a.end_round(18.1);
+        a.tick(18.1, "就绪", false);
     }
+}
+
+/// 主窗口的默认尺寸：按显示器大小算，留出边框与任务栏，再夹到人能看的区间。
+///
+/// 活动流窗口要「和主窗口一样大」，所以公式只写这一份 —— 两边各算一次必然漂移。
+pub(crate) fn default_window_size(mon: Vec2, chrome: Vec2) -> Vec2 {
+    // 任务栏高度没有 API 可查，按显示器高度取一个保守比例（默认约 48 逻辑点）
+    let taskbar = (mon.y * 0.06).clamp(36.0, 72.0);
+    // 贴边留一点呼吸空间
+    let margin = Vec2::new(80.0, 28.0);
+    Vec2::new(
+        (mon.x - margin.x - chrome.x).min(1380.0).max(1000.0),
+        (mon.y - taskbar - margin.y - chrome.y).min(900.0).max(620.0),
+    )
 }
 
 impl eframe::App for App {
@@ -1580,9 +1484,10 @@ impl eframe::App for App {
         if self.show_history {
             self.history_panel(ctx);
         }
-        if self.show_activity {
-            self.activity_panel(ctx);
-        }
+        // 活动流在独立窗口里：主窗口每帧把「现在在干什么」同步过去，并重新声明
+        // 那个视口（egui 的视口是声明式的，不声明就会被回收）。
+        activity::lock(&self.act).tick(self.now(), &self.status, self.busy);
+        activity::sync(ctx, &self.act);
         let frame = Frame::NONE.fill(P::bg());
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             let column_rect = ui.max_rect();
@@ -1592,7 +1497,7 @@ impl eframe::App for App {
             // 输入框改为一枚悬浮卡片（Foreground 层），直接压在对话内容之上。
             // 之所以不放在 TopBottomPanel::bottom 里：那会永久占掉一条底栏，
             // 面板底色与背景同色，看上去就是底部空出一片区域。
-            // constrain_to 在这里有两个作用：把裁切区域限制在本栏内（不会盖到右侧活动流），
+            // constrain_to 在这里有两个作用：把裁切区域限制在本栏内（不会盖到下一层内容），
             // 以及让 anchor 的居中参考系正好是本栏。
             let clip = Rect::from_min_max(
                 column_rect.min,
@@ -2477,118 +2382,10 @@ fn step_row(ui: &mut Ui, idx: usize, st: &StepView, width: f32) {
     ui.add_space(5.0);
 }
 
-fn act_row(ui: &mut Ui, a: &Act, panel_w: f32) {
-    // 时间轴：一条淡竖线 + 节点圆点，比单纯列点更像「进度流」
-    let rail_w = 20.0;
-    // 必须把 horizontal 布局的 item_spacing 也扣掉。
-    //
-    // 面板宽度是从「上一帧的内容矩形」反推出来的（egui 的 PanelState.rect = 内容矩形），
-    // 所以内容一旦比面板宽，面板下一帧就会跟着变宽——是个自激的反馈环：
-    // 每帧涨「溢出量」，几帧内就顶到 width_range 上限，此后无论怎么拖都会被弹回最大宽度。
-    // 这里漏掉一次 item_spacing（10px）就正好触发它。
-    let gap = ui.spacing().item_spacing.x;
-    let body_w = (panel_w - rail_w - gap - 2.0).max(120.0);
-
-    ui.horizontal_top(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(rail_w, 22.0), Sense::hover());
-        let color = a.kind.color();
-        let c = rect.center();
-        let painter = ui.painter();
-        // 竖线贯穿整段：上下都多伸出去一点，让相邻节点之间连成一条线
-        painter.line_segment(
-            [
-                Pos2::new(c.x, rect.top() - 18.0),
-                Pos2::new(c.x, rect.bottom() + 18.0),
-            ],
-            Stroke::new(1.0, P::border()),
-        );
-        if a.live {
-            let pulse = ((a.at * 2.0) as i32) % 2 == 0;
-            painter.circle_filled(c, 5.0, if pulse { color } else { P::text_faint() });
-        } else if a.kind.is_failure() {
-            // 失败：实心大点 + 叉，单色下也一眼可辨
-            painter.circle_filled(c, 6.0, color);
-            let s = 2.6;
-            let stroke = Stroke::new(1.6, P::panel());
-            painter.line_segment(
-                [Pos2::new(c.x - s, c.y - s), Pos2::new(c.x + s, c.y + s)],
-                stroke,
-            );
-            painter.line_segment(
-                [Pos2::new(c.x - s, c.y + s), Pos2::new(c.x + s, c.y - s)],
-                stroke,
-            );
-        } else {
-            painter.circle_filled(c, 3.6, color);
-            // 用面板底色在内圈开个孔，形成圆环，区分「进行中/已完成」
-            painter.circle_filled(c, 1.6, P::panel());
-        }
-
-        ui.vertical(|ui| {
-            ui.set_width(body_w);
-            ui.set_max_width(body_w);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(&a.title).color(color).size(14.5));
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(format!("+{:.1}s", a.at))
-                        .color(P::text_faint())
-                        .size(12.0),
-                );
-            });
-            if !a.body.trim().is_empty() {
-                let body = if a.detail {
-                    let b = clamp_str(&a.body, 900);
-                    if a.kind.mono() { b } else { collapse_ws(&b) }
-                } else {
-                    collapse_ws(&clamp_str(&a.body, 220))
-                };
-                ui.add_space(5.0);
-                // 参数/结果放进一张小卡片里，和标题分开，长内容也不会顶出面板
-                let card_w = (body_w - 26.0).max(100.0);
-                Frame::NONE
-                    .fill(P::surface())
-                    .corner_radius(CornerRadius::same(10))
-                    .stroke(Stroke::new(1.0, P::border()))
-                    .inner_margin(Margin::symmetric(13, 10))
-                    .show(ui, |ui| {
-                        ui.set_width(card_w);
-                        ui.set_max_width(card_w);
-                        let mut job = egui::text::LayoutJob::default();
-                        job.wrap.max_width = card_w;
-                        job.wrap.break_anywhere = a.kind.mono();
-                        job.append(
-                            &body,
-                            0.0,
-                            egui::TextFormat {
-                                font_id: if a.kind.mono() {
-                                    theme::mono_font(13.0)
-                                } else {
-                                    theme::body_font(13.5)
-                                },
-                                color: P::text_dim(),
-                                ..Default::default()
-                            },
-                        );
-                        ui.add(Label::new(job).selectable(true).wrap_mode(egui::TextWrapMode::Wrap));
-                    });
-            }
-        });
-    });
-    ui.add_space(14.0);
-}
-
-// ─────────────────────────── 文本工具 ───────────────────────────
-
 fn one_line(s: &str, max: usize) -> String {
     let joined = s.split_whitespace().collect::<Vec<_>>().join(" ");
     clamp_str(&joined, max)
 }
-
-fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 fn clamp_str(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut n = 0usize;
@@ -2602,16 +2399,6 @@ fn clamp_str(s: &str, max: usize) -> String {
     }
     out
 }
-
-fn clamp_tail(s: &mut String, max: usize) {
-    let len = s.chars().count();
-    if len <= max {
-        return;
-    }
-    let skip = len - max;
-    *s = s.chars().skip(skip).collect();
-}
-
 fn tail_lines(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.trim_end().lines().collect();
     let start = lines.len().saturating_sub(n);

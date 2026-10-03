@@ -13,7 +13,16 @@
 //! {"content":"帮我给项目加历史记录功能","kind":"message","role":"user"}
 //! {"content":null,"kind":"message","role":"assistant","tool_calls":[...]}
 //! {"content":"...","is_error":false,"kind":"message","name":"fs_ls","role":"tool"}
+//! {"act":{"at":1.7,"end":2.0,"kind":"tool","title":"fs_ls"},"kind":"act"}
 //! ```
+//!
+//! 除了消息，同一个文件里还会追加**活动流**记录（`kind:"act"`，见 [`load_acts`]）：
+//! 界面上那条横向时间轴上的每一枚色块就是一行。两者共用一个文件是**刻意**的 ——
+//! 它们本来描述同一件事（这一轮任务是怎么跑的），而且「删掉一段对话」必须连它的
+//! 时间轴一起删掉：共用一个文件，这件事是自动的，不需要任何额外的清理代码。
+//!
+//! 活动流的负载嵌在 `act` 键下，而不是平铺：`Act` 自己也有一个 `kind` 字段
+//! （输入 / 模型 / 工具 …），和行类型同名同层会互相覆盖，读回来就分不清是哪种行。
 //!
 //! 为什么是 JSONL 而不是一个 JSON 数组：
 //!   - 追加是 O(1)。长任务可能有几百条消息，每轮重写整个文件既慢又容易写坏；
@@ -264,13 +273,25 @@ fn message_line(msg: &Message, is_error: Option<bool>) -> Value {
     v
 }
 
-fn kind_of(line: &str) -> Option<Value> {
+/// 活动流一行。负载嵌在 `act` 键下 —— `Act` 自己有一个 `kind` 字段
+/// （输入 / 模型 / 工具 …），与行类型同名同层会互相覆盖。
+fn act_line(act: &Value) -> Value {
+    json!({ "kind": "act", "act": act })
+}
+
+/// 我们写出去的三种行。别的行（误放进 `history/` 的其它文件、被手改坏的行）
+/// 一律不认 —— 这也是「这个文件是我们的」最便宜的判据。
+const ROW_KINDS: [&str; 3] = ["meta", "message", "act"];
+
+/// 解析一行，认得出来就返回它的对象。
+fn parse_row(line: &str) -> Option<Value> {
     let v: Value = serde_json::from_str(line).ok()?;
     let k = v.get("kind")?.as_str()?;
-    if k != "meta" && k != "message" {
-        return None;
-    }
-    Some(v)
+    ROW_KINDS.contains(&k).then_some(v)
+}
+
+fn is_kind(v: &Value, kind: &str) -> bool {
+    v.get("kind").and_then(Value::as_str) == Some(kind)
 }
 
 // ─────────────────────────── 写入 ───────────────────────────
@@ -345,17 +366,29 @@ impl Log {
         let _ = write_line_to(&mut self.file, &line);
     }
 
+    /// 追加一条活动流记录（界面上时间轴里的一枚色块）。
+    ///
+    /// 与消息一样，写失败不返回错误：时间轴是「过程的样子」，丢了顶多少一条记录，
+    /// 不该让正在跑的对话出问题。
+    pub fn append_act(&mut self, act: &Value) {
+        let _ = write_line_to(&mut self.file, &act_line(act));
+    }
+
     /// 用给定的消息列表重写整个文件。
     ///
     /// 用于「中断回滚」：内存里的消息被丢弃了，文件必须跟着回到同一状态，
     /// 否则会留下一段「有 tool_calls 但没有结果」的半截记录
     /// （将来要恢复这段对话时，那种记录会直接让请求被拒）。
     ///
+    /// 活动流（`kind:"act"`）不属于消息流，所以**要先捞出来再原样补回**：
+    /// 回滚丢的是消息，没道理顺手把时间轴上「已经发生过的过程」也一起抹掉。
+    ///
     /// 实现上**不能**对 append 句柄直接 `set_len`：Windows 上 append 打开的句柄
     /// 没有截断权限，会返回 `os error 5（拒绝访问）`；而且 `O_APPEND` 会让 `seek`
     /// 形同虚设，继续写还是落在旧内容后面（这两条都实测过）。
     /// 所以另开一个截断句柄重写全文，再把 append 句柄换回来。
     pub fn rewrite(&mut self, msgs: &[Message]) {
+        let acts = load_acts(&self.path);
         let Ok(mut f) =
             OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)
         else {
@@ -370,6 +403,11 @@ impl Log {
                 return;
             }
         }
+        for a in &acts {
+            if write_line_to(&mut f, &act_line(a)).is_err() {
+                return;
+            }
+        }
         drop(f);
         // 换回追加句柄，后续 append 仍是「永远写在末尾」，不会覆盖已有内容
         if let Ok(f) = OpenOptions::new().write(true).append(true).open(&self.path) {
@@ -379,9 +417,11 @@ impl Log {
 }
 
 fn write_line_to(file: &mut File, v: &Value) -> Result<()> {
-    let line = serde_json::to_string(v)?;
+    let mut line = serde_json::to_string(v)?;
+    line.push('\n');
+    // 一次写入，而不是「先写正文、再写换行」：同一行要么整条落地要么整条不落，
+    // 否则中途出错会留下半行残记录 —— 读的时候被当成坏行丢掉，等于这条白写了。
     file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
     file.flush()?;
     Ok(())
 }
@@ -479,7 +519,9 @@ fn read_summary(e: Entry, this_year: u16) -> Option<Summary> {
     if reader.read_line(&mut line).ok()? == 0 {
         return None;
     }
-    kind_of(line.trim())?;
+    if !parse_row(line.trim()).is_some_and(|v| is_kind(&v, "meta")) {
+        return None;
+    }
 
     let mut messages = 0usize;
     let mut title: Option<String> = None;
@@ -492,16 +534,19 @@ fn read_summary(e: Entry, this_year: u16) -> Option<Summary> {
         if t.is_empty() {
             continue;
         }
+        let Some(v) = parse_row(t) else { continue };
+        // 活动流记录（`kind:"act"`）既不进「几条消息」，也不当标题 ——
+        // 否则侧边栏的条数会虚高，而且第一轮的一堆色块会把 `TITLE_SCAN_LINES`
+        // 的名额吃光，标题就取不到了。
+        if !is_kind(&v, "message") {
+            continue;
+        }
         messages += 1;
         if title.is_none() && messages <= TITLE_SCAN_LINES {
-            if let Some(v) = kind_of(t) {
-                if v.get("kind").and_then(Value::as_str) == Some("message")
-                    && v.get("role").and_then(Value::as_str) == Some("user")
-                {
-                    if let Some(c) = v.get("content").and_then(Value::as_str) {
-                        if !c.starts_with(HOST_PREFIX) {
-                            title = Some(clamp_title(c));
-                        }
+            if v.get("role").and_then(Value::as_str) == Some("user") {
+                if let Some(c) = v.get("content").and_then(Value::as_str) {
+                    if !c.starts_with(HOST_PREFIX) {
+                        title = Some(clamp_title(c));
                     }
                 }
             }
@@ -538,9 +583,9 @@ pub fn load(path: &Path) -> Result<Vec<Loaded>> {
         if t.is_empty() {
             continue;
         }
-        let Some(v) = kind_of(t) else { continue };
-        if v.get("kind").and_then(Value::as_str) != Some("message") {
-            continue;
+        let Some(v) = parse_row(t) else { continue };
+        if !is_kind(&v, "message") {
+            continue; // 活动流记录不是消息，回放对话时被跳过
         }
         let is_error = v.get("is_error").and_then(Value::as_bool);
         if let Ok(msg) = serde_json::from_value::<Message>(v) {
@@ -548,6 +593,30 @@ pub fn load(path: &Path) -> Result<Vec<Loaded>> {
         }
     }
     Ok(out)
+}
+
+/// 读出一个文件里所有的**活动流**记录（按写入顺序），负载原样返回。
+///
+/// 解析成什么结构由调用方决定：这一段是界面上的显示数据，`history` 不该知道
+/// 「色块」「轮次」这些概念，只管把行搬出来。坏行与未知行跳过。
+pub fn load_acts(path: &Path) -> Vec<Value> {
+    let Ok(file) = File::open(path) else { return Vec::new() };
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Some(v) = parse_row(t) else { continue };
+        if !is_kind(&v, "act") {
+            continue;
+        }
+        if let Some(payload) = v.get("act") {
+            out.push(payload.clone());
+        }
+    }
+    out
 }
 
 /// 只保留最新的 `keep` 个对话，多出来的删掉。`keep == 0` 表示不限制。
@@ -902,6 +971,45 @@ mod tests {
         let items = load(&path).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].msg.content.as_deref(), Some("好行"));
+    }
+
+    /// 活动流与消息共处一个文件，且互不干扰：
+    /// - `load` 只吐消息，`load_acts` 只吐活动流；
+    /// - 列表的「条数」只数消息（色块不该让侧边栏的条数虚高）；
+    /// - **中断回滚不牵连活动流**：回滚丢的是消息，不是「已经发生过的过程」。
+    #[test]
+    fn acts_live_alongside_messages() {
+        let d = Tmp::new("act");
+        let mut log = Log::create(d.path(), None, Path::new("C:/root"), 0).unwrap();
+        let path = log.path().to_path_buf();
+        log.append(&Message::user("第一句"), None);
+        log.append_act(&json!({"at": 0.0, "kind": "input", "title": "用户指令", "seq": 1}));
+        log.append_act(&json!({"at": 1.7, "end": 2.0, "kind": "tool", "title": "fs_ls", "seq": 2}));
+        log.append(&Message::assistant(Some("好".into()), None, vec![]), None);
+        drop(log);
+
+        // 消息侧：只有 2 条，色块不算
+        let items = load(&path).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].msg.role, "user");
+        let s = list(d.path(), 5);
+        assert_eq!(s[0].messages, 2, "活动流记录不该被当成消息计数");
+        assert_eq!(s[0].title, "第一句");
+
+        // 活动流侧：两条，顺序与负载原样
+        let acts = load_acts(&path);
+        assert_eq!(acts.len(), 2);
+        assert_eq!(acts[0]["title"], "用户指令");
+        assert_eq!(acts[1]["end"], 2.0);
+        assert_eq!(acts[1]["kind"], "tool", "负载里的 kind 是类别（工具/模型…），不是行类型");
+        assert_eq!(acts[1]["seq"], 2);
+
+        // 回滚：消息被丢掉，活动流必须还在
+        let mut again = Log::open(&path).unwrap();
+        again.rewrite(&[Message::user("第一句")]);
+        drop(again);
+        assert_eq!(load(&path).unwrap().len(), 1, "只剩「第一句」");
+        assert_eq!(load_acts(&path).len(), 2, "活动流不受消息回滚影响");
     }
 
     /// 序号 / 文件名主干都能定位到同一个对话。
