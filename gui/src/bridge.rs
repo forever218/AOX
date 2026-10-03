@@ -18,6 +18,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use aox::agent::Agent;
+use aox::history::UsageRecord;
 use aox::llm::{LlmProvider, StreamSink};
 use aox::runtime::Runtime;
 use aox::ui::{AgentEvent, AuthDecision, Ui};
@@ -52,6 +53,13 @@ pub enum FromAgent {
     TurnStart,
     /// 一轮任务结束（正常）
     TurnEnd,
+    /// 一轮任务的 token 账 —— 就是落进对话文件的那一行（排在 `TurnEnd` 之后）
+    Usage(Box<UsageRecord>),
+    /// 整段对话的用量账本（切对话 / 新建对话后重发）。
+    ///
+    /// **必须排在 `Switched` 之后发**：主线程收到 `Switched` 会把账本清空，
+    /// 顺序反了的话，刚接回来的数据会被自己抹掉。
+    UsageLog(Vec<UsageRecord>),
     /// 一轮任务被中断
     TurnAborted,
     /// 状态栏文字（思考中 / 执行 xx）
@@ -60,6 +68,9 @@ pub enum FromAgent {
     Reasoning(String),
     /// 一次响应的思考流结束（即时消失）
     ReasoningEnd,
+    /// 流式正文增量。正文本身走 `Event(AssistantText)`，这条**只为实时 token 计数** ——
+    /// 主线程需要知道「这一瞬间又吐出来多少字」，才能让数字一直在涨。
+    Content(String),
     /// 请求授权（阻塞等待主线程回填）
     AuthRequest { tool: String, args: String, reply: oneshot::Sender<AuthDecision> },
     /// 工具 / 插件快照（周期性刷新，用于右侧面板实时展示「自我增长」）
@@ -147,6 +158,10 @@ impl StreamSink for ChanSink {
         let _ = self.tx.send(FromAgent::Reasoning(delta.to_string()));
     }
 
+    fn on_content(&self, delta: &str) {
+        let _ = self.tx.send(FromAgent::Content(delta.to_string()));
+    }
+
     fn on_finish(&self) {
         let _ = self.tx.send(FromAgent::ReasoningEnd);
     }
@@ -198,6 +213,10 @@ impl Ui for GuiUi {
 
     async fn turn_end(&mut self) {
         let _ = self.tx.send(FromAgent::TurnEnd);
+    }
+
+    async fn turn_usage(&mut self, rec: &UsageRecord) {
+        let _ = self.tx.send(FromAgent::Usage(Box::new(rec.clone())));
     }
 
     async fn set_status(&mut self, label: &str) {
@@ -336,10 +355,14 @@ async fn next_command(
                     Err(e) => FromAgent::Switched { opened: None, error: Some(format!("{e:#}")) },
                 };
                 let _ = tx.send(msg);
+                // 账本紧跟 Switched 发出：主线程收到 Switched 会先把界面上的账清空，
+                // 顺序反了的话刚接回来的数据会被自己抹掉。
+                let _ = tx.send(FromAgent::UsageLog(agent.usage_log().to_vec()));
             }
             Some(ToAgent::NewConversation) => {
                 agent.new_conversation();
                 let _ = tx.send(FromAgent::Switched { opened: None, error: None });
+                let _ = tx.send(FromAgent::UsageLog(Vec::new()));
             }
             // 活动流落盘：就地进行，不进下一轮 —— 顺序与用户的操作完全一致，
             // 所以「这一轮的时间轴」永远落在这一轮的对话文件里。

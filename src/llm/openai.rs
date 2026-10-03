@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{ChatReply, LlmProvider, StreamSink};
+use super::{ChatReply, LlmProvider, StreamSink, Usage};
 use crate::config::ProviderConfig;
 use crate::message::{FunctionCall, Message, ToolCall};
 
@@ -84,9 +84,7 @@ impl OpenAiProvider {
         Ok(ChatReply {
             message,
             finish_reason: choice.get("finish_reason").and_then(|f| f.as_str()).map(str::to_string),
-            reasoning_tokens: v
-                .pointer("/usage/completion_tokens_details/reasoning_tokens")
-                .and_then(|n| n.as_u64()),
+            usage: Usage::parse(&v),
         })
     }
 
@@ -171,7 +169,8 @@ pub struct StreamAcc {
     /// 按 index 归并：同一工具调用的 name / arguments 会被拆到多个 chunk 里
     tool_calls: BTreeMap<u64, ToolCallAcc>,
     finish_reason: Option<String>,
-    reasoning_tokens: Option<u64>,
+    /// 端点给的用量。开了 `stream_options.include_usage` 之后，最后一帧会带上来。
+    usage: Usage,
     done: bool,
 }
 
@@ -201,11 +200,11 @@ impl StreamAcc {
     }
 
     fn apply(&mut self, v: &Value, sink: Option<&(dyn StreamSink + Send + Sync)>) {
-        if let Some(n) = v
-            .pointer("/usage/completion_tokens_details/reasoning_tokens")
-            .and_then(Value::as_u64)
-        {
-            self.reasoning_tokens = Some(n);
+        // 用量：多数端点在最后一帧单独发一个只有 usage 的 chunk。
+        // 只在真的带了数字时才覆盖 —— 否则会把先前那一份清成空。
+        let u = Usage::parse(v);
+        if !u.is_empty() {
+            self.usage = u;
         }
         // 纯 usage 的收尾 chunk 没有 choices，直接返回
         let Some(choice) = v.pointer("/choices/0") else { return };
@@ -229,7 +228,13 @@ impl StreamAcc {
         }
 
         if let Some(c) = delta.get("content").and_then(Value::as_str) {
-            self.content.push_str(c);
+            if !c.is_empty() {
+                self.content.push_str(c);
+                // 正文增量也推给 UI：实时 token 滚动要把输出侧（推理 + 正文）一起数
+                if let Some(s) = sink {
+                    s.on_content(c);
+                }
+            }
         }
 
         if let Some(arr) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -275,7 +280,7 @@ impl StreamAcc {
         ChatReply {
             message: Message::assistant(content, Some(self.reasoning), tool_calls),
             finish_reason: self.finish_reason,
-            reasoning_tokens: self.reasoning_tokens,
+            usage: self.usage,
         }
     }
 }

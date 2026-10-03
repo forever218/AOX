@@ -28,6 +28,8 @@ use egui::{
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
+use aox::history::UsageRecord;
+use aox::llm::{thousands, TokenEstimate, Usage};
 use aox::ui::{AgentEvent, AuthDecision};
 
 use crate::activity::{self, ActKind};
@@ -81,6 +83,9 @@ enum Item {
     Assistant(String),
     Process(Process),
     Note(NoteKind, String),
+    /// 一轮任务的 token 明细。紧跟在那轮 AI 答复下面 —— 账要贴着它花掉的地方，
+    /// 而不是攒到顶栏让人自己去对轮次。
+    Usage(String),
     /// 错误卡片（不可恢复）
     Error(String),
 }
@@ -94,6 +99,10 @@ struct Live {
     interim: Vec<String>,
     pending_final: Option<String>,
     started: Instant,
+    /// 输出侧（思考 + 正文）收到的字符数，用于实时滚动一个在涨的 token 数。
+    ///
+    /// 流式过程中服务端还没报数，只能估；一轮结束时会用 `TurnUsage` 里的精确值顶掉。
+    out: TokenEstimate,
 }
 
 struct AuthCard {
@@ -125,6 +134,17 @@ pub struct App {
     waiting_auth: bool,
     status: String,
     spin: f32,
+    /// 当前对话**逐轮**的 token 账。
+    ///
+    /// 打开一段旧对话时从文件读回来（`FromAgent::UsageLog`），每轮结束再追加一条。
+    /// 空的或全无数字的（端点不返回 usage）就整块不显示 —— 宁可没有，
+    /// 也不要拿一串 0 假装在统计。
+    usage_log: Vec<UsageRecord>,
+    /// 顶栏那枚「Σ 总 token」的面板是否正被指针压着。
+    ///
+    /// 单靠 `resp.hovered()` 会在指针从胶囊移向面板的那一瞬断开（两者之间有缝），
+    /// 于是面板一闪就没了。记一个跨帧的状态就稳住了。
+    usage_hover: bool,
 
     model: String,
     config_path: String,
@@ -202,6 +222,8 @@ impl App {
             waiting_auth: false,
             status: "就绪".into(),
             spin: 0.0,
+            usage_log: Vec::new(),
+            usage_hover: false,
             model: String::new(),
             config_path: String::new(),
             plugins: Vec::new(),
@@ -368,6 +390,7 @@ impl App {
                         interim: Vec::new(),
                         pending_final: None,
                         started: Instant::now(),
+                        out: TokenEstimate::default(),
                     });
                     self.busy = true;
                     self.status = "思考中".into();
@@ -377,6 +400,31 @@ impl App {
                     if let Some(l) = self.live.as_mut() {
                         l.status = s;
                     }
+                }
+                FromAgent::Content(d) => {
+                    // 正文增量只为让 token 数字继续涨。正文本身走
+                    // `Event(AssistantText)` 一次性送达，活动流的模型段也由那里推进 ——
+                    // 这里再插一遍会让同一段文字在活动流里出现两次。
+                    if let Some(l) = self.live.as_mut() {
+                        l.out.add(&d);
+                    }
+                }
+                FromAgent::Usage(rec) => {
+                    // 端点没报数就整块不显示，别拿 0 糊弄
+                    if !rec.is_empty() {
+                        // 明细紧跟在这轮答复后面（此时 turn 已结束，items 末尾正是它），
+                        // 顺带把视图拽到底 —— 凭空多出来的一行没人会自己去找
+                        self.items.push(Item::Usage(usage_line(&rec)));
+                        self.usage_log.push(*rec);
+                        self.force_follow = true;
+                    }
+                }
+                FromAgent::UsageLog(log) => {
+                    // 切换对话后由 agent 从文件接回来的整段账本。
+                    // 逐轮明细要重新插回对话流 —— 打开旧对话时，每轮的账该贴回
+                    // 它原来待着的位置，而不是在顶上堆成一坨。
+                    self.usage_log = log;
+                    self.rebuild_usage_rows();
                 }
                 FromAgent::Reasoning(d) => {
                     if let Some(l) = self.live.as_mut() {
@@ -390,6 +438,9 @@ impl App {
                         if l.reasoning.len() < 120_000 {
                             l.reasoning.push_str(&d);
                         }
+                        // 推理也计入输出：服务端的 completion_tokens 本来就含它，
+                        // 只数正文会明显偏低
+                        l.out.add(&d);
                         activity::lock(&self.act).model_push(&d);
                     }
                             }
@@ -502,6 +553,9 @@ impl App {
         self.waiting_auth = false;
         self.auth = None;
         self.auth_reply = None;
+        // 用量账本跟消息、活动流一起换掉：Agent 那边也把账重新接回来了，
+        // 紧接着的 `UsageLog` 会把这一段对话的记录送过来。
+        self.usage_log.clear();
         // 活动流同样换掉。它和消息躺在**同一个文件**里，所以「打开这段对话」
         // 就该看到它当时的那条时间轴；新建对话则清空。
         //
@@ -799,6 +853,24 @@ impl App {
                             .color(P::text_faint())
                             .size(13.5),
                         );
+                        // 累计 token 实时滚动 = 已完成各轮（精确）＋ 本轮进行中的估算。
+                        // 所以整个对话的账在任务执行期间也是一路在涨的，而不是
+                        // 每轮归零。带 `~` 是因为后半截还在估，一轮结束后由顶栏
+                        // 那枚精确的总数接手。
+                        let base = self.usage_sum().total.unwrap_or(0);
+                        let est = self.live.as_ref().map_or(0, |l| l.out.tokens());
+                        let shown = base + est;
+                        if shown > 0 {
+                            ui.add_space(7.0);
+                            ui.label(
+                                RichText::new(format!("Σ ~{} tok", thousands(shown)))
+                                    .color(P::text_faint())
+                                    .size(13.5),
+                            );
+                        }
+                    } else {
+                        // 空闲时只剩一个总 token，鼠标移上去就有明细
+                        self.token_chip(ui, ctx);
                     }
 
                     // 右上角只留三个图标：活动流开关 + 明暗切换 + 关于。
@@ -821,6 +893,96 @@ impl App {
             });
         if want_toggle {
             theme::apply_mode(ctx, theme::toggle_mode());
+        }
+    }
+
+    /// 顶栏左侧那枚「总 token」胶囊：**悬停**即展开合计，不必点。
+    ///
+    /// 用悬停而不是点击，是因为这个数字本来就是「瞟一眼」的东西：想确认的人
+    /// 鼠标移过去就有了，而点击反而要求他先认出「这里可以点」。
+    fn token_chip(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let Some(total) = self.usage_sum().total else { return };
+        let resp = ui.add(
+            Label::new(
+                RichText::new(format!("Σ {} tok", thousands(total)))
+                    .color(P::text_dim())
+                    .size(13.5),
+            )
+            .sense(Sense::hover()),
+        );
+        if resp.hovered() {
+            self.usage_hover = true;
+        }
+        if !self.usage_hover {
+            return;
+        }
+        // 面板就贴在胶囊正下方 6px：指针从胶囊走到面板的路上始终压着其中之一，
+        // 中间不会有一帧落空，也就不会闪。
+        //
+        // egui 0.33 没有 `layer_to_screen`，自己换算：视口原点（屏幕坐标）
+        // 加上控件在客户区里的位置。
+        let origin = ctx
+            .input(|i| i.viewport().inner_rect)
+            .map(|r| r.left_top())
+            .unwrap_or(Pos2::ZERO);
+        let screen = origin + resp.rect.left_bottom().to_vec2();
+        // 分开借：闭包里要写 hover 状态、又要读账本
+        let log = &self.usage_log;
+        let hovering = &mut self.usage_hover;
+        egui::Area::new(egui::Id::new("aox-usage-panel"))
+            .fixed_pos(screen + egui::vec2(0.0, 6.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let frame = Frame::popup(ui.style())
+                    .fill(P::surface())
+                    .corner_radius(CornerRadius::same(10))
+                    .stroke(Stroke::new(1.0, P::border()))
+                    .inner_margin(Margin::symmetric(16, 13))
+                    .show(ui, |ui| usage_detail(ui, log));
+                *hovering = resp.hovered() || ui.rect_contains_pointer(frame.response.rect);
+            });
+    }
+
+    /// 整段对话的累计 token（顶栏那枚 Σ 显示的数）。
+    ///
+    /// 直接取最后一条记录里的 `session_total` —— 那是落盘时就写好的累计值，
+    /// 不用每次把整本账重算一遍。
+    /// 当前对话各轮的**合计**（逐项累加）。
+    ///
+    /// 顶栏与展开面板都用它 —— 一个数说「花了多少」，一整套说「花在哪」。
+    fn usage_sum(&self) -> Usage {
+        sum_usage(&self.usage_log)
+    }
+
+    /// 把账本里的每一轮明细插回对话流，插在那一轮 AI 答复之后。
+    ///
+    /// 定位靠「每条用户消息开启一轮」这个天然分界：第 N 轮的明细落在第 N 条用户
+    /// 消息与下一条之间（没有下一条就落末尾）。这样打开一段旧对话时，每一轮的账
+    /// 都贴回它原来待着的位置，而不是在顶上堆成一坨。
+    fn rebuild_usage_rows(&mut self) {
+        self.items.retain(|it| !matches!(it, Item::Usage(_)));
+        if self.usage_log.is_empty() {
+            return;
+        }
+        // 先算出每一轮内容的结束下标
+        let mut ends: Vec<usize> = Vec::new();
+        for (i, it) in self.items.iter().enumerate() {
+            if matches!(it, Item::User(_)) {
+                if let Some(prev) = ends.len().checked_sub(1) {
+                    ends[prev] = i.saturating_sub(1);
+                }
+                ends.push(i);
+            }
+        }
+        if let Some(last) = ends.last_mut() {
+            *last = self.items.len().saturating_sub(1);
+        }
+        // 倒序插入：后面的轮次先插，前面轮次的下标才不会被带偏
+        for rec in self.usage_log.iter().rev() {
+            let Some(&end) = ends.get(rec.round.saturating_sub(1) as usize) else {
+                continue;
+            };
+            self.items.insert(end + 1, Item::Usage(usage_line(rec)));
         }
     }
 
@@ -859,6 +1021,7 @@ impl App {
                                 Item::Assistant(t) => assistant_block(ui, t, inner),
                                 Item::Process(p) => process_block(ui, p, inner),
                                 Item::Note(k, t) => note_row(ui, *k, t),
+                                Item::Usage(t) => usage_row(ui, t),
                                 Item::Error(t) => error_card(ui, t, inner),
                             }
                         }
@@ -983,6 +1146,17 @@ impl App {
                     .color(P::text_faint())
                     .size(13.0),
             );
+            // 输出 token 实时滚动。带 `~` 是因为流式过程中服务端还没报数，
+            // 这个值按字符估；任务结束后顶栏会换成精确的总数。
+            let est = l.out.tokens();
+            if est > 0 {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("~{} tok", thousands(est)))
+                        .color(P::text_faint())
+                        .size(13.0),
+                );
+            }
         });
 
         // 实时思考过程（尾部几行，响应结束即消失）
@@ -2128,6 +2302,117 @@ fn spinner_dot(ui: &mut Ui, spin: f32, color: Color32) {
         let ang = std::f32::consts::TAU * (i as f32) / 8.0;
         let p = Pos2::new(c.x + ang.cos() * 5.4, c.y + ang.sin() * 5.4);
         painter.circle_filled(p, 1.7, color.gamma_multiply(alpha));
+    }
+}
+
+/// 逐轮累加出一段对话的合计。
+fn sum_usage(log: &[UsageRecord]) -> Usage {
+    let mut u = Usage::default();
+    for r in log {
+        u.accrue(&r.usage);
+    }
+    u
+}
+
+/// 一轮明细在对话流里那一行的文字。
+///
+/// 「直接摊开所有项」是刻意的：这一行就埋在正文旁边，看它的人多半是为了查账，
+/// 让他再点开二级面板反而是折磨。缺的那几项不出现 —— 不拿 0 充数。
+fn usage_line(r: &UsageRecord) -> String {
+    let mut parts = vec![format!("#{} · {} 次调用", r.round, r.calls)];
+    let mut put = |k: &str, v: Option<u64>| {
+        if let Some(v) = v {
+            parts.push(format!("{k} {}", thousands(v)));
+        }
+    };
+    put("输入", r.usage.prompt);
+    put("输出", r.usage.completion);
+    put("合计", r.usage.total);
+    put("推理", r.usage.reasoning);
+    put("缓存命中", r.usage.cached);
+    put("缓存未命中", r.usage.cache_miss);
+    parts.join(" · ")
+}
+
+/// 对话流里那行 token 明细。刻意做得比正文更轻：它是附注，不是内容，
+/// 所以连标记点都不给 —— 一行数字自己就说明它是什么了。
+fn usage_row(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).color(P::text_faint()).size(12.5));
+    ui.add_space(10.0);
+}
+
+/// 顶栏那枚「Σ 总 token」点开后的明细：**这段对话的合计**。
+///
+/// 逐轮的账不放在这儿 —— 那一行行各自贴着它的 AI 答复写在对话流里（见 `usage_line`）。
+/// 这里回答的是另一个问题：「这一整段对话一共花了多少、花在哪」。
+fn usage_detail(ui: &mut Ui, log: &[UsageRecord]) {
+    // 行距压紧。这里是「一列数字」，默认的组块间距会把它撑得像一张松垮的卡片，
+    // 反而更难一眼对出哪几行属于同一项。
+    ui.spacing_mut().item_spacing.y = 1.0;
+    let rows: Vec<&UsageRecord> = log.iter().filter(|r| !r.is_empty()).collect();
+    if rows.is_empty() {
+        ui.label(
+            RichText::new("这段对话还没有用量记录")
+                .color(P::text_faint())
+                .size(13.0),
+        );
+        return;
+    }
+    let mut sum = Usage::default();
+    for r in &rows {
+        sum.accrue(&r.usage);
+    }
+    let calls: u32 = rows.iter().map(|r| r.calls).sum();
+
+    /// 一行「标签 …… 数字」。`v` 为 None 时整行跳过。
+    ///
+    /// 自己分配这一行的矩形，而不是 `horizontal` + `with_layout` —— 后者在
+    /// 竖向容器里会把行高撑到内容区的富余高度，一列数字 于是松得像张空卡片。
+    /// 数字用等宽字体，右对齐后能上下对齐，看数字比看标签重要。
+    fn row(ui: &mut Ui, k: &str, v: Option<u64>) {
+        let Some(v) = v else { return };
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 21.0), Sense::hover());
+        let p = ui.painter();
+        p.text(
+            Pos2::new(rect.left(), rect.center().y),
+            Align2::LEFT_CENTER,
+            k,
+            FontId::proportional(13.0),
+            P::text_faint(),
+        );
+        p.text(
+            Pos2::new(rect.right(), rect.center().y),
+            Align2::RIGHT_CENTER,
+            thousands(v),
+            theme::mono_font(13.5),
+            P::text(),
+        );
+    }
+
+    ui.label(
+        RichText::new(format!("本次对话 · {} 轮 · {} 次调用", rows.len(), calls))
+            .color(P::text())
+            .size(13.5),
+    );
+    ui.add_space(6.0);
+
+    row(ui, "输入", sum.prompt);
+    row(ui, "输出", sum.completion);
+    row(ui, "合计", sum.total);
+    // 细项缩进一格挂在「合计」下面：推理是输出的一部分，缓存是输入的一部分
+    row(ui, "　其中推理", sum.reasoning);
+    row(ui, "　缓存命中", sum.cached);
+    row(ui, "　缓存未命中", sum.cache_miss);
+
+    // 末次输入 ≠ 输入合计：前者是「当前上下文多大」，后者是「这些轮一共读进去多少」。
+    // 两个数都摆出来，才不至于把「上下文快满了」误判成「某一轮太贵」。
+    if let Some(v) = rows.last().and_then(|r| r.last_prompt) {
+        let (rule, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+        ui.painter()
+            .hline(rule.x_range(), rule.center().y, Stroke::new(1.0, P::border()));
+        ui.add_space(9.0);
+        row(ui, "当前上下文", Some(v));
     }
 }
 

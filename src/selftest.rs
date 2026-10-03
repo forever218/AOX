@@ -131,10 +131,14 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
         #[derive(Default)]
         struct Capture {
             reasoning: Mutex<String>,
+            content: Mutex<String>,
         }
         impl StreamSink for Capture {
             fn on_reasoning(&self, delta: &str) {
                 self.reasoning.lock().unwrap().push_str(delta);
+            }
+            fn on_content(&self, delta: &str) {
+                self.content.lock().unwrap().push_str(delta);
             }
         }
 
@@ -157,7 +161,14 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
             ]}}]}),
             json!({"choices": [{"delta": {"content": "好的"}, "finish_reason": null}]}),
             json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
-            json!({"choices": [], "usage": {"completion_tokens_details": {"reasoning_tokens": 42}}}),
+            json!({"choices": [], "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 300,
+                "total_tokens": 1500,
+                "prompt_tokens_details": {"cached_tokens": 1024},
+                "prompt_cache_miss_tokens": 176,
+                "completion_tokens_details": {"reasoning_tokens": 42}
+            }}),
         ];
         for c in &chunks {
             acc.feed(&format!("data: {c}"), Some(&cap));
@@ -168,6 +179,11 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
         let streamed = cap.reasoning.lock().unwrap().clone();
         if streamed != "先看有哪些插件" {
             bail!("思考过程未实时推送给 sink: {streamed:?}");
+        }
+        // 正文增量也得推给 sink —— 实时 token 滚动要靠它数输出侧
+        let streamed_text = cap.content.lock().unwrap().clone();
+        if streamed_text != "好的" {
+            bail!("正文增量未实时推送给 sink: {streamed_text:?}");
         }
         if !acc.is_done() {
             bail!("未识别 data: [DONE]");
@@ -195,8 +211,16 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
         if reply.finish_reason.as_deref() != Some("tool_calls") {
             bail!("finish_reason 未捕获: {:?}", reply.finish_reason);
         }
-        if reply.reasoning_tokens != Some(42) {
-            bail!("usage 中的推理 token 未捕获: {:?}", reply.reasoning_tokens);
+        // usage 要逐项解析到位：这些数字直接决定界面上给用户看什么
+        let u = &reply.usage;
+        if u.prompt != Some(1200)
+            || u.completion != Some(300)
+            || u.total != Some(1500)
+            || u.reasoning != Some(42)
+            || u.cached != Some(1024)
+            || u.cache_miss != Some(176)
+        {
+            bail!("usage 未完整捕获: {u:?}");
         }
     }
 

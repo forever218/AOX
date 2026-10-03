@@ -14,12 +14,16 @@
 //! {"content":null,"kind":"message","role":"assistant","tool_calls":[...]}
 //! {"content":"...","is_error":false,"kind":"message","name":"fs_ls","role":"tool"}
 //! {"act":{"at":1.7,"end":2.0,"kind":"tool","title":"fs_ls"},"kind":"act"}
+//! {"kind":"usage","round":1,"at":1759390999,"calls":3,"prompt":384,"total":1152}
 //! ```
 //!
-//! 除了消息，同一个文件里还会追加**活动流**记录（`kind:"act"`，见 [`load_acts`]）：
-//! 界面上那条横向时间轴上的每一枚色块就是一行。两者共用一个文件是**刻意**的 ——
-//! 它们本来描述同一件事（这一轮任务是怎么跑的），而且「删掉一段对话」必须连它的
-//! 时间轴一起删掉：共用一个文件，这件事是自动的，不需要任何额外的清理代码。
+//! 除了消息，同一个文件里还会追加**活动流**记录（`kind:"act"`，见 [`load_acts`]）与
+//! **token 用量**记录（`kind:"usage"`，见 [`UsageRecord`]）：时间轴上的每一枚色块
+//! 是一行，一轮任务的 token 账也是一行。
+//!
+//! 三者共用一个文件是**刻意**的：它们本来描述同一件事（这一轮对话是怎么跑的、
+//! 花了多少），而且「删掉一段对话」必须连它的时间轴和账本一起删掉 —— 共用一个文件，
+//! 这件事是自动的，不需要任何额外的清理代码。
 //!
 //! 活动流的负载嵌在 `act` 键下，而不是平铺：`Act` 自己也有一个 `kind` 字段
 //! （输入 / 模型 / 工具 …），和行类型同名同层会互相覆盖，读回来就分不清是哪种行。
@@ -41,6 +45,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::llm::Usage;
 use crate::message::Message;
 
 /// 历史目录名（相对应用根）。
@@ -279,9 +284,94 @@ fn act_line(act: &Value) -> Value {
     json!({ "kind": "act", "act": act })
 }
 
-/// 我们写出去的三种行。别的行（误放进 `history/` 的其它文件、被手改坏的行）
+/// 往一个对象里塞「有值才写」的字段。
+fn put_opt(v: &mut Value, key: &str, x: Option<u64>) {
+    if let Some(n) = x {
+        v[key] = json!(n);
+    }
+}
+
+/// 一轮任务的 token 账（对应 jsonl 里的一行 `kind:"usage"`）。
+///
+/// **逐轮各存一条**，而不是在文件末尾只留一个总数：那样只能回答「这段对话花了多少」，
+/// 回答不了「哪一轮最贵」。而最贵的那一轮往往正是出问题的那一轮 —— 定位要靠它。
+///
+/// 各项都是「有值才写」：端点少报一项，文件里就少一个键，读回来自然是 `None`，
+/// 不用拿 0 去冒充「没有消耗」。
+#[derive(Debug, Clone, Default)]
+pub struct UsageRecord {
+    /// 第几轮（从 1 起）
+    pub round: u32,
+    /// 写入时刻（unix 秒）
+    pub at: u64,
+    /// 本轮模型被调用了几次
+    pub calls: u32,
+    /// 本轮各项用量
+    pub usage: Usage,
+    /// 最后一次请求的输入规模 = 当前上下文占用
+    pub last_prompt: Option<u64>,
+    /// 截至本轮的**对话累计** token。冗余存一份，省得读出来还要自己累加，
+    /// 也让「这段对话一共花了多少」在文件里一眼可见。
+    pub session_total: Option<u64>,
+    /// 截至本轮的对话累计调用次数
+    pub session_calls: u32,
+}
+
+impl UsageRecord {
+    pub fn to_value(&self) -> Value {
+        let mut v = json!({
+            "round": self.round,
+            "at": self.at,
+            "calls": self.calls,
+            "session_calls": self.session_calls,
+        });
+        put_opt(&mut v, "prompt", self.usage.prompt);
+        put_opt(&mut v, "completion", self.usage.completion);
+        put_opt(&mut v, "total", self.usage.total);
+        put_opt(&mut v, "reasoning", self.usage.reasoning);
+        put_opt(&mut v, "cached", self.usage.cached);
+        put_opt(&mut v, "cache_miss", self.usage.cache_miss);
+        put_opt(&mut v, "last_prompt", self.last_prompt);
+        put_opt(&mut v, "session_total", self.session_total);
+        v
+    }
+
+    pub fn from_value(v: &Value) -> Self {
+        let num = |k: &str| v.get(k).and_then(Value::as_u64);
+        let n32 = |k: &str| num(k).unwrap_or(0) as u32;
+        Self {
+            round: n32("round"),
+            at: num("at").unwrap_or(0),
+            calls: n32("calls"),
+            usage: Usage {
+                prompt: num("prompt"),
+                completion: num("completion"),
+                total: num("total"),
+                reasoning: num("reasoning"),
+                cached: num("cached"),
+                cache_miss: num("cache_miss"),
+            },
+            last_prompt: num("last_prompt"),
+            session_total: num("session_total"),
+            session_calls: n32("session_calls"),
+        }
+    }
+
+    /// 这一行是否一个数字都没带（端点压根不返回 usage 时就是空的）
+    pub fn is_empty(&self) -> bool {
+        self.usage.is_empty()
+    }
+}
+
+fn usage_line(rec: &UsageRecord) -> Value {
+    let mut v = rec.to_value();
+    v["kind"] = json!("usage");
+    v
+}
+
+/// 我们写出去的行类型。别的行（误放进 `history/` 的其它文件、被手改坏的行）
 /// 一律不认 —— 这也是「这个文件是我们的」最便宜的判据。
-const ROW_KINDS: [&str; 3] = ["meta", "message", "act"];
+const ROW_KINDS: [&str; 4] = ["meta", "message", "act", "usage"];
 
 /// 解析一行，认得出来就返回它的对象。
 fn parse_row(line: &str) -> Option<Value> {
@@ -374,14 +464,22 @@ impl Log {
         let _ = write_line_to(&mut self.file, &act_line(act));
     }
 
+    /// 追加一轮的 token 账。
+    ///
+    /// 与消息、活动流一样，写失败不返回错误：一行统计丢了不该让正在跑的对话出问题。
+    pub fn append_usage(&mut self, rec: &UsageRecord) {
+        let _ = write_line_to(&mut self.file, &usage_line(rec));
+    }
+
     /// 用给定的消息列表重写整个文件。
     ///
     /// 用于「中断回滚」：内存里的消息被丢弃了，文件必须跟着回到同一状态，
     /// 否则会留下一段「有 tool_calls 但没有结果」的半截记录
     /// （将来要恢复这段对话时，那种记录会直接让请求被拒）。
     ///
-    /// 活动流（`kind:"act"`）不属于消息流，所以**要先捞出来再原样补回**：
-    /// 回滚丢的是消息，没道理顺手把时间轴上「已经发生过的过程」也一起抹掉。
+    /// 活动流（`kind:"act"`）与 token 用量（`kind:"usage"`）不属于消息流，
+    /// 所以**要先捞出来再原样补回**：回滚丢的是消息，没道理顺手把时间轴上
+    /// 「已经发生过的过程」和已经记下的账一起抹掉。
     ///
     /// 实现上**不能**对 append 句柄直接 `set_len`：Windows 上 append 打开的句柄
     /// 没有截断权限，会返回 `os error 5（拒绝访问）`；而且 `O_APPEND` 会让 `seek`
@@ -389,6 +487,7 @@ impl Log {
     /// 所以另开一个截断句柄重写全文，再把 append 句柄换回来。
     pub fn rewrite(&mut self, msgs: &[Message]) {
         let acts = load_acts(&self.path);
+        let usages = load_usage(&self.path);
         let Ok(mut f) =
             OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)
         else {
@@ -405,6 +504,11 @@ impl Log {
         }
         for a in &acts {
             if write_line_to(&mut f, &act_line(a)).is_err() {
+                return;
+            }
+        }
+        for u in &usages {
+            if write_line_to(&mut f, &usage_line(u)).is_err() {
                 return;
             }
         }
@@ -535,9 +639,9 @@ fn read_summary(e: Entry, this_year: u16) -> Option<Summary> {
             continue;
         }
         let Some(v) = parse_row(t) else { continue };
-        // 活动流记录（`kind:"act"`）既不进「几条消息」，也不当标题 ——
-        // 否则侧边栏的条数会虚高，而且第一轮的一堆色块会把 `TITLE_SCAN_LINES`
-        // 的名额吃光，标题就取不到了。
+        // 活动流（`kind:"act"`）与用量（`kind:"usage"`）既不进「几条消息」，
+        // 也不当标题 —— 否则侧边栏的条数会虚高，而且第一轮的一堆色块会把
+        // `TITLE_SCAN_LINES` 的名额吃光，标题就取不到了。
         if !is_kind(&v, "message") {
             continue;
         }
@@ -615,6 +719,28 @@ pub fn load_acts(path: &Path) -> Vec<Value> {
         if let Some(payload) = v.get("act") {
             out.push(payload.clone());
         }
+    }
+    out
+}
+
+/// 读出一个文件里所有的 **token 用量**记录（按写入顺序，即轮次顺序）。
+///
+/// 打开一段旧对话时靠它把账本接回来 —— 否则重启一次，之前那几轮的用量就凭空消失了。
+/// 坏行跳过，`kind:"usage"` 之外的行一概不认。
+pub fn load_usage(path: &Path) -> Vec<UsageRecord> {
+    let Ok(file) = File::open(path) else { return Vec::new() };
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Some(v) = parse_row(t) else { continue };
+        if !is_kind(&v, "usage") {
+            continue;
+        }
+        out.push(UsageRecord::from_value(&v));
     }
     out
 }
@@ -1111,6 +1237,131 @@ mod tests {
         assert_eq!(items[0].id, "20260102-100000-bbbb", "刚聊过的那段排最前");
         assert_eq!(items[0].messages, 2);
         assert!(items[0].time.contains(':'), "显示时间取自 mtime，不该为空: {}", items[0].time);
+    }
+
+    /// token 用量必须能跟着对话文件活过重启 —— 这条钉住「落盘 → 读回」整条链路。
+    #[test]
+    fn usage_round_trip() {
+        let d = Tmp::new("usage");
+        let mut log = Log::create(d.path(), Some("mock-model"), Path::new("C:/root"), 0).unwrap();
+        let id = id_of(&log);
+        let rec = UsageRecord {
+            round: 1,
+            at: 1_700_000_000,
+            calls: 3,
+            usage: Usage {
+                prompt: Some(384),
+                completion: Some(768),
+                total: Some(1152),
+                reasoning: Some(288),
+                cached: Some(192),
+                cache_miss: Some(192),
+            },
+            last_prompt: Some(128),
+            session_total: Some(1152),
+            session_calls: 3,
+        };
+        log.append_usage(&rec);
+        drop(log);
+
+        let back = load_usage(&file_of(d.path(), &id));
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].round, 1);
+        assert_eq!(back[0].at, 1_700_000_000);
+        assert_eq!(back[0].calls, 3);
+        assert_eq!(back[0].usage, rec.usage, "各项 token 必须逐项往返");
+        assert_eq!(back[0].last_prompt, Some(128));
+        assert_eq!(back[0].session_total, Some(1152));
+        assert_eq!(back[0].session_calls, 3);
+    }
+
+    /// 端点少报一项，读回来就该是 `None` —— 不能变成 0。
+    /// 「没有消耗」和「对方没报」是两件事，混起来就成了假账。
+    #[test]
+    fn usage_keeps_missing_fields_absent() {
+        let d = Tmp::new("usage-sparse");
+        let mut log = Log::create(d.path(), None, Path::new("C:/root"), 0).unwrap();
+        let id = id_of(&log);
+        log.append_usage(&UsageRecord {
+            round: 1,
+            at: 1,
+            calls: 1,
+            usage: Usage { total: Some(384), ..Default::default() },
+            last_prompt: None,
+            session_total: Some(384),
+            session_calls: 1,
+        });
+        drop(log);
+
+        let back = load_usage(&file_of(d.path(), &id));
+        assert_eq!(back[0].usage.total, Some(384));
+        assert_eq!(back[0].usage.reasoning, None, "没报就是没有，不许变成 0");
+        assert_eq!(back[0].last_prompt, None);
+        assert!(!back[0].is_empty());
+    }
+
+    /// 中断回滚丢的是消息，不该顺手把「已经记下的账」与「已经发生过的时间轴」抹掉
+    #[test]
+    fn rewrite_keeps_usage_and_acts() {
+        let d = Tmp::new("usage-rollback");
+        let path;
+        {
+            let mut log =
+                Log::create(d.path(), None, Path::new("C:/root"), 0).unwrap();
+            let id = id_of(&log);
+            log.append(&Message::user("第一句"), None);
+            log.append(&Message::assistant(Some("半截".into()), None, vec![]), None);
+            log.append_usage(&UsageRecord {
+                round: 1,
+                at: 1,
+                calls: 1,
+                usage: Usage { total: Some(10), ..Default::default() },
+                last_prompt: Some(4),
+                session_total: Some(10),
+                session_calls: 1,
+            });
+            log.append_act(&json!({ "kind": "tool", "title": "fs_ls", "at": 0.5 }));
+            path = file_of(d.path(), &id);
+        }
+
+        // 回滚到只剩第一条消息
+        let mut log = Log::open(&path).unwrap();
+        let mut msgs: Vec<Message> =
+            load(&path).unwrap().into_iter().map(|l| l.msg).collect();
+        msgs.truncate(1);
+        log.rewrite(&msgs);
+        drop(log);
+
+        assert_eq!(load(&path).unwrap().len(), 1, "回滚后只剩一条消息");
+        assert_eq!(load_usage(&path).len(), 1, "用量记录必须原样保留");
+        assert_eq!(load_acts(&path).len(), 1, "活动流也必须原样保留");
+    }
+
+    /// 侧边栏的「几条消息」不能把 usage 行算进去，否则条数会虚高
+    #[test]
+    fn summary_counts_messages_only() {
+        let d = Tmp::new("usage-count");
+        {
+            let mut log =
+                Log::create(d.path(), Some("mock-model"), Path::new("C:/root"), 0).unwrap();
+            let id = id_of(&log);
+            log.append(&Message::user("看看现在有什么能力"), None);
+            log.append_usage(&UsageRecord {
+                round: 1,
+                at: 1,
+                calls: 1,
+                usage: Usage { total: Some(384), ..Default::default() },
+                last_prompt: None,
+                session_total: Some(384),
+                session_calls: 1,
+            });
+            let _ = id;
+        }
+
+        let items = list(d.path(), 10);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].messages, 1, "usage 行不算消息");
+        assert_eq!(items[0].title, "看看现在有什么能力");
     }
 }
 

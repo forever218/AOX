@@ -352,6 +352,7 @@ async fn main() -> Result<()> {
                 ui.turn_end().await;
             }
             "/expand" => ui.expand_last_turn(),
+            "/usage" => ui.show_usage(agent.usage_log()),
             "/new" => {
                 // 与 GUI 顶栏那枚「+」同一条路径。旧对话不需要保存动作 ——
                 // 它一直是边聊边追加的，此刻已经在 history/ 里躺好了。
@@ -386,6 +387,7 @@ async fn main() -> Result<()> {
                     ("/new", "开一段新对话（当前这段已自动保存进历史）"),
                     ("/demo", "预览终端排版与过程折叠效果"),
                     ("/expand", "展开上一次被折叠的工具调用过程"),
+                    ("/usage", "回看上一次任务的 token 用量明细"),
                     ("/quit", "退出程序（/exit 等价）"),
                 ] {
                     println!(

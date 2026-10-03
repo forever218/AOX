@@ -10,9 +10,10 @@ use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use super::spinner::{self, Spinner, Status};
 use super::style as s;
 use super::{AgentEvent, AuthDecision, Ui};
-use crate::llm::StreamSink;
+use crate::history::UsageRecord;
+use crate::llm::{thousands, StreamSink};
 
-/// 把模型的思考过程实时喂给共享状态，由等待动画在屏幕上滚动回显。
+/// 把模型的思考过程与正文增量实时喂给共享状态，由等待动画在屏幕上滚动回显。
 ///
 /// 它不直接画屏：渲染由 spinner 后台任务负责（80ms 一帧），
 /// 因此即便 Provider 高频回调也只是往缓冲区追加字符串，不会拖慢流式读取。
@@ -25,8 +26,13 @@ impl StreamSink for ReasoningSink {
         self.status.push_reasoning(delta);
     }
 
+    /// 正文也喂进去，只为数 token —— 正文本身由 `TurnLog` 留存并渲染。
+    fn on_content(&self, delta: &str) {
+        self.status.push_content(delta);
+    }
+
     fn on_finish(&self) {
-        // 一次响应结束 → 思考过程立刻消失
+        // 一次响应结束 → 思考过程立刻消失（token 计数继续留着，一轮里会多次请求）
         self.status.clear_reasoning();
     }
 }
@@ -156,6 +162,112 @@ impl CliUi {
             println!("{}", s::render_markdown(f));
         }
         println!("{}", s::dim("────────────────────────────────────────────────────────────"));
+    }
+
+    /// 回看**当前对话逐轮**的 token 账（`/usage`）。
+    ///
+    /// 数据来自 agent 手里的账本 —— 也就是从对话文件读回来的那一份，所以切过对话、
+    /// 重启过程序都还在。逐轮列出来是有必要的：只给一个总数，就答不出「哪一轮最贵」，
+    /// 而最贵的那一轮往往正是出问题的那一轮。
+    pub fn show_usage(&self, log: &[UsageRecord]) {
+        let rows: Vec<&UsageRecord> = log.iter().filter(|r| !r.is_empty()).collect();
+        if rows.is_empty() {
+            println!(
+                "{} {}",
+                s::yellow("!"),
+                s::dim("当前对话还没有用量记录（尚未完成过任务，或端点不返回 usage）")
+            );
+            return;
+        }
+        let calls: u32 = rows.iter().map(|r| r.calls).sum();
+        println!();
+        println!(
+            "{}",
+            s::bold(&format!("token 用量 · 本次对话 {} 轮 · {} 次模型调用", rows.len(), calls))
+        );
+        if let Some(v) = rows.last().and_then(|r| r.session_total) {
+            println!("  {}  {}", s::dim("合计"), s::bold_cyan(&thousands(v)));
+        }
+        println!();
+        for r in &rows {
+            let mut line = vec![
+                s::dim(&format!("#{:<3}", r.round)),
+                // 先把数字补齐再上色：ANSI 转义符也算字符，对上色后的串做宽度填充会错位
+                s::bold_white(&format!("{:>9}", thousands(r.usage.total.unwrap_or(0)))),
+                s::dim(&format!("{} 次调用", r.calls)),
+            ];
+            if let Some(v) = r.usage.prompt {
+                line.push(s::dim(&format!("输入 {}", thousands(v))));
+            }
+            if let Some(v) = r.usage.completion {
+                line.push(s::dim(&format!("输出 {}", thousands(v))));
+            }
+            if let Some(v) = r.usage.reasoning {
+                line.push(s::dim(&format!("推理 {}", thousands(v))));
+            }
+            if let Some(v) = r.usage.cached {
+                line.push(s::green(&format!("缓存命中 {}", thousands(v))));
+            }
+            println!("  {}", line.join(&s::dim("  ·  ")));
+        }
+        if let Some(v) = rows.last().and_then(|r| r.last_prompt) {
+            println!();
+            println!("  {} {}", s::dim("当前上下文"), s::bold_white(&thousands(v)));
+        }
+        println!();
+    }
+
+    /// 打印一轮结束的 token 明细。
+    ///
+    /// 分三行是有取舍的：第一行放所有人都要看的输入 / 输出 / 合计，
+    /// 第二行是细项（推理、缓存命中），第三行才是调用次数与上下文规模。
+    /// 端点没给的项直接不出现 —— 宁可少一行，也不要拿 0 去冒充「没有消耗」。
+    fn print_usage(r: &UsageRecord) {
+        println!();
+        println!("{}", s::dim(&format!("  token 用量 · 第 {} 轮", r.round)));
+
+        let mut row1: Vec<String> = Vec::new();
+        if let Some(v) = r.usage.prompt {
+            row1.push(format!("{} {}", s::dim("输入"), s::bold_white(&thousands(v))));
+        }
+        if let Some(v) = r.usage.completion {
+            row1.push(format!("{} {}", s::dim("输出"), s::bold_white(&thousands(v))));
+        }
+        if let Some(v) = r.usage.total {
+            row1.push(format!("{} {}", s::dim("合计"), s::bold_cyan(&thousands(v))));
+        }
+        if !row1.is_empty() {
+            println!("    {}", row1.join(&s::dim("  ·  ")));
+        }
+
+        let mut row2: Vec<String> = Vec::new();
+        if let Some(v) = r.usage.reasoning {
+            row2.push(format!("{} {}", s::dim("其中推理"), s::bold_white(&thousands(v))));
+        }
+        if let Some(v) = r.usage.cached {
+            row2.push(format!("{} {}", s::dim("缓存命中"), s::green(&thousands(v))));
+        }
+        if let Some(v) = r.usage.cache_miss {
+            row2.push(format!("{} {}", s::dim("缓存未命中"), s::dim(&thousands(v))));
+        }
+        if !row2.is_empty() {
+            println!("    {}", row2.join(&s::dim("  ·  ")));
+        }
+
+        let mut row3: Vec<String> =
+            vec![format!("{} {}", s::dim("模型调用"), s::bold_white(&format!("{} 次", r.calls)))];
+        if let Some(v) = r.last_prompt {
+            row3.push(format!("{} {}", s::dim("末次输入"), s::dim(&thousands(v))));
+        }
+        if let Some(v) = r.session_total {
+            row3.push(format!(
+                "{} {}",
+                s::dim("本次对话累计"),
+                s::dim(&format!("{}（{} 次调用）", thousands(v), r.session_calls))
+            ));
+        }
+        println!("    {}", row3.join(&s::dim("  ·  ")));
+        println!();
     }
 
     /// 任务进行中的事件：折叠进缓冲，不在终端逐条刷屏。
@@ -346,6 +458,14 @@ impl Ui for CliUi {
             None => {}
         }
         self.last = Some(t);
+    }
+
+    async fn turn_usage(&mut self, rec: &UsageRecord) {
+        // 端点不报 usage 就整块不显示 —— 拿一串 0 去糊弄用户比什么都不说更糟
+        if rec.is_empty() {
+            return;
+        }
+        Self::print_usage(rec);
     }
 
     async fn set_status(&mut self, label: &str) {

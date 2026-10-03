@@ -6,6 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::history::UsageRecord;
 use crate::llm::StreamSink;
 
 /// Agent 流向 UI 的事件。GUI 实现可以直接订阅这个事件流做渲染。
@@ -52,6 +53,16 @@ pub trait Ui: Send {
     /// 一轮任务结束（模型不再调用工具）。
     /// UI 可在此停止动画，并把中间过程折叠成一行摘要。
     async fn turn_end(&mut self) {}
+    /// 一轮任务的 token 账。
+    ///
+    /// 参数就是**落进对话文件的那一行**（`kind:"usage"`），所以界面显示的账与
+    /// 存档里的账不可能对不上。里面有轮次、时刻、本轮各项、以及截至本轮的对话累计。
+    ///
+    /// 特意排在 `turn_end` **之后**调用：那时等待动画已经撤掉，
+    /// CLI 才能干干净净地把明细打在光标当前行，而不是被 spinner 的重绘盖过去。
+    ///
+    /// 端点不支持 usage 时 `rec.is_empty()` 为真，UI 直接跳过这段展示即可。
+    async fn turn_usage(&mut self, _rec: &UsageRecord) {}
     /// 更新进行中的状态提示（如「思考中」「执行 fs_read」）。
     /// 默认空实现；GUI 可映射为状态栏文字。
     async fn set_status(&mut self, _label: &str) {}

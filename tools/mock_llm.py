@@ -80,10 +80,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _end(self, finish):
         self._delta({}, finish=finish)
+        # usage 要给全：界面上的 token 明细（输入/输出/合计/推理/缓存）全靠它。
+        # cached + cache_miss = prompt，别写成对不上账的数。
         self._chunk({
             "choices": [],
             "usage": {"prompt_tokens": 128, "completion_tokens": 256,
-                      "total_tokens": 384, "completion_tokens_details": {"reasoning_tokens": 96}},
+                      "total_tokens": 384,
+                      "prompt_tokens_details": {"cached_tokens": 64},
+                      "prompt_cache_miss_tokens": 64,
+                      "completion_tokens_details": {"reasoning_tokens": 96}},
         })
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()

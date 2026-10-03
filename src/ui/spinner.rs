@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::style as s;
+use crate::llm::{thousands, TokenEstimate};
 
 /// 简洁的 braille 旋转帧
 const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -36,12 +37,17 @@ pub fn supported() -> bool {
     }
 }
 
-/// UI 与动画任务共享的状态：当前提示文字 + 本轮开始时间 + 思考过程缓冲。
+/// UI 与动画任务共享的状态：当前提示文字 + 本轮开始时间 + 思考过程缓冲 + 输出估算。
 pub struct Status {
     label: Mutex<String>,
     started: Instant,
     /// 模型思考过程的实时增量（仅流式思考模型非空）
     reasoning: Mutex<String>,
+    /// 输出侧（思考 + 正文）收到的字符数，用来实时估一个在涨的 token 数。
+    ///
+    /// 只估算 —— 流式响应里服务端直到最后一帧才给 usage，中途没有别的来源。
+    /// 一轮结束后由 `turn_usage` 给出精确值，两者不会同时出现在屏幕上。
+    out: Mutex<TokenEstimate>,
 }
 
 impl Status {
@@ -50,6 +56,7 @@ impl Status {
             label: Mutex::new(label.into()),
             started: Instant::now(),
             reasoning: Mutex::new(String::new()),
+            out: Mutex::new(TokenEstimate::default()),
         })
     }
 
@@ -62,6 +69,7 @@ impl Status {
 
     /// 追加一段思考过程增量。由 Provider 的流式回调直接驱动，会被高频调用。
     pub fn push_reasoning(&self, delta: &str) {
+        self.count(delta);
         let Ok(mut r) = self.reasoning.lock() else { return };
         r.push_str(delta);
         if r.len() > REASONING_KEEP {
@@ -73,14 +81,29 @@ impl Status {
         }
     }
 
+    /// 追加一段正文增量：正文本身由别处留存，这里只要拿来数 token。
+    pub fn push_content(&self, delta: &str) {
+        self.count(delta);
+    }
+
+    /// 输出侧的字符计数。推理与正文都要数 —— 服务端的 completion_tokens
+    /// 本来就把推理算在里面，只数正文会明显偏低。
+    fn count(&self, delta: &str) {
+        if let Ok(mut o) = self.out.lock() {
+            o.add(delta);
+        }
+    }
+
     /// 清空思考过程：一次响应结束后调用，实现「即时消失」。
+    /// 注意**不清** token 估算：一轮里模型可能被调用很多次，
+    /// 计数要跨响应累加，清了就等于只报最后一次。
     pub fn clear_reasoning(&self) {
         if let Ok(mut r) = self.reasoning.lock() {
             r.clear();
         }
     }
 
-    fn snapshot(&self) -> (String, f64, Option<String>) {
+    fn snapshot(&self) -> (String, f64, Option<String>, u64) {
         let label = self.label.lock().map(|g| g.clone()).unwrap_or_default();
         let reasoning = self
             .reasoning
@@ -88,7 +111,8 @@ impl Status {
             .ok()
             .map(|g| g.clone())
             .filter(|r| !r.trim().is_empty());
-        (label, self.started.elapsed().as_secs_f64(), reasoning)
+        let tok = self.out.lock().map(|o| o.tokens()).unwrap_or(0);
+        (label, self.started.elapsed().as_secs_f64(), reasoning, tok)
     }
 }
 
@@ -138,13 +162,19 @@ impl Drop for Spinner {
 
 /// 原地重绘一行状态；若有思考过程，则在其下方滚动展示末尾若干行。
 fn draw(frame: &str, status: &Status, width: usize, drawn: &mut usize) {
-    let (label, secs, reasoning) = status.snapshot();
-    let mut lines = vec![format!(
+    let (label, secs, reasoning, tok) = status.snapshot();
+    let mut head = format!(
         "{} {} {}",
         s::cyan(frame),
         s::bold(&label),
         s::dim(&format!("{secs:.1}s"))
-    )];
+    );
+    // 输出 token 实时滚动。带 `~` 是因为流式过程中服务端还没报数，
+    // 这个值是按字符估的；一轮结束时会用精确值另报一条明细。
+    if tok > 0 {
+        head.push_str(&format!("  {}", s::dim(&format!("~{} tok", thousands(tok)))));
+    }
+    let mut lines = vec![head];
     if let Some(text) = reasoning {
         // 留出缩进与右侧一点余量，避免整行折行把光标定位算错
         let wrap = width.saturating_sub(REASONING_INDENT.len() + 2).max(24);

@@ -5,7 +5,8 @@ use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 use crate::auth::AuthLevel;
-use crate::llm::LlmProvider;
+use crate::history::UsageRecord;
+use crate::llm::{LlmProvider, Usage};
 use crate::message::Message;
 use crate::runtime::Runtime;
 use crate::tool::{ToolKind, ToolOutput};
@@ -78,6 +79,19 @@ fn env_section(rt: &Runtime) -> String {
     s
 }
 
+/// 一轮任务的用量累加器。
+///
+/// 单独拎出来是因为 `run_loop` 可能中途 `bail!`（模型连续返回空回复等），
+/// 而**已经花掉的 token 是收不回来的** —— 用 `&mut` 传进去，出错时调用方
+/// 手里照样有一份完整账，能如实报给用户，而不是因为一个 `Err` 就把账丢了。
+#[derive(Default)]
+struct TurnAcc {
+    calls: u32,
+    total: Usage,
+    /// 最后一次请求的输入规模 = 当前上下文占用
+    last_prompt: Option<u64>,
+}
+
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     rt: Arc<Runtime>,
@@ -89,6 +103,14 @@ pub struct Agent {
     log: Option<crate::history::Log>,
     /// 落盘过程中的错误只报一次，避免每轮都刷同一句警告。
     log_error_reported: bool,
+    /// 本次对话到目前的累计用量（切对话 / 新建对话时从文件接回或归零）
+    session_usage: Usage,
+    session_calls: u32,
+    /// 当前对话**逐轮**的用量记录，与对话文件里的 `kind:"usage"` 行一一对应。
+    ///
+    /// 内存里留一份，是为了让界面立刻能答「这段对话一共花了多少、哪一轮最贵」，
+    /// 而不必每帧读盘；文件那边才是权威 —— 重启后从这里接回来。
+    usage_log: Vec<UsageRecord>,
 }
 
 impl Agent {
@@ -108,6 +130,9 @@ impl Agent {
             messages: vec![Message::system(sys)],
             log: None,
             log_error_reported: false,
+            session_usage: Usage::default(),
+            session_calls: 0,
+            usage_log: Vec::new(),
         }
     }
 
@@ -164,6 +189,11 @@ impl Agent {
         self.messages.len()
     }
 
+    /// 当前对话逐轮的用量记录（供界面显示「每轮各花了多少」）
+    pub fn usage_log(&self) -> &[UsageRecord] {
+        &self.usage_log
+    }
+
     /// 追加上一批**活动流**记录（界面侧产生，写进同一份对话文件）。
     ///
     /// 为什么由这里写、而不是界面自己去开文件：文件句柄只有这个线程握着，
@@ -201,6 +231,16 @@ impl Agent {
         self.messages.extend(items.iter().map(|i| i.msg.clone()));
         self.log = Some(log);
         self.log_error_reported = false;
+        // 用量账本从文件接回来。不接的话，重启一次或切一次对话，
+        // 之前那几轮的 token 就凭空消失了 —— 而「这段对话一共花了多少」
+        // 恰恰是最该跨会话保留的数字。
+        self.usage_log = crate::history::load_usage(path);
+        self.session_usage = Usage::default();
+        self.session_calls = 0;
+        for r in &self.usage_log {
+            self.session_usage.accrue(&r.usage);
+            self.session_calls += r.calls;
+        }
         Ok(items.len())
     }
 
@@ -213,6 +253,9 @@ impl Agent {
         self.messages.truncate(1);
         self.log = None;
         self.log_error_reported = false;
+        self.session_usage = Usage::default();
+        self.session_calls = 0;
+        self.usage_log.clear();
     }
 
     /// 中断当前任务后回滚对话历史，避免遗留「有 tool_calls 但无结果」的半截消息。
@@ -232,12 +275,42 @@ impl Agent {
         self.push_message(Message::user(input), None);
         // 包住整轮：UI 借此显示等待动画，并在结束时把中间过程折叠成一行
         ui.turn_start().await;
-        let result = self.run_loop(ui).await;
+        let mut acc = TurnAcc::default();
+        let result = self.run_loop(ui, &mut acc).await;
         ui.turn_end().await;
+        // 用量排在动画停掉之后再报（见 `Ui::turn_usage` 的注释）。
+        // 出错也报：token 是真花出去了，不能因为任务失败就装作没花。
+        if acc.calls > 0 {
+            let rec = self.commit_usage(&acc);
+            ui.turn_usage(&rec).await;
+        }
         result
     }
 
-    async fn run_loop(&mut self, ui: &mut dyn Ui) -> Result<()> {
+    /// 把本轮的账并入会话累计、记进 `usage_log`、落进对话文件，返回这一行的记录。
+    ///
+    /// 落盘的与交给界面的是**同一个对象** —— 界面显示的账与文件里存的账因此不可能
+    /// 对不上（这类「界面上一个数、文件里另一个数」的坑不值得踩第二次）。
+    fn commit_usage(&mut self, acc: &TurnAcc) -> UsageRecord {
+        self.session_usage.accrue(&acc.total);
+        self.session_calls += acc.calls;
+        let rec = UsageRecord {
+            round: self.usage_log.len() as u32 + 1,
+            at: crate::history::unix_now(),
+            calls: acc.calls,
+            usage: acc.total.clone(),
+            last_prompt: acc.last_prompt,
+            session_total: self.session_usage.total,
+            session_calls: self.session_calls,
+        };
+        if let Some(log) = self.log.as_mut() {
+            log.append_usage(&rec);
+        }
+        self.usage_log.push(rec.clone());
+        rec
+    }
+
+    async fn run_loop(&mut self, ui: &mut dyn Ui, acc: &mut TurnAcc) -> Result<()> {
         /// 模型返回「空回复」（无正文、无工具调用）时的重试上限。
         /// 思考模型偶发会返回空 content（推理把输出额度吃光、上游抖动等），
         /// 直接当成「任务结束」会让任务静默中断，所以先重试并明确报错。
@@ -252,6 +325,12 @@ impl Agent {
                 let sink = ui.stream_sink();
                 self.llm.chat(&self.messages, &schemas, sink.as_deref()).await?
             };
+            // 记账：端点不给 usage 时各项是 None，accrue 会安静跳过
+            acc.calls += 1;
+            acc.total.accrue(&reply.usage);
+            if reply.usage.prompt.is_some() {
+                acc.last_prompt = reply.usage.prompt;
+            }
             let msg = reply.message.clone();
             let calls = msg.tool_calls.clone().unwrap_or_default();
 
