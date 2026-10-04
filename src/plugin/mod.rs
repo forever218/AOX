@@ -27,18 +27,34 @@ const RUST_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// 抑制子进程在 Windows 上弹出控制台黑窗口。
 ///
-/// 插件进程的 stdin/stdout 是管道、stderr 落到 `stderr.log`，**从不需要控制台**。
-/// 但在 GUI 版里宿主编译为 `windows` 子系统（自身没有控制台），此时启动
-/// `python.exe` / `node.exe` / `rustc.exe` 这类控制台程序，Windows 会专门为它
-/// 分配一个新控制台——用户看到的表现就是「动不动弹出几个黑色窗口」。
-/// 统一加上 `CREATE_NO_WINDOW` 后，CLI 与 GUI 两边行为一致，且不影响任何 I/O。
+/// 子进程的**创建标志**。
+///
+/// 两件事共用这一处：
+///
+/// ① **`CREATE_NO_WINDOW`** —— 插件进程的 stdin/stdout 是管道、stderr 落到
+///    `stderr.log`，**从不需要控制台**。但在 GUI 版里宿主编译为 `windows` 子系统
+///    （自身没有控制台），此时启动 `python.exe` / `node.exe` / `rustc.exe` 这类
+///    控制台程序，Windows 会专门为它分配一个新控制台——用户看到的表现就是
+///    「动不动弹出几个黑色窗口」。统一加上这个标志后 CLI 与 GUI 行为一致。
+/// ② **围栏的 `CREATE_SUSPENDED`**（`src/sandbox.rs`）—— 让进程先冻住，好让宿主
+///    在它跑第一行代码之前把它塞进 Job Object。
 ///
 /// 有**两种** `Command`：插件子进程用 `tokio::process::Command`（异步），
 /// 而运行时装配链（certutil / tar / powershell）用 `std::process::Command`（同步）。
-/// 两者都实现了 `creation_flags`，所以这里用一个小 trait 统一，避免在每个调用点
-/// 各自复制一遍平台细节。
-pub(crate) trait HideConsole {
-    fn hide_console(&mut self);
+/// 两者都实现了 `creation_flags`，所以这里用一个小 trait 统一，
+/// 避免在每个调用点各自复制一遍平台细节。
+pub(crate) trait ProcessFlags {
+    /// 只要求「不弹控制台窗口」。装配链那几个调用点要的就是这个。
+    fn hide_console(&mut self) {
+        self.process_flags(0);
+    }
+
+    /// 设置创建标志：`CREATE_NO_WINDOW` **或上** `extra`。
+    ///
+    /// ⚠️ 底层是**覆盖**不是追加，所以必须一次给全 —— 这也是为什么 `extra`
+    /// 走参数进来、而不是让调用方自己再调一次 `creation_flags`（那样会把
+    /// `CREATE_NO_WINDOW` 抹掉，黑色窗口又回来了）。
+    fn process_flags(&mut self, extra: u32);
 }
 
 /// 不生成控制台窗口（`winbase.h`）。
@@ -46,28 +62,28 @@ pub(crate) trait HideConsole {
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(windows)]
-impl HideConsole for Command {
-    fn hide_console(&mut self) {
-        self.creation_flags(CREATE_NO_WINDOW);
+impl ProcessFlags for Command {
+    fn process_flags(&mut self, extra: u32) {
+        self.creation_flags(CREATE_NO_WINDOW | extra);
     }
 }
 
 #[cfg(windows)]
-impl HideConsole for std::process::Command {
-    fn hide_console(&mut self) {
+impl ProcessFlags for std::process::Command {
+    fn process_flags(&mut self, extra: u32) {
         use std::os::windows::process::CommandExt as _;
-        self.creation_flags(CREATE_NO_WINDOW);
+        self.creation_flags(CREATE_NO_WINDOW | extra);
     }
 }
 
 #[cfg(not(windows))]
-impl HideConsole for Command {
-    fn hide_console(&mut self) {}
+impl ProcessFlags for Command {
+    fn process_flags(&mut self, _extra: u32) {}
 }
 
 #[cfg(not(windows))]
-impl HideConsole for std::process::Command {
-    fn hide_console(&mut self) {}
+impl ProcessFlags for std::process::Command {
+    fn process_flags(&mut self, _extra: u32) {}
 }
 
 /// 插件除工具之外还贡献什么（阶段 6 · 6b）。
@@ -238,6 +254,17 @@ pub struct PluginHandle {
     pub hook_failures: Arc<std::sync::atomic::AtomicU64>,
     pub hook_last_error: Arc<std::sync::Mutex<Option<String>>>,
     cfg: RuntimesConfig,
+    /// 本插件进程的**围栏**（Job Object，见 `src/sandbox.rs`）。
+    ///
+    /// 放在这里而不是 `Runtime` 上，是为了让它的生命周期**等于进程的生命周期**：
+    /// `Fence::drop` 会关掉 Job 句柄，而 `KILL_ON_JOB_CLOSE` 随即带走这个插件
+    /// 连同它的子孙。于是「插件停止」这件事有两道保险 —— `child.kill()` 与围栏关闭。
+    ///
+    /// 用 `Mutex` 包一层只为一件事：`respawn` 要在 `&self` 上换掉它（原子替换，
+    /// 旧围栏那一刻被 Drop ⇒ 旧进程被 Job 兜底带走，即便 `kill()` 没等干净）。
+    pub fence: std::sync::Mutex<crate::sandbox::Fence>,
+    /// 建围栏用的配置（`respawn` 时要用它重新套一次）。
+    sandbox: crate::sandbox::Sandbox,
     /// 应用根目录：插件进程的工作目录。插件内相对路径因此与宿主视图一致。
     root: PathBuf,
     dir: PathBuf,
@@ -287,9 +314,13 @@ impl PluginHandle {
             let mut c = self.child.lock().await;
             let _ = c.kill().await;
         }
-        let mut child = spawn_command(&self.cfg, &self.root, &self.dir, &self.manifest)?
+        let mut child = spawn_command(&self.cfg, &self.root, &self.dir, &self.manifest, &self.sandbox)?
             .spawn()
             .context("重启插件进程失败")?;
+        // 新进程要**重新套一次围栏**，理由与首次启动相同：它也是冻着出来的。
+        // 旧围栏在这行之后才被换掉（它的 Job 里只有那个已经死掉的旧进程，
+        // 关不关都无所谓，但顺序上先套新的更安全）。
+        let fence = self.sandbox.contain(&child);
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("无法获取插件 stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("无法获取插件 stdout"))?;
         {
@@ -297,9 +328,20 @@ impl PluginHandle {
             *ch = RpcChannel { stdin, out: BufReader::new(stdout), next_id: 0 };
         }
         *self.child.lock().await = child;
+        if let Ok(mut f) = self.fence.lock() {
+            *f = fence;
+        }
         // 握手确认新进程可用
         self.rpc("initialize", json!({})).await?;
         Ok(())
+    }
+
+    /// 围栏状态的一行短文本（`/plugins` 用）。
+    pub fn fence_status(&self) -> String {
+        match self.fence.lock() {
+            Ok(f) => f.status_text(),
+            Err(_) => "围栏 ?".to_string(),
+        }
     }
 }
 
@@ -365,6 +407,7 @@ fn spawn_command(
     root: &Path,
     dir: &Path,
     manifest: &PluginManifest,
+    sandbox: &crate::sandbox::Sandbox,
 ) -> Result<Command> {
     let stderr_log = std::fs::OpenOptions::new()
         .create(true)
@@ -392,7 +435,9 @@ fn spawn_command(
         "rust" => Command::new(&entry),
         other => bail!("未知插件语言: {other}"),
     };
-    cmd.hide_console();
+    // 围栏要求「先冻住」（`CREATE_SUSPENDED`），由 `spawn_and_init` 在加入 Job 之后再放行。
+    // 沙箱关着时这一项是 0，行为与围栏之前完全一致。
+    cmd.process_flags(sandbox.create_flags());
     cmd.current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -407,10 +452,14 @@ async fn spawn_and_init(
     root: &Path,
     dir: &Path,
     manifest: &PluginManifest,
+    sandbox: &crate::sandbox::Sandbox,
 ) -> Result<PluginHandle> {
-    let mut child = spawn_command(cfg, root, dir, manifest)?
+    let mut child = spawn_command(cfg, root, dir, manifest, sandbox)?
         .spawn()
         .with_context(|| format!("启动插件 {} 失败（请检查 {} 是否在 PATH 中）", manifest.name, cfg.python))?;
+    // 立刻套围栏：进程是冻着出来的，这里是**唯一**能保证「它跑第一行代码之前
+    // 已经在 Job 里」的位置。放进 `PluginHandle` 之后它就与进程同生共死了。
+    let fence = sandbox.contain(&child);
     let stdin = child.stdin.take().ok_or_else(|| anyhow!("无法获取插件 stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("无法获取插件 stdout"))?;
 
@@ -423,6 +472,8 @@ async fn spawn_and_init(
         theme_patch: None,
         hook_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         hook_last_error: Arc::new(std::sync::Mutex::new(None)),
+        fence: std::sync::Mutex::new(fence),
+        sandbox: sandbox.clone(),
         cfg: cfg.clone(),
         root: root.to_path_buf(),
         dir: dir.to_path_buf(),
@@ -670,7 +721,7 @@ async fn create_plugin_inner(
     manifest.save(dir)?;
 
     let runtimes = rt.runtimes();
-    let handle = spawn_and_init(&runtimes, &rt.root, dir, &manifest).await?;
+    let handle = spawn_and_init(&runtimes, &rt.root, dir, &manifest, &rt.sandbox).await?;
     activate(rt, handle).await
 }
 
@@ -726,7 +777,7 @@ pub async fn load_all(rt: &Arc<Runtime>) -> Vec<(String, Result<Vec<String>>)> {
             }
         };
         let name = manifest.name.clone();
-        let result = match spawn_and_init(&runtimes, &rt.root, &dir, &manifest).await {
+        let result = match spawn_and_init(&runtimes, &rt.root, &dir, &manifest, &rt.sandbox).await {
             Ok(handle) => activate(rt, handle).await,
             Err(e) => Err(e),
         };

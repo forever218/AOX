@@ -30,11 +30,13 @@ use tokio::sync::oneshot;
 use aox::history::UsageRecord;
 use aox::llm::{thousands, TokenEstimate, Usage};
 use aox::ui::{AgentEvent, AuthDecision};
+use aox::workplace::Mode;
 
 use crate::activity::{self, ActKind};
-use crate::bridge::{BootInfo, FromAgent, RuntimeView, SessionFlags, Snapshot, ToAgent};
+use crate::bridge::{BootInfo, FromAgent, RuntimeView, SessionFlags, Snapshot, ToAgent, WorkplaceView};
 use crate::markdown;
 use crate::theme::{self, P};
+use crate::workplace_ui;
 
 // ─────────────────────────── 数据模型 ───────────────────────────
 
@@ -190,6 +192,12 @@ pub struct App {
     /// 创建窗口时下发的 viewport command 有可能在前端事件循环起来之前就被丢掉，
     /// 所以这里记一笔，保证至少从 `update` 里真正下发一次。
     native_theme: Option<theme::Mode>,
+
+    /// 输入框左下角那枚「工作区」按钮的状态（按钮 / 向上弹出列表 / 确认框 / 目录选择器）。
+    ///
+    /// 状态整体住在 `workplace_ui` 里，这里只持有一个句柄 —— 免得四个布尔量散落在
+    /// `App` 上、各自还要记得互斥关系（见 `workplace_ui::button` 里那段「开一个收两个」）。
+    ws: workplace_ui::WorkplaceUi,
 }
 
 impl App {
@@ -244,6 +252,7 @@ impl App {
             auth_shown_at: Instant::now(),
             fit_tries: 0,
             native_theme: None,
+            ws: workplace_ui::WorkplaceUi::new(),
         };
         if demo {
             seed_demo(&mut app);
@@ -363,6 +372,9 @@ impl App {
                 }
                 FromAgent::Snapshot(s) => self.apply_snapshot(s),
                 FromAgent::Runtimes(v) => self.runtimes = v,
+                // 工作区现状：按钮上的档位名与列表里打勾的那一项都靠它。
+                // 启动、每轮结束、每次切档后 bridge 都会重发一份。
+                FromAgent::Workplace(v) => self.ws.set_view(*v),
                 FromAgent::HistoryCurrent(id) => {
                     // 侧边栏开着时要让条数/标题保持最新；关着时只有「换了对话文件」
                     // 才值得扫一次目录（否则每轮都白读一遍磁盘）。
@@ -929,18 +941,18 @@ impl App {
         // 面板就贴在胶囊正下方 6px：指针从胶囊走到面板的路上始终压着其中之一，
         // 中间不会有一帧落空，也就不会闪。
         //
-        // egui 0.33 没有 `layer_to_screen`，自己换算：视口原点（屏幕坐标）
-        // 加上控件在客户区里的位置。
-        let origin = ctx
-            .input(|i| i.viewport().inner_rect)
-            .map(|r| r.left_top())
-            .unwrap_or(Pos2::ZERO);
-        let screen = origin + resp.rect.left_bottom().to_vec2();
+        // ⚠️ **坐标不要做任何换算**：`Area::fixed_pos` 与 `ui.allocate_*` 同处
+        // **客户区局部坐标**（`Area::begin` 拿 `ctx.content_rect()` 当约束）。
+        // 这里曾经加过一次「视口原点」`viewport().inner_rect.left_top()` ——
+        // 那是**屏幕（显示器）坐标**，两者根本不在一个坐标系，换算不来；
+        // 结果是面板随窗口在显示器上的位置整体平移（窗口不在 (0,0) 时实测偏
+        // ~(154,14) 逻辑像素）。同一处错误在 `workplace_ui::menu` 也犯过，已一并修掉。
+        let anchor = resp.rect.left_bottom() + egui::vec2(0.0, 6.0);
         // 分开借：闭包里要写 hover 状态、又要读账本
         let log = &self.usage_log;
         let hovering = &mut self.usage_hover;
         egui::Area::new(egui::Id::new("aox-usage-panel"))
-            .fixed_pos(screen + egui::vec2(0.0, 6.0))
+            .fixed_pos(anchor)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 let frame = Frame::popup(ui.style())
@@ -1200,6 +1212,26 @@ impl App {
         ui.add_space(16.0);
     }
 
+    /// 把工作区按钮产生的一条请求发给 Agent 线程。
+    ///
+    /// 界面自己切不了档：`Workplace` 住在 `Runtime` 里，而 `Runtime` 只有 Agent 那个
+    /// 线程拿得到（见 `bridge.rs` 的 `ToAgent::Workplace`）。所以这里只负责「发出去」，
+    /// 真正的结果与新档位由 bridge 回执（`FromAgent::Workplace`）驱动。
+    fn send_ws(&mut self, mode: Mode) {
+        if self.demo {
+            // 演示模式没有 Agent 线程来回执，就地模拟一下 —— 好让 `--demo` 也能把
+            // 「切档 → 按钮改名 + 列表打勾跟着走」演出来。只影响界面，不碰磁盘。
+            let (view_mode, root) = match &mode {
+                Mode::Default => (Mode::Default, None),
+                Mode::Fixed(p) => (Mode::Fixed(p.clone()), Some(p.clone())),
+                Mode::Full => (Mode::Full, None),
+            };
+            self.ws.set_view(WorkplaceView { mode: view_mode, root });
+            return;
+        }
+        let _ = self.tx.send(ToAgent::Workplace(mode));
+    }
+
     fn composer(&mut self, ui: &mut Ui) {
         let (inner, pad) = column(ui.available_width());
         let blocked = self.demo || self.boot.as_ref().is_some_and(|b| !b.provider_ready);
@@ -1276,6 +1308,19 @@ impl App {
                             } else if send_button(ui, can_send).clicked() && can_send {
                                 self.send();
                             }
+                        });
+
+                        // 第二行：输入框**左下角**的工作区按钮。
+                        //
+                        // 单独占一行而不是挤进上一行：它说的是「这段对话跑在什么权限下」，
+                        // 与「输入 + 发送」是两件事；挤在一起会把输入框挤窄，而且这枚按钮
+                        // 紧挨着发送圆钮也容易被误点（一个只是「发消息」，一个是「放开所有权限」）。
+                        //
+                        // 演示模式下**允许点**（`self.demo || ...`）：它弹出来的列表 / 确认框 /
+                        // 目录选择器全是纯界面，就地模拟一下就能把版式演完（见 `send_ws`）。
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            workplace_ui::button(ui, &mut self.ws, self.demo || !blocked);
                         });
                     });
             });
@@ -1534,7 +1579,7 @@ fn seed_demo(app: &mut App) {
     app.status = "就绪".into();
     // 演示模式也从真实的应用根读历史：预览本来就该是真实的样子，
     // 编几条假对话反而会让人以为侧边栏是装饰品。
-    let root = aox::paths::resolve_workspace().0;
+    let root = aox::paths::resolve_workplace().0;
     let store = aox::store::default_store(&root, 0);
     app.boot = Some(BootInfo {
         config_path: app.config_path.clone(),
@@ -1547,6 +1592,47 @@ fn seed_demo(app: &mut App) {
     });
     app.store = Some(store);
     app.refresh_history();
+
+    // 工作区按钮的初值：演示模式下 bridge 不会发 `FromAgent::Workplace`，
+    // 就地塞一份，好让 `--demo` 也能把按钮上的档位名与列表里打勾的那一项演出来。
+    app.ws.set_view(WorkplaceView { mode: Mode::Default, root: None });
+
+    // 顶栏那枚「Σ 用量」胶囊**只在有账本时才画**，而 `--demo` 没有真实调用 ——
+    // 补两条账，好让预览里也能看到它与被悬停展开的明细面板（也才验得了面板的位置）。
+    app.usage_log = vec![
+        UsageRecord {
+            round: 1,
+            at: 0,
+            calls: 2,
+            usage: Usage {
+                prompt: Some(9_312),
+                completion: Some(1_204),
+                total: Some(10_516),
+                reasoning: Some(486),
+                cached: Some(2_048),
+                cache_miss: Some(7_264),
+            },
+            last_prompt: Some(9_312),
+            session_total: Some(10_516),
+            session_calls: 2,
+        },
+        UsageRecord {
+            round: 2,
+            at: 0,
+            calls: 4,
+            usage: Usage {
+                prompt: Some(24_608),
+                completion: Some(2_174),
+                total: Some(26_782),
+                reasoning: Some(1_130),
+                cached: Some(6_144),
+                cache_miss: Some(18_464),
+            },
+            last_prompt: Some(24_608),
+            session_total: Some(37_298),
+            session_calls: 6,
+        },
+    ];
 
     app.items.push(Item::User("做一个插件，统计当前目录下各类文件的数量".into()));
     app.items.push(Item::Process(Process {
@@ -1722,6 +1808,18 @@ impl eframe::App for App {
                     self.composer(ui);
                 });
         });
+
+        // 工作区的三个浮层：向上弹出的三选一列表、完全访问的确认框、目录选择器。
+        // 都排在 CentralPanel 之后 —— 它们要盖在对话内容与输入卡片之上。
+        if let Some(mode) = workplace_ui::menu(ctx, &mut self.ws) {
+            self.send_ws(mode);
+        }
+        if let Some(mode) = workplace_ui::confirm(ctx, &mut self.ws) {
+            self.send_ws(mode);
+        }
+        if let Some(mode) = workplace_ui::picker(ctx, &mut self.ws) {
+            self.send_ws(mode);
+        }
 
         self.about_overlay(ctx);
         self.auth_overlay(ctx);
@@ -2192,7 +2290,7 @@ fn text_button(ui: &mut Ui, text: &str, b: Btn) -> egui::Response {
 }
 
 /// 透明底的次要按钮（如弹窗里的「关闭」）。
-fn flat_button(ui: &mut Ui, text: &str) -> egui::Response {
+pub(crate) fn flat_button(ui: &mut Ui, text: &str) -> egui::Response {
     text_button(
         ui,
         text,
@@ -2210,7 +2308,7 @@ fn flat_button(ui: &mut Ui, text: &str) -> egui::Response {
 }
 
 /// 主要动作：反白块（亮色下是墨黑底白字），比描边更有分量。
-fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
+pub(crate) fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
     text_button(
         ui,
         text,
@@ -2223,6 +2321,28 @@ fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
             fg_hover: P::on_reverse(),
             fill: P::reverse_bg(),
             fill_hover: P::ink_soft(),
+        },
+    )
+}
+
+/// 危险动作按钮（目前只有「完全访问」的二次确认用）。
+///
+/// 用 [`P::danger`] 当底色、文字色仍取 [`P::on_reverse`] —— 这不是巧合：danger 在
+/// 亮色下是深砖红（要浅字）、暗色下是浅砖红（要深字），与「反白块」的明暗方向正好
+/// 一致，所以不必再为它单独算一次前景色。
+pub(crate) fn danger_button(ui: &mut Ui, text: &str) -> egui::Response {
+    text_button(
+        ui,
+        text,
+        Btn {
+            size: 14.5,
+            pad: Vec2::new(18.0, 9.0),
+            radius: 10,
+            stroke: Stroke::NONE,
+            fg: P::on_reverse(),
+            fg_hover: P::on_reverse(),
+            fill: P::danger(),
+            fill_hover: P::danger().gamma_multiply(0.82),
         },
     )
 }

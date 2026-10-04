@@ -67,6 +67,21 @@ pub struct Runtime {
     /// 不静默退回 `standard`。`Agent::run_turn` 从这儿取一段循环来跑 ——
     /// 于是「换一套执行模型」是改配置，而不是改代码。
     pub loop_impl: Arc<dyn crate::agent_loop::AgentLoop>,
+    /// 插件子进程的**围栏**（Job Object，见 `src/sandbox.rs`）。
+    ///
+    /// 在 `Runtime::new` 里由 `config.toml [sandbox]` 定型。它本身只是个配置的持有者，
+    /// 真正的内核对象是每次 spawn 时现建的（一个插件一个 Job）——
+    /// 所以插件**运行期间**改这里不影响已经起来的进程，只影响下一次 spawn / 重启。
+    pub sandbox: crate::sandbox::Sandbox,
+    /// 模型的**文件边界**（工作区，见 `src/workplace.rs`）。
+    ///
+    /// 与 `sandbox` 并排但管的是另一件事：`sandbox` 限制插件子进程怎么跑，
+    /// `workplace` 限制「这次能碰哪些文件」。默认为 `full`（不受限），
+    /// 所以**不写 `[workplace]` 的用户行为与加这一层之前逐字节一致**。
+    ///
+    /// 内部是 `std::sync::Mutex`，只在同步上下文读写（判定在工具调用路径上跑）——
+    /// 与 `runtimes` / `prompt_segments` 同样的理由：从不跨 `await` 持锁。
+    pub workplace: crate::workplace::Workplace,
 }
 
 impl Runtime {
@@ -96,6 +111,12 @@ impl Runtime {
         // 这里用 `?`：`[loop] impl` 写了认不出的名字会在**启动时**报错，不静默退回 standard ——
         // 与 `[store] backend` 同一条原则。
         let loop_impl = crate::agent_loop::build(&config.loop_config)?;
+        // 围栏的配置在 `config` 被 move 进 Self 之前取出（`Sandbox` 只是个廉价的手持配置）。
+        let sandbox = crate::sandbox::Sandbox::new(config.sandbox.clone());
+        // 工作区同样在 `config` 被 move 之前定型。**这里用 `?`**：`[workplace] mode`
+        // 写了认不出的值、或 `fixed` 却没给 `root`，都在**启动时**报错 ——
+        // 与 `[store] backend` / `[loop] impl` 同一条原则（写了却不生效最难查）。
+        let workplace = crate::workplace::Workplace::new(config.workplace.clone(), &root)?;
         Ok(Arc::new(Self {
             config,
             auth,
@@ -109,6 +130,8 @@ impl Runtime {
             prompt_segments: std::sync::RwLock::new(prompt_segments),
             hooks,
             loop_impl,
+            sandbox,
+            workplace,
         }))
     }
 

@@ -22,6 +22,7 @@ mod bridge;
 mod markdown;
 mod syntax;
 mod theme;
+mod workplace_ui;
 
 use tokio::sync::mpsc;
 

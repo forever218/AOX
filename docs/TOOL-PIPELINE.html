@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="d0llGxcc8OAqkIShRUoj21">
+<head data-page-node-id="KuezLVFyvcXK40d61NVur6">
+<meta charset="UTF-8" data-page-node-id="2hxRUumHyNIWZ8fPFHgl3J">
+<meta name="viewport" content="width=device-width, initial-scale=1" data-page-node-id="gfam7R55bgtDSKDcEL20Ak">
+<title>AOX · 工具执行流水线</title>
+<style>
+:root{
+  --bg:#0e1116; --panel:#151a21; --panel2:#1b2129; --line:rgba(255,255,255,.09);
+  --line2:rgba(255,255,255,.16);
+  --tx:#e4e8ee; --tx2:#98a3b2; --tx3:#6a7583;
+  --blue:#85b7eb; --amber:#e8b96a; --purple:#b3adeb; --red:#f09595;
+  --teal:#7fd4b8; --green:#a3ce72; --gray:#b4b2a9; --pink:#ed93b1;
+  --mono:ui-monospace,"Cascadia Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font:400 14px/1.65 var(--sans);
+  -webkit-font-smoothing:antialiased;padding:0 0 96px}
+.wrap{max-width:1360px;margin:0 auto;padding:0 32px}
+code,.mono{font-family:var(--mono);font-size:12.5px}
+a{color:var(--blue);text-decoration:none}
+
+header{padding:64px 0 40px;border-bottom:1px solid var(--line)}
+h1{font:500 30px/1.25 var(--sans);letter-spacing:-.01em}
+.sub{margin-top:10px;color:var(--tx2);font-size:14px;max-width:820px}
+.meta{margin-top:22px;display:flex;flex-wrap:wrap;gap:8px}
+.chip{background:var(--panel);border:1px solid var(--line);border-radius:999px;
+  padding:4px 12px;font:400 12px var(--mono);color:var(--tx2)}
+
+h2{font:500 21px/1.4 var(--sans);margin:64px 0 6px;letter-spacing:-.005em}
+h2 .n{color:var(--tx3);font-family:var(--mono);font-size:15px;margin-right:10px}
+.lead{color:var(--tx2);margin:8px 0 24px;max-width:900px}
+h3{font:500 15px/1.5 var(--sans);margin:32px 0 10px}
+p{margin:10px 0;color:var(--tx2)}
+p strong{color:var(--tx);font-weight:500}
+.note{color:var(--tx3);font-size:13px}
+
+/* ── 图例 ── */
+.legend{display:flex;flex-wrap:wrap;gap:6px;margin:20px 0 4px}
+.lg{display:flex;align-items:center;gap:7px;background:var(--panel);
+  border:1px solid var(--line);border-radius:7px;padding:5px 11px;font-size:12.5px;color:var(--tx2)}
+.sw{width:9px;height:9px;border-radius:2.5px;flex:0 0 auto}
+.sw.dash{background:transparent;border:1.5px dashed var(--red)}
+
+/* ── 总览 SVG ── */
+.fig{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:26px 24px 20px;margin:22px 0 10px;overflow-x:auto}
+.fig svg{display:block;width:100%;height:auto;min-width:1080px}
+svg text{font-family:var(--sans)}
+.cap{margin-top:12px;font-size:12.5px;color:var(--tx3);padding-top:12px;border-top:1px solid var(--line)}
+
+/* ── 流水线卡 ── */
+.flow{margin:22px 0 0;border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.grp{background:var(--panel2);padding:11px 20px;font:500 12px/1.5 var(--mono);
+  letter-spacing:.09em;color:var(--tx2);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.grp:first-child{border-top:0}
+.grp .c{display:inline-block;width:9px;height:9px;border-radius:2.5px;margin-right:9px;vertical-align:baseline}
+.row{display:grid;grid-template-columns:44px 1fr 320px 300px;gap:0;
+  border-top:1px solid var(--line);background:var(--panel)}
+.row:first-of-type{border-top:0}
+.cell{padding:13px 18px;border-right:1px solid var(--line);min-width:0}
+.cell:last-child{border-right:0}
+.idx{font:400 12px var(--mono);color:var(--tx3);padding-left:20px;padding-right:0}
+.st{font-size:13.5px;color:var(--tx);line-height:1.5}
+.st b{font-weight:500}
+.loc{font:400 11.5px var(--mono);color:var(--tx3);margin-top:3px;display:block}
+.io{font-size:12.5px;color:var(--tx2);line-height:1.55}
+.io .io-k{color:var(--tx3)}
+.chipset{display:flex;flex-wrap:wrap;gap:5px}
+.tag{font:400 11px var(--mono);border-radius:5px;padding:2px 7px;
+  border:1px solid var(--line2);color:var(--tx2);white-space:nowrap}
+.tag.yes{border-color:rgba(225,149,149,.4);color:var(--red)}
+.tag.ok{border-color:rgba(163,206,114,.36);color:var(--green)}
+.tag.mut{border-color:var(--line);color:var(--tx3)}
+.deny{color:var(--red)}
+
+/* ── 通用表 ── */
+table{width:100%;border-collapse:collapse;margin:18px 0 6px;font-size:13px;
+  table-layout:fixed;overflow:hidden}
+th{text-align:left;font:500 12px/1.5 var(--mono);letter-spacing:.05em;color:var(--tx3);
+  padding:10px 14px;border-bottom:1px solid var(--line2);vertical-align:bottom}
+td{padding:11px 14px;border-bottom:1px solid var(--line);color:var(--tx2);
+  vertical-align:top;line-height:1.55;word-break:break-word}
+td:first-child{color:var(--tx)}
+tr:last-child td{border-bottom:0}
+table.fixed td{overflow-wrap:anywhere}
+
+/* ── 详情块 ── */
+.box{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:20px 24px;margin:16px 0}
+.box.warn{border-color:rgba(240,149,149,.32);background:#1a1518}
+.box h4{font:500 14px var(--sans);margin-bottom:4px;display:flex;align-items:center;gap:9px}
+.box h4 .dot{width:8px;height:8px;border-radius:2.5px;flex:0 0 auto}
+.box.warn h4{color:var(--red)}
+.box p{font-size:13px;margin:8px 0 0}
+.box pre{margin:12px 0 0;background:#0b0e12;border:1px solid var(--line);
+  border-radius:8px;padding:13px 15px;overflow-x:auto;font:400 12px/1.7 var(--mono);color:var(--tx2)}
+.box pre .k{color:var(--purple)}
+.box pre .s{color:var(--teal)}
+.box pre .c{color:var(--tx3)}
+
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 18px;margin:12px 0 0;font-size:13px}
+.kv dt{font-family:var(--mono);font-size:12px;color:var(--tx3);white-space:nowrap}
+.kv dd{color:var(--tx2)}
+
+.two{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:18px 0}
+@media(max-width:1080px){
+  .wrap{padding:0 20px}
+  .row{grid-template-columns:36px 1fr;}
+  .cell.io,.cell.side{border-right:0;border-top:1px solid var(--line)}
+  .two{grid-template-columns:1fr}
+}
+ul{margin:10px 0 0 18px;color:var(--tx2);font-size:13px}
+li{margin:5px 0}
+li::marker{color:var(--tx3)}
+footer{margin-top:72px;padding-top:24px;border-top:1px solid var(--line);
+  color:var(--tx3);font-size:12.5px}
+</style>
+</head>
+<body data-page-node-id="jfPx6jhALxICP7niLQNb7j">
+<div class="wrap" data-page-node-id="XSR2MzpfXOoDAiYMcgzxOY">
+
+<header data-page-node-id="1eGeerEsF8A5Ws8Gs3deYL">
+  <h1 data-page-node-id="6aBR46AH2W3q3vIliewvxQ">AOX 工具执行流水线</h1>
+  <p class="sub" data-page-node-id="2BPazOwF0Fo0CPenm2x0PI">从「模型要求调用 <code data-page-node-id="lNjK5uTMCPYV5vGRxSSBzK">fs_read</code>」到「这段结果出现在界面上、落进对话文件、
+  变成下一轮请求体的一部分」之间的全部步骤。六个横切关注点各自插在第几步、由谁实现、
+  能不能否决、以及它们为什么不需要改动循环骨架。</p>
+  <div class="meta" data-page-node-id="Os1rqF0iOjqyEkUfV7tHVm">
+    <span class="chip" data-page-node-id="GSULGr5PzNqj1b2QtYBOdW">基线 src/agent_loop.rs:141 StandardLoop::run</span>
+    <span class="chip" data-page-node-id="VgX578YzzITa21bQ3PDMKV">阶段 1–6 全部验收完毕</span>
+    <span class="chip" data-page-node-id="gf4K7zy9ha4xmc4tvK4eak">2026-10-04</span>
+    <span class="chip" data-page-node-id="A0qIMS75YolIBhwBIoXPVc">工作区守卫 = 未实现</span>
+  </div>
+  <div class="legend" data-page-node-id="BdJuTLml93YICDzu2PAfOT">
+    <span class="lg" data-page-node-id="08YXeUJHI5j0IdoGvXN0HH"><span class="sw" style="background:var(--blue)" data-page-node-id="4QYVF8X94OpP1ipFuzSIrX"></span>循环骨架</span>
+    <span class="lg" data-page-node-id="wE14QNcC6T3whWSkTEXDdz"><span class="sw" style="background:var(--amber)" data-page-node-id="SblUH18m7HeniJvRdldXwq"></span>授权策略</span>
+    <span class="lg" data-page-node-id="5Ew6Y3i9Z4QZG0rvZpfpOz"><span class="sw" style="background:var(--purple)" data-page-node-id="clFLsJcpfvZscoB1eyJd6Z"></span>循环钩子</span>
+    <span class="lg" data-page-node-id="m88GC9ny9FlqgilZ9ev18Q"><span class="sw dash" data-page-node-id="cWPkF8ZpWjLbUPoj4NFYFe"></span>文件系统守卫（计划中）</span>
+    <span class="lg" data-page-node-id="TF9PJJnGBljqwxzagrgCbm"><span class="sw" style="background:var(--teal)" data-page-node-id="AI23BF5PY8Ht1W4gDJhtPB"></span>结果重写</span>
+    <span class="lg" data-page-node-id="hI9RN6eGjKxAnLXHFYWZNt"><span class="sw" style="background:var(--green)" data-page-node-id="QuAD2r9w0q7VH7NYuXHf52"></span>UI 渲染</span>
+    <span class="lg" data-page-node-id="0aHQrBfMT9Sv74I9IqDum8"><span class="sw" style="background:var(--gray)" data-page-node-id="5bSthPdSRhAo1RRjvmYrEC"></span>落盘</span>
+  </div>
+</header>
+
+<!-- ═══════════ 1. 总览 ═══════════ -->
+<h2 data-page-node-id="FqcQfkfAQEcbcR155KClUD"><span class="n" data-page-node-id="Ur4AMWQMbz2B0f8S6yyjaY">01</span>一次调用的全景</h2>
+<p class="lead" data-page-node-id="AenApWCPvzNeFzOHbNv3IJ">竖轴是时间，向下是一个 <code data-page-node-id="tUv9LB1vRtZdNqMFzzctin">while</code> 迭代。左侧蓝色是循环骨架（写死在
+<code data-page-node-id="DQxOmXnKjyxL25AHu9OUeF">StandardLoop::run</code> 里），右侧是六个可以替换 / 插入的能力。虚线红框是<b data-page-node-id="KmcMcJ6qHepKUBfNyQOEfO">尚未存在</b>的
+文件系统守卫 —— 它计划插在第 8 步之前。</p>
+
+<div class="fig" data-page-node-id="fPcT04Wudw2CdX8h5tSLJN">
+<svg viewBox="0 0 1120 930" width="100%" role="img" aria-label="AOX 一次工具调用的完整执行流水线" data-page-node-id="OYwHGAY0f7VZAgj2T5eNU5">
+<title>AOX 一次工具调用的完整执行流水线</title>
+<desc data-page-node-id="FnjQ4fplh6iA74KPKPIJSJ">从 run_turn 包裹层进入 StandardLoop 循环，经过上下文裁剪、before_request 钩子、模型请求、
+记账、after_reply 钩子，然后进入每个工具调用的 before_tool 钩子、授权策略、守卫（计划）、
+Runtime 执行、after_tool 结果重写、UI 事件、落盘，最后回到循环。</desc>
+<defs data-page-node-id="IA0jDtZySeXSCh0HIqh0mM">
+  <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse" data-page-node-id="5DQczhAQGHz2cz63kAmurQ">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="Nm0vGOnPTcXw86WuDOBwYJ"/>
+  </marker>
+  <marker id="ar2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse" data-page-node-id="K0n982THsjxkHfWxSIgYwy">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="5Em7LN7qbiMMRfugL61Loc"/>
+  </marker>
+</defs>
+
+<!-- lane labels -->
+<text x="20" y="26" font-size="11" fill="#6a7583" font-family="ui-monospace,monospace" letter-spacing="1" data-page-node-id="pV3FEJVKc5tFKYHgIqOLgS">循环骨架 · StandardLoop::run</text>
+<text x="20" y="612" font-size="11" fill="#6a7583" font-family="ui-monospace,monospace" letter-spacing="1" data-page-node-id="L55BCfoFROO11t5KAjIGXR">每次 tool_call 的收口 · Agent::authorize_and_execute</text>
+<text x="690" y="26" font-size="11" fill="#6a7583" font-family="ui-monospace,monospace" letter-spacing="1" data-page-node-id="9LlOfYD5MgSma807eFnHJd">可替换 / 可插入的能力</text>
+
+<!-- ══ wrapper ══ -->
+<rect x="20" y="40" width="600" height="86" rx="10" fill="#1b2129" stroke="rgba(255,255,255,.16)" stroke-width="0.5" data-page-node-id="jJ2fEdokL8As3EtdbC1FXd"/>
+<text x="38" y="64" font-size="13.5" font-weight="500" fill="#e4e8ee" data-page-node-id="4NqhwVmGu3mNkc2H2L6Hm4">Agent::run_turn — 回合包裹层</text>
+<text x="38" y="84" font-size="11.5" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="ELeyrBatNDMYCTmEPMsJWa">ensure_log → push user → turn_start → begin_turn</text>
+<text x="38" y="103" font-size="11.5" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="CJQ9GNHuiILMjObM4TKEAR">lp.run(self, ui) → turn_end → finish_turn → turn_usage</text>
+<text x="38" y="119" font-size="10.5" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="mYDv3BMKBWvUW68JH1KTVx">src/agent.rs:231-247 · 循环搬出去之后这里只剩「开账 / 收账」</text>
+<path d="M320 126 L320 152" fill="none" stroke="#85b7eb" stroke-width="1.5" marker-end="url(#ar)" data-page-node-id="HvupfkZe5tDCjsTcQNANQs"/>
+
+<!-- ══ S1 trim ══ -->
+<rect x="20" y="152" width="600" height="58" rx="9" fill="#151a21" stroke="#85b7eb" stroke-width="0.5" stroke-opacity=".55" data-page-node-id="X1yHRlM7KKuvBNYeBJ4gh3"/>
+<text x="38" y="174" font-size="13" font-weight="500" fill="#e4e8ee" data-page-node-id="CgRMFy1glQXe3tL8TB2t5C">S1 · 上下文裁剪</text>
+<text x="38" y="192" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="6JqUijehsPRs2DT3UVVKV2">trim_point → drop_oldest(cut) → 内存 + 对话文件同步回滚</text>
+<text x="596" y="174" font-size="10.5" fill="#6a7583" text-anchor="end" font-family="ui-monospace,monospace" data-page-node-id="b34GUBabdSoIIhDzv98ruq">L162-170</text>
+<text x="596" y="192" font-size="10.5" fill="#6a7583" text-anchor="end" font-family="ui-monospace,monospace" data-page-node-id="92HjC0xHypxn3eBjKstdqI">max_rounds=0 → 完全不裁</text>
+<path d="M320 210 L320 234" fill="none" stroke="#85b7eb" stroke-width="1.5" marker-end="url(#ar)" data-page-node-id="5Zmj6waCXKCTz6g89T8qk7"/>
+
+<!-- ══ S2 before_request ══ -->
+<rect x="20" y="234" width="600" height="66" rx="9" fill="#151a21" stroke="#85b7eb" stroke-width="0.5" stroke-opacity=".55" data-page-node-id="l5xYt79Xk9OoTZLMM0svgF"/>
+<text x="38" y="256" font-size="13" font-weight="500" fill="#e4e8ee" data-page-node-id="pTpVnt2pSEUr7nHqQuDk2g">S2 · 钩子点 ① request.tools 快照 + before_request</text>
+<text x="38" y="274" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="IuJRP78I0l9aKZcbIefemc">Request { tools, inject } → hooks.before_request → inject 经 push_message 入列</text>
+<text x="38" y="291" font-size="10.5" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="7J2MyQsYetcfLSBw7wQv99">拿不到 &amp;mut messages —— 只能追加，这是为了守住落盘一致</text>
+<text x="596" y="256" font-size="10.5" fill="#6a7583" text-anchor="end" font-family="ui-monospace,monospace" data-page-node-id="3RJC1jZoCnakLSh5Sj2bj8">L176-183</text>
+<path d="M620 267 L672 267" fill="none" stroke="#b3adeb" stroke-width="1.5" marker-end="url(#ar2)" data-page-node-id="B98UoD41GJpVVpkGVyjCBn"/>
+<rect x="676" y="240" width="424" height="54" rx="9" fill="rgba(179,173,235,.07)" stroke="#b3adeb" stroke-width="0.5" stroke-opacity=".5" data-page-node-id="dAdbbjBIIPxuzfbC86OTTz"/>
+<text x="694" y="261" font-size="12.5" font-weight="500" fill="#b3adeb" data-page-node-id="jQwsYjpgt91cqUC9ogUJ1N">ConfigHook（config.toml [hook]）</text>
+<text x="694" y="279" font-size="10.5" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="O98VKLge2jKm1kTOmHw6Gd">ComponentHook（插件 [contributes] hooks → JSON-RPC，10s 超时，失败即降级）</text>
+<path d="M320 300 L320 324" fill="none" stroke="#85b7eb" stroke-width="1.5" marker-end="url(#ar)" data-page-node-id="1SZs3bq9eBcvi3l4mrX0EC"/>
+
+<!-- ══ S3 chat ══ -->
+<rect x="20" y="324" width="600" height="70" rx="9" fill="#151a21" stroke="#85b7eb" stroke-width="0.5" stroke-opacity=".55" data-page-node-id="rC9FiUARsMgFPD3WzFX4Yo"/>
+<text x="38" y="346" font-size="13" font-weight="500" fill="#e4e8ee" data-page-node-id="JDP8WCzRBihWPjncB8tt73">S3 · 模型请求（流式）</text>
+<text x="38" y="364" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="DBHUkcOgDcKMNNxHPhLxsJ">set_status("思考中") → llm.chat(messages, schemas, stream_sink)</text>
+<text x="38" y="382" font-size="10.5" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="FLNjkuDUFPZhWDkX6uHwCU">StreamSink 实时回显推理 / 正文增量；GUI 用它做实时 token 计数</text>
+<text x="596" y="346" font-size="10.5" fill="#6a7583" text-anchor="end" font-family="ui-monospace,monospace" data-page-node-id="mwYvCVyxk7IxUCxQH7ZCfS">L185-192</text>
+<path d="M320 394 L320 418" fill="none" stroke="#85b7eb" stroke-width="1.5" marker-end="url(#ar)" data-page-node-id="qOG6olIbHC1ZHxQuJGfHK2"/>
+
+<!-- ══ S5 on_error ══ -->
+<rect x="660" y="324" width="440" height="70" rx="9" fill="rgba(179,173,235,.07)" stroke="#b3adeb" stroke-width="0.5" stroke-opacity=".5" data-page-node-id="2sDmE2e97CcqFokzeCWLRB"/>
+<text x="678" y="345" font-size="12.5" font-weight="500" fill="#b3adeb" data-page-node-id="rwZuMn3VmRUWmG2ihWmFn1">钩子点 ⑤ on_error（只在 chat 失败时）</text>
+<text x="678" y="363" font-size="10.5" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="oE7UPjHIUpeSASSVELGeuI">Retry(note) → 注入宿主提示后重来，不看预算</text>
+<text x="678" y="380" font-size="10.5" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="SHlbHUPNjtRQSo7oyWB8qr">Propagate → 落到 [hook] max_llm_retries（默认 0 = 逐字节等价于原 ?）</text>
+<path d="M1100 359 L1110 359 L1110 300 L676 300 L676 267" fill="none" stroke="#b3adeb" stroke-width="1.2" stroke-dasharray="3 3" marker-end="url(#ar2)" data-page-node-id="sp9UJFcHXVNgzmNTbiWnye"/>
+<text x="1116" y="330" font-size="10" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="4Q2sYkdO7WHmFsEQFatCU0">重试</text>
+
+<!-- ══ S4 accrue ══ -->
+<rect x="20" y="418" width="600" height="48" rx="9" fill="#151a21" stroke="#85b7eb" stroke-width="0.5" stroke-opacity=".55" data-page-node-id="EzaGd6aAXmrvRvKBk5thLJ"/>
+<text x="38" y="438" font-size="13" font-weight="500" fill="#e4e8ee" data-page-node-id="vua4LuQAHke8sEvcuKDiTU">S4 · 记账 accrue_call</text>
+<text x="38" y="455" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="rESpO4tvMAnlkrbr0Akc6p">reply.usage → TurnAcc（次数 / 各项 token / 末次输入规模）</text>
+<text x="596" y="438" font-size="10.5" fill="#6a7583" text-anchor="end" font-family="ui-monospace,monospace" data-page-node-id="cvRxfXgFck6DxXlOcGtVqo">L229</text>
+<path d="M320 466 L320 490" fill="none" stroke="#85b7eb" stroke-width="1.5" marker-end="url(#ar)" data-page-node-id="UVBFfqbYEvRxCwIuo4r3Hc"/>
+
+<!-- ══ S6 after_reply ══ -->
+<rect x="20" y="490" width="600" height="62" rx="9" fill="#151a21" stroke="#85b7eb" stroke-width="0.5" stroke-opacity=".55" data-page-node-id="DukhenqbDBQEloBi4b2eDq"/>
+<text x="38" y="512" font-size="13" font-weight="500" fill="#e4e8ee" data-page-node-id="i2ky9gBZJGFBYj8EWcUAfv">S6 · 钩子点 ② after_reply（刻意排在记账之后）</text>
+<text x="38" y="530" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="OEZ7ebqmKVz97OPaico8EQ">可改正文；Reject → 视为一次无效回复，复用空回复重试路径</text>
+<text x="596" y="512" font-size="10.5" fill="#6a7583" text-anchor="end" font-family="ui-monospace,monospace" data-page-node-id="RsmzO5K62Yc0J6kKTjXneF">L237-252</text>
+<path d="M620 521 L672 521" fill="none" stroke="#b3adeb" stroke-width="1.5" marker-end="url(#ar2)" data-page-node-id="lzqUv8k7tM1D8U3ie9ex5A"/>
+<rect x="676" y="490" width="424" height="62" rx="9" fill="rgba(179,173,235,.07)" stroke="#b3adeb" stroke-width="0.5" stroke-opacity=".5" data-page-node-id="Vazz55QmQwkPCzbJKmHsGv"/>
+<text x="694" y="511" font-size="12.5" font-weight="500" fill="#b3adeb" data-page-node-id="RXJe6Zgs97zqDXh3BcDk5S">组件只能改正文，改不了 tool_calls</text>
+<text x="694" y="529" font-size="10.5" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="PV8rmhJ2K2p5BHd3rUSf7b">工具调用是「模型要做什么」的记录，让组件改它等于伪造模型意图</text>
+<path d="M320 552 L320 576" fill="none" stroke="#85b7eb" stroke-width="1.5" marker-end="url(#ar)" data-page-node-id="1AWKinlEMuf7cT12ySZuqz"/>
+
+<!-- ══ S7-11 ══ -->
+<rect x="20" y="576" width="600" height="86" rx="9" fill="#151a21" stroke="#85b7eb" stroke-width="0.5" stroke-opacity=".55" data-page-node-id="FMBLvAeNcWzt5Qi1AHEmMJ"/>
+<text x="38" y="598" font-size="13" font-weight="500" fill="#e4e8ee" data-page-node-id="NfMb2BeMBByYnOa3xohCZM">S7–S11 · 派发与分流</text>
+<text x="38" y="616" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="SLeDN3iZQYA6jicIWpNhVI">空回复 / 截断检查 → 文本分流（AssistantText / InterimText）</text>
+<text x="38" y="633" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="vIDiwDddV82CoBt0Zvx9lc">push_message(assistant+tool_calls) → 无 tool_calls 则 break 收工</text>
+<text x="38" y="653" font-size="10.5" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="sAQQJGw1plWcs7IxYS5GHg">L259-311 · 带 tool_calls 的 assistant 消息在此刻已落盘</text>
+<text x="596" y="598" font-size="10.5" fill="#6a7583" text-anchor="end" font-family="ui-monospace,monospace" data-page-node-id="M59Dup3dkzL2Hl9aPEm1JG">L259-311</text>
+<path d="M320 662 L320 690" fill="none" stroke="#85b7eb" stroke-width="1.5" marker-end="url(#ar)" data-page-node-id="VQjhgrCEb5Haatn3yUEAcr"/>
+
+<!-- ══ 分隔 ══ -->
+<path d="M20 686 L620 686" fill="none" stroke="rgba(255,255,255,.16)" stroke-width="1" stroke-dasharray="2 4" data-page-node-id="F8KWHtYSPRcYHTgVRVIOLl"/>
+<text x="20" y="700" font-size="10.5" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="HFUs0tYgCY19BQbIkV6XDn">↓ 以下每个 tool_call 走一遍 T0–T8</text>
+
+<!-- ══ T0 args ══ -->
+<rect x="20" y="708" width="600" height="52" rx="9" fill="#151a21" stroke="#85b7eb" stroke-width="0.5" stroke-opacity=".55" data-page-node-id="HSBC7xZjTjlptOTw9neAAc"/>
+<text x="38" y="729" font-size="13" font-weight="500" fill="#e4e8ee" data-page-node-id="2n8RFyKEUqaHCEzbmricDQ">T0 · 参数解析</text>
+<text x="38" y="746" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="7k3dOU2KXON3xtisFZPXq9">JSON 失败 → 直接回错误结果，钩子与策略都不参与</text>
+<text x="596" y="729" font-size="10.5" fill="#6a7583" text-anchor="end" font-family="ui-monospace,monospace" data-page-node-id="YUDppBZX9UKAlibtGrFV9G">L315-326</text>
+<path d="M320 760 L320 782" fill="none" stroke="#85b7eb" stroke-width="1.5" marker-end="url(#ar)" data-page-node-id="Uiv5KFeBZFeSQZ0UAjrraB"/>
+
+<!-- ══ T1 before_tool ══ -->
+<rect x="20" y="782" width="600" height="58" rx="9" fill="#151a21" stroke="#85b7eb" stroke-width="0.5" stroke-opacity=".55" data-page-node-id="cQR7BgSrpjpwsjFvbSZvgX"/>
+<text x="38" y="803" font-size="13" font-weight="500" fill="#e4e8ee" data-page-node-id="VB3xrcywBpDq8EW2HOVxvR">T1 · 钩子点 ③ before_tool</text>
+<text x="38" y="820" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="kaKJQBqzwNGoK8XlRFYzUD">可改 args（只补缺，不覆盖模型显式值）</text>
+<text x="38" y="836" font-size="10.5" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="rWIlF8dN8PswY0AGaZodBo">改的 args 不回写已落盘的 assistant 行 —— 历史 = 模型的真实请求</text>
+<text x="596" y="803" font-size="10.5" fill="#6a7583" text-anchor="end" font-family="ui-monospace,monospace" data-page-node-id="3dlRKGAWK9MgsRTC4uNtVF">L331-337</text>
+<path d="M620 811 L672 811" fill="none" stroke="#b3adeb" stroke-width="1.5" marker-end="url(#ar2)" data-page-node-id="Rn7rRcpRZYptB4clYrBRM2"/>
+<rect x="676" y="782" width="424" height="58" rx="9" fill="rgba(179,173,235,.07)" stroke="#b3adeb" stroke-width="0.5" stroke-opacity=".5" data-page-node-id="S3b7HCZBdqCbrSAYU6tFcQ"/>
+<text x="694" y="803" font-size="12.5" font-weight="500" fill="#b3adeb" data-page-node-id="JWjnX7kDTyToMuBmt3xnU8">按注册顺序执行，第一个 Reject 短路</text>
+<text x="694" y="821" font-size="10.5" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="HHiUCvNMnKBfATiRKisbXW">拦下 = 不执行工具，理由当工具结果回填给模型</text>
+<path d="M320 840 L320 862" fill="none" stroke="#85b7eb" stroke-width="1.5" marker-end="url(#ar)" data-page-node-id="7J7rtrIMQtZUuyv6Avgr4r"/>
+
+<!-- ══ T2 emit ToolCall ══ -->
+<rect x="20" y="862" width="600" height="42" rx="8" fill="#151a21" stroke="#a3ce72" stroke-width="0.5" stroke-opacity=".45" data-page-node-id="b7wFTjjOQEF39AH9xB2kmK"/>
+<text x="38" y="882" font-size="12.5" font-weight="500" fill="#e4e8ee" data-page-node-id="0nazHMasAuhPIf1f00xm7t">T2 · emit ToolCall</text>
+<text x="38" y="897" font-size="10.5" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="fHuU4G0zNudFym3bdJ1BGU">L338 · 发出的是「改过之后」的 args，模型原始参数只留在已落盘的 assistant 行里</text>
+
+<!-- ══ 右侧：守卫（计划中）═════════════════════ -->
+<rect x="676" y="708" width="424" height="176" rx="11" fill="rgba(240,149,149,.05)" stroke="#f09595" stroke-width="1" stroke-dasharray="5 4" data-page-node-id="OBiQ3NuGUeapEvCTNddyTq"/>
+<text x="694" y="732" font-size="12.5" font-weight="500" fill="#f09595" data-page-node-id="GQd1T4wywuGEUyFzP3HDj5">文件系统守卫 —— 计划插在这里（尚未实现）</text>
+<text x="694" y="752" font-size="10.5" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="v2LJhgRBZ3D2WhobN0QmMX">T3 之内、auth 之前：Agent::authorize_and_execute</text>
+<text x="694" y="772" font-size="10.5" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="kZZQuhJ2HVOiN0qX2v6wRC">默认 · 每次启动 + 每个新对话建 workplace/&lt;时间戳&gt;/</text>
+<text x="694" y="789" font-size="10.5" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="Lfl2pfpEVgRRMU5LY16vUW">选择工作区 · 用户指定一个目录</text>
+<text x="694" y="806" font-size="10.5" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="fCdnQUFVLq0IJrEC2THzAW">完全访问 · 现状（红字加粗 + 弹窗二次确认）</text>
+<path d="M694 822 L1084 822" fill="none" stroke="rgba(240,149,149,.3)" stroke-width="0.5" data-page-node-id="eE1FnnbJoFr7VeRBAWeZfi"/>
+<text x="694" y="840" font-size="10.5" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="GExFGSWK3ws2HQhRlTpBRN">越界不是静默拦下：结构化文本回给模型 + 一条 Warn 给用户</text>
+<text x="694" y="857" font-size="10.5" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="be6S9JQloePBrp1ZKQrgvI">今天：Tool trait 没有路径概念，fs 插件裸奔</text>
+<path d="M620 734 L672 734" fill="none" stroke="#f09595" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ar2)" data-page-node-id="QNjCnPo9xZOGBCzG9oXABC"/>
+</svg>
+</div>
+<p class="cap" data-page-node-id="6z07tqbEpAUD3TBve5BBAv">上半段 S1–S11 是循环的每一次迭代（拿到回复为止）；下半段 T0–T8 是<b data-page-node-id="4p5ccSsji5N6xT8oARU5Tt">同一个循环里的一个 for</b> ——
+模型一次返回 N 个 <code data-page-node-id="GVO4YMZtEzNz0YKsiyKprs">tool_calls</code> 就走 N 遍，走完再回到 S1。
+右侧紫色是已实现的能力面，红色虚框是尚不存在的守卫（详见第 3 节），此后各步在第 2 节的表里逐行展开。</p>
+
+<!-- ═══════════ 2. 逐步明细 ═══════════ -->
+<h2 data-page-node-id="ESZMdp1Y2fyNHkwXJhKBVP"><span class="n" data-page-node-id="RgbVW4rZmGea7DySrc1stR">02</span>逐步明细（含落盘与副作用）</h2>
+<p class="lead" data-page-node-id="qcbKkwXmAMQpioPl9DzRSo">每一行都对着源码位置。「可否决」列问的是：这一步能不能让流程改道 —— 往回退、
+往模型回一条错误、或者整轮中止。</p>
+
+<div class="flow" data-page-node-id="R4iHJUXtGi9D5ZpPeJx7Rm">
+  <div class="grp" data-page-node-id="8CsYFgy376jU58JQJhznIw"><span class="c" style="background:var(--gray)" data-page-node-id="JGCira65clHwHeFVojt7Dl"></span>回合包裹 · src/agent.rs:231-247 · 在循环之外</div>
+
+  <div class="row" data-page-node-id="QlYKTSgjmgjQN39bWkq834">
+    <div class="cell idx" data-page-node-id="PjIge6y6gTRd860ivbvz3v">W0</div>
+    <div class="cell" data-page-node-id="ZefMh04CnymlN8UT2LDhwQ"><div class="st" data-page-node-id="uypBWkxVotEUemyFPIsu0V"><b data-page-node-id="59T7nLJLKNkrJmmBEdOg1G">ensure_log</b> —— 惰性建对话文件</div>
+      <span class="loc" data-page-node-id="GHCLubEbuPABBPU8NoDsj7">agent.rs:232 → :89-108</span></div>
+    <div class="cell io" data-page-node-id="TaijJqhwft4hIJGXgZb0sJ"><span class="io-k" data-page-node-id="MCzRTjFNhiOD0mnbImzXNj">输入</span> history.enabled + store<br data-page-node-id="l1NUsdJR9GsaU7xQaiE52u">
+      <span class="io-k" data-page-node-id="zqvzLjqRBAkf7i5XnFx2uA">输出</span> Option&lt;Box&lt;dyn Session&gt;&gt;</div>
+    <div class="cell side" data-page-node-id="tvgQRpXwhweCRF7on8jakj"><div class="chipset" data-page-node-id="5k3dSNHk8WC4E9tafjYrCn"><span class="tag mut" data-page-node-id="4qvfmp3Fo3buF962GWRXC1">失败只 Warn 一次</span>
+      <span class="tag mut" data-page-node-id="OEcuZ2LTqIAY6QjdWtTPqi">不回滚对话</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="bquS8NeW9sJvz8D7UUtXk7">
+    <div class="cell idx" data-page-node-id="BZxqhuZiQZWVcJCQNxiPPx">W1</div>
+    <div class="cell" data-page-node-id="Di6KLV4kBMEXhRnHnQb5Xq"><div class="st" data-page-node-id="hkl5iwtT4Ie25h8HeZaTi9"><b data-page-node-id="p5zx0eXe6MdkvvkREyCsZT">push_message(user)</b> → turn_start → begin_turn</div>
+      <span class="loc" data-page-node-id="h7St3raBeicB4aBfgDxpAf">agent.rs:233-236</span></div>
+    <div class="cell io" data-page-node-id="uSwK268sLOI7odKBJHLqpY"><span class="io-k" data-page-node-id="A8F3eCjxBE1xRnxvKOJxWx">落盘</span> 第一条 user 消息写入 jsonl<br data-page-node-id="WNJL1eOalMLEnjl9ScHhKS">
+      <span class="io-k" data-page-node-id="C5TD2OKOo9whQmcZbGMGs5">账本</span> TurnAcc 归零</div>
+    <div class="cell side" data-page-node-id="I8f9l6a27hRJfNgwfytYJj"><div class="chipset" data-page-node-id="95P2nrbm7enEU6IuAVG00M"><span class="tag ok" data-page-node-id="LE4VWXvvQxxBCvq6nBjp0t">不可否决</span>
+      <span class="tag mut" data-page-node-id="VOdc0GO8K0oyhM49ii1WZe">messages 唯一写入口</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="vPgnuzCp2retW0idH5nWDY">
+    <div class="cell idx" data-page-node-id="k1YuTPSJkGQ5h77Lkm476R">W2</div>
+    <div class="cell" data-page-node-id="wrd9eURIHAdzY8f6soKyf2"><div class="st" data-page-node-id="wliMvDIaUsGFL6uSa1IUMU"><b data-page-node-id="lAbi37EXhROGqX28n2JvXu">lp.run(self, ui)</b> —— 控制权交给循环实现</div>
+      <span class="loc" data-page-node-id="ClNuI8qzUhxbdK8ekUCivD">agent.rs:239 · loop_impl 来自 config.toml [loop] impl</span></div>
+    <div class="cell io" data-page-node-id="Xf7EdwzKDHe0LbVw3rwfqM"><span class="io-k" data-page-node-id="VjvnGLbB49r4E3l4QPyg0X">输入</span> &amp;mut Agent, &amp;mut dyn Ui<br data-page-node-id="E1JjvoYhy1jT7w2e2lp1ZO">
+      <span class="io-k" data-page-node-id="JUqLOkcZKdXk5YMNUWORSg">输出</span> Result&lt;()&gt;</div>
+    <div class="cell side" data-page-node-id="rC3oCzO70sfGNng0Ju4n2k"><div class="chipset" data-page-node-id="6pf2sg0a9gPewXEWrzo1En"><span class="tag mut" data-page-node-id="2zZyTbpJufA2uOYljaStjm">换个 [loop] impl 就是换整套执行模型</span></div></div>
+  </div>
+
+  <div class="grp" data-page-node-id="031EFTuAJE5IrVXjK0qst9"><span class="c" style="background:var(--blue)" data-page-node-id="0eDanDcmlHVwlDao5dwZLo"></span>循环骨架 · StandardLoop::run · src/agent_loop.rs:141-358</div>
+
+  <div class="row" data-page-node-id="MAYMD2AikbQ28xIs8HDE21">
+    <div class="cell idx" data-page-node-id="cpMjMVlHxAdEPEEOU9CNBV">S1</div>
+    <div class="cell" data-page-node-id="LbitBEAhvr7P6F3wDFQUM8"><div class="st" data-page-node-id="Nd7gBVxqoTjfx0d9DEFiiI"><b data-page-node-id="B0FpfQzj6VFnZdOK1ZtFEI">上下文裁剪</b> trim_point → drop_oldest</div>
+      <span class="loc" data-page-node-id="1T7bRz2GuMKqGAWNP44C1O">agent_loop.rs:162-170 · agent.rs:216-224</span></div>
+    <div class="cell io" data-page-node-id="l3jezrwV1e9ZOuRlEm7OnG"><span class="io-k" data-page-node-id="1jfTUvHfFBxLctnBKkWiFi">规则</span> 轮次以 role=="user" 为界；切点天然落在 user 上<br data-page-node-id="RVW0mgUxyTX4yz02ek3wlE">
+      <span class="io-k" data-page-node-id="3X802NYIo5N6Gpt6gpz3ru">落盘</span> Session::rewrite（内存与文件同步）</div>
+    <div class="cell side" data-page-node-id="ORxwvHCMpcbRk9sCCC29sD"><div class="chipset" data-page-node-id="qgaj6v38PfZHZkI2qdDcbN"><span class="tag mut" data-page-node-id="gCbkpAV569kKeLObfQU8Ae">max_rounds=0 → 不裁</span>
+      <span class="tag ok" data-page-node-id="F8Ln9eWbaMa7gvKScYOlLV">裁完仍是合法请求体</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="2Ros8d40RlW2R2WS6p9fUh">
+    <div class="cell idx" data-page-node-id="EFb8YwcXZFfehtwyDU0oRi">S2</div>
+    <div class="cell" data-page-node-id="Fk4WAVOa3qQTSZecev8E2S"><div class="st" data-page-node-id="SQaFaf5hYxEMgX71QHFzxm"><b data-page-node-id="1sxSMEJbIOSfT5EhbBMRGD">工具表快照 + 钩子点 ① before_request</b></div>
+      <span class="loc" data-page-node-id="IP9jKNuc7UZmPdrSE5ASvC">agent_loop.rs:176-183</span></div>
+    <div class="cell io" data-page-node-id="ADzDGlaSXvuxOI2qRxJu4I"><span class="io-k" data-page-node-id="3yAURCuLd8M0rtXE32NAtu">能改</span> req.tools（整段替换）· req.inject（追加）<br data-page-node-id="ArgbR576Y4qM4CgpmJAor2">
+      <span class="io-k" data-page-node-id="A9mH9lvZPZaIBwGdF2NYsx">否决</span> bail! 中止本轮</div>
+    <div class="cell side" data-page-node-id="eEbMhyPsKOkrFxb3K78N5n"><div class="chipset" data-page-node-id="yCLSgLeQGAl5YoSDab6428"><span class="tag yes" data-page-node-id="frQdWXm65n81o5KxWOZ5CP">可中止整轮</span>
+      <span class="tag mut" data-page-node-id="M56LdtdNWvRksoDlOSFVII">拿不到 &amp;mut messages</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="w4jFvCJ08UlDfZ5g0dH8PC">
+    <div class="cell idx" data-page-node-id="TpguyaRaDZDVtYB24ozWGK">S3</div>
+    <div class="cell" data-page-node-id="fSP75PVosoc3PZz0f1sH1C"><div class="st" data-page-node-id="zho65uGeSdDZaMh5Lhan0h"><b data-page-node-id="82jl3DEFefTwYMVTNRj1QP">模型请求</b> llm.chat（流式，sink 实时回显）</div>
+      <span class="loc" data-page-node-id="st6Bvekv6HBlrGk576NnDG">agent_loop.rs:185-192 · llm/openai.rs:134-150</span></div>
+    <div class="cell io" data-page-node-id="dwIKCMyyKP9wmlfh8LaeiO"><span class="io-k" data-page-node-id="MLhDBACvZvBmkwoXBz2zQf">出参</span> ChatReply { message, finish_reason, usage }<br data-page-node-id="ZLGpboOvG02fbYhIvaiU56">
+      <span class="io-k" data-page-node-id="19Zh7KJdSuswskK91xGHaa">旁路</span> StreamSink → GUI / CLI 动画</div>
+    <div class="cell side" data-page-node-id="0DTkxD8RxwjNFvFokhgI7L"><div class="chipset" data-page-node-id="WDn7UD547rjSZPKJcp16mc"><span class="tag mut" data-page-node-id="P1iACXHIjbr2fmEPpJDOFM">失败 → 走 S5</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="nFE8wKlt1d7qpC2e08DBmr">
+    <div class="cell idx" data-page-node-id="pl1mDGxyW31Z9WvEIYGEOF">S5</div>
+    <div class="cell" data-page-node-id="dIIC87tfImHcAaCpDRLkJ6"><div class="st" data-page-node-id="nY67fyBWrCj6O4QBHwE2eY"><b data-page-node-id="ndmL1XwMLt91BJyGNsRfL3">钩子点 ⑤ on_error</b>（只包 chat 的失败）</div>
+      <span class="loc" data-page-node-id="hcWiP8IdDpiuU92lcnw9cS">agent_loop.rs:199-226 · hook.rs:247-256</span></div>
+    <div class="cell io" data-page-node-id="ucWHFVX2jbXygouvi77SRp"><span class="io-k" data-page-node-id="i6NIXK6PDn2SLtSS4rC8po">Retry</span> 注入宿主提示 → continue（不看预算）<br data-page-node-id="QUfeyRquvuPesgM6IYOICm">
+      <span class="io-k" data-page-node-id="PosBRs2JSVWhXS6FolqZVv">兜底</span> [hook] max_llm_retries，默认 0</div>
+    <div class="cell side" data-page-node-id="WrWFEQrQGGMj9one3AFjEy"><div class="chipset" data-page-node-id="DvW5I66e7GNwKVQzqizny1"><span class="tag yes" data-page-node-id="Nw4m1t6WvQu40xdSDGljyw">可吞掉错误</span>
+      <span class="tag mut" data-page-node-id="nxe27HxpSIxkSHXiQMsgJN">不覆盖空回复 bail!</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="jvnq7jRcjIGRSS3Zn62e38">
+    <div class="cell idx" data-page-node-id="6mOVSnEboF25VbJpS8oISz">S4</div>
+    <div class="cell" data-page-node-id="mhP0QMhBDly9lFPqe2F35M"><div class="st" data-page-node-id="XB5yMQq0cdjGyytdDzV4dw"><b data-page-node-id="RB8DKhJAFdFlvBYz7OD8pk">记账 accrue_call</b> —— 刻意在 after_reply 之前</div>
+      <span class="loc" data-page-node-id="5qKtaL73sCYYHSjIoI27Ds">agent_loop.rs:229 → agent.rs:276-282</span></div>
+    <div class="cell io" data-page-node-id="JgIdzznWgIBZOII5zta6jO"><span class="io-k" data-page-node-id="f65JDI1CCBUX7o3XiY3kzy">写</span> TurnAcc { calls, total, last_prompt }<br data-page-node-id="mZ0sc12cQNL9azjzHzTbes">
+      <span class="io-k" data-page-node-id="LnsHIW65SpBLTs1PAfWgC9">理由</span> 被否决的那次调用 token 也是真花掉的</div>
+    <div class="cell side" data-page-node-id="EYrBUUs2VZd7aa7sh7CXoz"><div class="chipset" data-page-node-id="kDUWzPttAJdfpsuOgnrK9A"><span class="tag ok" data-page-node-id="gfXgfphq1Jq96YCYk4meNk">端点不给 usage 则安静跳过</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="XQTnHeia8eTCQd3A2le2nM">
+    <div class="cell idx" data-page-node-id="HjRhKEcGjvWHBdB0RGCMJE">S6</div>
+    <div class="cell" data-page-node-id="TfrFCuIRHoqjlYmLxwGWhy"><div class="st" data-page-node-id="SCTcEZVmxHJA7JCoeWP0xz"><b data-page-node-id="znFl9neYdVobP0RaW1IR44">钩子点 ② after_reply</b></div>
+      <span class="loc" data-page-node-id="yWPWNoAAzRegabQDJ4JknE">agent_loop.rs:237-252 · hook.rs:220-227</span></div>
+    <div class="cell io" data-page-node-id="Sr8Dp1kGVpfU3wTgHQsyF0"><span class="io-k" data-page-node-id="EjWV4WB0SIqB50Wo1MKqo1">能改</span> 正文（组件仅此一项）<br data-page-node-id="v9U9t3kPTMcagUIaG59vgk">
+      <span class="io-k" data-page-node-id="Cz0ZPu0HgxxyKFOgkJIVEY">否决</span> 复用空回复重试路径（上限 2）</div>
+    <div class="cell side" data-page-node-id="1AMZCJdnCK515GXhC6rKHD"><div class="chipset" data-page-node-id="YClgiJV2nf9BChgnNH8MCI"><span class="tag yes" data-page-node-id="DCUAsjt7UuGE7qLSzTyjjM">可否决回复</span>
+      <span class="tag mut" data-page-node-id="TxJ7f2hjMbebsOkYYC9x3Q">改不了 tool_calls</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="Pzurzma29dT8TR2rzgyy2m">
+    <div class="cell idx" data-page-node-id="VUMV8SaDWW1VmHKob3x7PF">S7</div>
+    <div class="cell" data-page-node-id="crmT4AryErQdw4BN6YKeKr"><div class="st" data-page-node-id="ldHGu84kjcJGtHSaSDFDJp"><b data-page-node-id="eQhSMPls63IrBHmzUSIqTY">空回复 / 截断检查</b></div>
+      <span class="loc" data-page-node-id="3gf4XDgBqAhSvRAV6YT2fB">agent_loop.rs:259-298 · MAX_EMPTY_RETRY = 2</span></div>
+    <div class="cell io" data-page-node-id="wfNL5hkTHMZ4J2ihRDPK0D"><span class="io-k" data-page-node-id="6b0r8yxREzBMIhpiAJwWTQ">空回复</span> 重试 2 次 → bail 并给诊断文案<br data-page-node-id="aRaBnKpajLBklJFuNLLFe7">
+      <span class="io-k" data-page-node-id="0EJPtPxhoSwJbxNjpm5m7O">截断</span> finish_reason=="length" → Warn</div>
+    <div class="cell side" data-page-node-id="Ao9hyNMZ2UVuC8R9tYA9vt"><div class="chipset" data-page-node-id="dK5baHVyAw3SUGc7vGtpkf"><span class="tag yes" data-page-node-id="IamgpQz8XWIpClfmOEbqXO">耗尽即中止本轮</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="f8LE3P0x7q80UsGwR6b2nB">
+    <div class="cell idx" data-page-node-id="R6S10Uxjn2cJCVSLIrWtHE">S8</div>
+    <div class="cell" data-page-node-id="SsKfFhu6A3ttSXC7hNoBkW"><div class="st" data-page-node-id="yusZYFi1ka5PwhmA2L2SDH"><b data-page-node-id="frX0WObIXjUJFgylFUa8lI">文本分流 + push_message(assistant)</b></div>
+      <span class="loc" data-page-node-id="Y7jStFLQnidvV938jrVvVE">agent_loop.rs:301-308</span></div>
+    <div class="cell io" data-page-node-id="Jz7fJg9aDPEbqwhlEyxLqu"><span class="io-k" data-page-node-id="JGz0jHqgOSkmmr78lGAKrO">有工具调用</span> InterimText（折叠进过程区）<br data-page-node-id="IBZcOxrMMDrD08sRmVNkLX">
+      <span class="io-k" data-page-node-id="YUFXOfRpN4oK8NwOy0ccER">无工具调用</span> AssistantText（最终答复）</div>
+    <div class="cell side" data-page-node-id="k8IDvAt4OoffOcX8c2p58E"><div class="chipset" data-page-node-id="Je9BXRNxDNrRpSDNa1DMJO"><span class="tag mut" data-page-node-id="68tYyZJFI6v1pZRHJop0b1">落盘</span>
+      <span class="tag mut" data-page-node-id="5jFKwHCNFB9kdIRr3a1LIF">此后再无 tool_calls 即 break</span></div></div>
+  </div>
+
+  <div class="grp" data-page-node-id="FVUV3BDZBj7dbG3EgPNZvS"><span class="c" style="background:var(--blue)" data-page-node-id="LCqt3Bd1PfCMj4P0hUlnPq"></span>单个 tool_call · for call in calls · src/agent_loop.rs:313-355</div>
+
+  <div class="row" data-page-node-id="wT3RRA1Dr41HLUJco1775R">
+    <div class="cell idx" data-page-node-id="5w7PAvg9EkM1DdIg6MC6gW">T0</div>
+    <div class="cell" data-page-node-id="FBwY0jlFMEkAnyw8GphCaA"><div class="st" data-page-node-id="gQZ1zFsKiYA7MD1UvLDeVX"><b data-page-node-id="gkeCHeZhBzx6LSUv5b19RI">参数 JSON 解析</b></div>
+      <span class="loc" data-page-node-id="ik2qSwRZUAY5aNXcCTMX9W">agent_loop.rs:315-326</span></div>
+    <div class="cell io" data-page-node-id="KX2YUzfcyff64Tidoa5GTP"><span class="io-k" data-page-node-id="eXkfPPWCkoG2BtRnic6kHg">失败</span> emit ToolCall{} + ToolResult(is_error)<br data-page-node-id="UeVHO5grtg8klloUvW51Nk">
+      <span class="io-k" data-page-node-id="gg7oJJNpYRoqYzq2B4fzd8">落盘</span> tool 结果消息（is_error=true）</div>
+    <div class="cell side" data-page-node-id="Lo9JyGryHjE8rw2y86IjpL"><div class="chipset" data-page-node-id="1j1Xdzzsy2tXnm81WcSlL4"><span class="tag mut" data-page-node-id="BGOGHHbN3ofkwYLVbVKfhi">钩子与策略均不参与</span>
+      <span class="tag mut" data-page-node-id="mMIIugZUJsw4OVPeBv1GQV">还没有「可改的对象」</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="fvmCRuYap6yPPIYaH2ZjXu">
+    <div class="cell idx" data-page-node-id="MYetjjGCVhhplFM3Tqiv92">T1</div>
+    <div class="cell" data-page-node-id="d6dsZ9Pf8ZggNF5y5hHCVP"><div class="st" data-page-node-id="sGAG14CaWEP5XY0iQW8juJ"><b data-page-node-id="RRM8FSqTsTtuq1C1Nc5BL8">钩子点 ③ before_tool</b> —— 可改 args</div>
+      <span class="loc" data-page-node-id="epoXWWuSkHCGoBKAxtSVb7">agent_loop.rs:331-337 · hook.rs:229-236</span></div>
+    <div class="cell io" data-page-node-id="j1omGxTPKlDwmNRD3NHrTq"><span class="io-k" data-page-node-id="lbL1YifqtnEWuv9fgLtRqa">语义</span> 改只影响本次执行<br data-page-node-id="sBhdDKbiBodTGZvh8L9ZiH">
+      <span class="io-k" data-page-node-id="7jtl4Gujgnhbj6sffGVgNw">否决</span> 不执行工具，理由当结果回填</div>
+    <div class="cell side" data-page-node-id="ah6w7EjrJPq6UNXShtx0JI"><div class="chipset" data-page-node-id="AtePrlVKs1g6J8scx9KYAV"><span class="tag yes" data-page-node-id="LLpDShiKkDwOoXAhzDoJst">可拦下调用</span>
+      <span class="tag mut" data-page-node-id="YYy6AftsGHmXYO6TGttfFn">不回写历史</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="ZwFFVB5D8y7oidg75tpXKS">
+    <div class="cell idx" data-page-node-id="BZapP7gbeoHDzDlORiCwbj">T2</div>
+    <div class="cell" data-page-node-id="TSRqb0akmzidO16Ai5sG55"><div class="st" data-page-node-id="USleK091rGwB80OBr1kaCO"><b data-page-node-id="Tc4CpGpj8oaIsdByX3HZGS">emit ToolCall</b></div>
+      <span class="loc" data-page-node-id="AvsemKPaeRrwethvnfbCxu">agent_loop.rs:338</span></div>
+    <div class="cell io" data-page-node-id="Anvw0fkRHtdHfd70C0odkO"><span class="io-k" data-page-node-id="t7kcOdJPrz9mnYpfp0dI0o">载荷</span> 改过之后的 args（不是模型原始参数）<br data-page-node-id="CTq2ZFKOY3HKbctKUyYiiu">
+      <span class="io-k" data-page-node-id="j3XsoQuFBbmXl4dXNr0Nzn">消费</span> CLI 折叠进 TurnLog / GUI 活动流 tool_begin</div>
+    <div class="cell side" data-page-node-id="poT1d2EPxXjbxgYz9jd5gn"><div class="chipset" data-page-node-id="vErI7LKZeh24rHR0rimeSw"><span class="tag mut" data-page-node-id="Khv1YDV89y74sXVTlujgsF">UI 与历史在这里分叉</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="RS2FNU8lTiiF7fhtXDIf52">
+    <div class="cell idx" data-page-node-id="LhGBHkWa8NFfTTLcrA6ndv">T3</div>
+    <div class="cell" data-page-node-id="gnxEasDXbDxuOArJRng7vj"><div class="st" data-page-node-id="dmMPDbeQ04iBSFL6VUZ5lA"><b data-page-node-id="RCJjaZSFsfPnHrcGEYiHhF">authorize_and_execute</b> —— 所有工具的唯一收口</div>
+      <span class="loc" data-page-node-id="JhctLRZ1FYibfrEmY4DwL2">agent.rs:314-360（含 workplace 守卫的预定插入点）</span></div>
+    <div class="cell io" data-page-node-id="tnutkqfHJy8wtoBvHtimme"><span class="io-k" data-page-node-id="kqE3GpA3SBpPD7l5AdMf7c">顺序</span> tool_kind → caps_for → level_for<br data-page-node-id="NSvOOhwK9IwUjBswS8MCfV">
+      <span class="io-k" data-page-node-id="KRdxEsGbVL1dbGBHis5WbH">否决</span> 策略禁止 / 用户当场拒绝，两句不同文案</div>
+    <div class="cell side" data-page-node-id="B94DCSe4o5BslBasfUx6dK"><div class="chipset" data-page-node-id="NcNZ6BCYplSGI1zojOzYD6"><span class="tag yes" data-page-node-id="rmbG96KvczCTr3ThO9Cypy">Auto / Ask / Deny</span>
+      <span class="tag mut" data-page-node-id="EbtsSJQf0HaRbClsXvgrzK">早于 auth 就有守卫的计划位</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="JGpa1Lu0gwspYUZSUtB8Fi">
+    <div class="cell idx" data-page-node-id="TLhHXlKTeno94gD674wgeq">T4</div>
+    <div class="cell" data-page-node-id="7rthy5Cs65MHB8hniWdgkR"><div class="st" data-page-node-id="bYxHlJaAMQ67Sm5UsLDx9k"><b data-page-node-id="hStltEdBNqzosfG6RIA4kM">emit ToolRunning → Runtime::execute</b></div>
+      <span class="loc" data-page-node-id="GTkrhGPLsl3ENhLffoz625">agent.rs:341-345 → runtime.rs:210-222</span></div>
+    <div class="cell io" data-page-node-id="2HDGjhwACwbHDN60TkHIg8"><span class="io-k" data-page-node-id="NBBlf7bev3rihfqosuMAXx">兜底超时</span> tool_timeout_secs + 30 秒<br data-page-node-id="HBV0xEUddrpVnvfdyogqTl">
+      <span class="io-k" data-page-node-id="tU5H4J4ndAhIvSYT41ekNs">不存在</span> 直接 err</div>
+    <div class="cell side" data-page-node-id="vsH4TE6NkRZMxhAS73JkYl"><div class="chipset" data-page-node-id="uqRimaGwU2uYXt1OAVZLBf"><span class="tag mut" data-page-node-id="GUyPpYRjyEGc7C2CYEWZcj">插件路径：RPC → 失败则 respawn 重试一次</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="dTYAgXrFwX2V9bczlEAInm">
+    <div class="cell idx" data-page-node-id="DCDY5XjnwcIA7tGR85QmNS">T5</div>
+    <div class="cell" data-page-node-id="HxZirMFHUu0D9nAKH0FTqZ"><div class="st" data-page-node-id="fWu8M6EzYntEfnLLozUBRq"><b data-page-node-id="fgrTqCAcv9DkPfVLOH9Plu">钩子点 ④ after_tool</b> —— 结果重写</div>
+      <span class="loc" data-page-node-id="hxJOCf0Zhy7V4eBGADtI7P">agent_loop.rs:342-344 · hook.rs:238-245</span></div>
+    <div class="cell io" data-page-node-id="cFZLwpd6vaCJecY08GqlQy"><span class="io-k" data-page-node-id="wEoyduCnESuJnJlBOj7udZ">能改</span> content · is_error（组件两者都能改）<br data-page-node-id="Ez95ySPc5CZ88ClltOW63f">
+      <span class="io-k" data-page-node-id="r9mf4AdmUeKNXCpNK3qABR">否决</span> 整块换成带理由的 err</div>
+    <div class="cell side" data-page-node-id="xe9b05QLn7GWd2iiK8f45s"><div class="chipset" data-page-node-id="EGtaQatBndSPWESh2n3gte"><span class="tag yes" data-page-node-id="8XHU4zmSLrSGmDgOV2L4D4">可改可拦</span>
+      <span class="tag mut" data-page-node-id="dc3tKLF0qGhpWDPFwoGrz5">刻意排在 emit 之前</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="3Dsg2q4Gm0WrfcIIWBOcjt">
+    <div class="cell idx" data-page-node-id="Q8BKgOo9KfHQelpoXhGGA1">T6</div>
+    <div class="cell" data-page-node-id="EXwzRCh7ctLORE1CHHpje1"><div class="st" data-page-node-id="Wzs2XkgUgvItxkGb2R8s8t"><b data-page-node-id="OWhheZo7X9kXo7wOzwlxHx">emit ToolResult</b> —— 界面看到的第一份结果</div>
+      <span class="loc" data-page-node-id="alS8jKWAY9WszkNvAO5dN6">agent_loop.rs:345-349 · preview 截到 300 字符</span></div>
+    <div class="cell io" data-page-node-id="zFPNWUKTz8iDA8VMGwf8YZ"><span class="io-k" data-page-node-id="jMBE0ONYjx3jagl4UnPwen">CLI</span> 挂到最近一个同名未回填的 step<br data-page-node-id="KfZgKrVixKe4UAOrFcA8uR">
+      <span class="io-k" data-page-node-id="CkNSdAP6kBFBMu3YGLWpsl">GUI</span> 活动流 tool_end 补耗时与成败</div>
+    <div class="cell side" data-page-node-id="QgyjtX1egr232BZbBWSfZg"><div class="chipset" data-page-node-id="dLPmTE8pNiuTAIS87gAtwr"><span class="tag ok" data-page-node-id="Pot2KLsJcEMHFi4YmBmWKb">已含 T5 的改写</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="rP75nAierzSU5BrpGlJSeb">
+    <div class="cell idx" data-page-node-id="kgwHnsr3cTAME5FsTToCAn">T7</div>
+    <div class="cell" data-page-node-id="zRaDcgizvhJIYaa6OUP2Sv"><div class="st" data-page-node-id="oO8RybhTXAaMTvUzHSxFJM"><b data-page-node-id="TUcErBvgWK2dsn4xPKhJSU">cap_chars</b> —— 送回模型的第二份结果</div>
+      <span class="loc" data-page-node-id="eQY6tfUdZz2Uz9Yt80Exk8">agent_loop.rs:350, 369-376 · max_result_chars = 20000</span></div>
+    <div class="cell io" data-page-node-id="tiLs7PyC6H4uwLH5Ki7wFC"><span class="io-k" data-page-node-id="Rw7buBUtg023W9fMnvrmSC">截断</span> 超出则追加「原长度 N 字符」<br data-page-node-id="Dn1ZDSfUAlntyM8zAa1Xmu">
+      <span class="io-k" data-page-node-id="x7CgpeBbvVJOm4fWBMKtRL">注意</span> 与 T6 的 300 字符 preview 是两套独立阈值</div>
+    <div class="cell side" data-page-node-id="TF1akC1Kt3NGv1x5DtzYVk"><div class="chipset" data-page-node-id="2AEIAz4TfhWu2yjHr7swFZ"><span class="tag mut" data-page-node-id="RDcRrE2sGH8nyioNv9eJx8">界面看到的 ≠ 模型看到的</span></div></div>
+  </div>
+
+  <div class="row" data-page-node-id="xrJUQYMnR8qBzW1oe7wBDQ">
+    <div class="cell idx" data-page-node-id="BXuLs1SuyqWgZQisEYuV9n">T8</div>
+    <div class="cell" data-page-node-id="e9sKHAFNOFYBii1mdxPTEH"><div class="st" data-page-node-id="JWa1uB3nzo7uwNvpb4fDFI"><b data-page-node-id="D2rHvVBg9D5YZeb7iNl0bZ">push_message(tool_result)</b> —— 落盘</div>
+      <span class="loc" data-page-node-id="uCSY6zgogeVtBwSJBjk1vo">agent_loop.rs:351-354 → agent.rs:115-120</span></div>
+    <div class="cell io" data-page-node-id="edCuL0soLiS3QqGoiAhwA2"><span class="io-k" data-page-node-id="nauYaITNyNODEus2JDnSVZ">落盘</span> {kind:"message", role:"tool", is_error}<br data-page-node-id="JUIdM9VnS8WDCDJCoxTDQ7">
+      <span class="io-k" data-page-node-id="5ZrC81ieANeuv0rew2HGXE">下一轮</span> 成为请求体的一部分</div>
+    <div class="cell side" data-page-node-id="ExKYeI0bkuvjZr7su8uHFQ"><div class="chipset" data-page-node-id="J6SVhdZ1dqJ3yQ2lyFK1gA"><span class="tag ok" data-page-node-id="Vd5cUgGdDc7bZx4kqjdkYW">T6/T7/T8 同源同值</span></div></div>
+  </div>
+
+  <div class="grp" data-page-node-id="wKFBbWVuT3yoPdfoAmL83y"><span class="c" style="background:var(--gray)" data-page-node-id="EM5YjSQVxvTR1nmgaNjMBi"></span>回合收尾 · src/agent.rs:240-246</div>
+
+  <div class="row" data-page-node-id="DADBjtQaLyL0WtTDpWtutK">
+    <div class="cell idx" data-page-node-id="3E9sWZ795EPBqAVrLKkT6B">W3</div>
+    <div class="cell" data-page-node-id="irrF0w2ZEAyu7T5s5lpGXl"><div class="st" data-page-node-id="lyv4Y9VNeoGS9UuJXv7E9Z"><b data-page-node-id="RNGazKCwrC8aPVzot2muhz">turn_end</b> → <b data-page-node-id="Ld14MohRTL8k9HDVaNXiDE">finish_turn</b> → <b data-page-node-id="4HLn9kHqzLERkoLvvoIuuI">turn_usage</b></div>
+      <span class="loc" data-page-node-id="x8J9SuBE4xOZQqSGkkgTRn">agent.rs:240-246 · finish_turn: agent.rs:290-310</span></div>
+    <div class="cell io" data-page-node-id="WD4Lvj0lfdfZEbpqOFWOuS"><span class="io-k" data-page-node-id="5vmvov9W3gceHVB6Y2EcoS">落盘</span> {kind:"usage", round, calls, 各项 token}<br data-page-node-id="GdPAsuWhrgAnNFcG1EhE4G">
+      <span class="io-k" data-page-node-id="prc6uFKZLFDHvlv7JzUtaL">顺序</span> 动画撤掉之后才报账</div>
+    <div class="cell side" data-page-node-id="kBFoylMTv7UxaNlNSeAUnx"><div class="chipset" data-page-node-id="llEd94SdMojpX9RnQztH53"><span class="tag ok" data-page-node-id="4F3hAlXbH6yW1nWycIGNSe">出错也报账</span>
+      <span class="tag mut" data-page-node-id="mmSGKvugrb0alB701JgYwo">界面显示的账 = 落盘的账</span></div></div>
+  </div>
+</div>
+
+<!-- ═══════════ 3. 六个横切点 ═══════════ -->
+<h2 data-page-node-id="uI6FI3i7mlLzRTb9dH9xx7"><span class="n" data-page-node-id="eIEWBKtEFf9CP8Joy6QCzu">03</span>六个横切点，各自插在第几步</h2>
+<p class="lead" data-page-node-id="XxSgxwCVQHt3DcDGM3cUzm">「不改变循环」的含义是：这些能力全部以<b data-page-node-id="rRDoTG8M8ExYDnFCPl6Cuo">可替换对象</b>或<b data-page-node-id="81NDCnxuOUvja6YeTKyi4N">单点插入的调用</b>的形式存在，
+循环骨架的语句顺序与它们无关 —— 摘掉任何一个对象，循环照样跑，只是行为退化。</p>
+
+<table class="fixed" data-page-node-id="wpBlxB2HNRaFqUGvgDJ1zq">
+<colgroup data-page-node-id="xWnXaqr1DflaSS5pTZ1Tlm"><col style="width:15%" data-page-node-id="p8c5c1ERDaHHXF1beEKiTp"><col style="width:12%" data-page-node-id="MONfhgrrYJTbcCsM2dPPxE"><col style="width:27%" data-page-node-id="DQ2THkPFPPj81FUaEFkzXN"><col style="width:20%" data-page-node-id="nPKl0Lcebkor60hmoQ3cwB"><col style="width:26%" data-page-node-id="DJAUGDec67tsSsQc0IfxVB"></colgroup>
+<thead data-page-node-id="6tEE3y0Nu9ykuIk7rr36yJ"><tr data-page-node-id="F5SHgERGGZDNOVFEI6pmBa"><th data-page-node-id="jEl5b9XLVtU5865FyYzmnT">关注点</th><th data-page-node-id="xwKTKUK9PACwhvVT1w90Is">插在</th><th data-page-node-id="CMDTZxo1fpTdPzOiitA3nK">形态</th><th data-page-node-id="8svE3XBoGyTw1y8ZB8jLZW">能做什么</th><th data-page-node-id="U4FMOCuHYlLhnCEHwbikY5">撤掉之后</th></tr></thead>
+<tbody data-page-node-id="fC4wTNgdVozg9ihXnSuwr6">
+<tr data-page-node-id="bUVqlhQa7WC96nFaXzsV8X">
+  <td data-page-node-id="n0OnMDTZl1SRf19V4ogMC8"><b data-page-node-id="zKurM978D5VnxBnKW6HzD6">授权策略</b><br data-page-node-id="ZZsmn0EqKl64ytp7BzOWhw"><span class="note" data-page-node-id="CNr1q8rTzBo3e3HpRa6Cu2">auth.rs · 阶段 3</span></td>
+  <td data-page-node-id="Fn5auC7sAQNjkWSqDenGs3">T3 内部<br data-page-node-id="WppnJtrZgqsoBiMpKjEtB7"><span class="note" data-page-node-id="LcXLBlAeV7CkknCAnJPufl">agent.rs:320-339</span></td>
+  <td data-page-node-id="DxG9ExKivCLkTXDrs1U41p"><code data-page-node-id="mWcRTII1jzSroMqJ5uGIPv">Arc&lt;dyn Policy&gt;</code><br data-page-node-id="6GZuGr1rTRtzVV0cpIpGXA"><span class="note" data-page-node-id="yVO1fG2H5T41tUuFGrl7Hp">ConfigPolicy 是唯一实现</span></td>
+  <td data-page-node-id="mCL07nihtRDeXFLecJf9fX">四层判定：工具名 override（含 <code data-page-node-id="A2Gru2i3vp2OCrun948EaS">fs_*</code> 通配，长前缀优先）→ 插件名 override → 组件 caps 声明（非空即 Ask）→ 类别默认。<code data-page-node-id="8nWbS0A3pC4jlk0Cva0Lag">Ask</code> 时先查本会话白名单，再问用户。</td>
+  <td data-page-node-id="yipH6E1x3sKPtDW9p6lfRN">无策略对象 ⇒ 无法编译。默认配置下 <code data-page-node-id="kPDGNbbM45dtbA31CqLJqI">meta_tools=ask</code> / <code data-page-node-id="hwNSoZvJ7eGsA1V4lrGBfN">plugin_tools=auto</code>，判定与逐条手写一致。</td>
+</tr>
+<tr data-page-node-id="5glnCSdcloZpF9u8bqk5xA">
+  <td data-page-node-id="U5qAHPmhL5HPn2I819e8mX"><b data-page-node-id="KSzc5nkqkEgrYfBwQxKX1v">循环钩子</b><br data-page-node-id="cSnQxpbLD1wQZ0T7ZUFRoK"><span class="note" data-page-node-id="noRG7uW4VMrvyUHhXlHGun">hook.rs · 阶段 4 + 6b</span></td>
+  <td data-page-node-id="KJ8QVx4cLFeNbzbPEr3Yyx">S2 / S5 / S6 / T1 / T5<br data-page-node-id="hsJedwaxRFj3TqtJ4mIHYe"><span class="note" data-page-node-id="oIvkuZu0duemR5h5Ovd3O5">五个点</span></td>
+  <td data-page-node-id="gYNP5sW8Hd3Ob1igqCfdni"><code data-page-node-id="XqSfoHhtjJVR9jqoxfDA3h">HookChain</code>（<code data-page-node-id="CjuXfKXK7SD6dKaONfYaro">Vec&lt;Arc&lt;dyn Hook&gt;&gt;</code> + 运行期 push）<br data-page-node-id="0twp716ogggb84GYdKZkAS"><span class="note" data-page-node-id="IEcRHfTiigAmdmpvCCY0g1">两个来源：config.toml + 组件</span></td>
+  <td data-page-node-id="4ToBNCdLcXFcMtkFkSLOLt">改工具列表、追加消息、改正文、改 args、改结果、降级重试。链内按注册顺序执行，<b data-page-node-id="58WluIjtoRe0BrjjH8ggeN">遇第一个 Reject 短路</b>。</td>
+  <td data-page-node-id="nDz9hvt9CDkoVxMjJ7JgFD">空链下每个点退化成「在空 vec 上循环 0 次」—— 这就是「无钩子 = 行为与加钩子之前等价」的机制证明（<code data-page-node-id="fXHdYwZMWCGb7HuBecJmEO">empty_chain_never_intervenes</code>）。</td>
+</tr>
+<tr data-page-node-id="L375qEB4QPzUfj8y4tMPvw">
+  <td data-page-node-id="ByC0lLClHD4Ey4BTsHUi30"><b data-page-node-id="UcxLa4Y20K6z1SMeHXqw2f">文件系统守卫</b><br data-page-node-id="Aa2juzweGjWKmYKRf7oLSp"><span class="note" style="color:var(--red)" data-page-node-id="q2u5oqAVZ8d7r66UTNAXJO">未实现</span></td>
+  <td data-page-node-id="DItAqqI5yrkyYo98y39wdJ">计划在 T3 之前<br data-page-node-id="ylhehAXIg2VofrnTfmeuE4"><span class="note" data-page-node-id="cBYAKRo5CZ2UyHUdsHSS2R">agent.rs:314 之后、auth 之前</span></td>
+  <td data-page-node-id="fHmHoVXJR2VXTXhHV5JkFc">计划：<code data-page-node-id="t6qD4kxp0Ci7knrCIskl7G">src/workplace.rs</code><br data-page-node-id="yEJvChUvw68luotRAFwdIj"><span class="note" data-page-node-id="r97gVn5eCkChw6VNruycpB">契约文本集中一处</span></td>
+  <td colspan="2" style="color:var(--tx2)" data-page-node-id="FZEatLVTb7cBNyhRMZ1jmQ">
+    <b style="color:var(--red)" data-page-node-id="v8zDKZ0iLTVYWuHnGeNI63">今天不存在。</b>判定点已经选好（所有工具的唯一收口，早于 auth），
+    但 <code data-page-node-id="dRKwOvDXFS3AzOAKKBHbjn">Tool</code> trait（tool/mod.rs:35-54）没有路径概念，<code data-page-node-id="W8o4eijHtjpdkCC9Xb4Cnw">src/paths.rs</code> 只管应用根、不是工作区约束。
+    <code data-page-node-id="vY739oPc1I6QJkuES4zBrS">plugins/fs/main.py</code> 是裸的：<code data-page-node-id="MgZRNLCYYERlDGgMs4UzfM">fs_write</code> 自动 <code data-page-node-id="W3jVm7bRUnKaCJfEIE5Mwr">makedirs</code> 造父目录（:58），
+    <code data-page-node-id="kGxXs9fmvjZ40by3VWQC32">fs_rm(recursive=true)</code> 直接 <code data-page-node-id="a2kLCzZfDea5luEywFtohi">shutil.rmtree</code>（:89），
+    <code data-page-node-id="km11iL25GRruBkaDVsy7wB">fs_read</code> 读任意绝对路径。设计已定：越界不是静默拦下，而是把「发生了什么 + 这是权限边界 +
+    别重试 + 请转述用户并告知如何提权」作为结构化文本回给模型，另发一条 Warn 给用户。
+  </td>
+</tr>
+<tr data-page-node-id="YDbaUAA4CowPFidRGIjNGo">
+  <td data-page-node-id="mrrCiHTz0se518dmT23IkC"><b data-page-node-id="LjGGnCl3QFACwVCOO9Fcek">结果重写</b><br data-page-node-id="TQlTtN3dRJBhYdLCNbbTqM"><span class="note" data-page-node-id="qLgs9TApLFcWeQ8kqDvuNP">agent_loop.rs:342-354</span></td>
+  <td data-page-node-id="g3gV5Etzyef70f2qRAunPW">T5 → T6 之前<br data-page-node-id="DrIqBPt6d6XI29D9Rg5px3"><span class="note" data-page-node-id="WrRzywHTqKWof6YCrWSwVE">且在 T7 截断之前</span></td>
+  <td data-page-node-id="YO6DtEHXK59bqycO2fdS7T">钩子点 ④ + 两段固定裁剪</td>
+  <td data-page-node-id="tlf63VBJLkeHSJDu3qc77i">先把 <code data-page-node-id="nzV0rTmrGp5rLiQPaTLa6b">output</code> 交给 <code data-page-node-id="G0D6P7fg08SdPOu7K3TZEQ">after_tool</code>（可改 content / is_error，可整块换成 err），<b data-page-node-id="juosqsNIlr1VSlSsMNmsHv">改完</b>才 emit 与落盘 ⇒ 界面、历史、下一轮请求体三者看到的是同一份值。</td>
+  <td data-page-node-id="HsTkqEqzHE0WjWLvnGYHmP">无钩子时 <code data-page-node-id="SS7LzPAMPuexP9MCBUkNZP">after_tool</code> 是 no-op，剩下两段裁剪照旧（preview 300 / 模型 20000）。</td>
+</tr>
+<tr data-page-node-id="vzJXsHjLsAtHggxpResfTm">
+  <td data-page-node-id="mHuZSYPBygNA38YqDSrvNp"><b data-page-node-id="iSsNRLKYpmDammC3grUKvw">最终结果观察</b><br data-page-node-id="cBndKsU1pLhAA5q2vFInbs"><span class="note" data-page-node-id="RPY86GnPvZz4pmc3G4fIsY">agent.rs:243 · ui/mod.rs:52-65</span></td>
+  <td data-page-node-id="NlZzuMFWzDve3AvFhCbIwX">循环<b data-page-node-id="J83AOhx4XaSydnsJFCBtBC">之外</b><br data-page-node-id="6kKph5R25atZsoZnF40bV8"><span class="note" data-page-node-id="PgihkKoecbaLA1X2EGXC8N">turn_end 之后</span></td>
+  <td data-page-node-id="IEKF7olQ2ZLFlXYcvO0geH">Ui trait 的三个方法<br data-page-node-id="lijVRnFlDIupEu3lxFEl5a"><span class="note" data-page-node-id="4S8zTmdv5WPrMCvzPSE35P">turn_start / turn_end / turn_usage</span></td>
+  <td data-page-node-id="0GDuh2nwLsKTgb1DqYlWsH">一轮跑完后 UI 才拿到「这一轮结束了」与「这一轮花了多少 token」。<code data-page-node-id="8CfaEgXaQcMSx6ScIHoDTy">turn_usage</code> 排在 <code data-page-node-id="G5ERta6wASWQfyOKAeBT0d">turn_end</code> 之后，是为了让 CLI 能把明细打在光标当前行而不被 spinner 盖掉。</td>
+  <td data-page-node-id="pfGafALAT717UJEmtDE4mR">默认空实现 ⇒ CLI 与 GUI 想不想看、怎么看都不影响核心。GUI 靠这条拿到轮次边界来切时间轴。</td>
+</tr>
+<tr data-page-node-id="uOHOsqntRltMPW1KvrRdpN">
+  <td data-page-node-id="fDRis37azT4W9X9xolcv8C"><b data-page-node-id="C8x3BOM6BGSEJxzZDDp9fx">UI 渲染</b><br data-page-node-id="lxWmFMyqyJZK8y0R5HWxvC"><span class="note" data-page-node-id="CMh6x5ww3PymdpUzgb891J">ui/mod.rs · gui/src/bridge.rs</span></td>
+  <td data-page-node-id="BDLJApSTpy5a87arfLZY8t">T2 / T4 / T6 三处 emit<br data-page-node-id="OC9QuxCPjFNtsyOxIjibO9"><span class="note" data-page-node-id="O67MqIDNDxd8xgOCh5WtGU">+ 包裹层四处</span></td>
+  <td data-page-node-id="5VDg9D707Tv0153iTmGrBW"><code data-page-node-id="L7UZabq66ohIkbkeTEluit">AgentEvent</code> 枚举（8 个变体）<br data-page-node-id="jJX1l24a4oKaNDWcpN7lWR"><span class="note" data-page-node-id="yGNFAd4zrAmQZriOSIgdDO">CLI 与 GUI 完全同源</span></td>
+  <td data-page-node-id="Ron3F9kIejzN0qQUryrOap"><code data-page-node-id="FIDBAgdqmLTMQT6PWBXgkg">ToolCall</code> 开一个色块 → <code data-page-node-id="uuKV71k6P5FXAk9vQDNYMo">ToolRunning</code> 补状态与超时上限 → <code data-page-node-id="vukYdlCKuk9areO6bFAWBm">ToolResult</code> 补耗时与成败；文本分 <code data-page-node-id="3G71xqbQy4IBLAKU7fluwe">AssistantText</code>（最终）与 <code data-page-node-id="dwU4kWzYXIkemDRkl8wScV">InterimText</code>（过程）两条路。</td>
+  <td data-page-node-id="HkXdHOH6BQ9PEa8lLF5VVQ">emit 只是往通道里塞消息。GUI 侧 <code data-page-node-id="RVUXiyb1W5kWF88fgUzS1P">on_event</code> 之外的东西（侧边栏、主题、输入区）与执行链路完全解耦。</td>
+</tr>
+</tbody>
+</table>
+
+<div class="box warn" data-page-node-id="dTAxUd7ex7oBTP6WiNlASb">
+  <h4 data-page-node-id="4WDMOwueVf5jva2ACA6hbK"><span class="dot" style="background:var(--red)" data-page-node-id="oaHWpiaqR4BElS5uE8e9Ox"></span>守卫缺席造成的一条真实自提权链</h4>
+  <p data-page-node-id="nMhD1mNvXeBx6hiXTK0two">今天 <code data-page-node-id="ihWA7vwXVSoFz7J59RHWgb">RULES.md</code> 按<b data-page-node-id="DmeAjddvJEXq2NHZKfUbxX">应用根</b>解析（prompt.rs:225），而 <code data-page-node-id="7SKcqDBWWkrEutXQWP7Rd2">config.toml</code>（含 <code data-page-node-id="HQtjODobhXS7qZFjVpADjE">[auth]</code>）
+  与 <code data-page-node-id="0FoAF5JRsFkwsr4lILxLMC">plugins/</code> 同在该目录，<code data-page-node-id="V0cbsKOSCBuLUF1bwjue7a">fs</code> 系列走 <code data-page-node-id="vkppOrnM2SBarhzJ3w2vUx">plugin_tools = "auto"</code>（免询问）。
+  于是「读到投毒文件 → 改写 <code data-page-node-id="WQEUcU4CLOOMdtQXnBuSWg">RULES.md</code> → 改 <code data-page-node-id="K8t0EtDBKXyoqeK3xO5tG6">[auth]</code> → 丢一个插件」这四步<b data-page-node-id="A77VSetz2ZNPr9dHb54EH5">没有任何机制会拦</b>，
+  唯一防线是「模型自己不去做」。守卫插在 T3 之前正是为了堵这一条。</p>
+</div>
+
+<!-- ═══════════ 4. 分叉 ═══════════ -->
+<h2 data-page-node-id="XCoiT4x42l2TkCkiuwka3V"><span class="n" data-page-node-id="aKRmqXRzAHS6VaUFirY1mX">04</span>分叉与失败路径</h2>
+<p class="lead" data-page-node-id="MpjxQzUtKDx0QYDJBnqWbA">同一次调用的六种结局。注意最后三行：<b data-page-node-id="KuPDGtThtwAofQp1T3WUfh">被拒绝的调用同样会 emit ToolCall + ToolResult</b>，
+所以界面上看到的一次「红色失败」要分清是哪一种 —— 三者的措辞不同。</p>
+
+<table class="fixed" data-page-node-id="wGtAhsZptlNy40hZyw6Ut1">
+<colgroup data-page-node-id="oEFuHvX2PuJL7uyeEJW0B9"><col style="width:19%" data-page-node-id="EuxE9b92cQ83GDsi0MCE0I"><col style="width:26%" data-page-node-id="tsqEoBKHehz8Ox40sWQtTZ"><col style="width:26%" data-page-node-id="l58qdxAlwlAHs5EuCAdvwc"><col style="width:29%" data-page-node-id="bMTgIJOt4kuLVJEIMBbhOE"></colgroup>
+<thead data-page-node-id="ap2ifCFkKiZjADlRebgOS6"><tr data-page-node-id="jm5VMH2DJrS4pCDTczw00F"><th data-page-node-id="YQHLt5BeuElhgxXUELIv4E">分叉位置</th><th data-page-node-id="IOpa9RwEavqSVr2bDPF1cn">触发</th><th data-page-node-id="3IqTdC3JGbJsILf2DfpeTC">工具执行？</th><th data-page-node-id="FiGCvYIlTDmt2locWCAEbZ">回给模型的措辞 / 后续</th></tr></thead>
+<tbody data-page-node-id="lNDOgSFdnoUfTA21gUvtdT">
+<tr data-page-node-id="GR9XFLaZOSui5XKgnL567f"><td data-page-node-id="bI87AsuRDktym7jEiNPnEO">T0</td><td data-page-node-id="6NwphaXgjfsvxtA8tHumxp">参数不是合法 JSON</td><td class="deny" data-page-node-id="I2B1hreEoJ1lpNVVeC33dR">否</td><td data-page-node-id="l1Qe4ZrSqXk8q0kBiL0npM"><code data-page-node-id="Q6qkZmx13xqDuOxySSCNs3">工具参数不是合法 JSON: {e}</code> · is_error=true</td></tr>
+<tr data-page-node-id="i4ioXLD2oqEYhu36rHDly6"><td data-page-node-id="MnxurBA6gFnwgTUx1Z2Wav">T1</td><td data-page-node-id="Nxm7pSBJH23sSZZ5Sl2NZs">钩子点 ③ Reject</td><td class="deny" data-page-node-id="ijdG6SioJ7feO0q2GgOnpr">否</td><td data-page-node-id="JzKdEQsSHCAE20RaWMTACJ">钩子给的 <code data-page-node-id="RPKXWuFltq9HmwWSfpyGdr">reason</code> 原样当结果 · 后续钩子不再被问</td></tr>
+<tr data-page-node-id="Uu9kxyCuBPGLmNOfvRlNkI"><td data-page-node-id="u8A8WrJ5RmjHmjf0qsv4J8">T3</td><td data-page-node-id="9Xh99r3pxnzyOp9myH5HA5"><code data-page-node-id="5XNGC4nHg7bQxX4bV4PfcE">AuthLevel::Deny</code></td><td class="deny" data-page-node-id="Y3VuVfOmYALK2wrIdMFom6">否</td><td data-page-node-id="z4KduDYkuaXAmWiFGdUEOn">「工具 X 被宿主策略禁止（config.toml 的 [auth]）。不要再尝试调用它，改用其它工具或换一条实现路径。」</td></tr>
+<tr data-page-node-id="2yo0M2kFe6tyfeAfNSxJDa"><td data-page-node-id="wKMHCywuOVoUOgJQDLNVco">T3</td><td data-page-node-id="zgHKYkYVhrOGcPICxPCuaV">用户当场选 n</td><td class="deny" data-page-node-id="XVqdMvzYUSZbWIsI4MUO1V">否</td><td data-page-node-id="JTfgs65HrVRJnfP4OXKRZ0">「用户拒绝了这次工具调用。请改用其他方式完成任务，或向用户说明原因。」</td></tr>
+<tr data-page-node-id="j4rXFfpDGoaSRhS7assZxM"><td data-page-node-id="2DhKQENd6mEww2HfZEjMmo">T3</td><td data-page-node-id="4NVHe44l2iBel4AIyA0qrr">白名单命中（选过 a）</td><td style="color:var(--green)" data-page-node-id="ZUiXnMGbARD3lpfMaC4PzG">是</td><td data-page-node-id="hB0KCT3jWoeen5mBsJQMWw">静默放行，不再询问；白名单按<b data-page-node-id="OlzJRhDNnpnVQv16GlgfvR">工具名</b>记，存在 <code data-page-node-id="FKzikdrhCdrM5DPNGD7noc">rt.session_allowed</code></td></tr>
+<tr data-page-node-id="WzdzTQvVYKDL5ykAAGHuRh"><td data-page-node-id="9Gmg9TxqqGsIEL5YWGt0cL">T4</td><td data-page-node-id="GYeLKImTY9Zps7NqwAlCpF">插件超时 / 崩溃</td><td style="color:var(--amber)" data-page-node-id="LOHb64e1lFvHKiWuWMUP7F">试过</td><td data-page-node-id="YgotunbCwPl1AmnhDHUvUH">respawn 后重试一次；仍失败则 <code data-page-node-id="g6i0Oed9dWOqqbvf0QI5NS">{首次原因}；重启插件后重试仍…</code></td></tr>
+<tr data-page-node-id="pgoBfgcAOlnobahSWBeEfD"><td data-page-node-id="Mxuppeh2m5YeAzHD9QdE32">T4</td><td data-page-node-id="KY9TpP2qJGDuTLAxsryAOV">超出兜底超时（+30s）</td><td style="color:var(--amber)" data-page-node-id="va34f3bCAXjrl5uIsngOwZ">被掐断</td><td data-page-node-id="5uAaCNTr03I8HO6qyOgtYl">「工具 X 执行超时（N 秒）」· 记为 is_error</td></tr>
+<tr data-page-node-id="zwywpEYgBEHFHU7LdcuGGE"><td data-page-node-id="MGME3epbBYVZw9SP7o03WL">T5</td><td data-page-node-id="1FFH1y2udHwwOdLuuRe9RB">钩子点 ④ Reject</td><td style="color:var(--green)" data-page-node-id="dmNyoOR3dyPVNHrtfUwDZ6">已执行</td><td data-page-node-id="9tNrEjhFd8tib6rYneJSSU">结果整块被替换成 <code data-page-node-id="SI5iQJGMfoSbk3XpDR21kH">err(why)</code> —— 工具的原始输出<b data-page-node-id="1aCp8eEoECYW3vfGb1RQRD">不会</b>进历史</td></tr>
+</tbody>
+</table>
+
+<div class="box" data-page-node-id="2juTr41tNFz60le9b67728">
+  <h4 data-page-node-id="9VCVboLTBD3FSlIjusdK89"><span class="dot" style="background:var(--blue)" data-page-node-id="srhqVlttSQNJngg0XJERhO"></span>轮次级中止（不回到工具循环）</h4>
+  <div class="kv" data-page-node-id="XUvXUg2bpGCCg79fCojxmF">
+    <dt data-page-node-id="0jsWBy2FjRmKkAjfl6RHk8">S2 Reject</dt><dd data-page-node-id="63AQXJ5Q0h34j20QbAEoFS"><code data-page-node-id="I7uf6HGAiXDPR58MZFb5eb">bail!("本轮请求被宿主钩子拦下：{why}")</code> —— 整轮结束</dd>
+    <dt data-page-node-id="sPr1d7g782Z4e0x3Hb4KE8">S5 预算耗尽</dt><dd data-page-node-id="s8392nrRI9eMLzzgNLwyBn"><code data-page-node-id="mOGjhOK2Wxw9i9dHB9zcRA">return Err(e)</code> —— 原始错误上抛</dd>
+    <dt data-page-node-id="Mb6QUdkcbuKPTGP9BQdN4V">S6 / S7 耗尽</dt><dd data-page-node-id="Q7vws3MhqsjJZO2QGQlJaw"><code data-page-node-id="2BFIuI63oQnn08umWlem0u">bail!</code> + 诊断文案（含 <code data-page-node-id="y7vKzoRvP4EtFxFqEhcrm7">AOX_DEBUG_LLM=1</code> 复现指引）</dd>
+    <dt data-page-node-id="PBaRmvhnXoYsVHx9rvpyVD">用户中断</dt><dd data-page-node-id="RZpVf9hHgrg8a6JnLxqwbo">CLI：<code data-page-node-id="Tvgc4015Lcmx3PwShJHJNr">ctrl_c()</code> · GUI：<code data-page-node-id="u8bo9TwMs5VewSyiHfGeo7">wait_abort</code>（50ms 轮询）→ 都走
+      <code data-page-node-id="Q9Zhv0Mo8Qewjhcpmb6JEF">agent.truncate_messages(mark)</code>：内存回滚到任务前，<code data-page-node-id="5jrmqoKCvzH3fm4Xw4yrOw">Session::rewrite</code> 让文件跟着回滚</dd>
+  </div>
+  <p class="note" data-page-node-id="DnFpr7kyAn7MdgGgvo6bFO">中断回滚必须动文件，否则会留下一段「有 tool_calls 但没有结果」的残记录 ——
+  将来恢复这段对话时，端点会直接拒绝该请求体。</p>
+</div>
+
+<!-- ═══════════ 5. 零漂移 ═══════════ -->
+<h2 data-page-node-id="hf2l8N3J5yOJKn1dYhGb2G"><span class="n" data-page-node-id="dkNMRYFH0m6y3C02qqTWA1">05</span>「不改变循环」是怎么做到的</h2>
+<p class="lead" data-page-node-id="WOMIRxWyfFnCoiIMlMCfxx">这五条不是口号，每一条都对应一个可检查的机制。<b data-page-node-id="SpVifVGl9eH9PB2K7AkvtC">撤掉对象 ≠ 改循环</b> 是它们共同的形式。</p>
+
+<div class="two" data-page-node-id="jCDgjwrLmkWFYKMxI3okdg">
+  <div class="box" data-page-node-id="uc10gIrS9DFr5fAmHfivV0">
+    <h4 data-page-node-id="EO8T35loo3CaRQ9wH0rsZC"><span class="dot" style="background:var(--purple)" data-page-node-id="4qswSdHJKhlqnVBnkNxwm7"></span>默认空链</h4>
+    <p data-page-node-id="1ZGtSPHgOuV8gCyjFERDS0"><code data-page-node-id="A8XuGh1DEQmZV4u7WoHhCf">Hook</code> 的五个方法<b data-page-node-id="C4fxoJ16swYvXuKUMHHtZM">全部带默认空实现</b>，<code data-page-node-id="cisHirHc5fqjai7FGNrnE3">[hook]</code> 为空时链是空的。
+    空链的每次调用退化成「查一下长度然后返回」，五个插入点全部是 no-op。</p>
+  </div>
+  <div class="box" data-page-node-id="CUIifPfQjME2lkDsHzZNR2">
+    <h4 data-page-node-id="uwnk9gCEeSCQv9ajI3HTA0"><span class="dot" style="background:var(--purple)" data-page-node-id="1Qwm9UPVA8lNDJRzEoMb0Y"></span>钩子拿不到裸 Vec</h4>
+    <p data-page-node-id="std0skjlLHEwhkO9Ff9H0S"><code data-page-node-id="68BqggzFITEPGx1orKkW9G">before_request</code> 只能往 <code data-page-node-id="U0VI85RU2AgJCGkS3AIpci">Request::inject</code> 里放东西，由循环经
+    <code data-page-node-id="gto2RkO4gwt5ESJWb4i9Rc">Agent::push_message</code> 入列。<code data-page-node-id="yppfAXou2PIhAculHnSto6">messages</code> 的唯一写入口同时写文件 ——
+    交出裸 <code data-page-node-id="Np9uFFJCz1R8oNEsqRRElZ">Vec</code> 等于开一个「内存里有、文件里没有」的后门。</p>
+  </div>
+  <div class="box" data-page-node-id="ITHxuBaJGukvltEYOADypu">
+    <h4 data-page-node-id="PnpzCtRWSfdQa0E21HxQUS"><span class="dot" style="background:var(--purple)" data-page-node-id="mEDctWuJAttjeWvqvM9uay"></span>快照而非持锁迭代</h4>
+    <p data-page-node-id="Zfhx05IWZE1TsQOFp8fGiG">钩子点每次调用先在读锁下克隆一份 <code data-page-node-id="vjadAHUyeBu9QeKAM3U3qc">Arc</code> 快照再迭代。因为 <code data-page-node-id="a4MCXMGHmHzMFdtLUVFZP8">std::sync</code>
+    读锁不是 <code data-page-node-id="uli6A4rMK9uMQDszSk1T1q">Send</code>，跨 <code data-page-node-id="CUAEf4OCyyhLDk3NFAxmr4">await</code> 持着它整个 future 就失去 <code data-page-node-id="yjyNoHgOOM3j68jgzpJLo6">Send</code>。
+    空链克隆不分配 —— 默认配置下这条路径零开销。</p>
+  </div>
+  <div class="box" data-page-node-id="ZFe5i3FAwYnSe3OZp0NbPm">
+    <h4 data-page-node-id="rascklcSEEBomxdmLpQiz3"><span class="dot" style="background:var(--amber)" data-page-node-id="jAbQAhANhhEgdDIgDr7Ha7"></span>只有一条授权判定路径</h4>
+    <p data-page-node-id="zyh4N1GTcQ4GteD8r07Ge8">组件在 <code data-page-node-id="rdWbTxGm1sQyT3T98dIWHW">[contributes] caps</code> 里声明能力，宿主把它原样转进
+    <code data-page-node-id="dLsxpTT0QpEJnTOCvwvdiJ">Policy::level_for</code>，而不是新造一套。规则：插件工具 + caps 非空 ⇒ <code data-page-node-id="USZo9rCkCLGgPwu46Irkby">Ask</code>，
+    位置钉在「用户显式 override」之后、「类别默认」之前。</p>
+  </div>
+  <div class="box" data-page-node-id="264tHokdu8EicloYXgLy26">
+    <h4 data-page-node-id="xwiXcnsS3WwLavAeSYUh8t"><span class="dot" style="background:var(--red)" data-page-node-id="uM6aVxIzzFceH2YUK7Tz6f"></span>组件可降级是硬要求</h4>
+    <p data-page-node-id="4U8R3qScb3tenceaOhGbXh"><code data-page-node-id="K0VXjUfBK3qdqQwt9dalA1">ComponentHook</code> 的每个出口都有兜底值：组件不在 / 10s 超时 / 返回垃圾 / 认不出的
+    <code data-page-node-id="RWZl4TauaMASxSUuQYdDfY">verdict</code> —— 一律 <code data-page-node-id="fqyzloEJCZA34AEdTgGeXc">Pass</code>。失败记在共享的 <code data-page-node-id="YBr86RAKICcwH3GbO08GTn">Arc&lt;AtomicU64&gt;</code> 上，
+    <code data-page-node-id="cUTvFzjR3xdT3c0fQo1a0H">/hook</code> 看得见（静默降级，但不静默消失）。</p>
+  </div>
+  <div class="box" data-page-node-id="jJ1sA1tEijD4qFDoB2W3AS">
+    <h4 data-page-node-id="SwDuihL2YDYA9aQESAoTEf"><span class="dot" style="background:var(--blue)" data-page-node-id="HixUX1NNPg3RwkAk2wAQcO"></span>循环本身也是可替换的</h4>
+    <p data-page-node-id="EbG66BW3cY6dgmhfar3KSh"><code data-page-node-id="FoC7MsbjqcpnoYPLfBDoEg">StandardLoop</code> 是原 <code data-page-node-id="25VkPwWppvLgR91pKFrtju">Agent::run_loop</code> 的逐语句搬运。
+    <code data-page-node-id="uOBCeCEpOOEKFQ04ssDAUz">[loop] impl</code> 写了认不出的名字<b data-page-node-id="W6q5bIGto6wb8T6JTjABJA">启动即报错</b>，不静默退回 standard ——
+    与 <code data-page-node-id="v67qCayUoS5cKGlwMYJHB7">[store] backend</code> 同一条原则：写了却不生效最难查。</p>
+  </div>
+</div>
+
+<h3 data-page-node-id="r1gRVD4ffXDylBxxA5Scz1">调用面与实现面</h3>
+<table class="fixed" data-page-node-id="ISS2agQcn48kDg6e5UlhvK">
+<colgroup data-page-node-id="KJnWpTeT6XGcAz1dCSKnb7"><col style="width:22%" data-page-node-id="THjPGjevvDRYtPT7iNg6vy"><col style="width:30%" data-page-node-id="olYaRyFF9AG4EH6AG8wDmi"><col style="width:48%" data-page-node-id="xSZvOHHZg4U804r3CNV9Rc"></colgroup>
+<thead data-page-node-id="pHXWeOHULxtiqyHzGdFPJ1"><tr data-page-node-id="t9krFT63nN4YVuBNEhxzRV"><th data-page-node-id="zF7MiZWO6XV7w7O8owMZBV">扩展点</th><th data-page-node-id="z7yXuzVOS8HCD8tGlJ0xgO">消费者看到的类型</th><th data-page-node-id="DVRZeIByh5FHJM58DiYdbs">可替换的东西</th></tr></thead>
+<tbody data-page-node-id="bjryQGkPbRDNRQcBAYigYE">
+<tr data-page-node-id="Hj8ZCCdgT1P0Okf2yE7Z72"><td data-page-node-id="U3qyZBEOgBTFd34rHUowB2">授权策略</td><td data-page-node-id="yfTUb1h4YJhlD1ziAs3NML"><code data-page-node-id="8hec7pNU8CbxJOA7ZKewiW">Arc&lt;dyn Policy&gt;</code></td><td data-page-node-id="qlk3d3fHvaXkPBR2BwDhN7">判定来源（config / 策略文件 / 组件自带），三档语义与优先级不动</td></tr>
+<tr data-page-node-id="8y7KRb3AIBvFmKbnV155fo"><td data-page-node-id="6MHKhwGemCWFgMg62EKrAr">循环钩子</td><td data-page-node-id="HermwWkxIcU2VjtfHwc3av"><code data-page-node-id="nBmb2gr5lJ3H23ccCUbYjh">HookChain</code></td><td data-page-node-id="uWztBJkgSHIuSACQpecSm2">任意多个 Hook，配置驱动 + 组件贡献，运行期可追加</td></tr>
+<tr data-page-node-id="NQncwh2HGpYQbVmpilndm6"><td data-page-node-id="vkUMvLic0JiLrZvhEwgO2s">主循环</td><td data-page-node-id="DihUB1heAevH1RpZTB4O5G"><code data-page-node-id="OZeuXLRsb4VqFdW4cnV4Cz">Arc&lt;dyn AgentLoop&gt;</code></td><td data-page-node-id="8MpLHhdKQkrgplKX01phSF">整段循环骨架（换一套执行模型，而记账与收尾仍走同一条路）</td></tr>
+<tr data-page-node-id="QVEoiZGetJJuqtsgwRoGXA"><td data-page-node-id="vCamWVgfKJZhwrAhLP4LXn">存储</td><td data-page-node-id="lIEPrmKEjM3LWGrteVW2a9"><code data-page-node-id="pz2YS5m4c2H71h8iDqE6sr">Arc&lt;dyn Store&gt;</code> + <code data-page-node-id="t4JgOv3cXGoUHcyknIxjEB">dyn Session</code></td><td data-page-node-id="VTme4fUWM1Xjt8L0aBmPaF">后端与落盘格式。<b data-page-node-id="l4SuR82Gasn981EeMGEDhu">接口上刻意不出现路径</b>，调用方一律按 id 说话</td></tr>
+<tr data-page-node-id="ysBezIJw2Nqb5y2FBSehDF"><td data-page-node-id="lT3DMD1tJbbAU8oDpANYKp">提示词</td><td data-page-node-id="ZBFGce7bWLr8gokFDoscFq"><code data-page-node-id="HWk8iS7Bpc01t9EEKOgqbG">Vec&lt;PromptSegment&gt;</code> 注册表</td><td data-page-node-id="Ipc9MsA1A3yP7GWnlEBh8I">段的增删改与顺序（id 重复则后注册者整段替换）</td></tr>
+<tr data-page-node-id="OuqPY2ODVgaGW0sanrCHJ5"><td data-page-node-id="qIKRRmYXHBy9ZJYvTEhCyr">主题</td><td data-page-node-id="7PtfgHiEJ5u0vEP68OtKDQ"><code data-page-node-id="PtpksAGNW35Z3wzDMPzpR9">PaletteConfig</code>（18 个 Option）</td><td data-page-node-id="rxKyoJHD5APVLu2JaS4LQ2">配色；核心库不许依赖 egui，GUI 侧再 merge</td></tr>
+<tr data-page-node-id="AAAHDBhazXjuwGJihEi5Dy"><td data-page-node-id="LFOoz47lKqG0OHtfmOMOWn">配置来源</td><td data-page-node-id="XFxd92g8rfuu9nMOGDgQ5i">层栈</td><td data-page-node-id="mS6O3WwggxGL1SfGNv1MlM">profile → bundle（可整层取代）→ patch → config.toml</td></tr>
+<tr data-page-node-id="xDGn4UBCT0gQLAQbhQEaom"><td data-page-node-id="PqmYtDZYPhmeFTV13knftu">界面</td><td data-page-node-id="Mypi6oOjQMGikCYqQAariE"><code data-page-node-id="XlHl5VdLUnLLZcbFCbDyIh">AgentEvent</code> + <code data-page-node-id="nkmyio9ZxN1K6ZuqVaA401">dyn Ui</code></td><td data-page-node-id="M56j9O5cRHPZnkNkjNEm8z">CLI 与 GUI 是两个平级实现，共享同一个 <code data-page-node-id="SEzQLYeyJadbbVFpqf1gJM">Runtime</code> 与同一条循环</td></tr>
+</tbody>
+</table>
+
+<!-- ═══════════ 6. 时序 ═══════════ -->
+<h2 data-page-node-id="cHMHAQUf1ZuCy0WXqdqmrH"><span class="n" data-page-node-id="IvBTOGuyTozgx7vWDfXBkd">06</span>三种视图下的同一件事</h2>
+<p class="lead" data-page-node-id="J3EiIbNEkH99F3aPHpNT7F">同一次 <code data-page-node-id="AEnQPvje1zT23WXlKrPTv8">fs_read</code>，在三个地方各留下一条轨迹。它们<b data-page-node-id="OpBNY5NLuJ901KWtnytwjw">不是</b>同一个字节：
+preview 与送模型的正文走两套独立阈值，而落盘那份与送模型的那份同源。</p>
+
+<div class="fig" data-page-node-id="Kz0yY4mdlKsjjNbAs2lflR">
+<svg viewBox="0 0 1120 330" width="100%" role="img" aria-label="同一次工具调用在界面、对话文件、模型上下文三条轨迹上的差异" data-page-node-id="xFkoUjuCFxspdeov7MrKit">
+<title>同一次工具调用在三条轨迹上的差异</title>
+<desc data-page-node-id="FLQ4Ev25jdDjrvV45MQ7WO">UI 看到 300 字符 preview，对话文件与模型上下文看到同一份截断到 20000 字符的结果；
+T5 的结果重写发生在两者之前，所以三者看到的是同一份改写后的内容。</desc>
+
+<text x="20" y="30" font-size="12" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="BKuPkWUzHyaoZKfPZNwGec">T5 结果重写（钩子点 ④）· 之后三条轨迹分叉</text>
+<path d="M20 44 L1100 44" fill="none" stroke="rgba(255,255,255,.12)" stroke-width="1" data-page-node-id="jRv4gWTgPDRTMTKPMYPQ9q"/>
+<circle cx="20" cy="44" r="3" fill="#7fd4b8" data-page-node-id="W2bRMQflY50WeL6XSiyd84"/>
+
+<rect x="20" y="60" width="340" height="200" rx="11" fill="#151a21" stroke="#a3ce72" stroke-width="0.5" stroke-opacity=".5" data-page-node-id="6GBb0uom9xPjnboFcDdnWf"/>
+<text x="40" y="86" font-size="13" font-weight="500" fill="#a3ce72" data-page-node-id="JA9zA2OQJOkLqFk3rnFX5K">UI（T6）</text>
+<text x="40" y="107" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="fCbbiepHceOc4dC2rVZrFU">AgentEvent::ToolResult</text>
+<text x="40" y="130" font-size="11" fill="#e4e8ee" font-family="ui-monospace,monospace" data-page-node-id="8nxoiChKDLLvBDf3Ak1egR">preview = truncate(content, 300)</text>
+<text x="40" y="156" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="N9yfXkaqGEmyip6WFHTnbl">CLI  · TurnLog.steps 回填</text>
+<text x="40" y="176" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="zObUpuNrRyy2T0RYtS1AD2">    /expand 展开</text>
+<text x="40" y="196" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="5QNZWIAcppbJBvQFfjf75C">GUI  · 活动流 tool_end</text>
+<text x="40" y="216" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="hetytHBQAxpzMdq6FDEAHy">    + 耗时 / 成败</text>
+<text x="40" y="243" font-size="10.5" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="FqC4rqwW6VFPR8CQSCLoXP">turn_end 时整轮折叠成一行摘要</text>
+
+<rect x="390" y="60" width="340" height="200" rx="11" fill="#151a21" stroke="#b4b2a9" stroke-width="0.5" stroke-opacity=".5" data-page-node-id="zAR6oiO5OKoZBsIjW7FgL4"/>
+<text x="410" y="86" font-size="13" font-weight="500" fill="#b4b2a9" data-page-node-id="PykN91vPX7701l1kOhyHTv">对话文件（T8）</text>
+<text x="410" y="107" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="KZI8HwyJOftIsvojoRYDxP">Session::append</text>
+<text x="410" y="130" font-size="11" fill="#e4e8ee" font-family="ui-monospace,monospace" data-page-node-id="53MMijukwobjCOnHtUhQTA">{kind:"message", role:"tool",</text>
+<text x="410" y="148" font-size="11" fill="#e4e8ee" font-family="ui-monospace,monospace" data-page-node-id="NmCz4RoWfIjT8j3pQTYUYp"> tool_call_id, is_error}</text>
+<text x="410" y="173" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="215nSHU8iuDLDBeSzl2ty5">与模型侧逐字节相同（T7/T8 同源）</text>
+<text x="410" y="196" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="B3ejeAfkHenux0CBb0FE1q">同文件还混着 kind:"act"</text>
+<text x="410" y="216" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="CTFNGXTw4rgvgMQuFhvkx4">（活动流）与 kind:"usage"</text>
+<text x="410" y="243" font-size="10.5" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="ZGJF9yidYI5P6lwWYOT9Xg">rewrite 是非原子的（truncate 后重写）</text>
+
+<rect x="760" y="60" width="340" height="200" rx="11" fill="#151a21" stroke="#85b7eb" stroke-width="0.5" stroke-opacity=".5" data-page-node-id="kIV4ZsuojrMWoRX1JJAOOW"/>
+<text x="780" y="86" font-size="13" font-weight="500" fill="#85b7eb" data-page-node-id="MeCdYKWqvqELEx63xDDjxN">模型上下文（T7）</text>
+<text x="780" y="107" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="ycZflGMDveBx2ufqATD2ul">Message::tool_result</text>
+<text x="780" y="130" font-size="11" fill="#e4e8ee" font-family="ui-monospace,monospace" data-page-node-id="h9J2IpBbQXtzgt3oiaEvgB">content = cap_chars(content,</text>
+<text x="780" y="148" font-size="11" fill="#e4e8ee" font-family="ui-monospace,monospace" data-page-node-id="qxIzXotKxOlVMg7UPddG8F">                max_result_chars)</text>
+<text x="780" y="173" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="cnDyQ3oZhABduG9KDJZRzP">默认 20000；截断时追加</text>
+<text x="780" y="196" font-size="11" fill="#98a3b2" font-family="ui-monospace,monospace" data-page-node-id="J4T1CE0oj3zUBr9ae75k2X">「结果过长已截断，原长度 N」</text>
+<text x="780" y="224" font-size="11" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="I0B7yRvL6dSpEoOUWm0t3l">下一轮 llm.chat(messages, …)</text>
+<text x="780" y="243" font-size="10.5" fill="#6a7583" font-family="ui-monospace,monospace" data-page-node-id="sU2rs7DvRhVx3xZ3ojkorZ">下一轮还会被 max_rounds 裁掉</text>
+
+<path d="M360 160 L386 160" fill="none" stroke="#6a7583" stroke-width="1.2" marker-end="url(#ar)" data-page-node-id="pxvGvWUO1fO7d6fm6kYY4e"/>
+<path d="M730 160 L756 160" fill="none" stroke="#6a7583" stroke-width="1.2" marker-end="url(#ar)" data-page-node-id="6rVWVZvjnvnp8PHFSKDCo5"/>
+
+<rect x="20" y="278" width="1080" height="42" rx="8" fill="rgba(127,212,184,.06)" stroke="#7fd4b8" stroke-width="0.5" stroke-opacity=".4" data-page-node-id="fDc7NwPVcISBBavEPvAgqR"/>
+<text x="40" y="295" font-size="11.5" fill="#98a3b2" data-page-node-id="1B2BHcNLGvUMlbGbex1Hgt">因为 after_tool 排在 emit 之前，「界面看到的 / 文件里存的 / 模型读到的」是同一份改写后的结果</text>
+<text x="40" y="311" font-size="11.5" fill="#6a7583" data-page-node-id="lPKt2xopivVk4eDOxEnN5H">—— 只有长度阈值不同（300 vs 20000）。</text>
+</svg>
+</div>
+<p class="cap" data-page-node-id="DvPTvXnfk34jzEZWc9XNlE">这也是 6a/6b e2e 的一条教训：断言要断<b data-page-node-id="5VAbnKhjBLbCHnmhSdo7Rm">内容 + 确切措辞</b>，且要先确认调用次数 ——
+测试夹具自己也会截断被测数据（<code data-page-node-id="2S9Cvg9DFkaUIqDjO1wKC0">history_lines()</code> 截 120 字会把 <code data-page-node-id="dduycOHUlfvnpTZDcaMnmn">after_tool</code> 的尾部印记切掉）。</p>
+
+<!-- ═══════════ 7. 缺口 ═══════════ -->
+<h2 data-page-node-id="xR5uGypkYTh5GbSXt6BXhu"><span class="n" data-page-node-id="KuSFWMesMhejZXkaNL36Yj">07</span>这条流水线上的已知缺口</h2>
+<p class="lead" data-page-node-id="EE98nYvL0JvgIo0y12hOto">不是流水线的 bug，是这条链路<b data-page-node-id="Ihi0h36ATy8wGVnVgvyfT5">没有被覆盖到</b>的地方。守卫排第一不是因为它最复杂，
+而是因为可扩展性这条轴推得越远，它越紧急。</p>
+
+<table class="fixed" data-page-node-id="K3nOOeGjpNRr2z4FVskeKS">
+<colgroup data-page-node-id="LLLUAl1TLkDFmvyntTl19T"><col style="width:5%" data-page-node-id="GG4y8UO8EEIq1ek29yEHCa"><col style="width:24%" data-page-node-id="IdvL3P1Kt9oDML5tq3QBWI"><col style="width:38%" data-page-node-id="KpuSjPnhfEseqWex93iGFe"><col style="width:33%" data-page-node-id="0JeO2HXgav2pgNTirEgPBu"></colgroup>
+<thead data-page-node-id="f3fe3GD7l7ERrSSkmsRS6q"><tr data-page-node-id="c786OpHonrFORpFc3tbgpL"><th data-page-node-id="aZydiyqNT42cbrZdPdnMG1">#</th><th data-page-node-id="wOhAyeY3ciH3Ew9bkNePGP">缺口</th><th data-page-node-id="Yhfnv2mOPoa9zss8RDbuby">现状</th><th data-page-node-id="B5N6HdfWCBCl3wj076NTNG">可以借用什么</th></tr></thead>
+<tbody data-page-node-id="0GFC8l2CUMFLtBO70Q29BJ">
+<tr data-page-node-id="x2rISTvifVJod5urCTeInb"><td data-page-node-id="yXPjZMkjAuAGYntXT7p6aI">1</td><td data-page-node-id="0BcxlrDEq9SACeMaYROEG8">保护路径名单 + 工作区根</td><td data-page-node-id="vwwiKDdyNDNbybx1IRedtZ"><code data-page-node-id="9YQsfUFKa5Hc6ja77SNmT4">fs</code> 插件可写应用根下的 <code data-page-node-id="DdGgcPPS3WZod3sqXPMyvG">config.toml</code> / <code data-page-node-id="OVleRBxCGgkbSFW1g8oybY">RULES.md</code> / <code data-page-node-id="f4vppkERzdiaBTZuBLuuGK">plugins/</code> / <code data-page-node-id="8l4O1AB9K0ToKk0nV9D210">history/</code>；<code data-page-node-id="PX89BwqLl2EjVMKtORZhlW">fs_rm(recursive)</code> 是裸 <code data-page-node-id="pQfVASvrdR2L5rzMR6t6lq">shutil.rmtree</code></td><td data-page-node-id="NGEGunt5bsC8pPTvG1Abej">钩子点 ③ 已能拦下并改 args（成本极低）；完整的判定点在 <code data-page-node-id="Jx0Pw2EyPfXIpANdTek3MW">authorize_and_execute</code></td></tr>
+<tr data-page-node-id="sqkwBUbxD3C5zCLHYAIiDg"><td data-page-node-id="rZflmeUdt6paQLsfFoernP">2</td><td data-page-node-id="MRHsoA1bBpVWXnJumZw52K">子进程不降权</td><td data-page-node-id="hS5TVm8etXD5RoPGs5pSdJ"><code data-page-node-id="lqwDYW5VMaN151bCtpwyVx">Command::new</code> 直起，<code data-page-node-id="EieAtTG2OjPsuQGSLtIq2F">current_dir(root)</code>，<b data-page-node-id="MgU2my5Li8wZiTW0xkBvcJ">没有 <code data-page-node-id="EAFYGY2CXZvl7EarVwAWcd">env_clear</code></b>，继承全部环境变量；无网络出口控制</td><td data-page-node-id="JlVjzUPds8StLhD7oMTzWs">真沙箱（受限令牌 / Job Object / seccomp）最贵，归入「行为沙箱」议题</td></tr>
+<tr data-page-node-id="pFhKOSMWKhWUdntN9XgfPj"><td data-page-node-id="nrSFGTBLw1jskiP6QtlHlp">3</td><td data-page-node-id="sHIurd6XDtE0iTtV6rhOGn">授权框看不见要授权的代码</td><td data-page-node-id="d5mjhfBgrR4n5RD5vwnHlk">CLI 只显示 args 的<b data-page-node-id="nFXhY27dD5lu3anmzaUayD">前 20 行</b>，而 <code data-page-node-id="0RxDyVfQLBB9WGMREqd9ZW">create_plugin</code> 的 <code data-page-node-id="rtyBuEoZBRWTscEEcqrVkc">source</code> 是整段源码；回车即 y（默认放行）；<code data-page-node-id="J5fo3Csb62LSjhFrYXUd7N">a</code> 把<b data-page-node-id="0QdESpN4yMtEa0GakIa0ai">工具名</b>整会话放白名单</td><td data-page-node-id="9b6xC1KRuI4RVGZY01Xjtn">Ui trait 已把决定回传（Allow / AllowSession / Deny），改的是呈现与粒度，不动判定</td></tr>
+<tr data-page-node-id="HosuJ8UNffC7wCnffKttpt"><td data-page-node-id="eYEvpgjx7EuXisCAHXwJ5V">4</td><td data-page-node-id="KyxCLMs5W7inW4zr8NUlhR">历史改写非原子</td><td data-page-node-id="HsXc4lofqUvQ26jvRIpryR"><code data-page-node-id="s8oC0vWaHlxB522jHdlHeb">truncate(true).open()</code> 原地清空再写，而这条路径正是 <code data-page-node-id="GoxWd07CPf0aTB3r1VlJAE">max_rounds</code> 裁剪与中断回滚用的</td><td data-page-node-id="qmafVzVU5GmgsYfF5skq8d">临时文件 + rename，十行</td></tr>
+<tr data-page-node-id="eCYIgHaRqjBhY2bZgzCk1B"><td data-page-node-id="B0tJ79KRnjqokqt8aRLLCk">5</td><td data-page-node-id="WG5z8GbJ7l74PYQjmyBZTo">无累计预算</td><td data-page-node-id="7SoPVWWGjGkA7Xt0hd1QlV"><code data-page-node-id="KhMFCbndRLgPx8HfqepEva">TurnAcc</code> 只逐轮，<code data-page-node-id="oJsi9HtwhfTZo1wrM6H6le">/usage</code> 只回看上一次任务；<code data-page-node-id="nubVILYbC71rB6UTAPj2WH">max_rounds</code> 与 <code data-page-node-id="t2D6hBgnObugBSfHb4y2cs">max_tokens</code> 各自为政，没有总闸</td><td data-page-node-id="5zu9lDguJLhXtgevKEzAOR">循环层的 <code data-page-node-id="dBDCdgCLUeaHlLYNI9yk7J">AgentLoop</code> 本身就是一个可替换的收口</td></tr>
+<tr data-page-node-id="b7TdWnOEQd83TrScjZCwPF"><td data-page-node-id="dyXCaQ9ZF29fDCbgXp17LW">6</td><td data-page-node-id="SzPRpqS58qaFQlV5RvH8AG">密钥与历史明文</td><td data-page-node-id="iZO8uCiRhx2kwn7fXKZNGg"><code data-page-node-id="y13w2tWPEULP1MF06sA9QD">api_key</code> 明文落 <code data-page-node-id="WuxhgWrLX6ODcgKbs5exOT">config.toml</code>（有 <code data-page-node-id="uZ2PjeaCDwQ3z1mnnCELWU">api_key_env</code> 这条正路但非强制）；历史 JSONL 无脱敏</td><td data-page-node-id="OjmNeevuqVsYLFpMBOpRXI">—</td></tr>
+</tbody>
+</table>
+
+<div class="box" data-page-node-id="wf3yYxbXWsP76MkR71FiUK">
+  <h4 data-page-node-id="3gisoTc7apGKzqnXYqC1m3"><span class="dot" style="background:var(--green)" data-page-node-id="OHSyYEdae6ObjExOfxtynw"></span>这条链路上做得好、别一并否定的部分</h4>
+  <p data-page-node-id="sV9OrGOU0EN6AjArWfVAu0">零漂移的证明方式、失败一律降级、认不出的配置<b data-page-node-id="4Vn4EAS009UiuwgQx75JPd">启动即报错</b>、
+  Python 运行时 zip 的 SHA-256 校验、per-user 安装免 UAC、钩子 10 秒独立超时、
+  <code data-page-node-id="CGS1tIxUUKnsJqOPDDAAGt">meta_tools = "ask"</code> 默认、历史 <code data-page-node-id="hYWyom1aFVPTqeGaMnezm6">keep = 200</code>、无遥测。</p>
+</div>
+
+<footer data-page-node-id="DRHj6kCrTCoY2BOmWcacj7">
+  图中的行号对应 <code data-page-node-id="dZhAEUQTd3TXNzjUgXSml5">src/agent_loop.rs</code> / <code data-page-node-id="ixPDdgIY4G0CAVJvAaP005">src/agent.rs</code> / <code data-page-node-id="ifGhlb3rh73q4snhwPyVkL">src/hook.rs</code> /
+  <code data-page-node-id="u9a2XaYYywuDxsi5EhVqtf">src/auth.rs</code> / <code data-page-node-id="ItimVIchHDHFt5o9EutPSj">src/runtime.rs</code> / <code data-page-node-id="Wudsy03eOprOCmeDKSG2L6">src/plugin/mod.rs</code> /
+  <code data-page-node-id="uJUgQwBh66euPAGzO4Uo47">src/ui/*</code> / <code data-page-node-id="TVj7Feb2H6IDMnkZs2iH1R">gui/src/bridge.rs</code> / <code data-page-node-id="MtClbcMePL5jd5otnVhZI7">gui/src/app.rs</code>，2026-10-04 读取。
+  阶段 1–6 全部验收完毕；文件系统守卫（工作区划分）为进行中的需求，本图按已定契约标注其<b data-page-node-id="Z6asej4ruLFn9JCgAZ1KtS">预定插入点</b>，
+  不描述任何已存在的实现。
+</footer>
+
+</div>
+</body>
+</html>

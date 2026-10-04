@@ -50,6 +50,12 @@ pub struct Agent {
     /// 内存里留一份，是为了让界面立刻能答「这段对话一共花了多少、哪一轮最贵」，
     /// 而不必每帧读盘；文件那边才是权威 —— 重启后从这里接回来。
     usage_log: Vec<UsageRecord>,
+    /// **本对话已经落盘过**的工作区状态（档位名 + 根）；`None` = 还没写过。
+    ///
+    /// 有了它才能「只在真的变了的时候补一条」：每轮无脑追加会让文件里堆满重复行，
+    /// 而读的时候是取最后一条 —— 那种文件后来者根本看不出哪几行才算数。
+    /// 新建对话 / 打开旧对话时重置，对齐那一刻文件里的实际情况。
+    workplace_logged: Option<(String, Option<std::path::PathBuf>)>,
     /// 本轮的用量累加器（由 `AgentLoop` 通过 [`Agent::accrue_call`] 驱动）。
     ///
     /// 放在 `Agent` 里而不是循环的局部变量里：循环是可替换的，账不行 ——
@@ -75,6 +81,7 @@ impl Agent {
             session_usage: Usage::default(),
             session_calls: 0,
             usage_log: Vec::new(),
+            workplace_logged: None,
             turn: TurnAcc::default(),
         }
     }
@@ -83,6 +90,23 @@ impl Agent {
     /// id 由存储后端在新建时定下（jsonl 后端就是文件名主干），这里只是转述。
     pub fn history_id(&self) -> Option<&str> {
         self.log.as_ref().map(|l| l.id())
+    }
+
+    /// 把当前工作区状态记进**本对话的存档**（只在真的变了的时候写）。
+    ///
+    /// 调用点三处：每轮开头一次（首条消息把刚建好的那块地记下来）、CLI 的 `/workplace`
+    /// 切档后、GUI 的工作区按钮切档后。
+    ///
+    /// **没有对话文件时直接返回** —— 那种情况等 `ensure_log` 建好文件、下一轮的
+    /// 这一步再记，不会丢。
+    pub fn persist_workplace(&mut self) {
+        let Some(log) = self.log.as_mut() else { return };
+        let cur = self.rt.workplace.persisted();
+        if self.workplace_logged.as_ref() == Some(&cur) {
+            return;
+        }
+        log.append_workplace(&cur.0, cur.1.as_deref());
+        self.workplace_logged = Some(cur);
     }
 
     /// 确保本次对话已有落盘文件。失败只警告一次，不打断对话。
@@ -176,6 +200,19 @@ impl Agent {
             self.session_usage.accrue(&r.usage);
             self.session_calls += r.calls;
         }
+        // 工作区跟着**对话**走，不是跟着进程走：把这段对话存档里的那条还回来，
+        // 并把「已落盘」对齐到它。于是重开这段对话会落在**它自己**那块地里，
+        // 而不是「当前这块」—— 原先正是后者，于是同一个对话每次进去工作区都不一样。
+        //
+        // 旧对话文件没有这条记录（那时还没这个功能）：什么都不动，等它下一次落盘时
+        // 由 `persist_workplace` 把当前状态记上，从此这段对话也就有了自己的地。
+        self.workplace_logged = match self.rt.store.load_workplace(id) {
+            Some((mode, root)) => {
+                self.rt.workplace.restore(&mode, root.clone());
+                Some((mode, root))
+            }
+            None => None,
+        };
         Ok(items.len())
     }
 
@@ -191,6 +228,13 @@ impl Agent {
         self.session_usage = Usage::default();
         self.session_calls = 0;
         self.usage_log.clear();
+        // 工作区也跟着翻页：**一律回到「默认」档**（用户 2026-10-04 定的语义）——
+        // 上一段对话里临时切过的档不继承；下一轮的首条消息会在 `workplace/` 下开一块新地。
+        // 不清的话，「+」之后模型还写在上一次对话挑的那块地里，那就不是「新对话」了。
+        self.rt.workplace.reset_for_new_conversation();
+        // 新对话的文件还没建，落盘记录等首条消息时由 `persist_workplace` 补上；
+        // 这里先清掉「已落盘」，免得拿上一段对话的记录去比对、把首条消息那次写漏。
+        self.workplace_logged = None;
     }
 
     /// 中断当前任务后回滚对话历史，避免遗留「有 tool_calls 但无结果」的半截消息。
@@ -229,7 +273,27 @@ impl Agent {
     /// 提供；本方法只负责「开一轮、开账、把账收口」这三件事。换一个 `[loop] impl`
     /// 就是换一套执行模型，而记账与收尾仍然走同一条路。
     pub async fn run_turn(&mut self, ui: &mut dyn Ui, input: &str) -> Result<()> {
+        // 工作区：`default` 档位在**首条消息**时开一块新地（`started` 保证一段对话只开一次）。
+        //
+        // 放在整轮最前面（早于 `push_message` 与循环），是为了让**本轮任何工具调用之前**
+        // 根就已经定好。否则第一条消息里模型要写文件时会被判成「工作区还没建立」而拒掉，
+        // 用户会觉得莫名其妙 —— 那是实现顺序造成的假故障，不是权限边界。
+        match self.rt.workplace.ensure_started(&self.rt.root) {
+            Ok(Some(dir)) => ui.emit(AgentEvent::Info(format!(
+                // 措辞按新语义（读不设限、写删受限）：说「只会读写文件」会让用户以为
+                // 连读也被关住了，于是白白去提权 —— 那是 2026-10-04 改语义时漏掉的一句。
+                "本对话的工作区：{}\n  写入与删除都被限制在这个目录里（读取不受限，设备上任何文件都能读）。\
+                 要放宽：`/workplace`，或输入框左下角的「工作区」。",
+                dir.display()
+            ))),
+            Ok(None) => {}
+            // 建目录都失败了（权限 / 磁盘），照实说但不打断对话：此后文件写入会被边界拒绝。
+            Err(e) => ui.emit(AgentEvent::Warn(format!("创建工作区失败：{e:#}"))),
+        }
         self.ensure_log(ui);
+        // 首条消息这一趟把「本对话在哪块地干活」记进存档（`ensure_started` 刚定下根，
+        // 所以这条记录里带的是那块地的真实路径）。之后只在切档时才再写。
+        self.persist_workplace();
         self.push_message(Message::user(input), None);
         // 包住整轮：UI 借此显示等待动画，并在结束时把中间过程折叠成一行
         ui.turn_start().await;
@@ -313,6 +377,22 @@ impl Agent {
     /// 记白名单、执行并兜超时」这一整套收在一个入口里，循环不需要、也不应该自己拼。
     pub async fn authorize_and_execute(&mut self, ui: &mut dyn Ui, name: &str, args: Value) -> ToolOutput {
         let kind = self.rt.tool_kind(name).await.unwrap_or(ToolKind::Meta);
+        // ── 工作区边界：**早于授权**判定 ──
+        //
+        // 放在授权之前有两个理由：
+        // ① 越界调用不必先弹一次授权框、再告诉用户「其实那个位置根本碰不到」；
+        // ② 这里拿得到 `Ui`，能给用户发一条 `Warn`（工具自己的 `call` 拿不到 Ui，
+        //    所以工具内那层只能把契约塞回给模型 —— 两层是纵深，不是重复）。
+        //
+        // `full` 档位（配置默认）在 `workplace_reject` 里**整个短路**：不扫参数、
+        // 不 `canonicalize`。早先这里是「照样调 `check`，反正它返回 `Ok`」——
+        // 而调用方只取 `.err()`，于是 `normalize` 的结果被丢掉，65~224 µs 的系统调用
+        // 白花；这条路径又是**每次工具调用**都要走的，也就是绝大多数用户
+        // （不写 `[workplace]`）走的那条。「不写配置 = 行为不变」要连开销一起不变。
+        if let Some(reject) = self.workplace_reject(name, &kind, &args) {
+            ui.emit(AgentEvent::Warn(reject.user_text()));
+            return ToolOutput::err(reject.model_text());
+        }
         // 能力位（阶段 6 · 6b 起真的填上）：插件在 `[contributes] caps` 里声明要什么能力，
         // 这里原样转给策略 —— 声明了能力的插件，它的工具调用一律走 `Ask`
         // （见 `auth::Policy::level_for`）。元工具、以及没声明能力的插件拿到的都是空切片，
@@ -355,6 +435,57 @@ impl Agent {
                 _ => ToolOutput::err(
                     "用户拒绝了这次工具调用。请改用其他方式完成任务，或向用户说明原因。",
                 ),
+            }
+        }
+    }
+
+    /// 判定一次工具调用是否触到工作区边界。`None` = 放行。
+    ///
+    /// 按工具类别分三条路，精度不同，都是刻意的：
+    ///
+    /// - `ToolKind::Meta`（`create_plugin` / `list_plugins` / `remove_plugin`）：
+    ///   不声明路径参数，直接放行。
+    ///
+    /// - `ToolKind::Host`（宿主文件工具）：schema 是我们自己定义的，直接读 `path` 参数，
+    ///   而且**知道这次是读还是写**（`tool::host_tool_access`）。读（`read_file` /
+    ///   `list_dir`）不受工作区限制 ⇒ 这条路恒等于放行；只有写（`write_file`）与删
+    ///   （`remove`）才真正过边界。`list_dir` 允许**不传** `path`（那时指的是工作区根，
+    ///   位置由宿主自己给），所以缺参不是错误、不放行的是「模型指定的位置」。
+    ///
+    /// - `ToolKind::Plugin`：插件是黑盒，宿主只能按参数名与值形态扫一遍「像路径」的
+    ///   字符串（见 `workplace::scan_paths`）。这张**粗网按「落盘」判**是刻意的：
+    ///   宿主看不出插件拿这个路径去读还是去写，而「少挡一次写」的代价远大于
+    ///   「多挡一次读」—— 保守方向就是把每个像路径的参数都当成潜在的写。
+    ///   同时它**宁漏勿误伤**：漏判只是少一层粗网，误判会直接拒掉一次合法调用。
+    ///
+    /// 三条路用的是**同一套** `Workplace` 判定，所以不存在「两套规则」。
+    fn workplace_reject(
+        &self,
+        name: &str,
+        kind: &ToolKind,
+        args: &Value,
+    ) -> Option<crate::workplace::Reject> {
+        // `full` 档（配置默认）：**一切放行**。放在 `match` 之前，是为了连
+        // `scan_paths` 那张粗网都不跑 —— 见调用点那一段注释。
+        if self.rt.workplace.is_unrestricted() {
+            return None;
+        }
+        match kind {
+            ToolKind::Meta => None,
+            ToolKind::Host => {
+                let raw = args.get(crate::workplace::PATH_ARG).and_then(|v| v.as_str())?;
+                // 读 / 写按**工具名**分：宿主文件工具的 schema 是我们自己的，一目了然。
+                let access = crate::tool::host_tool_access(name);
+                self.rt.workplace.check_access(raw, access).err()
+            }
+            ToolKind::Plugin(_) => {
+                for (_key, raw) in crate::workplace::scan_paths(args) {
+                    // 粗网统一按「落盘」判 —— 插件的意图宿主看不见。
+                    if let Err(r) = self.rt.workplace.check(&raw) {
+                        return Some(r);
+                    }
+                }
+                None
             }
         }
     }

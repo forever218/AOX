@@ -109,7 +109,8 @@ impl Policy for ConfigPolicy {
         // ② 插件名（精确 → 通配）—— 同样属于「用户明确写下的表态」，压在能力位之上
         let plugin_hit = match kind {
             ToolKind::Plugin(plugin_name) => self.lookup(plugin_name),
-            ToolKind::Meta => None,
+            // 元工具与宿主文件工具都没有「插件名」这一层
+            ToolKind::Meta | ToolKind::Host => None,
         };
         if let Some(l) = plugin_hit {
             return l;
@@ -126,9 +127,15 @@ impl Policy for ConfigPolicy {
             return AuthLevel::Ask;
         }
         // ④ 都没有才退到类别默认
+        //
+        //    宿主文件工具（`ToolKind::Host`）跟着**插件工具那一档**走：两者都是
+        //    「让别的东西去干一件活」，而不是「改宿主自身」。于是 `plugin_tools = "auto"`
+        //    （默认）下文件工具也是 auto —— 与 `fs_*` 那类插件工具行为一致，模型换用
+        //    哪个工具都一样；想单独收紧就用名字 override（如 `read_file = "ask"`），
+        //    第 ① 步会先命中它。
         match kind {
             ToolKind::Meta => self.meta,
-            ToolKind::Plugin(_) => self.plugin,
+            ToolKind::Host | ToolKind::Plugin(_) => self.plugin,
         }
     }
 }

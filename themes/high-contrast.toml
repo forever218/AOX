@@ -47,6 +47,7 @@ quote_bar = "#767676"
 reverse_bg = "#000000"
 on_reverse = "#FFFFFF"
 shadow = "#00000044"
+danger = "#C00000"
 
 [theme.dark]
 bg = "#000000"
@@ -67,3 +68,4 @@ quote_bar = "#8A8A8A"
 reverse_bg = "#FFFFFF"
 on_reverse = "#000000"
 shadow = "#000000CC"
+danger = "#FF6B6B"

@@ -112,14 +112,14 @@ pub fn ensure_writable_root(root: PathBuf) -> PathBuf {
 
 /// 只解析「可写的应用根」，不做插件迁移。
 ///
-/// 插件迁移是 `resolve_workspace` 的副作用；只想问「根目录在哪」的调用方（例如
+/// 插件迁移是 `resolve_workplace` 的副作用；只想问「根目录在哪」的调用方（例如
 /// GUI 主线程要先读 `config.toml` 的 `[theme]`）用这个，避免与后台线程重复触发迁移。
 pub fn app_root() -> PathBuf {
     ensure_writable_root(resolve_app_root(exe_dir().as_deref()))
 }
 
 /// 一步到位：解析出可写的应用根 + 插件目录（可被 --plugins 覆盖）。
-pub fn resolve_workspace() -> (PathBuf, PathBuf) {
+pub fn resolve_workplace() -> (PathBuf, PathBuf) {
     let exe = exe_dir();
     let root = ensure_writable_root(resolve_app_root(exe.as_deref()));
     let plugins = root.join("plugins");

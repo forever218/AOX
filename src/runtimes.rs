@@ -30,7 +30,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::RuntimesConfig;
-use crate::plugin::HideConsole;
+use crate::plugin::ProcessFlags;
 
 /// 离线运行时包的约定文件名。
 /// 放到 **exe 同目录** / 应用根 / `<应用根>/runtime` / `%LOCALAPPDATA%\AOX` 下都会被自动发现，

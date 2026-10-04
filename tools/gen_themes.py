@@ -2,7 +2,7 @@
 """从 gui/src/theme.rs 的 LIGHT / DARK 常量生成 themes/paper.toml 与 themes/ink.toml。
 
 为什么不手抄：这两天刚吃过「手工搬运长文本」的亏（阶段 1 的提示词、env_section）。
-18 个颜色 × 2 套，抄错一个字节都不会有人发现，但主题文件是给用户当基准看的。
+19 个颜色 × 2 套，抄错一个字节都不会有人发现，但主题文件是给用户当基准看的。
 所以直接从源码里抽，抽完再反向核对一遍。
 """
 
@@ -35,8 +35,8 @@ def parse(name: str, text: str) -> list[tuple[str, str]]:
             if len(nums) != 4:
                 raise SystemExit(f"ABORT: {name}.{field} 分量数不对: {args}")
             out.append((field, "#%02X%02X%02X%02X" % tuple(nums)))
-    if len(out) != 18:
-        raise SystemExit(f"ABORT: {name} 只解析出 {len(out)} 个字段（应为 18）")
+    if len(out) != 19:
+        raise SystemExit(f"ABORT: {name} 只解析出 {len(out)} 个字段（应为 19）")
     return out
 
 

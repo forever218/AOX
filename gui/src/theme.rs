@@ -147,7 +147,7 @@ pub fn toggle_mode() -> Mode {
 // 主题偏好落盘位置：应用根目录下的一个小文件。
 // 找不到可写位置就静默放弃（只是记不住偏好，不影响使用）。
 fn pref_path() -> Option<std::path::PathBuf> {
-    let (root, _) = aox::paths::resolve_workspace();
+    let (root, _) = aox::paths::resolve_workplace();
     let p = root.join(".aox-gui-theme");
     if p.parent().is_some_and(|d| d.is_dir()) {
         Some(p)
@@ -210,6 +210,12 @@ struct Palette {
     on_reverse: Color32,
     /// 悬浮卡片的投影色。亮色下一层淡墨就够；暗色下阴影几乎看不见，只能加重补偿。
     shadow: Color32,
+    /// **整套配色里唯一的色相**：危险动作（目前只有「完全访问」这一处用）。
+    ///
+    /// 上面那一排刻意只用明度表达语义，但「越界之后没有任何边界」这件事值得破一次例 ——
+    /// 它是唯一一个**点下去就越过所有保护**的开关，明度层次表达不出「这不是一个普通选项」。
+    /// 所以只给这一处留一点砖红，其余仍然全灰。
+    danger: Color32,
 }
 
 /// 纸：略微发暖的白，不是纯白。
@@ -232,6 +238,8 @@ const LIGHT: Palette = Palette {
     reverse_bg: Color32::from_rgb(0x1A, 0x19, 0x16),
     on_reverse: Color32::from_rgb(0xF7, 0xF5, 0xF0),
     shadow: Color32::from_rgba_unmultiplied_const(0x1A, 0x19, 0x16, 26),
+    // 砖红：不是信号用的鲜红，是纸面上站得住的那种沉红（与整块暖纸底同调）。
+    danger: Color32::from_rgb(0x9E, 0x2B, 0x21),
 };
 
 /// 墨：暖调的黑，不是纯黑。
@@ -254,6 +262,9 @@ const DARK: Palette = Palette {
     reverse_bg: Color32::from_rgb(0xEC, 0xE9, 0xE1),
     on_reverse: Color32::from_rgb(0x14, 0x14, 0x12),
     shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 96),
+    // 墨底上不能用亮色模式那份砖红（#9E2B21 在近黑底上暗得读不出来），
+    // 换成同色相、亮度提上去的高一档红 —— 一样是纸墨体系里的「红」，不是信号灯。
+    danger: Color32::from_rgb(0xE0, 0x6C, 0x5C),
 };
 
 /// 叠加了配置覆盖之后的两套配色。`apply` 时写一次，之后只读 —— 所以取色仍是零开销。
@@ -269,7 +280,7 @@ fn pal() -> &'static Palette {
 
 /// 把配置里的逐字段覆盖叠到内置配色上；没写的字段原样保留。
 ///
-/// 只覆盖某个字段（例如只改 `text`）是完全安全的：其余 17 项仍是内置值。
+/// 只覆盖某个字段（例如只改 `text`）是完全安全的：其余 18 项仍是内置值。
 fn merge_palette(base: &Palette, ov: &PaletteConfig) -> Palette {
     let c = |d: Color32, o: Option<RgbColor>| match o {
         Some(x) => Color32::from_rgba_unmultiplied(x.r, x.g, x.b, x.a),
@@ -294,6 +305,7 @@ fn merge_palette(base: &Palette, ov: &PaletteConfig) -> Palette {
         reverse_bg: c(base.reverse_bg, ov.reverse_bg),
         on_reverse: c(base.on_reverse, ov.on_reverse),
         shadow: c(base.shadow, ov.shadow),
+        danger: c(base.danger, ov.danger),
     }
 }
 
@@ -367,6 +379,11 @@ impl P {
     /// 悬浮卡片的投影色
     pub fn shadow() -> Color32 {
         pal().shadow
+    }
+    /// 危险动作专用色 —— 整套配色里唯一的色相。只给「完全访问」这类
+    /// **点下去就越过所有保护**的开关用，别拿它当普通强调色。
+    pub fn danger() -> Color32 {
+        pal().danger
     }
 }
 

@@ -1146,3 +1146,171 @@ initialize 的返回里多带一个可选项：
 | 6a 循环可替换 | 已验收（2026-10-03） | 2026-10-03 |
 | 6b 组件贡献 | 已验收（2026-10-03） | 2026-10-03 |
 | — UI 定制层（原 6c） | **已立项、缓做** → `docs/UI-CUSTOMIZATION.md` | — |
+| 7a 插件围栏（新线 · ① Job Object） | **待验收** → `docs/SANDBOX.md` | — |
+| 7b 工作区边界（新线 · ③ 文件能力收回宿主 + GUI 入口 + 读写语义 + 命名统一） | **待验收** → `docs/SANDBOX.md` | — |
+
+---
+
+## 阶段 7 · 插件围栏（新线，2026-10-04 立项）
+
+**方案对照、威胁模型、以及「现在到底挡住了什么」，全部写在
+[`docs/SANDBOX.md`](SANDBOX.md)** —— 包括 ②a AppContainer / ②b 低完整性级别 /
+③ 文件能力收回宿主 / ④ WASM 四套备选方案的代价对照与实施要点。
+
+- **为什么另起一条线**：阶段 1–6 全部在「扩展性」轴上（把编译期硬编码换成可替换接口），
+  安全边界轴基本没动。6 收束后重新审计，最大的缺口是「模型自己写的插件能干任何事」。
+- **本阶段做两件**：① Job Object 围栏（进程数 / 内存 / UI，由内核强制）与
+  ③ 工作区边界（把文件能力收回宿主）。两样都**不含文件系统的 OS 级隔离** ——
+  真要挡住恶意第三方插件得靠 ②a，还没做。
+- 落地 ①：新增 `src/sandbox.rs` ＋ `config.toml [sandbox]` 段；接入点只有
+  `plugin::spawn_command` / `spawn_and_init` / `respawn` 三处（没有第二条启动路径）。
+- 证据 ①：`aox selftest` 回归 7 的**三段对拍** —— 默认额度下插件能开子进程、且自身照常干活 /
+  `max_processes = 0` 时被围栏拦下 / 关掉围栏又能开（对照组：证明拦住它的确实是 Job，
+  而不是这台机器上 python 自己有别的毛病）；
+  实机 `aox` 跑一遍，8 个真实插件（python 与 rust 都有）全部 `围栏 ✓`。
+- 体积 ①：`aox.exe` 3,122,688 → **3,139,584 B（+16,896，+0.54%）**；
+  `aox-gui.exe` 6,024,704 → **6,034,944 B（+10,240）**。远在 ≤300 KB/阶段预算内。
+- 新增命令：`/sandbox`（看限制，并复述「它管不了什么」）；`/plugins` 每项多一枚
+  `围栏 ✓ / ✗`；启动时若某个插件没套上围栏，CLI 与 GUI 都会出声（共用一份判定与文案）。
+- ✅ **三处修复（2026-10-04，用户反馈「都修了」）**：
+  ① `Workplace::is_unrestricted()` + `Agent::workplace_reject` 开头短路 —— full 档（配置默认）
+     整条判定一步不跑，省掉每次工具调用 65~224 µs 的 `canonicalize`；
+  ② `scan_paths` 的值形态闸门（含换行 / 长过 260 字符 ⇒ 不判为路径）—— 修掉「2.2 KB 插件源码
+     被整段当路径」：受限档下 `create_plugin` 不再被误拒、full 档不再白烧 ~1 ms；
+  ③ `max_processes` 语义改为「插件能再开几个子进程」，默认 1 → 8 —— 见下一条。
+- ⚠️ **`max_processes` 的语义在 2026-10-04 改过一次**（同一次反馈）：
+  它现在的意思是**「插件能再开几个子进程」（不含插件自己）**，写进 Job 时 `+1`
+  （`ACTIVE_PROCESS` 数的是整个 Job，插件自己占一个名额）。以前那个数字是
+  「含插件自己的进程总数」，于是默认值 1 = 插件连自己都刚好占满 ⇒ 任何靠 `subprocess`
+  干活的插件一律 `WinError 1816 配额不足`（**插件全废，不是变慢**）。
+  现在默认 8，`0` 才是「一个都不许」，平台口径收在 `SandboxConfig::job_process_limit` 一处。
+- 体积（三处修复之后，2026-10-04 收尾口径）：`aox.exe` **3,209,216 B**、
+  `aox-gui.exe` **6,088,704 B** —— 相对 ③ 结束时 +1,024 / +512 B（+0.03%）：
+  full 档短路与粗网闸门都是「加一道判断、少一次文件系统调用」，`max_processes` 那次换的是语义与文案。
+- 落地 ③：新增 `src/workplace.rs`（三档 + 边界判定 + 越界契约）与 `src/tool/hostfs.rs`
+  （四个宿主文件工具），＋ `config.toml [workplace]` 段 —— **默认 `full`，不写则行为不变**。
+  接入点：`Runtime.workplace`、`Agent::run_turn`（首条消息建地）、
+  `Agent::authorize_and_execute`（早于授权的判定 + 给用户的 `Warn`）、
+  `Agent::new_conversation`（换地）、CLI/GUI 各注册一次 `host_file_tools()`、新增 `/workplace`。
+- 新增 `ToolKind::Host`：宿主文件工具**不并进** `Meta` —— `meta_tools` 默认 `ask`，
+  并进去会让每次读写都弹授权框，而 `fs_*` 那类插件工具是 `auto`，同一件事两套行为最难解释。
+- 体积 ③：`aox.exe` 3,139,584 → **3,208,192 B（+68,608，+2.19%）**；
+  `aox-gui.exe` 6,034,944 → **6,088,192 B（+53,248）**。比 ① 大得多，因为这一块带来两个
+  新模块（约 1,150 行，其中越界契约文案与成套单测占大头）；仍在 ≤300 KB/阶段预算内。
+- 证据 ③：`aox selftest` 回归 8 的 A/B 对拍（受限档拦住越界**且文件真的没被创建** /
+  full 档同一个调用必须成功 —— 单边测不出「拦住它的到底是工作区还是别的」）；
+  另有 `workplace` / `hostfs` 两个模块共 15 条单测（`..` 逃逸、大小写、Pending 必须拒、
+  URL 不被误判为路径等）。
+- ✅ **GUI 的「工作区」按钮（2026-10-04 落地）** —— ③ 的界面入口，本轮完成。
+  输入框**左下角**一枚「工作区 · <档位>」→ 向上弹出三选一（默认 / 选择工作区… / 完全访问）→
+  「完全访问」红色加粗 + 红色二次确认 →「选择工作区…」开**内置 egui 目录选择器**
+  （盘符 chips / 上级目录 / 子目录列表 / 选定此目录）。新增 `gui/src/workplace_ui.rs`。
+  - **界面不自己切档**：`Workplace` 住在 `Runtime` 里、只有 Agent 线程拿得到 ⇒
+    新增 `ToAgent::Workplace(Mode)`（请求）+ `FromAgent::Workplace(WorkplaceView)`（回执）。
+    回执在**启动 / 每轮结束 / 每次切档后**各推一次（第三处不能省：`default` 档的根要到
+    首条消息才建，不重推界面会一直显示「还没定」）。打勾靠 `PartialEq` 比档位，不解析文案。
+  - `Workplace::snapshot()`：**一次取锁**同时给「档位 + 根」，`mode()` 也改走它 ——
+    防的正是「两次取锁之间首条消息刚好在建地」导致界面上档位与目录对不上（也是坑 1 的复发点）。
+    回归 `snapshot_agrees_with_mode_and_root`（含「`default` 建成后档位仍须是 Default」）。
+  - `Reject::model_text()` 的提权途径补上界面这一条（两条前端入口都写全）。
+  - `Palette` 新增 `danger`（整套配色里**唯一**的色相，只给「完全访问」用）；
+    它是普通可覆盖的调色板字段 ⇒ `PaletteConfig` 同步加、`tools/gen_themes.py` 的字段数
+    18 → 19、`themes/{paper,ink,high-contrast}.toml` 同步。
+  - 体积（2026-10-04 收尾口径）：`aox.exe` **3,210,240 B**（+1,024）、
+    `aox-gui.exe` **6,124,544 B**（相对三处修复后 6,088,704，**+35,840 / +0.59%**）——
+    新增约 640 行界面代码，仍在 ≤300 KB/阶段预算内。
+  - 证据：`--demo` 实机截图逐屏核对（按钮 / 向上弹出 / 打勾 / 红确认框 / 目录选择器 /
+    进子目录 / 选定后按钮改名 / 点外部收起）；`cargo check --all-targets` 零警告、
+    `cargo test --workspace` 122 + 12 全过、`aox selftest` 全过。
+- ✅ **读写语义修正 + 顶栏 Σ 面板偏移（2026-10-04，用户反馈「1.修正偏移，2.修改一点…」）**：
+  - **新语义：读不设限，写·删限定在工作区里。** `workplace` 新增 `Access::{Read, Write}` 与
+    `check_access`：`check` = `Write`（行为原样），`check_read` = `Read` —— **从不返回 `Err`**，
+    只把路径规格化（连 `Pending`「地还没开」也照读）。`read_file` / `list_dir` 走
+    `hostfs::guard_read`（不设限）；`write_file` / `remove` 仍走 `guard`（受限）。
+    `Agent::workplace_reject` 增加 `name` 参数，经 `tool::host_tool_access` 按工具名分流；
+    **插件粗网一律按「写」判**（宿主看不出插件意图，取保守方向：宁可多挡一次读）。
+    理由：读是取信息、写删是改设备（不可逆），后果不对称 —— 为「读一份别处的资料」设提权
+    只会把用户逼去常开 `full`，边界反而更松。代价如实写进 `docs/SANDBOX.md` 已知边界第一条
+    （**这层挡不住「读遍整台机器」**，要连读一起关只有 ②a）。
+  - **`token_chip` 的 Σ 用量面板偏移已修**：`Area::fixed_pos` 与 `ui.allocate_*` 同处
+    **客户区局部坐标**，原先误加了「视口原点」`viewport().inner_rect.left_top()`（**屏幕坐标**）
+    ⇒ 面板随窗口在显示器上的位置整体平移（实测偏 ~(154,14) 逻辑像素）。改为直接用
+    `resp.rect.left_bottom() + vec2(0,6)` 当锚点。同一错误在 `workplace_ui::menu` 已先修，
+    这处是当时报告、本轮一并修掉的既存 bug。
+  - 体积：`aox.exe` **3,215,872 B**（相对 GUI 落地的 3,210,240，**+5,632 / +0.18%**）；
+    `aox-gui.exe` **6,123,520 B**（相对 6,124,544，**−1,024 / −0.02%** —— 去掉那段
+    「屏幕坐标换算」正好抵掉新增文案）。均在 ≤300 KB/阶段预算内。
+  - 证据：`cargo check --workspace --all-targets` 零警告；`workplace` 新增
+    `read_is_never_restricted_but_write_is`、`hostfs` 新增 `read_outside_is_allowed_but_remove_is_not`
+    （**读区外放行 + 删区外拦截**对拍，只钉一边会变成永远绿的假测试）；`selftest` 回归 8
+    加「读区外放行 / 删区外拦截」，并把原先挂在 `read_file` 上的「相对路径必须拒」改挂
+    `write_file`（新语义下读**不**拒相对路径）。
+- ✅ **工作区界面两处微调（2026-10-04，用户实机验收「界面没问题」之后提的）**：
+  - **目录选择器的「选定此目录」从左下角挪到右下角**：同排改成一个 `ui.horizontal` ——
+    说明文字照旧在左，右侧用 `with_layout(right_to_left)` 的子布局（它会吃掉剩下的横向宽度，
+    于是先放进去的按钮就贴在最右）。与「完全访问」确认框里「取消」的摆法同一套。
+  - **上拉菜单只保留「默认」那行的说明文字**，`选择工作区…` / `完全访问` 改为单行 ——
+    前者不带说明是因为「当前选了哪个目录」按钮上本来就写着（「工作区 · <目录名>」），
+    重复一遍只会把菜单撑高；后者红色加粗本身就是说明。
+    连带 `row()` 支持**两种行高**（两行 46 / 单行 32，单行时标题整体居中）——
+    单行若沿用 46，那行字会浮在上半截，看着像没画完。
+  - 体积：`aox.exe` 3,215,872 B（未变）、`aox-gui.exe` **6,123,520 B**（与上一条同值：
+    删掉的两段说明文字与新增的行高/布局分支正好抵消）。
+- ✅ **命名统一到 `workplace`（2026-10-04，两轮）**。此前一个功能有三个名字：CLI 命令
+  `/workspace`、配置段 `[workspace]`、实际目录 `workplace/`（只有 GUI 的提示用了最后那个）。
+  **第一轮**（用户提「命令行是 workspace、GUI 是 workplace」）改的是用户看得见的三面；
+  **第二轮**（用户提「把文件 `src/workspace.rs` 也改成 workplace」）连代码侧一起改了。
+  - 第一轮：CLI 命令 → `/workplace`；配置段 → `[workplace]`；目录名本来就是 `workplace/`，不动。
+  - 第二轮：`src/workspace.rs` → **`src/workplace.rs`**、`gui/src/workspace_ui.rs` →
+    **`gui/src/workplace_ui.rs`**；类型 `Workspace` / `WorkspaceConfig` / `WorkspaceView` /
+    `WorkspaceUi` → `Workplace…`；字段 `rt.workspace` → `rt.workplace`；
+    `paths::resolve_workspace` → `resolve_workplace`。全仓机械替换 + 编译器兜底。
+  - **两个旧名都留着**：`/workspace` 是命令的隐式别名（不写进 `/help`）、`[workspace]`
+    走 serde 的 `alias`。不留的话，`config.toml` 里写着 `[workspace]` 的用户会被 serde
+    **静默忽略**（认不出的段直接跳过）⇒ 以为边界还开着、实际退回 `full` ——
+    「写了却不生效」那一类最难查的问题。两条各有一个回归钉着
+    （`command_answers_to_both_names_and_parses_args`、`workplace_section_accepts_the_legacy_name`，
+    后者还钉住「同一段写两个名字要报错而不是静默取一个」）。
+  - 顺带修 **`args` 的剥法**：原来用 `trim_start_matches("/workspace")`，它会**反复**剥前缀 ⇒
+    目录名恰好叫 `/workplace` 时，`/workplace /workplace` 被剥成空串＝「不带参数」，
+    用户拿到现状而不是切换结果且毫无提示。改成「按名精确匹配 + 剥一次前缀 + 去掉一个空格」。
+  - 顺带修一句过期的提示：`Agent::run_turn` 建地时那句「AOX 只会在这个目录里**读写**文件」
+    是改语义之前写的，会让用户以为连读也被关住（于是白白去提权）；改成
+    「写入与删除都被限制在这个目录里（读取不受限…）」。
+  - ⚠️ **机械替换的教训**：`--workspace`（**cargo 的参数**）也在替换面里，被改成了
+    `--workplace` ⇒ 文档里那 18 处命令全成了假的。`[workspace]`（cargo 的清单段）因为
+    `Cargo.toml` 刻意没进替换范围而躲过一劫。**改名脚本必须先圈定范围，替换完立刻 grep
+    复核**——只看「能不能编译过」是查不出这类假的。
+  - 体积：`aox.exe` 3,215,872 → **3,215,360 B**、`aox-gui.exe` 6,123,520 → **6,123,008 B**
+    （各 −512，纯改名，净增长为零）。验证：`cargo check --workspace --all-targets` 零警告、
+    `cargo test --workspace` **127 + 12 全过**、`aox selftest` 全过；另用一份**临时应用根**
+    实机跑通（config.toml 里写**旧段名** `[workspace] mode = "default"` ⇒ 正确报「档位：默认」；
+    `/workplace` 与 `/workspace` 都响应；`/workplace /workplace` 的参数没被吞掉）。
+- ✅ **工作区跟着对话走 + `/new` 回默认档 + GUI 回执（2026-10-04，用户报「每次新建对话，
+  默认工作区还是上一个」与「每次进入同一个对话都是不同的工作区」）**。两个现象、三个不同的
+  原因，一起修：
+  - **GUI 少了一条回执**（真 bug，第一个现象的直接原因）：`ToAgent::NewConversation` 与
+    `ToAgent::Resume` 都推了 `Switched` + `UsageLog`，**唯独没推工作区回执** ⇒ 按钮上一直
+    挂着上一段对话（甚至上一次点击）的档位名，界面显示的是陈旧值。两处各补一次 `sync_workplace`。
+  - **`/new` 一律回到「默认」档**：原先只在 `cfg.mode == "default"` 时才重置，于是
+    「上一段挑了某个目录 → 点 + → 新对话还在那个目录里」。现在 `reset_for_new_conversation`
+    无条件回到 `Pending`。⚠️ 代价（用户确认接受）：配置写 `mode = "fixed"` 的用户，只有本次
+    启动的**第一段**对话落在配置点名的那块地。
+  - **工作区按对话存档**：`.jsonl` 新增一种记录 `{"kind":"workplace","mode":…,"root":…}`
+    （`Store::{append,load}_workplace`，读的时候取最后一条）；`Agent` 在「每轮开头」与
+    「每次切档后」**比对后**追加（没变就不写，免得文件里堆重复行），`resume` 读回来 →
+    `Workplace::restore`。`rewrite`（中断回滚）也把它捞出来原样补回 —— 回滚只该丢消息，
+    不该把「这段对话在哪块地」一起抹掉。
+  - **顺带修 `snapshot()` 的档位来源**（新增 `State::picked`）：判据改成「运行期怎么来的」，
+    不再拿 `cfg.mode` 推；`Workplace` 里那份「只用来定启动档」的 `cfg` 字段直接删掉 ——
+    留着只会诱使人再按配置推档位。
+  - 验证：`cargo check --workspace --all-targets` 零警告 · `cargo test --workspace`
+    **131 + 12 全过**（新增 4 条：`snapshot_follows_the_runtime_origin_not_the_config` /
+    `new_conversation_always_returns_to_default` / `persisted_and_restore_round_trip` /
+    `workplace_record_keeps_the_last_one_across_rewrite`）· `aox selftest` 全过。
+    实机（临时应用根）跑通三件事：`mode = "fixed"` ⇒ `/new` 后报「默认」且根还没定；
+    手写一份带 `workplace` 记录的旧存档 ⇒ `/history open` 后工作区还原成**它自己**那块；
+    在对话里发 `/workplace full` ⇒ 文件里真的追加了 `{"kind":"workplace","mode":"full"}`，
+    再打开这段对话即报「完全访问」。
+  - 体积：`aox.exe` 3,215,360 → **3,218,944 B**、`aox-gui.exe` 6,123,008 → **6,127,616 B**。
+- **下一步**：②b 的 30 分钟 spike（若通，②a 可降级为备选）。

@@ -255,9 +255,19 @@ fn usage_line(rec: &UsageRecord) -> Value {
     v
 }
 
+/// 工作区一行。`root` **只在有值时才写** —— 与用量记录同一个理由：
+/// 没有的东西不要拿空串去冒充（`full` 档本来就没有根）。
+fn workplace_line(mode: &str, root: Option<&Path>) -> Value {
+    let mut v = json!({ "kind": "workplace", "mode": mode });
+    if let Some(p) = root {
+        v["root"] = json!(p.display().to_string());
+    }
+    v
+}
+
 /// 我们写出去的行类型。别的行（误放进 `history/` 的其它文件、被手改坏的行）
 /// 一律不认 —— 这也是「这个文件是我们的」最便宜的判据。
-const ROW_KINDS: [&str; 4] = ["meta", "message", "act", "usage"];
+const ROW_KINDS: [&str; 5] = ["meta", "message", "act", "usage", "workplace"];
 
 /// 解析一行，认得出来就返回它的对象。
 fn parse_row(line: &str) -> Option<Value> {
@@ -379,6 +389,11 @@ impl Store for JsonlStore {
         load_usage(&file_of(&self.dir, id))
     }
 
+    fn load_workplace(&self, id: &str) -> Option<(String, Option<PathBuf>)> {
+        // 「最后一条」= 这段对话当前的工作区。
+        load_workplaces(&file_of(&self.dir, id)).pop()
+    }
+
     fn remove(&self, key: &str) -> Result<Summary> {
         // 删除原先散在 `main.rs` 里（直接 `std::fs::remove_file`）——
         // 收进后端，否则换个后端（比如一个库装所有对话）就没有「删除」这个语义。
@@ -486,15 +501,23 @@ impl Session for JsonlSession {
         let _ = write_line_to(&mut self.file, &usage_line(rec));
     }
 
+    /// 追加一条「本对话的工作区」。同上：写失败不出声。
+    ///
+    /// 写在对话文件里（而不是另开一个旁路文件），是因为它**属于这段对话**：
+    /// 对话被删、被裁剪、被换后端时，这条记录自然跟着走，不会留下孤儿。
+    fn append_workplace(&mut self, mode: &str, root: Option<&Path>) {
+        let _ = write_line_to(&mut self.file, &workplace_line(mode, root));
+    }
+
     /// 用给定的消息列表重写整个文件。
     ///
     /// 用于「中断回滚」：内存里的消息被丢弃了，文件必须跟着回到同一状态，
     /// 否则会留下一段「有 tool_calls 但没有结果」的半截记录
     /// （将来要恢复这段对话时，那种记录会直接让请求被拒）。
     ///
-    /// 活动流（`kind:"act"`）与 token 用量（`kind:"usage"`）不属于消息流，
-    /// 所以**要先捞出来再原样补回**：回滚丢的是消息，没道理顺手把时间轴上
-    /// 「已经发生过的过程」和已经记下的账一起抹掉。
+    /// 活动流（`kind:"act"`）、token 用量（`kind:"usage"`）与工作区（`kind:"workplace"`）
+    /// 不属于消息流，所以**要先捞出来再原样补回**：回滚丢的是消息，没道理顺手把时间轴上
+    /// 「已经发生过的过程」、已经记下的账、以及「这段对话在哪块地里干活」一起抹掉。
     ///
     /// 实现上**不能**对 append 句柄直接 `set_len`：Windows 上 append 打开的句柄
     /// 没有截断权限，会返回 `os error 5（拒绝访问）`；而且 `O_APPEND` 会让 `seek`
@@ -503,6 +526,7 @@ impl Session for JsonlSession {
     fn rewrite(&mut self, msgs: &[Message]) {
         let acts = load_acts(&self.path);
         let usages = load_usage(&self.path);
+        let workplaces = load_workplaces(&self.path);
         let Ok(mut f) =
             OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)
         else {
@@ -524,6 +548,11 @@ impl Session for JsonlSession {
         }
         for u in &usages {
             if write_line_to(&mut f, &usage_line(u)).is_err() {
+                return;
+            }
+        }
+        for (mode, root) in &workplaces {
+            if write_line_to(&mut f, &workplace_line(mode, root.as_deref())).is_err() {
                 return;
             }
         }
@@ -710,8 +739,34 @@ fn load_usage(path: &Path) -> Vec<UsageRecord> {
     out
 }
 
-/// 只保留最新的 `keep` 个对话，多出来的删掉。`keep == 0` 表示不限制。
+/// 读出一个文件里所有的**工作区**记录（按写入顺序）—— 调用方取最后一条 = 当前那块地。
 ///
+/// 与 `load_usage` 一样：坏行跳过，`kind:"workplace"` 之外的行一概不认。
+fn load_workplaces(path: &Path) -> Vec<(String, Option<PathBuf>)> {
+    let Ok(file) = File::open(path) else { return Vec::new() };
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Some(v) = parse_row(t) else { continue };
+        if !is_kind(&v, "workplace") {
+            continue;
+        }
+        let Some(mode) = v.get("mode").and_then(Value::as_str) else { continue };
+        let root = v
+            .get("root")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from);
+        out.push((mode.to_string(), root));
+    }
+    out
+}
+
+/// 只保留最新的 `keep` 个对话，多出来的删掉。`keep == 0` 表示不限制。
 /// 「最新」= 最后一次对话时间，所以裁剪淘汰的是**最久没聊过**的那些 ——
 /// 刚接着聊过的旧对话会被保住，哪怕它是几个月前开的。
 /// 返回被删除的文件数。
@@ -1136,6 +1191,43 @@ mod tests {
         assert_eq!(back[0].last_prompt, Some(128));
         assert_eq!(back[0].session_total, Some(1152));
         assert_eq!(back[0].session_calls, 3);
+    }
+
+    /// 工作区记录：**最后一条才算数**，而且要活过「中断回滚」（`rewrite` 重写全文）。
+    ///
+    /// 最后一条 = 这段对话当前在哪块地里干活。回滚丢的是消息，不该顺手把
+    /// 「这段对话用哪块地」也抹掉 —— 抹掉之后重开这段对话就会换一块新地
+    /// （这正是用户报的「每次进入同一个对话都是不同的工作区」）。
+    #[test]
+    fn workplace_record_keeps_the_last_one_across_rewrite() {
+        let d = Tmp::new("workplace");
+        let s = d.store();
+        let mut log = s.create(None).unwrap();
+        let id = log.id().to_string();
+
+        assert_eq!(s.load_workplace(&id), None, "还没写过就是 None（旧对话文件都走这一支）");
+
+        log.append_workplace("default", None);
+        log.append(&Message::user("第一句"), None);
+        // 头一条是「根还没定」，后一条才是落到具体目录 —— 读的必须是后者
+        log.append_workplace("default", Some(Path::new(r"C:\tmp\workplace\20261004200000")));
+        log.append_workplace("fixed", Some(Path::new(r"C:\tmp\picked")));
+        drop(log);
+
+        let got = s.load_workplace(&id).expect("应当读到最后一条");
+        assert_eq!(got.0, "fixed");
+        assert_eq!(got.1.as_deref(), Some(Path::new(r"C:\tmp\picked")), "取的是最后一条，不是第一条");
+
+        // 回滚重写消息：工作区记录必须原样还在
+        let mut log = s.open(&id).unwrap();
+        log.rewrite(&[Message::system("sys"), Message::user("只剩这句")]);
+        drop(log);
+        assert_eq!(
+            s.load_workplace(&id),
+            Some(("fixed".to_string(), Some(PathBuf::from(r"C:\tmp\picked")))),
+            "中断回滚只该丢消息，不该丢掉「这段对话在哪块地」"
+        );
+        assert_eq!(s.load(&id).unwrap().len(), 1, "消息确实被回滚成 1 条");
     }
 
     /// 端点少报一项，读回来就该是 `None` —— 不能变成 0。

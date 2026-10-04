@@ -44,6 +44,12 @@ pub trait Session: Send {
     fn append_act(&mut self, act: &Value);
     /// 追加一轮的 token 账。
     fn append_usage(&mut self, rec: &UsageRecord);
+    /// 追加一条「本对话的工作区」记录（档位名 + 根）。
+    ///
+    /// 每段对话首条消息写一条、每次切档再写一条；读的时候**取最后一条**。
+    /// 存它是为了两件事：① 打开旧对话时把当时那块地还回来；
+    /// ② 「同一个对话每次进去都是不同的工作区」不再发生（见 `workplace.rs`）。
+    fn append_workplace(&mut self, mode: &str, root: Option<&Path>);
     /// 用给定消息列表重写整个文件（中断回滚）；活动流与用量原样保留。
     fn rewrite(&mut self, msgs: &[Message]);
 }
@@ -72,6 +78,11 @@ pub trait Store: Send + Sync {
     fn load_acts(&self, id: &str) -> Vec<Value>;
     /// 读出逐轮 token 用量。
     fn load_usage(&self, id: &str) -> Vec<UsageRecord>;
+    /// 读出本对话**最后一条**工作区记录；从没写过就是 `None`（旧对话文件都没有）。
+    ///
+    /// `None` 时的语义由调用方定：`Agent::resume` 选择**不动**当前状态 ——
+    /// 不知道那段对话当时用哪块地，就不该替用户猜。
+    fn load_workplace(&self, id: &str) -> Option<(String, Option<std::path::PathBuf>)>;
     /// 删除一段对话，返回被删掉的那一项。
     fn remove(&self, key: &str) -> Result<Summary>;
     /// 只保留最新的 `keep` 个对话（`0` = 不限制），返回删除数。

@@ -42,6 +42,13 @@ windows-sys = { version = "0.59", features = [
     # FileTimeToSystemTime 在 System::Time，两个都得开。
     "Win32_Storage_FileSystem",
     "Win32_System_Time",
+    # 插件子进程的围栏（`src/sandbox.rs`）：Job Object 本体、找回并恢复主线程
+    # （`CreateToolhelp32Snapshot` + `OpenThread` + `ResumeThread`）、
+    # 以及 `CreateJobObjectW` 签名里的 SECURITY_ATTRIBUTES（Win32_Security）。
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security",
 ] }
 
 

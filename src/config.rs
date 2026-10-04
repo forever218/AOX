@@ -32,6 +32,23 @@ pub struct Config {
     /// （靠 `rename` 对上），配置文件里看到的就是 `[loop]`。
     #[serde(default, rename = "loop")]
     pub loop_config: LoopConfig,
+    /// `config.toml` 的 `[sandbox]` 段（插件子进程的围栏，见 `src/sandbox.rs`）。
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+    /// `config.toml` 的 `[workplace]` 段（模型的文件边界，见 `src/workplace.rs`）。
+    ///
+    /// 与 `[sandbox]` 是两层：它管「能碰哪些文件」，不管「子进程怎么跑」。
+    ///
+    /// ⚠️ **TOML 里的段名是 `[workplace]`，旧名 `[workspace]` 仍然认**（`alias`）。
+    /// 2026-10-04 统一过一次命名：**这个词一律是 `workplace`** —— 目录名
+    /// `<应用根>/workplace/`、CLI 命令 `/workplace`、配置段 `[workplace]`；
+    /// 第二轮连 Rust 侧的模块与类型（`src/workplace.rs` / `Workplace` /
+    /// `WorkplaceConfig`）也一起改了，于是再没有第二种拼法。
+    ///
+    /// **别删那个 `alias`**：少一个别名，已经写好的 `config.toml` 会**静默**退回 `full`
+    /// （serde 认不出的段直接忽略，不报错）—— 正是「写了却不生效」那一类最难查的问题。
+    #[serde(default, rename = "workplace", alias = "workspace")]
+    pub workplace: WorkplaceConfig,
     /// GUI 专用外观配置。CLI 的 bin 目标也会编译本文件，但读不到这个字段。
     #[allow(dead_code)]
     #[serde(default)]
@@ -298,6 +315,99 @@ fn default_loop_impl() -> String {
     crate::agent_loop::default_impl().to_string()
 }
 
+/// 插件子进程的**围栏**（Job Object，见 `src/sandbox.rs`）。
+///
+/// 默认**开着**，而且默认值就是「对合法插件零影响」的那一组：允许插件再开 8 个子进程、
+/// 关闭即全灭、USER 对象隔离。它们一次拿掉 fork bomb、孤儿进程、
+/// 以及插件伸手碰宿主窗口/剪贴板这三件事。
+///
+/// ⚠️ 这一段的默认值**不是**「零漂移」—— 它是刻意的加固，`enabled = false` 可退回原样。
+/// 但请注意它**管不了文件与网络**：那两样要 AppContainer（见 docs 的方案对照）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SandboxConfig {
+    /// 总开关。关掉后不再建 Job、也不加 `CREATE_SUSPENDED`，与围栏之前逐字节一致。
+    pub enabled: bool,
+    /// 每个插件**最多能再开几个子进程**（**不含插件自己**）。
+    ///
+    /// `0` = 禁止插件开子进程（唯一能把这条路锁死的档）；默认 `8`。
+    ///
+    /// 为什么默认不再是 `1`：以前这个数字是「**含插件自己**的进程总数」，直接写进 Job，
+    /// 于是默认值 1 等于「Job 里只准有 1 个进程」—— 插件自己就占满，任何靠子进程干活的
+    /// 插件（调 `curl` / `git` / 解释器）一概 `WinError 1816`（配额不足），
+    /// 表现是「插件莫名其妙干不了活」。平台那个「含自己」的口径现在收在
+    /// [`SandboxConfig::job_process_limit`] 一处，配置这一层只说用户关心的事。
+    ///
+    /// 为什么仍留一个**有限的小额度**（而不是不限）：fork bomb 靠并发翻倍，
+    /// 把并发封顶它就起不来（子进程还自动继承这个 Job，跑不出围栏）。
+    /// 要放开就写一个大数，**别写 0** —— 这里的 0 是「一个都不许」，
+    /// 与 `max_memory_mb = 0`（不限）方向相反：问「允许几个」时 0 就是 0 个，
+    /// 而内存那个 0 只是「不设上限」的简写。
+    ///
+    /// 注意这是**每个插件一份**的额度（一个插件一个 Job），不是全局预算 ——
+    /// 否则一个插件把额度吃光，别的插件连启动都启动不了。
+    pub max_processes: u32,
+    /// 每个插件进程的提交内存上限，单位 MB。`0`（默认）= 不限。
+    ///
+    /// ⚠️ 为什么默认关：超限是**整个进程被内核结束**，不是一次分配失败 ——
+    /// 一个偏紧的帽子会把「合法但吃内存」的插件直接打死，而且从插件侧看不到任何原因，
+    /// 表现就是「插件老是莫名其妙重启」。想开就明确地开。
+    pub max_memory_mb: usize,
+    /// 禁止插件使用宿主进程的 USER 对象（窗口 / 剪贴板 / 桌面 / 全局原子）。
+    /// 插件进程本来就不需要这些 —— 它的全部通信都走 stdin/stdout 管道。
+    pub ui_limits: bool,
+}
+
+impl SandboxConfig {
+    /// 真正写进 Job 的 `ActiveProcessLimit`。
+    ///
+    /// `+1` 是**平台语义**不是配置语义：`JOB_OBJECT_LIMIT_ACTIVE_PROCESS` 数的是
+    /// **整个 Job** 里的进程数，而插件自己就占一个名额。把这一层收在这里（唯一一处），
+    /// 配置里的 [`max_processes`](SandboxConfig::max_processes) 才真的是
+    /// 「插件能再开几个子进程」—— 否则用户得自己在脑子里 +1，而漏掉这一步的后果
+    /// 恰恰是「默认配置下插件干不了活」。
+    ///
+    /// `saturating_add`：配置写 `u32::MAX` 也不会回绕成 0（0 在 Job 里是「不限」，
+    /// 那是另一个意思，不能因为一个手滑的极端值撞上去）。
+    pub fn job_process_limit(&self) -> u32 {
+        self.max_processes.saturating_add(1)
+    }
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self { enabled: true, max_processes: 8, max_memory_mb: 0, ui_limits: true }
+    }
+}
+
+/// 工作区边界（沙箱方案 ③「把文件能力收回宿主」的配置面，见 `src/workplace.rs`）。
+///
+/// 它与 `[sandbox]` 是**两件事**，别混：
+/// - `[sandbox]` 管的是**插件子进程**能不能开子进程 / 吃内存 / 碰宿主窗口（进程围栏）；
+/// - `[workplace]` 管的是**模型这次能碰哪些文件**（写入与删除的路径边界；读不设限）。
+///
+/// 默认 `mode = "full"`（不受限），这是刻意的：**不写 `[workplace]` 配置的用户，行为
+/// 与加这一层之前逐字节一致**。用户最初要的「每次启动默认受限」由 GUI 那枚「工作区」
+/// 按钮去兑现（那一层才是用户表达意图的地方），配置这一层只负责「不写就不变」。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WorkplaceConfig {
+    /// `"full"`（不受限，默认）/ `"default"`（每段对话在 `<应用根>/workplace/<时间戳>/`
+    /// 开一块新地）/ `"fixed"`（配合 `root` 指定固定目录）。
+    ///
+    /// **认不出的值在启动时报错**，不静默退回 `full` —— 与 `[store] backend` /
+    /// `[loop] impl` 同一条原则：写了却不生效是最难查的一类问题。
+    pub mode: String,
+    /// `mode = "fixed"` 时的固定工作区目录。相对路径相对**应用根**解释。
+    pub root: Option<String>,
+}
+
+impl Default for WorkplaceConfig {
+    fn default() -> Self {
+        Self { mode: "full".into(), root: None }
+    }
+}
+
 // ─────────────────────────── 界面外观（GUI 主题）───────────────────────────
 //
 // 这一段只描述**数据**，不认识 egui。原因有两个：
@@ -416,6 +526,13 @@ pub struct PaletteConfig {
     pub on_reverse: Option<RgbColor>,
     /// 悬浮卡片的投影色
     pub shadow: Option<RgbColor>,
+    /// **整套配色里唯一的色相**：危险动作（目前只有「完全访问」那一处用）。
+    ///
+    /// 其余字段刻意只用明度表达语义，但「越界之后没有任何边界」值得破一次例 ——
+    /// 它是唯一一个点下去就越过所有保护的开关，明度层次表达不出「这不是普通选项」。
+    /// 仍然是一项普通可覆盖的调色板字段（与 `gen_themes.py` 的字段对拍保持一致）：
+    /// 主题作者若真要去掉这点红，那是他自己的选择，不该在合并层里被静默忽略。
+    pub danger: Option<RgbColor>,
 }
 
 /// 界面的字号与尺度。每项都留了内置默认值，只写想改的那几项即可。
@@ -571,6 +688,8 @@ impl Config {
             prompt: PromptConfig::default(),
             hook: HookConfig::default(),
             loop_config: LoopConfig::default(),
+            sandbox: SandboxConfig::default(),
+            workplace: WorkplaceConfig::default(),
             theme: ThemeConfig::default(),
         }
     }
@@ -839,6 +958,33 @@ mod tests {
         assert_eq!(on.hook.max_llm_retries, 2);
     }
 
+    /// `[workplace]` 是正式段名，`[workspace]` 是**旧名**（2026-10-04 统一命名）。
+    ///
+    /// 这条是硬要求：少了 `alias`，已经写好 `[workspace]` 的 config.toml 会被 serde
+    /// **静默忽略**（认不出的段直接跳过，不报错）⇒ 用户以为边界还开着，实际退回了 `full`
+    /// —— 正是「写了却不生效」那一类最难查的问题。所以两个名字都要钉住。
+    #[test]
+    fn workplace_section_accepts_the_legacy_name() {
+        const BASE: &str = r#"
+[provider]
+base_url = "https://example.com/v1"
+model = "m"
+api_key = "k"
+"#;
+        let new: Config = toml::from_str(&format!("{BASE}\n[workplace]\nmode = \"default\"\n"))
+            .expect("[workplace] 应当能解析");
+        let old: Config = toml::from_str(&format!("{BASE}\n[workspace]\nmode = \"default\"\n"))
+            .expect("旧段名 [workspace] 必须仍能解析");
+        assert_eq!(old.workplace, new.workplace, "旧段名读出来的必须与新段名一模一样");
+        assert_eq!(new.workplace.mode, "default", "值要真的读进来，而不是落回默认");
+
+        // 两个名字都写（理论上不该发生）：宁可**报错**，也别静默取其中一个 ——
+        // 取错了就是「我明明写了 full，它却还在拦我」这种没法自查的现象。
+        let both =
+            format!("{BASE}\n[workplace]\nmode = \"default\"\n[workspace]\nmode = \"full\"\n");
+        assert!(toml::from_str::<Config>(&both).is_err(), "同一段写两个名字应当报错");
+    }
+
     /// 老配置（完全没写 `[hook]`）必须照常解析，且钩子表为空 ——
     /// 阶段 4 和阶段 2 一样，不能打破任何一份既有的 config.toml。
     #[test]
@@ -910,5 +1056,84 @@ mod tests {
         .expect("[loop] 只写一个键也应可解析");
         assert_eq!(c.loop_config.implementor, "standard");
         assert_eq!(c.loop_config.max_rounds, 3);
+    }
+
+    /// `[sandbox]` 的默认值：**开着**，且是「对合法插件零影响」的那一组。
+    ///
+    /// 这条与其它各段的「默认 = 不生效」是**刻意不同**的：围栏的默认值本身就是行为，
+    /// 所以更要把它钉死 —— 哪天有人顺手改了默认，这条测试应当立刻红。
+    #[test]
+    fn sandbox_defaults_are_on_and_conservative() {
+        let c: Config = toml::from_str(
+            r#"
+            [provider]
+            base_url = "https://example.com/v1"
+            model = "m"
+            api_key = "k"
+            "#,
+        )
+        .expect("没有 [sandbox] 的旧配置必须仍能解析");
+
+        assert!(c.sandbox.enabled, "围栏默认开着");
+        assert_eq!(c.sandbox.max_processes, 8, "默认必须放行子进程（0 才是锁死）");
+        assert_eq!(c.sandbox.max_memory_mb, 0, "内存帽默认关（超限是杀进程，不能默认开）");
+        assert!(c.sandbox.ui_limits);
+
+        let d = SandboxConfig::default();
+        assert!(d.enabled && d.max_processes == 8 && d.max_memory_mb == 0 && d.ui_limits);
+        // `+1` 是**平台口径**（`ACTIVE_PROCESS` 含插件自己）。钉住它只加一次，
+        // 而且 0 真的是「一个子进程都不许」，不是「不限」。
+        assert_eq!(d.job_process_limit(), 9, "配置 8 ⇒ Job 里 9 个名额（含插件自己）");
+        assert_eq!(
+            SandboxConfig { max_processes: 0, ..SandboxConfig::default() }.job_process_limit(),
+            1,
+            "0 = 只准插件自己 ⇒ 一个子进程都开不了"
+        );
+        assert_eq!(
+            SandboxConfig { max_processes: u32::MAX, ..SandboxConfig::default() }.job_process_limit(),
+            u32::MAX,
+            "极端值不能回绕成 0 —— 在 Job 里 0 是「不限」，意思正好相反"
+        );
+    }
+
+    /// 只写一个键时其余取默认（与其它各表一样「整表可缺项」）。
+    #[test]
+    fn sandbox_section_partial_still_parses() {
+        let c: Config = toml::from_str(
+            r#"
+            [provider]
+            base_url = "https://example.com/v1"
+            model = "m"
+            api_key = "k"
+
+            [sandbox]
+            max_processes = 4
+            max_memory_mb = 512
+            "#,
+        )
+        .expect("[sandbox] 只写两个键也应可解析");
+
+        assert_eq!(c.sandbox.max_processes, 4);
+        assert_eq!(c.sandbox.max_memory_mb, 512);
+        assert!(c.sandbox.enabled, "没写的键仍取默认");
+        assert!(c.sandbox.ui_limits);
+    }
+
+    /// 关掉围栏这条路必须真的存在（它是唯一的退路）。
+    #[test]
+    fn sandbox_can_be_turned_off() {
+        let c: Config = toml::from_str(
+            r#"
+            [provider]
+            base_url = "https://example.com/v1"
+            model = "m"
+            api_key = "k"
+
+            [sandbox]
+            enabled = false
+            "#,
+        )
+        .expect("应能解析");
+        assert!(!c.sandbox.enabled);
     }
 }

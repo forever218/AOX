@@ -10,10 +10,12 @@ mod plugin;
 mod prompt;
 mod runtime;
 mod runtimes;
+mod sandbox;
 mod selftest;
 mod store;
 mod tool;
 mod ui;
+mod workplace;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,7 +26,7 @@ use crate::agent::Agent;
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::LlmProvider;
 use crate::runtime::Runtime;
-use crate::tool::meta;
+use crate::tool::{hostfs, meta};
 use crate::ui::cli::CliUi;
 use crate::ui::{AgentEvent, Ui};
 
@@ -302,6 +304,12 @@ async fn main() -> Result<()> {
     for t in meta::meta_tools() {
         rt.register(t).await?;
     }
+    // 宿主文件工具（沙箱方案 ③：把文件能力收回宿主）。
+    // 参数与实现都在宿主手里，所以「路径必须先过工作区判定」无法被绕过 ——
+    // 与 `meta_tools` 同一批注册；默认档位（full）下它们与普通读写工具无异。
+    for t in hostfs::host_file_tools() {
+        rt.register(t).await?;
+    }
 
     let mut ui = CliUi::new();
     // 恢复持久化插件。成功的静默（启动横幅保持干净），失败才出声。
@@ -311,6 +319,16 @@ async fn main() -> Result<()> {
         if let Err(e) = result {
             ui.emit(AgentEvent::Warn(format!("插件 {name} 加载失败: {e:#}")));
         }
+    }
+    // 围栏没套上的插件要出声 —— 这是「以为有保护、其实没有」的典型场景，
+    // 与「插件加载失败」同属「用户必须知道、但不该中断启动」的那一类。
+    // 判定与文案由 `sandbox::unfenced` 统一提供（GUI 那边共用同一份）。
+    let unfenced = sandbox::unfenced(&rt).await;
+    if !unfenced.is_empty() {
+        ui.emit(AgentEvent::Warn(format!(
+            "以下插件没套上进程围栏，它们不受进程数 / 内存 / UI 限制：{}",
+            unfenced.join("；")
+        )));
     }
 
     let llm: Arc<dyn LlmProvider> = match OpenAiProvider::new(&rt.config.provider) {
@@ -373,7 +391,17 @@ async fn main() -> Result<()> {
                 } else {
                     let mut names: Vec<_> = plugins.keys().cloned().collect();
                     names.sort();
-                    ui.emit(AgentEvent::Info(format!("插件: {}", names.join(", "))));
+                    // 顺带把**围栏状态**带出来：`围栏 ✗` 表示这个进程没进 Job
+                    // （沙箱关着、或外层 Job 不允许嵌套），它不是致命错误，
+                    // 但「以为有保护、其实没有」值得被看一眼。
+                    let listed: Vec<String> = names
+                        .iter()
+                        .map(|n| match plugins.get(n) {
+                            Some(h) => format!("{n}（{}）", h.fence_status()),
+                            None => n.clone(),
+                        })
+                        .collect();
+                    ui.emit(AgentEvent::Info(format!("插件: {}", listed.join(", "))));
                     // 组件贡献（阶段 6 · 6b）：只列**有贡献**的那些 —— 只提供工具的
                     // 老插件不在这儿重复出现（上面那行已经说过它们了）。
                     let mut extra: Vec<String> = Vec::new();
@@ -435,6 +463,18 @@ async fn main() -> Result<()> {
             "/prompt" => ui.emit(AgentEvent::Info(prompt::report(&rt))),
             "/hook" => ui.emit(AgentEvent::Info(hook::report(&rt))),
             "/loop" => ui.emit(AgentEvent::Info(agent_loop::report(&rt))),
+            "/sandbox" => ui.emit(AgentEvent::Info(sandbox::report(&rt))),
+            // 工作区：`/workplace` 看现状，`/workplace full|default|<目录>` 切档位。
+            // 判定与执行都在 `workplace` 模块里（一份实现，CLI 与 GUI 共用）。
+            _ if workplace::is_cmd(line) => match workplace::command(&rt, line) {
+                Ok(text) => {
+                    ui.emit(AgentEvent::Info(text));
+                    // 档位要跟着记进本对话的存档。「看现状」那条也会走到这里，
+                    // 但 `persist_workplace` 自己比对过、没变就不写。
+                    agent.persist_workplace();
+                }
+                Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
+            },
             "/config" => ui.emit(AgentEvent::Info(layer_summary.clone())),
             "/new" => {
                 // 与 GUI 顶栏那枚「+」同一条路径。旧对话不需要保存动作 ——
@@ -478,6 +518,14 @@ async fn main() -> Result<()> {
                         "查看主循环实现与上下文裁剪（config.toml 的 [loop]：impl 换实现、max_rounds 限轮数）",
                     ),
                     (
+                        "/sandbox",
+                        "查看插件子进程的围栏（config.toml 的 [sandbox]：进程数 / 内存 / UI 限制；也写明它管不了什么）",
+                    ),
+                    (
+                        "/workplace",
+                        "查看/切换模型的文件边界；/workplace full|default|<目录> 切档位（config.toml 的 [workplace]）",
+                    ),
+                    (
                         "/config",
                         "查看这份配置由哪几层合成（应用根下的 aox.toml 可自定义；--dump-config 看每个值的来源）",
                     ),
@@ -485,7 +533,7 @@ async fn main() -> Result<()> {
                 ] {
                     println!(
                         "  {}  {}",
-                        ui::style::cyan(&format!("{cmd:<9}")),
+                        ui::style::cyan(&format!("{cmd:<10}")),
                         ui::style::dim(desc)
                     );
                 }

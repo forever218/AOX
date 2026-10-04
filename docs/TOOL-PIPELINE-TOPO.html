@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="LVdVP2ESFSRv5orJbVhAJE">
+<head data-page-node-id="Xk2fJMyrKyEunAr472t3vj">
+<meta charset="UTF-8" data-page-node-id="WhWJ7Rda6j8eYZI1bvaccU">
+<meta name="viewport" content="width=device-width, initial-scale=1" data-page-node-id="XdjOOnzPmuIG6I2ypucPHq">
+<title>AOX · 工具执行拓扑</title>
+<style>
+:root{
+  --bg:#0b0b0d; --nd:#14161a; --nd2:#181b20; --line:rgba(255,255,255,.13);
+  --tx:#e6e8ec; --tx2:#98a0ac; --tx3:#666e79;
+  --mono:ui-monospace,"Cascadia Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font:400 14px/1.6 var(--sans);
+  -webkit-font-smoothing:antialiased;padding:32px 0 40px}
+.wrap{max-width:1300px;margin:0 auto;padding:0 24px}
+h1{font:500 17px/1.4 var(--sans);margin:0 0 14px;color:var(--tx2);font-weight:500}
+.canvas{border:1px solid var(--line);border-radius:14px;background:#0d0e11;
+  padding:18px 14px 10px;overflow-x:auto}
+.canvas svg{display:block;width:100%;height:auto;min-width:1200px}
+.nd{fill:#14161a;stroke:rgba(255,255,255,.14);stroke-width:1}
+.nd2{fill:#181b20;stroke:rgba(255,255,255,.14);stroke-width:1}
+.pl{fill:rgba(240,149,149,.045);stroke:#f09595;stroke-width:1;stroke-dasharray:5 4}
+.t2{font:400 10.5px var(--sans);fill:#98a0ac}
+.t3{font:400 9.5px var(--mono);fill:#666e79}
+.tc{font:400 10px var(--mono);fill:#7fb0e8}
+.el{font:400 9.5px var(--mono);fill:#9aa3af}
+</style>
+</head>
+<body data-page-node-id="TxGkqFfPLY9YagkqVUCcFN">
+<div class="wrap" data-page-node-id="EuOEoQPKnLOnnfuYXDDnv4">
+<h1 data-page-node-id="GTAcrSA8ifoyLkMa7CJlMD">AOX · 工具执行拓扑</h1>
+<div class="canvas" data-page-node-id="uFPZdhRhlE3D70toFD5bfm">
+<svg viewBox="0 0 1260 2150" width="100%" role="img" aria-label="AOX 工具执行拓扑图" data-page-node-id="38jRhomUsTnmglMGN4VoyN">
+<title>AOX 工具执行拓扑</title>
+<desc data-page-node-id="ceWR60r795Oxm3mTlOejDi">从 run_turn 进入 StandardLoop，循环内依次经过裁剪、before_request 钩子、模型请求、
+记账、after_reply 钩子；每个 tool_call 依次经过参数解析、before_tool 钩子、授权策略、
+工作区守卫（计划中）、执行、after_tool 结果重写、事件发出与落盘，再回到循环。</desc>
+<defs data-page-node-id="HAUDRhK1o9cCuLJmOaCbl5">
+  <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse" data-page-node-id="VQy6rEh3vxEcRDGdmcFdKO">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="l1B9anBmsG1aWKlKFu4tHp"/>
+  </marker>
+  <marker id="g" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse" data-page-node-id="yuO0go585zI7aJ0oOQOyX2">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="7G78MMhC4LiTnoHGYTjvLy"/>
+  </marker>
+</defs>
+
+<text x="20" y="26" font-size="9.5" fill="#666e79" font-family="ui-monospace,monospace" letter-spacing=".09" data-page-node-id="aDup8iLS9fUXxAtvJzQXvv">控制流主干 · src/agent_loop.rs</text>
+<text x="700" y="26" font-size="9.5" fill="#666e79" font-family="ui-monospace,monospace" letter-spacing=".09" data-page-node-id="yOUTPxxwhZ6MGN3zaoEXba">能力面 · 插在主干上的可替换对象</text>
+<text x="1040" y="26" font-size="9.5" fill="#666e79" font-family="ui-monospace,monospace" letter-spacing=".09" data-page-node-id="5kHudIXRZlXntcJp21UtXQ">计划中</text>
+
+<!-- N1 run_turn -->
+<rect class="nd" x="240" y="40" width="320" height="60" rx="8" data-page-node-id="Ta18XOo427Ndev6BglPIPO"/>
+<rect x="254" y="52" width="66" height="16" rx="4" fill="rgba(127,176,232,.15)" data-page-node-id="R7U2mI7ex4rHmAfqb9HXEt"/>
+<text class="tc" x="262" y="63" data-page-node-id="MiJHslLjqCIqEqQddqpXFB">run_turn</text>
+<text class="t2" x="254" y="82" data-page-node-id="NYAKs5fe2wUfVCtiQdeeZN">ensure_log · push user · begin_turn · turn_start</text>
+<text class="t3" x="546" y="63" text-anchor="end" data-page-node-id="OrxQfRInvFbZ69vYotqBfT">agent.rs:231</text>
+<path d="M400 100 L400 140" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="uBB1YiuVqW0YpmPcdqrSDL"/>
+
+<!-- N2 StandardLoop -->
+<rect class="nd" x="240" y="140" width="320" height="56" rx="8" data-page-node-id="5JYyK66kcmHRbOAaaT1HY7"/>
+<rect x="254" y="152" width="132" height="16" rx="4" fill="rgba(127,176,232,.15)" data-page-node-id="XEkS6iMit7R0hpPECzRDlo"/>
+<text class="tc" x="262" y="163" data-page-node-id="rdmRBANZylJzpAA9TvQKmy">StandardLoop::run</text>
+<text class="t2" x="254" y="182" data-page-node-id="1LSYvYnKVozdY1Tt9AGazA">循环骨架 · 由 [loop] impl 定型</text>
+<text class="t3" x="546" y="163" text-anchor="end" data-page-node-id="5QWrJLnzEvPyo583c6mOel">agent_loop.rs:141</text>
+<path d="M400 196 L400 236" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="WHpqdLVHTFpJppKT3Vp3m9"/>
+<rect x="408" y="208" width="76" height="16" rx="4" fill="#22262d" data-page-node-id="uDFwQdYqYSAg9CmqV3Ddj7"/>
+<text class="el" x="416" y="219" data-page-node-id="g4BQYqJZhUd42pxJm5cia4">每次迭代</text>
+
+<!-- N3 trim_point -->
+<rect class="nd" x="240" y="236" width="320" height="56" rx="8" data-page-node-id="Aov5IdWVFuuLnDqGTvRIp5"/>
+<rect x="254" y="248" width="176" height="16" rx="4" fill="rgba(127,176,232,.15)" data-page-node-id="VevmZpP4vbdP6P3J42DbaT"/>
+<text class="tc" x="262" y="259" data-page-node-id="Mv0ioDkNVXuDvezUOkkfnO">trim_point → drop_oldest</text>
+<text class="t2" x="254" y="278" data-page-node-id="pdUNGSYbByVjHEFNS57J5j">max_rounds = 0 → 完全不裁（默认）</text>
+<text class="t3" x="546" y="259" text-anchor="end" data-page-node-id="WZwRp4zvT6GsG8ahtqt95S">L162</text>
+<path d="M400 292 L400 332" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="YrjJs8Pdl686yf0GZixmeu"/>
+
+<!-- N4 before_request -->
+<rect class="nd" x="240" y="332" width="320" height="72" rx="8" data-page-node-id="p47BcWmCuncei5Uk1wa34X"/>
+<rect x="254" y="344" width="150" height="16" rx="4" fill="rgba(179,173,235,.16)" data-page-node-id="Luu6QWmFqJsMySvTF4yxht"/>
+<text class="tc" x="262" y="355" fill="#b3adeb" data-page-node-id="08OKXDEJZ3cwk6e99NcpRX">hooks.before_request</text>
+<text class="t2" x="254" y="374" data-page-node-id="EQXmHqniU8eNIlcSCbTLtR">改本轮 tools · 追加 inject 消息</text>
+<text class="t2" x="254" y="390" data-page-node-id="zHoesGIBrryTEH0DgpvqS9">拿不到 &amp;mut messages（只给追加）</text>
+<text class="t3" x="546" y="355" text-anchor="end" data-page-node-id="sAshSKqSiXDTSyt4TA2j7Q">L176</text>
+<path d="M400 404 L400 444" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="8T5N0RpIG5Fh9LKcJE4uzX"/>
+<rect x="408" y="415" width="38" height="16" rx="4" fill="#22262d" data-page-node-id="FrsejDhLjh8VLlOQ2SD6OL"/>
+<text class="el" x="416" y="426" data-page-node-id="bDnFvAIZmmXmLHf5cKSAUG">Pass</text>
+
+<!-- N5 llm.chat -->
+<rect class="nd" x="240" y="444" width="320" height="60" rx="8" data-page-node-id="6dGhlIppyveHHeHC5DRnbD"/>
+<rect x="254" y="456" width="72" height="16" rx="4" fill="rgba(127,176,232,.15)" data-page-node-id="SfHAuhPGWc8iskrRshtOxq"/>
+<text class="tc" x="262" y="467" data-page-node-id="aiyYWUionWSNqY5B0dJEs1">llm.chat</text>
+<text class="t2" x="254" y="486" data-page-node-id="Qphk0hzzMU6NaasJCW90nb">messages + schemas + stream_sink</text>
+<text class="t3" x="546" y="467" text-anchor="end" data-page-node-id="HeH5nbimM3ikDX5Ny84poP">L191</text>
+<path d="M400 504 L400 544" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="gUtlQ8vWKVf4r1fuCfvyLI"/>
+
+<!-- N6 accrue_call -->
+<rect class="nd" x="240" y="544" width="320" height="52" rx="8" data-page-node-id="JchYpEqIIXpzIXyj6Hdh58"/>
+<rect x="254" y="556" width="92" height="16" rx="4" fill="rgba(127,176,232,.15)" data-page-node-id="iEDcamyFUh66w2dpxLAGej"/>
+<text class="tc" x="262" y="567" data-page-node-id="li2zafSC28fo0Za8AZi34v">accrue_call</text>
+<text class="t2" x="254" y="586" data-page-node-id="qHANEyC5JuWhIRQ4kwGsYE">刻意排在 after_reply 之前</text>
+<text class="t3" x="546" y="567" text-anchor="end" data-page-node-id="1QxPWv1WgMmkMSJ68FLqN7">L229</text>
+<path d="M400 596 L400 636" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="tBZoNy1m9NrhHAFuHcoaWO"/>
+
+<!-- N7 after_reply -->
+<rect class="nd" x="240" y="636" width="320" height="60" rx="8" data-page-node-id="j6nLQWe6eo2SOiwVl1h77E"/>
+<rect x="254" y="648" width="132" height="16" rx="4" fill="rgba(179,173,235,.16)" data-page-node-id="b879dE0L0CYucT0FqtESw5"/>
+<text class="tc" x="262" y="659" fill="#b3adeb" data-page-node-id="1MAkL9HKNjkChoFEQ6e2Qr">hooks.after_reply</text>
+<text class="t2" x="254" y="678" data-page-node-id="y6COWk4o0uUUlSYvDuvBAL">只改正文 · 改不了 tool_calls</text>
+<text class="t3" x="546" y="659" text-anchor="end" data-page-node-id="dmEAjhTvU9IHEGUv49nsoo">L237</text>
+<path d="M400 696 L400 736" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="ZW0mqYBFNZpjlxUMtxkkaI"/>
+
+<!-- N8 is_empty -->
+<rect class="nd" x="240" y="736" width="320" height="72" rx="8" data-page-node-id="VPgDHkuDI7PlbtClAfzh6H"/>
+<rect x="254" y="748" width="158" height="16" rx="4" fill="rgba(127,176,232,.15)" data-page-node-id="Zw3ZXsxyZuRLKV8Rb2lCFe"/>
+<text class="tc" x="262" y="759" data-page-node-id="hPQ7GzfrR59Q3O7vpPaT1w">is_empty() / truncated()</text>
+<text class="t2" x="254" y="778" data-page-node-id="Nt8bYbCf1aSNplqY5iKBbL">空回复重试上限 2 次</text>
+<text class="t2" x="254" y="794" data-page-node-id="AEtoie68XuAiHzI3G5qljj">finish_reason=length → Warn</text>
+<text class="t3" x="546" y="759" text-anchor="end" data-page-node-id="SXQvGBlmDm7wjHFoVSl0Dq">L259</text>
+<path d="M400 808 L400 848" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="iowvq7yL4lsDmxoLISrcwL"/>
+
+<!-- N9 push assistant -->
+<rect class="nd" x="240" y="848" width="320" height="60" rx="8" data-page-node-id="Lj83OwFp4oBvlZO9vhjtAF"/>
+<rect x="254" y="860" width="164" height="16" rx="4" fill="rgba(127,176,232,.15)" data-page-node-id="XGthsIVTfjXPpPOcT7z0xj"/>
+<text class="tc" x="262" y="871" data-page-node-id="1FtvWJYsEHaN9Z4xMyQpIp">push_message(assistant)</text>
+<text class="t2" x="254" y="890" data-page-node-id="z10ki3g7ePE3mWGmAeW2jS">AssistantText / InterimText 分流 · 已落盘</text>
+<text class="t3" x="546" y="871" text-anchor="end" data-page-node-id="5Tm8IxVj1GzwLQYEoXlFIk">L301</text>
+<path d="M400 908 L400 948" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="Qh7OuFyukUavzTBEo3PwZn"/>
+<rect x="408" y="919" width="86" height="16" rx="4" fill="#22262d" data-page-node-id="E7empKGc71rmJ9H6xDkj90"/>
+<text class="el" x="416" y="930" data-page-node-id="69tYbdQ6fttoi4hVYdPM5O">有 tool_calls</text>
+
+<!-- N10 args parse -->
+<rect class="nd" x="240" y="948" width="320" height="52" rx="8" data-page-node-id="zsglmIC7qhAkxZfOWkEfve"/>
+<rect x="254" y="960" width="152" height="16" rx="4" fill="rgba(127,176,232,.15)" data-page-node-id="y6o2ZAI6A0664EJx9vmEuB"/>
+<text class="tc" x="262" y="971" data-page-node-id="dVN22PfIcMR17xSksEG27A">serde_json::from_str</text>
+<text class="t2" x="254" y="990" data-page-node-id="QZHmK63kbLUEzsnkHpaPKr">失败 → 钩子与策略都不参与</text>
+<text class="t3" x="546" y="971" text-anchor="end" data-page-node-id="ZzdCf9DTyCAvX1wNBJDuLq">L315</text>
+<path d="M400 1000 L400 1040" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="oTXkrQ1HecemEpTAQcr6iQ"/>
+
+<!-- N11 before_tool -->
+<rect class="nd" x="240" y="1040" width="320" height="72" rx="8" data-page-node-id="LF2Eqp72x0TmDPOJrCsWUD"/>
+<rect x="254" y="1052" width="132" height="16" rx="4" fill="rgba(179,173,235,.16)" data-page-node-id="4sz1vueSQpKZotkCjli7D3"/>
+<text class="tc" x="262" y="1063" fill="#b3adeb" data-page-node-id="qHkV8Xi4jHYYYO4T4RRcXk">hooks.before_tool</text>
+<text class="t2" x="254" y="1082" data-page-node-id="awRt6gYudblhDP9NF4R6Tb">只补缺 · 不覆盖模型显式给的值</text>
+<text class="t2" x="254" y="1098" data-page-node-id="9u6mJ2cDpoH9fpuSYfslxU">改的 args 不回写已落盘的 assistant 行</text>
+<text class="t3" x="546" y="1063" text-anchor="end" data-page-node-id="sVGq35wSgHBlUR0COfLfxT">L331</text>
+<path d="M400 1112 L400 1152" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="aYVGTtfylbV8tIZxcSE7xn"/>
+
+<!-- N12 emit ToolCall -->
+<rect class="nd" x="240" y="1152" width="320" height="52" rx="8" data-page-node-id="EVCAP1uGHNvFPRbkFYYvPN"/>
+<rect x="254" y="1164" width="96" height="16" rx="4" fill="rgba(163,206,114,.16)" data-page-node-id="bd0GPRmWLBusgvyBPo2Jfi"/>
+<text class="tc" x="262" y="1175" fill="#a3ce72" data-page-node-id="5z1li29zBjnRpEhUfUd2pM">emit ToolCall</text>
+<text class="t2" x="254" y="1194" data-page-node-id="olfhjmKrTyunniipHZmXnN">发出的是「改过之后」的 args</text>
+<text class="t3" x="546" y="1175" text-anchor="end" data-page-node-id="TCws5Gc1m57MA9Q6itetCJ">L338</text>
+<path d="M400 1204 L400 1244" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="GSxMeu4oABtSlKElg3J8SN"/>
+
+<!-- N13 authorize -->
+<rect class="nd" x="240" y="1244" width="320" height="84" rx="8" data-page-node-id="vEhrNwDq2hW44UfGkuSOZL"/>
+<rect x="254" y="1256" width="212" height="16" rx="4" fill="rgba(232,185,106,.16)" data-page-node-id="EVTIE7HGVAkqa0QqaTRl84"/>
+<text class="tc" x="262" y="1267" fill="#e8b96a" data-page-node-id="X5WQHwIREEzNPvlxbPvm7j">authorize_and_execute</text>
+<text class="t2" x="254" y="1286" data-page-node-id="KPnR6iSLmaBGsFBNsvx9O8">所有工具的唯一收口 · 早于任何 auth</text>
+<text class="t2" x="254" y="1302" data-page-node-id="v2OdcIghKDOOQhYkyTZt6d">tool_kind → caps_for → level_for</text>
+<text class="t2" x="254" y="1318" data-page-node-id="zltlo8VAQUAosYv0ckIzML">会话白名单 → ui.authorize</text>
+<text class="t3" x="546" y="1267" text-anchor="end" data-page-node-id="g7h5YVHY2THkSNf4L7h0de">agent.rs:314</text>
+<path d="M400 1328 L400 1368" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="cvHYqNPFRi9nQVikeMMtLM"/>
+
+<!-- N14 execute -->
+<rect class="nd" x="240" y="1368" width="320" height="80" rx="8" data-page-node-id="5wn57MTyQyGQcqziZKe3xC"/>
+<rect x="254" y="1380" width="120" height="16" rx="4" fill="rgba(163,206,114,.16)" data-page-node-id="ZUe81yBAC4DRytzNIzh4Dr"/>
+<text class="tc" x="262" y="1391" fill="#a3ce72" data-page-node-id="VrmN7KmNxPp9mhrlAAFVV3">emit ToolRunning</text>
+<text class="t2" x="254" y="1410" data-page-node-id="KWHQVLc1dfYaYjdcqe0G3G">→ Runtime::execute（工具不存在 → err）</text>
+<text class="t2" x="254" y="1426" data-page-node-id="8SSJhHH2IPhdMcYybQHnSc">兜底超时 = tool_timeout_secs + 30s</text>
+<text class="t3" x="546" y="1391" text-anchor="end" data-page-node-id="YPJ8TA86Zwd13HVgXLZpsg">runtime.rs:210</text>
+<path d="M400 1448 L400 1488" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="yV57avVuY9ewOQUfa7YQDh"/>
+
+<!-- N15 after_tool -->
+<rect class="nd" x="240" y="1488" width="320" height="72" rx="8" data-page-node-id="sveyZzSLlTz61Uf5nG7B9y"/>
+<rect x="254" y="1500" width="132" height="16" rx="4" fill="rgba(127,212,184,.17)" data-page-node-id="ssWMkcYIWne37sGmcmDkVq"/>
+<text class="tc" x="262" y="1511" fill="#7fd4b8" data-page-node-id="kW9WNI67KExx3PZeicnxeb">hooks.after_tool</text>
+<text class="t2" x="254" y="1530" data-page-node-id="hOadynlBJCCELrpt9Zec2g">可改 content / is_error · 可整块换 err</text>
+<text class="t2" x="254" y="1546" data-page-node-id="dfR5BN5KEoFO3BGjAkdmbU">刻意排在 emit 之前 → 界面与历史同源</text>
+<text class="t3" x="546" y="1511" text-anchor="end" data-page-node-id="z5F7SjCbjEBgNEU4EotB0s">L342</text>
+<path d="M400 1560 L400 1600" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="3ybRydxMU6oLolFmTwbo8S"/>
+
+<!-- N16 emit ToolResult -->
+<rect class="nd" x="240" y="1600" width="320" height="52" rx="8" data-page-node-id="0brpX0tAOjXc7edwsfgsKB"/>
+<rect x="254" y="1612" width="110" height="16" rx="4" fill="rgba(163,206,114,.16)" data-page-node-id="9gQ8FIvVEzWhX03YdIdVCU"/>
+<text class="tc" x="262" y="1623" fill="#a3ce72" data-page-node-id="pctg8IxzlsejkW7TL2Jbln">emit ToolResult</text>
+<text class="t2" x="254" y="1642" data-page-node-id="7XOmhv7glkMyF4XVchxiqW">preview = truncate(content, 300)</text>
+<text class="t3" x="546" y="1623" text-anchor="end" data-page-node-id="VaV9klrn2KfgKjT3YCKXQp">L345</text>
+<path d="M400 1652 L400 1692" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="7Ze2yjyLd1dtFR69z5HkbA"/>
+
+<!-- N17 cap + push -->
+<rect class="nd" x="240" y="1692" width="320" height="72" rx="8" data-page-node-id="EPRZbnATCeRx6ogiyHG3EM"/>
+<rect x="254" y="1704" width="166" height="16" rx="4" fill="rgba(180,178,169,.16)" data-page-node-id="fCOj2jbsUT9qk1TbAwjJjM"/>
+<text class="tc" x="262" y="1715" fill="#b4b2a9" data-page-node-id="BLouK0TQHKbkH7xOAj9jvF">cap_chars → push_message</text>
+<text class="t2" x="254" y="1734" data-page-node-id="A3EXcDz9PuIahErIt6DrAE">content = cap 20000 → 下一轮请求体</text>
+<text class="t2" x="254" y="1750" data-page-node-id="uU54hSgJonTEj015nn5zEd">落盘 kind:"message", role:"tool", is_error</text>
+<text class="t3" x="546" y="1715" text-anchor="end" data-page-node-id="W7Wxg8I0m90kUFMsNaHtpy">L350</text>
+
+<!-- A2 HookChain -->
+<rect class="nd2" x="700" y="332" width="300" height="96" rx="8" data-page-node-id="fyHJHvHFQOYUSo38dYqeDQ"/>
+<rect x="714" y="344" width="86" height="16" rx="4" fill="rgba(179,173,235,.16)" data-page-node-id="dPkuE32lpPbr2iSfQRREeP"/>
+<text class="tc" x="722" y="355" fill="#b3adeb" data-page-node-id="rydoCjgOS0K8uHrCgYslwC">HookChain</text>
+<text class="t2" x="714" y="374" data-page-node-id="TO99y7g5SxK3e5JFAcPlEC">config.toml [hook] → ConfigHook</text>
+<text class="t2" x="714" y="390" data-page-node-id="4QTum9pdqbiwLVH7HVCHk8">插件 [contributes] hooks → ComponentHook</text>
+<text class="t2" x="714" y="408" data-page-node-id="5nzEWC84q0Lq3HCMOE4bUt">空链 = 零开销 = 行为与加钩子前等价</text>
+<text class="t3" x="986" y="355" text-anchor="end" data-page-node-id="L7MWZ3LZAramRw3zaX9XOw">hook.rs:176</text>
+<path d="M700 366 C 660 366, 630 368, 560 368" fill="none" stroke="#7f77dd" stroke-width="1.1" stroke-dasharray="4 3" marker-end="url(#g)" data-page-node-id="xGbeWHHwC26TwsJ1lUXmMa"/>
+
+<!-- hook bus -->
+<path d="M760 428 C 700 442, 600 460, 600 500 L600 1524" fill="none" stroke="#7f77dd" stroke-width="1.1" stroke-dasharray="4 3" data-page-node-id="uWtMjJvAMOkiOAfxrHlBpr"/>
+<path d="M600 666 L560 666" fill="none" stroke="#7f77dd" stroke-width="1.1" stroke-dasharray="4 3" marker-end="url(#g)" data-page-node-id="ElB8J38Ii2onBLAZQORKyQ"/>
+<path d="M600 1092 L560 1092" fill="none" stroke="#7f77dd" stroke-width="1.1" stroke-dasharray="4 3" marker-end="url(#g)" data-page-node-id="g77R8iSA8bE4AcpIwDechy"/>
+<path d="M600 1524 L560 1524" fill="none" stroke="#7f77dd" stroke-width="1.1" stroke-dasharray="4 3" marker-end="url(#g)" data-page-node-id="9J9Q8pcoQOSAHPbnIwsuAl"/>
+<rect x="544" y="796" width="112" height="16" rx="4" fill="#22262d" data-page-node-id="94fCVKxBzWHg7fRKoOGCfK"/>
+<text class="el" x="552" y="807" data-page-node-id="8O3nstJ0bz3NjsmHLxprWH">按序 · 首个 Reject 短路</text>
+
+<!-- A1 on_error -->
+<rect class="nd2" x="700" y="444" width="300" height="76" rx="8" data-page-node-id="kSiTaqlLh1FGdQqwaxDd2g"/>
+<rect x="714" y="456" width="118" height="16" rx="4" fill="rgba(179,173,235,.16)" data-page-node-id="HmDPVgCTr69Lw67iMCNyLF"/>
+<text class="tc" x="722" y="467" fill="#b3adeb" data-page-node-id="4wfEMDeVsUD3VpFd3wLkIQ">hooks.on_error ⑤</text>
+<text class="t2" x="714" y="486" data-page-node-id="JK1N9Sv0kNrugHUy1HwQkQ">Retry(note) → 注入宿主提示后重来</text>
+<text class="t2" x="714" y="502" data-page-node-id="HJAMryhGRuStz3d0RcSd9l">Propagate → max_llm_retries（默认 0）</text>
+<text class="t3" x="986" y="467" text-anchor="end" data-page-node-id="KiNU4ZzuIsL3xdujiGKnV5">L199</text>
+<path d="M560 474 C 618 474, 648 480, 700 482" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="cmBuMB9bfshUqIXDDBrc7M"/>
+<rect x="600" y="458" width="66" height="16" rx="4" fill="#22262d" data-page-node-id="QPH04OKFNl003G1l5DLtjv"/>
+<text class="el" x="608" y="469" data-page-node-id="xTmTe142uaqZ0RDA3W3Hoq">chat 失败</text>
+<path d="M700 470 C 648 452, 628 320, 560 268" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="6x0DWyAdTEkdpTSs6qprw1"/>
+<rect x="596" y="336" width="72" height="16" rx="4" fill="#22262d" data-page-node-id="pZ7EA0uM6FAmezLgzsFhNx"/>
+<text class="el" x="604" y="347" data-page-node-id="tvhEmpX6CyiVYCACRo9YZO">retry · continue</text>
+
+<!-- A3 拒绝汇总 -->
+<rect class="nd2" x="700" y="1036" width="300" height="84" rx="8" data-page-node-id="0PnXN6d0x8mF7WdEFtoqEw"/>
+<rect x="714" y="1048" width="86" height="16" rx="4" fill="rgba(255,255,255,.07)" data-page-node-id="qGUUEVGBRl4yy79SPyejgK"/>
+<text class="tc" x="722" y="1059" fill="#c8cdd4" data-page-node-id="68mrMoxQNtf3rcNGcxpIxt">四种拒绝</text>
+<text class="t2" x="714" y="1078" data-page-node-id="hbGtWiUEgwyBYIXmbXZHg1">策略 deny / 用户当场拒绝</text>
+<text class="t2" x="714" y="1094" data-page-node-id="usdoW7nBFfFA8riMu52JOm">钩子拦下 / 参数 JSON 非法</text>
+<text class="t2" x="714" y="1110" data-page-node-id="JXCj77M3PUGlYfjms7aLKs">仍回填 tool 结果 → 循环继续</text>
+<path d="M560 974 C 622 974, 650 1046, 700 1058" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="zoSSYRL2JxBLU8nfaOSjQY"/>
+<rect x="612" y="996" width="72" height="16" rx="4" fill="#22262d" data-page-node-id="3It8J1mrC9X9qIMDw73h49"/>
+<text class="el" x="620" y="1007" data-page-node-id="CAlILjps5wKiIscyMBdICX">invalid JSON</text>
+<path d="M560 1060 L700 1060" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="HpKEecg88fXDiFV3mtOYNy"/>
+<rect x="606" y="1044" width="48" height="16" rx="4" fill="#22262d" data-page-node-id="XLepHDSv4iMrAkYHGjUFpw"/>
+<text class="el" x="614" y="1055" data-page-node-id="QqDNq6eF71ZFlYGtxq70eP">reject</text>
+
+<!-- A4 ui.authorize -->
+<rect class="nd2" x="700" y="1240" width="300" height="84" rx="8" data-page-node-id="LFojLHxqANBDQHhxKNYkgc"/>
+<rect x="714" y="1252" width="88" height="16" rx="4" fill="rgba(232,185,106,.16)" data-page-node-id="5T3fDmTSDhvTddcvxWegNE"/>
+<text class="tc" x="722" y="1263" fill="#e8b96a" data-page-node-id="DFSyaktGoUh7mf357LcHaR">ui.authorize</text>
+<text class="t2" x="714" y="1282" data-page-node-id="e6jbsCdYQL1JAQHRECyCEN">Allow / AllowSession / Deny</text>
+<text class="t2" x="714" y="1298" data-page-node-id="gewYeYUp9S7kLG5oH4b4fL">白名单按「工具名」记入 session_allowed</text>
+<text class="t2" x="714" y="1314" data-page-node-id="OvUaCzP9iv8ldbjeCfzyOk">GUI 弹窗 · CLI 只显示 args 前 20 行</text>
+<text class="t3" x="986" y="1263" text-anchor="end" data-page-node-id="PxriQbe72rUgMZNNscFLSt">agent.rs:329</text>
+<path d="M560 1286 L700 1284" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="ii4gLZIZI00JqQDBwUmFuP"/>
+<rect x="614" y="1268" width="30" height="16" rx="4" fill="#22262d" data-page-node-id="QKMZg6x59CE945SeGAy9KI"/>
+<text class="el" x="622" y="1279" data-page-node-id="xmuNHHVOrDZGetrYJw6lD7">ask</text>
+<path d="M790 1240 C 790 1180, 812 1146, 848 1120" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="ApzxuGkHTvuhwe6Mqmv6Ao"/>
+<rect x="762" y="1172" width="34" height="16" rx="4" fill="#22262d" data-page-node-id="DK9sw5GM6a8qFxvCGMHhlw"/>
+<text class="el" x="770" y="1183" data-page-node-id="4zTIYaLvT2QynXXk9PBJr3">deny</text>
+
+<!-- A5 PluginTool -->
+<rect class="nd2" x="700" y="1364" width="300" height="84" rx="8" data-page-node-id="dS8mmTJ2FPfEEYXwlzlgHL"/>
+<rect x="714" y="1376" width="106" height="16" rx="4" fill="rgba(232,185,106,.16)" data-page-node-id="YbK6E50fBSDQHhpgNghLjI"/>
+<text class="tc" x="722" y="1387" fill="#e8b96a" data-page-node-id="2d3r3TOMGW6wO9Fbbbq8FU">PluginTool::call</text>
+<text class="t2" x="714" y="1406" data-page-node-id="6RqHwqpPckNARA6TjdnA7i">子进程 stdio 行 JSON · 无 env_clear</text>
+<text class="t2" x="714" y="1422" data-page-node-id="W0MaPDVvYBPFjpHwBBVQ4j">超时 → respawn 重试一次 → 仍失败则合并报错</text>
+<text class="t3" x="986" y="1387" text-anchor="end" data-page-node-id="AoRDXXXepppHwizkOfHXSd">plugin/mod.rs:327</text>
+<path d="M560 1408 L700 1406" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="QleAeEbwCDnZz6iSHWJhsx"/>
+<rect x="596" y="1390" width="92" height="16" rx="4" fill="#22262d" data-page-node-id="BD3EmHMPz2JWPd31MJu2f4"/>
+<text class="el" x="604" y="1401" data-page-node-id="HJBzr6AhsDGGfCABZNoGCx">ToolKind::Plugin</text>
+
+<!-- A6 ComponentHook -->
+<rect class="nd2" x="700" y="1484" width="300" height="72" rx="8" data-page-node-id="QHmwPQnPDDOEoNfvOEReu2"/>
+<rect x="714" y="1496" width="122" height="16" rx="4" fill="rgba(179,173,235,.16)" data-page-node-id="1merJDM3acAzciEvJThQQF"/>
+<text class="tc" x="722" y="1507" fill="#b3adeb" data-page-node-id="bDDEuNgKB5CCXacqYZS486">ComponentHook</text>
+<text class="t2" x="714" y="1526" data-page-node-id="K48F96gneNb5g1Ge70FjiX">RPC 超时 10s（远小于工具的 120s）</text>
+<text class="t2" x="714" y="1542" data-page-node-id="zDRXMUr8hsE15QhVrRbfV9">不在 / 超时 / 垃圾返回 → 一律 Pass</text>
+<path d="M700 1520 L600 1520" fill="none" stroke="#7f77dd" stroke-width="1.1" stroke-dasharray="4 3" marker-end="url(#g)" data-page-node-id="E7C34UcpB6Req44RDZjw0Q"/>
+
+<!-- A7 三条轨迹 -->
+<rect class="nd2" x="700" y="1690" width="300" height="92" rx="8" data-page-node-id="9uQtULrbx7ZDSmFmUOT6Yg"/>
+<rect x="714" y="1702" width="92" height="16" rx="4" fill="rgba(127,212,184,.17)" data-page-node-id="rjcXOnFCCcSVvSMB1l2Ww6"/>
+<text class="tc" x="722" y="1713" fill="#7fd4b8" data-page-node-id="eDqhhOBqp75ak9WFQVSZK5">三条轨迹</text>
+<text class="t2" x="714" y="1732" data-page-node-id="OB0AXRziLV2qZFkJplVtGj">UI · preview 300 字符</text>
+<text class="t2" x="714" y="1748" data-page-node-id="u8hj7SiB1GhSj3oyOOQ2za">对话文件 · 与模型侧逐字节相同</text>
+<text class="t2" x="714" y="1764" data-page-node-id="Nr0EK8gf9l24UwaGLI9X9W">模型上下文 · cap 20000 字符</text>
+<path d="M560 1728 L700 1736" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="3AEtacc7yLphGusbrOChcB"/>
+
+<!-- B1 守卫（计划中） -->
+<rect class="pl" x="1040" y="1244" width="200" height="112" rx="9" data-page-node-id="s0obrWhULjnXUen7Tx0IKc"/>
+<rect x="1054" y="1258" width="64" height="16" rx="4" fill="rgba(240,149,149,.16)" data-page-node-id="apfD1NoWQ8aiNmjWTWIUGN"/>
+<text class="tc" x="1062" y="1269" fill="#f09595" data-page-node-id="RedTtG4jFoMJpuBNRsAKuc">workplace</text>
+<text class="t2" x="1054" y="1292" fill="#c8a0a0" data-page-node-id="NtqvsIkBOnTBP8y5Fh0Njr">默认 · 选工作区</text>
+<text class="t2" x="1054" y="1308" fill="#c8a0a0" data-page-node-id="s3T3H6hHTeIUZcF9pGWIn4">完全访问 · 现状</text>
+<text class="t2" x="1054" y="1328" fill="#8f7a7a" data-page-node-id="vdEgjFiQ9hflFCe2emN00N">越界 → 结构化文本回模型</text>
+<text class="t2" x="1054" y="1344" fill="#8f7a7a" data-page-node-id="Dk9p8UDRRotxP1AgemLhhv">+ 一条 Warn 给用户</text>
+<path d="M560 1300 C 580 1300, 580 1340, 600 1348 L1030 1348" fill="none" stroke="#f09595" stroke-width="1.2" stroke-dasharray="4 3" data-page-node-id="pcVeWmmP2jEq8pG8RSFxiD"/>
+<path d="M1030 1348 L1040 1348" fill="none" stroke="#f09595" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#g)" data-page-node-id="a7MOGvr05B8ZC1WK7pnAhL"/>
+<rect x="758" y="1332" width="96" height="16" rx="4" fill="#2a2020" data-page-node-id="cqQlm5equ7A8sVqRUJhkiD"/>
+<text class="el" x="766" y="1343" fill="#e0a0a0" data-page-node-id="5Qy19mZAFbsPdGwJcFDE3s">尚未实现</text>
+
+<!-- 左泳道：三种中止 -->
+<path d="M240 350 L60 350 L60 1946 L240 1946" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="qKMG6xzXcAI3KXxofbfHo5"/>
+<rect x="14" y="700" width="132" height="16" rx="4" fill="#22262d" data-page-node-id="6RifMUhyILXuE7CSfk4R0Y"/>
+<text class="el" x="22" y="711" data-page-node-id="wwFA6VFgWWNVNqxsj0tdRy">Reject → bail!</text>
+
+<path d="M240 772 L130 772 L130 1972 L240 1972" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="gBEXh3p3voeFel15VeIm4E"/>
+<rect x="26" y="1150" width="150" height="16" rx="4" fill="#22262d" data-page-node-id="2wrnDLr6ICoh5RExenLxpK"/>
+<text class="el" x="34" y="1161" data-page-node-id="xB3oDCISkA5sFNC3Z8E4fQ">重试耗尽 → bail!</text>
+
+<path d="M240 878 L95 878 L95 1958 L240 1958" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="uVAumNqvcbEA2byuOkAi2L"/>
+<rect x="14" y="1450" width="162" height="16" rx="4" fill="#22262d" data-page-node-id="CC0d5qyBaPwih0maFCMdRD"/>
+<text class="el" x="22" y="1461" data-page-node-id="Xoc7d1avtS391xbWtZCbth">无 tool_calls · break</text>
+
+<path d="M240 1728 L150 1728 L150 264 L240 264" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="aZEWV0yXaEcByGJOFO54Ag"/>
+<rect x="14" y="1210" width="136" height="16" rx="4" fill="#22262d" data-page-node-id="sJ0UPKrrbHj7oHvNnLP3Ik"/>
+<text class="el" x="22" y="1221" data-page-node-id="KHTlggOHtVb3MOu39ylJyy">下一个 call / 下一轮</text>
+
+<path d="M1000 482 L1020 482 L1020 1990 L560 1990" fill="none" stroke="#5b6470" stroke-width="1.2" marker-end="url(#a)" data-page-node-id="W8BuU83NZ6BwQ5fPpXJptn"/>
+<rect x="964" y="1178" width="112" height="16" rx="4" fill="#22262d" data-page-node-id="W1KZhvTv9uxD7M4C2dblb7"/>
+<text class="el" x="972" y="1189" data-page-node-id="u6yIfERMGUdb2aVfO3jXHW">Propagate 耗尽 → Err</text>
+
+<!-- AgentEvent 总线 -->
+<path d="M560 1178 L650 1178 L650 1840 L560 1840" fill="none" stroke="#4a5058" stroke-width="1.1" stroke-dasharray="2 3" data-page-node-id="0RTk3h2aHqoRNT7UtoM9RT"/>
+<path d="M560 1408 L650 1408" fill="none" stroke="#4a5058" stroke-width="1.1" stroke-dasharray="2 3" data-page-node-id="EzLAPzYIiQAogbBeinlrAZ"/>
+<path d="M560 1626 L650 1626" fill="none" stroke="#4a5058" stroke-width="1.1" stroke-dasharray="2 3" data-page-node-id="BWVrUnQF1fkQBuI7pRl7gT"/>
+<rect x="586" y="1690" width="128" height="16" rx="4" fill="#22262d" data-page-node-id="SiW6uyCXdUGzdceiFXc8uZ"/>
+<text class="el" x="594" y="1701" data-page-node-id="556Qfhxq0PaeyAgQtlM03c">AgentEvent · 8 变体</text>
+
+<!-- 终点 -->
+<rect class="nd" x="240" y="1798" width="320" height="84" rx="8" data-page-node-id="nuVaMSzF3OOrN5XM18BPXq"/>
+<rect x="254" y="1810" width="152" height="16" rx="4" fill="rgba(163,206,114,.16)" data-page-node-id="IfhnPdn4i87CeFIgbGduvt"/>
+<text class="tc" x="262" y="1821" fill="#a3ce72" data-page-node-id="6vWsFQ3ekBg6UcYhFxbTWa">AgentEvent 事件泵</text>
+<text class="t2" x="254" y="1840" data-page-node-id="qGzNGWYN9lgRlR2dkgpLfh">CLI TurnLog 折叠 / GUI 活动流</text>
+<text class="t2" x="254" y="1856" data-page-node-id="v6hlEdcuA7agA9pkHIoElm">tool_begin → tool_note → tool_end</text>
+<text class="t2" x="254" y="1872" data-page-node-id="bTyNQOEk0pJ2DBTaFLsA00">八个变体一个枚举，CLI 与 GUI 完全同源</text>
+<path d="M400 1882 L400 1918" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="7YRVgbBkwrps98BxToF1r6"/>
+<rect x="408" y="1890" width="66" height="16" rx="4" fill="#22262d" data-page-node-id="LT06mgt9uB4s5op1d4fGad"/>
+<text class="el" x="416" y="1901" data-page-node-id="jP6YAySPl0WgHVv34pyKze">turn_end</text>
+
+<rect class="nd" x="240" y="1918" width="320" height="96" rx="8" data-page-node-id="pjiqBFLi1Z5UnHT8Ga1iQ6"/>
+<rect x="254" y="1930" width="188" height="16" rx="4" fill="rgba(180,178,169,.16)" data-page-node-id="lVswt8JsGVVpr5BcdudcXF"/>
+<text class="tc" x="262" y="1941" fill="#b4b2a9" data-page-node-id="LgjWNabExElFSLLGHlr8wB">finish_turn → turn_usage</text>
+<text class="t2" x="254" y="1960" data-page-node-id="x48KIElfLP24rFfGJvPavs">并入会话累计 · 写 usage_log</text>
+<text class="t2" x="254" y="1976" data-page-node-id="SMOnSFu4zNWzJOvGFgGx5q">落盘 kind:"usage"（出错也报账）</text>
+<text class="t2" x="254" y="1992" data-page-node-id="1ODXIPGzZoUsFPu1Nv0go8">交给界面的账 = 落盘的账（同一对象）</text>
+<text class="t3" x="546" y="1941" text-anchor="end" data-page-node-id="bkJfMA8xfOkEkvYopmefaO">agent.rs:243</text>
+<path d="M400 2014 L400 2046" fill="none" stroke="#5b6470" stroke-width="1.3" marker-end="url(#a)" data-page-node-id="dymorDl6tPdVttCpphKH23"/>
+<rect x="408" y="2020" width="76" height="16" rx="4" fill="#22262d" data-page-node-id="FDwKPyMsB7GFwQPRfDINAp"/>
+<text class="el" x="416" y="2031" data-page-node-id="wXP8ISyqgiOWA0EvpWJMj2">GUI 每轮一次</text>
+
+<rect class="nd" x="240" y="2046" width="320" height="68" rx="8" data-page-node-id="uLYwp6kwiAgnYSTE7W4HAt"/>
+<rect x="254" y="2058" width="86" height="16" rx="4" fill="rgba(180,178,169,.16)" data-page-node-id="8smT4sHBS8RwAQafcDpgk8"/>
+<text class="tc" x="262" y="2069" fill="#b4b2a9" data-page-node-id="V3WvRhICZoaitrW1dSqwYC">append_acts</text>
+<text class="t2" x="254" y="2088" data-page-node-id="trBvXAJBYNkbhiK07vYxeY">活动时间轴写回「同一个对话文件」</text>
+<text class="t2" x="254" y="2104" data-page-node-id="tfmG74WIt9yFK8Xo35kG9w">句柄在 agent 线程，顺序天然对齐</text>
+
+<rect class="nd2" x="1040" y="1918" width="200" height="96" rx="8" data-page-node-id="Sn7Cqr4t7hvYmyAufhAnh1"/>
+<rect x="1054" y="1932" width="104" height="16" rx="4" fill="rgba(255,255,255,.07)" data-page-node-id="FL8FKUB6DO8YbceDC9Q3CM"/>
+<text class="tc" x="1062" y="1943" fill="#c8cdd4" data-page-node-id="gm4jronCwVWvchJagvSvg3">中断回滚</text>
+<text class="t2" x="1054" y="1962" data-page-node-id="lvetvwYTBgxQtmjVEc8eyv">truncate_messages(mark)</text>
+<text class="t2" x="1054" y="1978" data-page-node-id="7vhD5wUU3jNGeVEcFfvp0r">Session::rewrite 同步文件</text>
+<text class="t2" x="1054" y="1998" data-page-node-id="pxZJUEzprGGeTHUxRNel3y">turn_end 不会执行</text>
+<path d="M560 1866 C 592 1866, 602 1900, 612 1960 L1040 1960" fill="none" stroke="#5b6470" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#a)" data-page-node-id="W0Tl6rF5kfqwar5HeMDvU4"/>
+<rect x="700" y="1944" width="196" height="16" rx="4" fill="#22262d" data-page-node-id="0akupK5F23zo0KMxpXvVrU"/>
+<text class="el" x="708" y="1955" data-page-node-id="Z39TsF44ngqMNYpSE1RVNl">TurnAborted / abort_turn</text>
+</svg>
+</div>
+</div>
+</body>
+</html>

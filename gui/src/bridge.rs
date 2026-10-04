@@ -39,6 +39,14 @@ pub enum ToAgent {
     /// 走这条队列而不是让主线程自己开文件：句柄在 Agent 线程手里，而且「新建对话」
     /// 与「中断回滚」也在那个线程里发生 —— 队列天然保住了写入顺序。
     Act(Vec<Value>),
+    /// 工作区：切档位（输入框左下角那枚按钮，见 `gui/src/workplace_ui.rs`）。
+    ///
+    /// 与 `Input` 一样必须**回到 Agent 所在线程**才做得了 —— `Workplace` 住在 `Runtime`
+    /// 里，只有这个线程拿得到它；界面不能自己调 `set_mode`，只能把请求发过来。
+    ///
+    /// 只带「要切成哪一档」：界面不需要主动问现状，因为启动 / 每轮结束 / 每次切档后
+    /// bridge 都会主动推一份 [`FromAgent::Workplace`]。
+    Workplace(aox::workplace::Mode),
     /// 退出：关闭插件子进程并结束驱动线程
     Shutdown,
 }
@@ -89,8 +97,49 @@ pub enum FromAgent {
     ///
     /// 只带 id 不带消息：载入后的内容由主线程自己读盘重建（见上一条说明）。
     Switched { opened: Option<String>, error: Option<String> },
+    /// 工作区现状（档位 + 当前生效的根）。
+    ///
+    /// 启动、每轮结束、以及任何一次切档之后都会回执一份：界面要它做两件事 ——
+    /// 按钮上显示当前档位名、三选一列表里给当前档位打勾。
+    /// 用结构体而不是一行文本：打勾要靠 `PartialEq` 比档位，解析「选择工作区」这种
+    /// 字符串太脆（文案一改就静默失效），理由与 [`RuntimeView`] 一致。
+    Workplace(Box<WorkplaceView>),
     /// 本轮出现不可恢复错误
     Fatal(String),
+}
+
+/// 工作区现状（见 [`FromAgent::Workplace`]）。
+#[derive(Debug, Clone)]
+pub struct WorkplaceView {
+    pub mode: aox::workplace::Mode,
+    /// 当前生效的根。`full` 档、以及 `default` 档**还没开地**时都是 `None`
+    /// —— 后者不是「不受限」，是「这条对话还没开始」，界面别把两者说成一回事。
+    pub root: Option<PathBuf>,
+}
+
+/// 把当前工作区现状发给界面。
+///
+/// 一次取锁同时拿档位与根（[`aox::workplace::Workplace::snapshot`]），与 CLI 的
+/// `/workplace` 读的是同一份状态 —— 两个前端不各留一套「现在是什么档」的判断。
+fn sync_workplace(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
+    let (mode, root) = rt.workplace.snapshot();
+    let _ = tx.send(FromAgent::Workplace(Box::new(WorkplaceView { mode, root })));
+}
+
+/// 处理界面发来的工作区请求（输入框左下角那枚按钮，见 `gui/src/workplace_ui.rs`）。
+///
+/// 与 CLI 的 `/workplace` 是**同一条实现**（[`aox::workplace::Workplace::set_mode`]），
+/// 这里只决定「结果写到哪」：切档成功/失败进活动流（用户看得见的反馈），
+/// 随后无论成败都补一份现状回执 —— 按钮上的档位名与三选一列表里的勾立即跟上，
+/// 不用等下一轮结束。
+fn set_workplace(ui: &mut GuiUi, rt: &Arc<Runtime>, mode: aox::workplace::Mode) {
+    // 先取名字：`set_mode` 会把 `mode` 收走，而报错文案里要用它。
+    let label = mode.label();
+    match rt.workplace.set_mode(mode, &rt.root) {
+        Ok(msg) => ui.emit(AgentEvent::Info(msg)),
+        Err(e) => ui.emit(AgentEvent::Error(format!("切换工作区失败（{label}）: {e:#}"))),
+    }
+    sync_workplace(&ui.tx, rt);
 }
 
 pub struct BootInfo {
@@ -190,9 +239,10 @@ impl Ui for GuiUi {
             match self.rx.recv().await {
                 Some(ToAgent::Input(s)) => return Ok(Some(s)),
                 Some(ToAgent::Shutdown) | None => return Ok(None),
-                Some(ToAgent::Resume(_)) | Some(ToAgent::NewConversation) | Some(ToAgent::Act(_)) => {
-                    continue
-                }
+                Some(ToAgent::Resume(_))
+                | Some(ToAgent::NewConversation)
+                | Some(ToAgent::Act(_))
+                | Some(ToAgent::Workplace(_)) => continue,
             }
         }
     }
@@ -341,6 +391,13 @@ async fn idle_until_shutdown(
             }
             // 这一段里没有 log 可写（Agent 根本没起来），如实丢掉
             ToAgent::Act(_) => {}
+            // 工作区按钮这时也按不动 —— `Workplace` 住在 `Runtime` 里，而 Runtime 没起来。
+            // 出声回一句，别让按钮看起来「点了没反应」（与上面 Input 那条同一个理由）。
+            ToAgent::Workplace(_) => {
+                let _ = tx.send(FromAgent::Event(AgentEvent::Warn(
+                    "模型未就绪，工作区暂时无法切换。".into(),
+                )));
+            }
         }
     }
 }
@@ -368,15 +425,33 @@ async fn next_command(
                 // 账本紧跟 Switched 发出：主线程收到 Switched 会先把界面上的账清空，
                 // 顺序反了的话刚接回来的数据会被自己抹掉。
                 let _ = tx.send(FromAgent::UsageLog(agent.usage_log().to_vec()));
+                // 工作区也要跟着推：每段对话有自己的档位与根（`resume` 已经把存档里的那份
+                // 还原了）。不推的话按钮上会一直挂着**上一段对话**的档位 —— 这就是实机撞出来的
+                // 「打开旧对话，工作区还是上一个」。
+                sync_workplace(&tx, agent.rt());
             }
             Some(ToAgent::NewConversation) => {
                 agent.new_conversation();
                 let _ = tx.send(FromAgent::Switched { opened: None, error: None });
                 let _ = tx.send(FromAgent::UsageLog(Vec::new()));
+                // 新对话一律回到「默认」档（`new_conversation` 里已经切了），界面必须立刻跟上，
+                // 否则按钮继续显示上一段对话的档位。
+                sync_workplace(&tx, agent.rt());
             }
             // 活动流落盘：就地进行，不进下一轮 —— 顺序与用户的操作完全一致，
             // 所以「这一轮的时间轴」永远落在这一轮的对话文件里。
             Some(ToAgent::Act(acts)) => agent.append_acts(&acts),
+            // 工作区按钮：切档 / 查现状。就地做完 —— `Workplace` 住在 `Runtime` 里，
+            // 而这个线程是唯一拿得到 Agent（进而拿得到它的 `rt`）的地方。
+            // 不进下一轮：切档是纯宿主动作，与模型对话无关。
+            Some(ToAgent::Workplace(mode)) => {
+                let rt = agent.rt().clone();
+                set_workplace(ui, &rt, mode);
+                // 切档也要记进**本对话**的存档：工作区是跟着对话走的，切完不记的话
+                // 下次打开这段对话就回到默认那块地了。`persist_workplace` 自己比对过、
+                // 没变就不写，所以失败/无变化时都不会留下垃圾行。
+                agent.persist_workplace();
+            }
             Some(ToAgent::Shutdown) | None => return Ok(None),
         }
     }
@@ -413,7 +488,7 @@ async fn boot_and_run(
     flags: Arc<SessionFlags>,
 ) -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let (root, default_plugins) = aox::paths::resolve_workspace();
+    let (root, default_plugins) = aox::paths::resolve_workplace();
     let plugins_dir = aox::paths::arg_value(&args, "--plugins")
         .map(PathBuf::from)
         .unwrap_or(default_plugins);
@@ -459,6 +534,12 @@ async fn boot_and_run(
     for t in aox::tool::meta::meta_tools() {
         rt.register(t).await?;
     }
+    // 宿主文件工具（工作区边界，见 src/workplace.rs 与 src/tool/hostfs.rs）。
+    // 与 CLI 注册的是同一组、同一份实现；默认 `[workplace] mode = "full"` 时
+    // 它们的行为与普通读写工具无异 —— 边界只在你收紧档位之后才生效。
+    for t in aox::tool::hostfs::host_file_tools() {
+        rt.register(t).await?;
+    }
 
     let mut ui = GuiUi { tx: tx.clone(), rx };
 
@@ -478,6 +559,15 @@ async fn boot_and_run(
             ui.emit(AgentEvent::Warn(format!("插件 {name} 加载失败: {e:#}")));
         }
     }
+    // 围栏没套上的插件也要出声（与 CLI 共用同一份判定与文案）。
+    // `围栏 ✗` 不是致命错误，但「以为有保护、其实没有」值得用户看一眼。
+    let unfenced = aox::sandbox::unfenced(&rt).await;
+    if !unfenced.is_empty() {
+        ui.emit(AgentEvent::Warn(format!(
+            "以下插件没套上进程围栏，它们不受进程数 / 内存 / UI 限制：{}",
+            unfenced.join("；")
+        )));
+    }
 
     let llm: Arc<dyn LlmProvider> = match aox::llm::openai::OpenAiProvider::new(&rt.config.provider) {
         Ok(p) => Arc::new(p),
@@ -495,6 +585,8 @@ async fn boot_and_run(
                 rt.store.clone(),
                 config_layers.clone(),
             );
+            // 仍是「未就绪」状态，但工作区现状照样发一份：按钮若可见，至少显示的是真档位。
+            sync_workplace(&tx, &rt);
             idle_until_shutdown(&mut ui.rx, &tx).await;
             return Ok(());
         }
@@ -505,6 +597,9 @@ async fn boot_and_run(
     let mut agent = Agent::new(llm, rt.clone());
     boot(&tx, &config_path, &model, true, None, rt.store.clone(), config_layers);
     send_history_current(&tx, &agent);
+    // 启动就把工作区现状发过去：按钮上「工作区 · <档位>」的初值，以及三选一列表里
+    // 该给哪一项打勾，都靠它。
+    sync_workplace(&tx, &rt);
 
     // 周期性广播插件快照：模型每造出一个新插件，右侧面板立刻可见。
     // （工具名不再广播——顶栏的工具胶囊已去掉，没有消费方。）
@@ -564,6 +659,10 @@ async fn boot_and_run(
         // 每轮结束后同步一次「当前对话」：第一轮会新建文件（侧边栏出现新条目），
         // 之后同一 id 的重复通知让侧边栏刷新条数。
         send_history_current(&tx, &agent);
+        // 工作区也顺手同步一次：`default` 档的根是**首条消息时**才建的，所以
+        // 「默认」档下按钮背后的目录是到这一轮结束才有值 —— 不重发的话界面会一直显示
+        // 「根：还没定」。
+        sync_workplace(&tx, &rt);
     }
 
     snap_task.abort();

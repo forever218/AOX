@@ -25,6 +25,29 @@ serve("selftest", {
 })
 "#;
 
+/// 围栏验证用插件：它的唯一工作就是**尝试拉起一个子进程**。
+///
+/// 用「子进程有没有真的跑起来（有没有打印 child-ok）」而不是「有没有抛异常」来判定 ——
+/// 断言要断内容，不要断错误的形状（错误码/措辞会随系统版本变）。
+const SPAWN_SOURCE: &str = r#"
+import sys, os, subprocess
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sdk"))
+from plugin_sdk import serve
+
+def child(args):
+    try:
+        p = subprocess.run([sys.executable, "-c", "print('child-ok')"],
+                           capture_output=True, timeout=30)
+        return "SPAWN: rc={} out={}".format(
+            p.returncode, p.stdout.decode("utf-8", "replace").strip())
+    except Exception as e:
+        return "SPAWN-BLOCKED: {}: {}".format(type(e).__name__, e)
+
+serve("selftest_spawn", {
+    "selftest_spawn_child": ("尝试拉起一个子进程", {"type": "object", "properties": {}}, child),
+})
+"#;
+
 pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
     println!("[selftest] 初始化运行时…");
     plugin::ensure_sdk(&plugins_dir)?;
@@ -222,6 +245,182 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
         {
             bail!("usage 未完整捕获: {u:?}");
         }
+    }
+
+    // 回归 7：进程围栏（Job Object）。**三段对拍** ——
+    //        A 默认额度：插件必须照常干活，子进程也拉得起来（「围栏不该挡插件干活」）；
+    //        B 额度锁 0：必须有围栏拦下（fork bomb 防护还在）；
+    //        C 围栏整个关掉：又拉得起来（对照组 —— 若 C 也失败，那 B 的「被拦下」
+    //          根本不是围栏的功劳，而是这台机器上的 python 自己有别的毛病）。
+    //        只有三段都过，上面两条结论才成立。
+    println!("[selftest] 回归：进程围栏（Job Object）…");
+    {
+        let t = plugin::create_plugin(&rt, "selftest_spawn", "python", "围栏验证", SPAWN_SOURCE).await?;
+        if !t.contains(&"selftest_spawn_child".to_string()) {
+            bail!("围栏验证插件未注册工具");
+        }
+        // A：默认额度。这一条钉住「默认配置不阻止插件干活」—— 以前默认是 1
+        // （而且那个 1 是**含插件自己**的进程总数），于是任何靠 `subprocess` 的插件
+        // 都是 `WinError 1816 配额不足`，插件等于废了。
+        let ok = rt.execute("selftest_spawn_child", json!({})).await;
+        println!("[selftest]   默认额度: {}", ok.content);
+        if ok.is_error {
+            bail!("围栏验证插件自身执行失败（围栏不该影响插件自己）: {}", ok.content);
+        }
+        if !ok.content.contains("child-ok") {
+            bail!(
+                "默认配置（max_processes = {}）下插件拉不起子进程 —— \
+                 默认额度把插件干活挡住了: {}",
+                rt.config.sandbox.max_processes,
+                ok.content
+            );
+        }
+        plugin::remove_plugin(&rt, "selftest_spawn").await?;
+    }
+
+    {
+        // B：把子进程额度锁到 0 ⇒ 必须拦下。
+        let mut cfg = Config::dummy();
+        cfg.sandbox.max_processes = 0;
+        let rt0 = Runtime::new(cfg, rt.root.clone(), rt.plugins_dir.clone())?;
+        plugin::create_plugin(&rt0, "selftest_spawn", "python", "围栏验证（锁死）", SPAWN_SOURCE).await?;
+        let blocked = rt0.execute("selftest_spawn_child", json!({})).await;
+        println!("[selftest]   额度锁 0: {}", blocked.content);
+        if blocked.is_error {
+            bail!("额度锁 0 时插件自身执行失败（围栏不该影响插件自己）: {}", blocked.content);
+        }
+        if blocked.content.contains("child-ok") {
+            bail!("max_processes = 0 没锁住：插件仍然拉起了子进程 —— {}", blocked.content);
+        }
+        plugin::remove_plugin(&rt0, "selftest_spawn").await?;
+    }
+
+    {
+        // C：对照组（围栏整个关掉）。
+        let mut cfg = Config::dummy();
+        cfg.sandbox.enabled = false;
+        let rt2 = Runtime::new(cfg, rt.root.clone(), rt.plugins_dir.clone())?;
+        plugin::create_plugin(&rt2, "selftest_spawn", "python", "围栏验证（对照）", SPAWN_SOURCE).await?;
+        let open = rt2.execute("selftest_spawn_child", json!({})).await;
+        println!("[selftest]   围栏关闭: {}", open.content);
+        if !open.content.contains("child-ok") {
+            bail!(
+                "对照组失败：关掉围栏后插件仍拉不起子进程 ⇒ 挡住它的不是围栏，\
+                 上面那条「额度锁 0 生效」的结论无效 —— {}",
+                open.content
+            );
+        }
+        plugin::remove_plugin(&rt2, "selftest_spawn").await?;
+    }
+
+    // 回归 8：工作区边界（沙箱方案 ③）。同样是 **A/B 对拍** —— 受限档必须拦住越界、
+    //         **而且那个文件真的没被创建**；full 档下同一个调用必须成功。
+    //         只测一边的话，「被拦住了」可能只是因为路径本身有问题（父目录不存在之类），
+    //         那样这条测试是在自欺 —— 与回归 7 同一个理由。
+    //         新语义（2026-10-04）：**读不设限、写删受限** —— 「相对路径被拒」那条已改到
+    //         **写**上，另加「读区外放行 / 删区外拦截」的对拍。
+    println!("[selftest] 回归：工作区边界（文件能力收回宿主）…");
+    {
+        let ws_root = std::env::temp_dir().join("aox-selftest-ws");
+        let outside = std::env::temp_dir().join("aox-selftest-outside.txt");
+        // 「读不设限」那条要读一个**真实存在**的区外文件：读一个不存在的路径也会失败，
+        // 那种失败归因不到边界上。
+        let outside_read = std::env::temp_dir().join("aox-selftest-outside-read.txt");
+        let _ = std::fs::remove_dir_all(&ws_root);
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_file(&outside_read);
+        std::fs::create_dir_all(ws_root.join("inside"))?;
+
+        // ── A：固定工作区 ⇒ 只准里面 ──
+        let mut cfg = Config::dummy();
+        cfg.workplace = crate::config::WorkplaceConfig {
+            mode: "fixed".into(),
+            root: Some(ws_root.to_string_lossy().into()),
+        };
+        let rt_ws = Runtime::new(cfg, ws_root.clone(), ws_root.join("plugins"))?;
+        for t in crate::tool::hostfs::host_file_tools() {
+            rt_ws.register(t).await?;
+        }
+        if rt_ws.workplace.active_root().is_none() {
+            bail!("fixed 档位没有确定工作区根");
+        }
+
+        let inside = ws_root.join("inside").join("ok.txt");
+        let w = rt_ws
+            .execute("write_file", json!({"path": inside.to_string_lossy(), "content": "工作区内的内容"}))
+            .await;
+        if w.is_error {
+            bail!("工作区内写入被拒了（边界太紧）: {}", w.content);
+        }
+        let r = rt_ws.execute("read_file", json!({"path": inside.to_string_lossy()})).await;
+        if r.is_error || !r.content.contains("工作区内的内容") {
+            bail!("工作区内的读写往返失败: {}", r.content);
+        }
+
+        let bad = rt_ws
+            .execute("write_file", json!({"path": outside.to_string_lossy(), "content": "x"}))
+            .await;
+        println!("[selftest]   受限档越界: {}", bad.content.lines().next().unwrap_or(""));
+        if !bad.is_error {
+            bail!("越界写入没被拦下");
+        }
+        if outside.exists() {
+            bail!("越界写入被拒了，但文件真的被创建了 —— 这个边界是假的");
+        }
+        for needle in ["权限边界", "不要重试", "转述给用户"] {
+            if !bad.content.contains(needle) {
+                bail!("越界文案缺了「{needle}」这一段（模型会因此反复重试）: {}", bad.content);
+            }
+        }
+        // 相对路径必须拒（**只对写/删成立**）：宿主与插件子进程的 cwd 不同，
+        // 同一个相对路径会指到两个文件 —— 那是「写」才有的风险。
+        let rel = rt_ws
+            .execute("write_file", json!({"path": "config.toml", "content": "x"}))
+            .await;
+        if !rel.is_error {
+            bail!("受限档位下**写**的相对路径没被拒");
+        }
+        // 新语义（2026-10-04）：**读不设限、写删受限**。两条一起对拍 ——
+        // 只测一边的话，「读通过了」也可能只是因为读压根没走判定（那是实现漏了，不是语义对）。
+        std::fs::write(&outside_read, "区外的内容")?;
+        let rd = rt_ws.execute("read_file", json!({"path": outside_read.to_string_lossy()})).await;
+        if rd.is_error || !rd.content.contains("区外的内容") {
+            bail!("受限档位下读区外文件失败（读应当不设限）: {}", rd.content);
+        }
+        let rm = rt_ws.execute("remove", json!({"path": outside_read.to_string_lossy()})).await;
+        if !rm.is_error {
+            bail!("受限档位下删区外文件没被拦下");
+        }
+        if !outside_read.exists() {
+            bail!("区外删除被拒了，但文件真的被删了 —— 这个边界是假的");
+        }
+        println!("[selftest]   读区外放行 / 删区外拦截: 对拍通过");
+        let _ = std::fs::remove_file(&outside_read);
+
+        // ── B：对照组（full）—— 同一个越界调用必须成功，A 的拦截才归因于工作区 ──
+        let mut cfg_full = Config::dummy();
+        cfg_full.workplace = crate::config::WorkplaceConfig { mode: "full".into(), root: None };
+        let rt_full = Runtime::new(cfg_full, ws_root.clone(), ws_root.join("plugins"))?;
+        for t in crate::tool::hostfs::host_file_tools() {
+            rt_full.register(t).await?;
+        }
+        if rt_full.workplace.active_root().is_some() {
+            bail!("full 档位不该有工作区根");
+        }
+        let ok = rt_full
+            .execute("write_file", json!({"path": outside.to_string_lossy(), "content": "x"}))
+            .await;
+        if ok.is_error {
+            bail!(
+                "对照组失败：full 档位下同一个路径也写不了 ⇒ 上面「越界被拦」不能归因于工作区 —— {}",
+                ok.content
+            );
+        }
+        if !outside.exists() {
+            bail!("对照组报告写入成功，但文件不在");
+        }
+        let _ = std::fs::remove_dir_all(&ws_root);
+        let _ = std::fs::remove_file(&outside);
     }
 
     println!("[selftest] 全部通过 ✔");
