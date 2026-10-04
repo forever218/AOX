@@ -27,11 +27,27 @@ EnumWindows = user32.EnumWindows
 EnumWindowsProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
 
-def find_window(title_substr: str, exact: bool = False):
+def find_window(title_substr: str, exact: bool = False, pid: int = 0):
+    """找目标窗口，两种定位方式二选一：
+
+    - 按标题（默认）：子串或全等匹配；
+    - 按 `pid`：主窗口标题改成空串之后（2026-10-04 用户要求删掉标题栏字样），
+      按标题这条路走不通 —— 改成「该进程可见窗口里**面积最大**的那个」，就是主窗口。
+    """
     found = []
 
     def cb(hwnd, _):
         if not user32.IsWindowVisible(hwnd):
+            return True
+        if pid:
+            p = wt.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+            if p.value != pid:
+                return True
+            r = wt.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            area = (r.right - r.left) * (r.bottom - r.top)
+            found.append((area, hwnd, "(pid {})".format(pid)))
             return True
         n = user32.GetWindowTextLengthW(hwnd)
         if n <= 0:
@@ -45,6 +61,9 @@ def find_window(title_substr: str, exact: bool = False):
         return True
 
     EnumWindows(EnumWindowsProc(cb), 0)
+    if pid:
+        found.sort(reverse=True)  # 面积大的在前
+        return [(h, label) for _, h, label in found]
     return found
 
 
@@ -58,6 +77,13 @@ def main() -> int:
         help="标题必须完全相等（默认子串匹配）。界面上同时开着「AOX」与「AOX 活动流」"
         "两个窗口，子串匹配很容易抓到活动流那个 —— 截主窗口时加这个开关。",
     )
+    ap.add_argument(
+        "--pid",
+        type=int,
+        default=0,
+        help="按进程 ID 找窗口（取该进程可见窗口中面积最大的）。主窗口标题改成空串后，"
+        "按标题找不到它了 —— 用 tasklist 拿到 aox-gui.exe 的 pid 再传进来。",
+    )
     ap.add_argument("--w", type=int, default=0, help="物理像素宽，0=保持原尺寸")
     ap.add_argument("--h", type=int, default=0)
     ap.add_argument("--wait", type=float, default=25.0)
@@ -66,7 +92,7 @@ def main() -> int:
     deadline = time.time() + a.wait
     win = []
     while time.time() < deadline:
-        win = find_window(a.title, a.exact)
+        win = find_window(a.title, a.exact, a.pid)
         if win:
             break
         time.sleep(0.3)

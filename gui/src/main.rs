@@ -76,12 +76,12 @@ fn main() -> eframe::Result<()> {
         Some(bridge::spawn(from_agent_tx, to_agent_rx, flags.clone()))
     };
 
-    // 不给窗口单独设图标：标题栏左上角就只剩光秃秃的应用名。
-    // （exe 自身仍带着 build.rs 从 assets/aox.ico 写进资源段的图标，
-    //   任务栏与「设置 → 应用」里认得出是谁。）
+    // 标题留空（2026-10-04 用户要求）：原生标题栏不再写「AOX」，加上 hide_caption_icon
+    // 把左上角的图标抹掉，标题栏就只剩系统按钮 —— 与主界面一块底色，认不出「栏」。
+    // 任务栏仍靠 exe 自带的资源图标认出这个程序。
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("AOX")
+            .with_title("")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([1000.0, 640.0]),
         ..Default::default()

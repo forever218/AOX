@@ -36,11 +36,27 @@ MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 
 
-def find_window(title_substr, exact=False):
+def find_window(title_substr, exact=False, pid=0):
+    """找目标窗口，两种定位方式二选一：
+
+    - 按标题（默认）：子串或全等匹配；
+    - 按 `pid`：主窗口标题改成空串之后（2026-10-04 用户要求删掉标题栏字样），
+      按标题这条路走不通 —— 改成「该进程可见窗口里**面积最大**的那个」，就是主窗口。
+    """
     found = []
 
     def cb(hwnd, _):
         if not user32.IsWindowVisible(hwnd):
+            return True
+        if pid:
+            p = wt.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+            if p.value != pid:
+                return True
+            r = wt.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            area = (r.right - r.left) * (r.bottom - r.top)
+            found.append((area, hwnd, "(pid {})".format(pid)))
             return True
         n = user32.GetWindowTextLengthW(hwnd)
         if n <= 0:
@@ -54,6 +70,9 @@ def find_window(title_substr, exact=False):
         return True
 
     EnumWindows(EnumWindowsProc(cb), 0)
+    if pid:
+        found.sort(reverse=True)  # 面积大的在前
+        return [(h, label) for _, h, label in found]
     return found
 
 
@@ -66,6 +85,13 @@ def main() -> int:
         help="标题必须完全相等（默认子串匹配）。界面同时开着「AOX」与「AOX 活动流」"
         "两个窗口时，子串匹配可能抓到活动流那个（EnumWindows 的顺序不保证），"
         "点主窗口时加这个开关。",
+    )
+    ap.add_argument(
+        "--pid",
+        type=int,
+        default=0,
+        help="按进程 ID 找窗口（取该进程可见窗口中面积最大的）。主窗口标题改成空串后，"
+        "按标题找不到它了 —— 用 tasklist 拿到 aox-gui.exe 的 pid 再传进来。",
     )
     ap.add_argument("--right", type=float, help="距客户区右边多少逻辑像素")
     ap.add_argument("--left", type=float, help="距客户区左边多少逻辑像素")
@@ -83,7 +109,7 @@ def main() -> int:
         print("必须给出 --left 或 --right", file=sys.stderr)
         return 2
 
-    win = find_window(a.title, a.exact)
+    win = find_window(a.title, a.exact, a.pid)
     if not win:
         print(f"NOTFOUND: 没有标题包含 {a.title!r} 的可见窗口", file=sys.stderr)
         return 2

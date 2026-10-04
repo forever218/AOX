@@ -793,6 +793,61 @@ pub(crate) const DWMWCP_ROUND: i32 = 2;
 /// - `DWMWA_TEXT_COLOR`(36)：标题栏文字色
 /// - `DWMWA_BORDER_COLOR`(34)：窗口外框线
 #[cfg(windows)]
+/// 标题栏左上角那枚小图标的**替身**：一张 1×1 的全透明 PNG。
+///
+/// Windows 在「窗口没设图标、窗口类也没设图标」时会一路回退到 **exe 资源里的
+/// 第一个图标**（实测 `WM_SETICON` 传 0 清不掉）—— 标题栏左上角于是永远杵着
+/// 那枚 AOX 图标。想让它消失，稳的办法只有一个：**给它一个看不见的图标**。
+///
+/// 字节由 `PIL` 生成 `Image.new('RGBA',(1,1),(0,0,0,0))` 得来，紧跟在
+/// `CreateIconFromResourceEx` 能直接消化的 PNG 裸字节。
+const TRANSPARENT_PNG: [u8; 70] = [
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+    0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+    0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x60,
+    0x60, 0x60, 0x60, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0xA5, 0xF6, 0x45, 0x40, 0x00, 0x00,
+    0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+/// 把标题栏左上角那枚**小**图标换成透明。
+///
+/// 只动 `ICON_SMALL`：`ICON_BIG`（任务栏与 Alt+Tab 用的那枚）不碰 ——
+/// 那里还靠 exe 的图标认人，一并抹掉的话任务栏就只剩一块空按钮。
+///
+/// HICON 只造一次、缓存复用，并且**故意不销毁**：`WM_SETICON` 的句柄归应用所有，
+/// 销毁了窗口再画标题栏就是在用悬空句柄 —— 反正只有一个，进程退出时随进程回收。
+#[cfg(windows)]
+fn hide_caption_icon(hwnd: isize) {
+    use std::sync::OnceLock;
+    static ICON: OnceLock<isize> = OnceLock::new();
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn CreateIconFromResourceEx(
+            pb_icon_bits: *const u8,
+            cb_icon_bits: u32,
+            f_icon: i32,
+            dw_version: u32,
+            cx_desired: i32,
+            cy_desired: i32,
+            flags: u32,
+        ) -> isize;
+        fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    }
+
+    let icon = *ICON.get_or_init(|| unsafe {
+        CreateIconFromResourceEx(TRANSPARENT_PNG.as_ptr(), 70, 1, 0x0003_0000, 16, 16, 0)
+    });
+    if icon != 0 {
+        const WM_SETICON: u32 = 0x0080;
+        const ICON_SMALL: usize = 0;
+        unsafe { SendMessageW(hwnd, WM_SETICON, ICON_SMALL, icon) };
+    }
+}
+
+#[cfg(not(windows))]
+fn hide_caption_icon(_hwnd: isize) {}
+
 pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
     use raw_window_handle::RawWindowHandle;
 
@@ -807,13 +862,18 @@ pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
         ((c.b() as u32) << 16) | ((c.g() as u32) << 8) | c.r() as u32
     };
 
-    let cap = colorref(P::panel());
+    // 标题栏与边框都吃主界面的**底色**：顶栏拆掉之后，对话区的底色就是整个窗口
+    // 的底色，标题栏再用 panel 就成了一条明晃晃的色差（2026-10-04 用户要求「无色差」）。
+    // 边框一并抹平 —— 不然窗口四周还会留一圈「另一档灰」。
+    // （用 panel 是顶栏还在时的选择：顶栏与标题栏同色读作一体。顶栏没了，跟 bg 走。）
+    let cap = colorref(P::bg());
     let text = colorref(P::text_dim());
-    let border = colorref(P::border());
+    let border = colorref(P::bg());
     // 失败也无所谓（老系统不支持），所以返回值直接丢掉
     dwm_set_attribute(hwnd, DWMWA_CAPTION_COLOR, std::ptr::addr_of!(cap).cast(), 4);
     dwm_set_attribute(hwnd, DWMWA_TEXT_COLOR, std::ptr::addr_of!(text).cast(), 4);
     dwm_set_attribute(hwnd, DWMWA_BORDER_COLOR, std::ptr::addr_of!(border).cast(), 4);
+    hide_caption_icon(hwnd);
 }
 
 #[cfg(not(windows))]
