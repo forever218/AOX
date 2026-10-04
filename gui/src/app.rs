@@ -3,16 +3,26 @@
 //! 布局（参考主流 AI 编程软件）：
 //! ```text
 //! ┌───────────────────────────────────────────────────────────┐
-//! │ 顶栏：状态 · [历史] [新建]              [活动流] [明暗] [关于] │
-//! ├───────────────────────────────────────────────────────────┤
-//! │ 对话流：用户气泡 / 助手 Markdown / 折叠的过程                 │
-//! │                  ┌──────────────────┐                      │
-//! │                  │ 悬浮输入框（覆盖）│                      │
-//! └──────────────────┴──────────────────┴──────────────────────┘
+//! │ [历史] [+] 状态 · Σ tok              [活动流] [明暗] [关于] │  ← 浮动按钮，无顶栏
+//! │ ┌───────────────┐                                         │
+//! │ │ 历史记录（滑出）│  对话流：用户气泡 / 助手 Markdown         │
+//! │ │  · 这一段      │                ┌──────────────────┐     │
+//! │ │  · 那一段      │                │ 悬浮输入框（覆盖）│     │
+//! │ └───────────────┘                └──────────────────┘     │
+//! └───────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! 活动流**不在主窗口里**，点顶栏那枚图标会以独立窗口打开（见 `activity.rs`）；
-//! 左侧历史栏也默认折叠。所以主窗口只有一栏内容。
+//! **没有顶栏**（2026-10-04 用户要求）：原先那条 `TopBottomPanel` 拆掉了，五枚图标变成
+//! 浮在对话内容之上的独立按钮，各带一块与旧顶栏同色的底（[`P::panel`]）。位置按下表复原：
+//! 左上 20/7、右上同样内缩 20 —— 与旧顶栏里 `Margin::symmetric(20, 0)` + 36px 热区
+//! 算出来的落点**逐像素相同**（按钮中心 y = 7 + 18 = 25 = 旧顶栏 50 高的一半）。
+//!
+//! **左侧历史栏也不再是布局里的一条 `SidePanel`**，改成从左上按钮**向下滑出**的浮层
+//! （见 [`App::history_overlay`]）；同时「新建对话」那枚「+」从历史按钮**背后向右滑出**
+//! （默认藏起来，见 [`App::toolbar`]）。两者共用同一个进度 `hist_t`，动画时长
+//! [`HIST_ANIM_SECS`]。
+//!
+//! 活动流**不在主窗口里**，点那枚图标会以独立窗口打开（见 `activity.rs`）。
 //!
 //! 底部没有独立的「输入区」栏位：输入框是一枚浮在对话内容之上的卡片，
 //! 滚动时可以一直滑到它下面。
@@ -168,8 +178,24 @@ pub struct App {
     current_history: Option<String>,
     /// 正在等 Agent 回执的切换请求（切换前先灰掉列表，避免连点造成来回跳）
     switching: bool,
-    /// 左侧历史侧边栏是否展开
+    /// 左上角那枚「历史记录」按钮的开关。浮层的目标状态就是它。
     show_history: bool,
+    /// 滑出动画进度：`0` = 完全收起，`1` = 完全展开。
+    ///
+    /// 由 `App::update` 每帧朝 `show_history` 逼近，`toolbar` / `history_overlay`
+    /// 都按它算位移。**不要直接用那个布尔量**：那样只有「在」与「不在」两态，
+    /// 中间那两百多毫秒就没有落脚点，滑出会退化成瞬移。
+    hist_t: f32,
+    /// 历史浮层**上一帧**的实际高度。
+    ///
+    /// 滑入距离要等于面板自身高度（整块从上方滑进来），而高度由内容（有几条记录）
+    /// 决定 —— 只有画完才知道。于是记一帧：本帧拿它算位移，画完再记下新的那个。
+    hist_h: f32,
+    /// 左上角历史按钮的矩形。只用来回答一个问题：这一下点击算不算「点在浮层外面」。
+    ///
+    /// 不记的话，点按钮那一帧会同时命中「按钮点击」与「点外部」两条路径 ——
+    /// 打开的动作当场被自己关掉，表现为「点了没反应」。
+    bar_hist_rect: Option<Rect>,
 
     /// 演示模式（--demo）：不连 LLM，只展示界面与事件流的排布
     demo: bool,
@@ -243,7 +269,12 @@ impl App {
             current_history: None,
             switching: false,
             show_history: false,
-            // 左右两个侧栏默认都收起：主区宽度全部让给对话，需要时再点顶栏那两枚图标。
+            hist_t: 0.0,
+            // 面板高度给一个「几条记录的窗口」的初值：第一帧还没画过，没有实测值可用，
+            // 而这一帧的滑入位移必须马上有个数。之后每帧都会被真实高度覆盖。
+            hist_h: 320.0,
+            bar_hist_rect: None,
+            // 历史浮层默认收起：主区宽度全部让给对话，需要时再点左上角那枚图标。
             follow: true,
             force_follow: true,
             about_open: false,
@@ -592,82 +623,151 @@ impl App {
         self.force_follow = true;
     }
 
-    /// 左侧历史侧边栏（会话切换器）。
-    fn history_panel(&mut self, ctx: &egui::Context) {
-        let frame = Frame::side_top_panel(&ctx.style())
-            .fill(P::panel())
-            .inner_margin(Margin::symmetric(16, 16));
-        let mut want_refresh = false;
-        let mut open: Option<String> = None;
+    /// 从左上按钮**向下滑出**的历史浮层（会话切换器）。
+    ///
+    /// 它顶替了原先那条 `SidePanel::left`：内容照搬侧边栏（标题 / 刷新 / 分隔线 /
+    /// 列表 / 空状态），外壳从「布局里的一条栏」换成「浮在对话之上的一层」。
+    ///
+    /// # 滑出是怎么做出来的
+    ///
+    /// 两块拼起来 —— **位置**（整块内容从「目标位置 − 自身高度」滑到目标位置）
+    /// 加上**裁剪**（可视区钉在目标位置上沿）。只做位移的话，面板会先在按钮
+    /// **脸上**冒出来再往下走；有了裁剪，它就是从按钮下沿一点点长出来的。
+    ///
+    /// `Ui::set_clip_rect` 顺带把交互也管住了：egui 给控件的 `interact_rect` 正是
+    /// `clip_rect ∩ rect`，被裁掉的那半截点不到。否则滑出途中鼠标扫过「还没长出来」
+    /// 的区域也会命中一行，凭空切走一段对话。
+    fn history_overlay(&mut self, ctx: &egui::Context) {
+        if self.hist_t <= 0.0 {
+            return;
+        }
+        let ease = ease_out_cubic(self.hist_t);
         // 切换请求在飞行中、或正在跑任务时不接受点击：这两段时间里发起切换，
         // 结果会排在后面才生效，点的人只会看到界面「迟疑一下才跳」。
         let locked = self.busy || self.switching;
-        egui::SidePanel::left("aox-history")
-            .resizable(true)
-            .default_width(266.0)
-            .width_range(206.0..=430.0)
-            .frame(frame)
+
+        // 与左上那枚按钮同一条左边线；顶边 = 按钮下沿 + 8。
+        let x = BAR_LEFT;
+        let top = BAR_TOP + BAR_BTN + 8.0;
+        let w = HISTORY_W;
+        // 面板高度由内容（有几条记录）定，这里只封顶：超过窗口下沿就会被窗口边界
+        // 硬切一刀。留 22px 给底部的圆角与阴影。
+        let max_h = (ctx.content_rect().bottom() - top - 22.0).clamp(150.0, 620.0);
+        let slide = -(1.0 - ease) * self.hist_h;
+
+        let mut want_refresh = false;
+        let mut open: Option<String> = None;
+
+        let area = egui::Area::new(egui::Id::new("aox-history"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::new(x, top + slide))
+            // 滑出途中位置在目标位置**上方**（`top + slide` 会跑到按钮上面去），
+            // 而 Area 默认会把越界的位置拉回屏幕内 —— 位移当场被抹平、动画失效。
+            // 这里放开约束：位置说了算。
+            .constrain_to(loose_rect())
             .show(ctx, |ui| {
-                // 与活动流窗口同样的理由：把内容宽度钉死在面板宽度上，
-                // 否则内容比面板窄一点点，面板宽度会一帧帧缩到下限。
-                let pw = ui.available_width();
-                ui.set_min_width(pw);
-                ui.set_max_width(pw);
+                // 可视区比面板四周各松一圈，免得把圆角描边和投影切出硬边。
+                ui.set_clip_rect(Rect::from_min_max(
+                    Pos2::new(x - 26.0, top - 2.0),
+                    Pos2::new(x + w + 26.0, top + max_h + 30.0),
+                ));
+                Frame::NONE
+                    .fill(P::surface())
+                    .corner_radius(CornerRadius::same(12))
+                    .stroke(Stroke::new(1.0, P::border()))
+                    .shadow(egui::Shadow {
+                        offset: [0, 8],
+                        blur: 22,
+                        spread: 0,
+                        color: P::shadow(),
+                    })
+                    .inner_margin(Margin::symmetric(14, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(w - 28.0);
+                        let pw = ui.available_width();
 
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("历史记录").color(P::text_dim()).size(13.0));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if flat_button(ui, "刷新").clicked() {
-                            want_refresh = true;
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("历史记录").color(P::text_dim()).size(13.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if flat_button(ui, "刷新").clicked() {
+                                    want_refresh = true;
+                                }
+                            });
+                        });
+                        ui.add_space(7.0);
+                        let (rule, _) = ui.allocate_exact_size(Vec2::new(pw, 1.0), Sense::hover());
+                        ui.painter().hline(
+                            rule.left()..=rule.right(),
+                            rule.center().y,
+                            Stroke::new(1.0, P::border()),
+                        );
+                        ui.add_space(9.0);
+
+                        if self.history.is_empty() {
+                            ui.label(
+                                RichText::new(
+                                    "还没有历史记录。\n发出第一条指令后，这段对话会自动保存到这里。",
+                                )
+                                .color(P::text_faint())
+                                .size(13.0),
+                            );
+                            ui.add_space(10.0);
+                            // 目录路径可能很长，用 truncate 让它自己在面板宽度内收口，
+                            // 而不是靠面板边界去切。
+                            ui.add(
+                                Label::new(
+                                    RichText::new(
+                                        self.store
+                                            .as_ref()
+                                            .map(|s| s.location().display().to_string())
+                                            .unwrap_or_default(),
+                                    )
+                                    .color(P::text_faint())
+                                    .size(11.5),
+                                )
+                                .truncate(),
+                            );
+                            return;
                         }
+
+                        // 高度**贴合内容**（`auto_shrink` 的第二个分量），只封一个上限：
+                        // 记录少的时候面板就矮，最后一条下面不会拖着一片空。
+                        //
+                        // ⚠️ 别改成「按条数算高度」（`rows × 行高`）。上一版就是那么写的，
+                        // 但那个乘积只是**行本身**的高度，滚动区还会另算自己的边距 ——
+                        // 估出来的数对不上面板实际的长相，一条记录的面板底下会多出
+                        // 二十几个逻辑像素的空白（截图比对才看出来）。
+                        ScrollArea::vertical()
+                            .max_height((max_h - HIST_HEAD).max(60.0))
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for s in &self.history {
+                                    let current =
+                                        Some(s.id.as_str()) == self.current_history.as_deref();
+                                    if history_row(ui, s, current, locked, pw).clicked() && !locked {
+                                        open = Some(s.id.clone());
+                                    }
+                                }
+                            });
                     });
-                });
-                ui.add_space(7.0);
-                let (rule, _) = ui.allocate_exact_size(Vec2::new(pw, 1.0), Sense::hover());
-                ui.painter().hline(
-                    rule.left()..=rule.right(),
-                    rule.center().y,
-                    Stroke::new(1.0, P::border()),
-                );
-                ui.add_space(9.0);
-
-                if self.history.is_empty() {
-                    ui.label(
-                        RichText::new("还没有历史记录。\n发出第一条指令后，这段对话会自动保存到这里。")
-                            .color(P::text_faint())
-                            .size(13.0),
-                    );
-                    ui.add_space(10.0);
-                    // 目录路径可能很长，用 truncate 让它在面板宽度内收口，
-                    // 而不是靠面板边界去切。
-                    ui.add(
-                        Label::new(
-                            RichText::new(
-                                self.store
-                                    .as_ref()
-                                    .map(|s| s.location().display().to_string())
-                                    .unwrap_or_default(),
-                            )
-                            .color(P::text_faint())
-                            .size(11.5),
-                        )
-                        .truncate(),
-                    );
-                    return;
-                }
-
-                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    for s in &self.history {
-                        let current = Some(s.id.as_str()) == self.current_history.as_deref();
-                        if history_row(ui, s, current, locked, pw).clicked() && !locked {
-                            open = Some(s.id.clone());
-                        }
-                    }
-                    // 面板里**不放**「新建对话」：顶栏那枚「+」离侧边栏开关只有 38px，
-                    // 两处入口挨得太近，反而要停下来分辨该点哪个。列表就只做一件事 ——
-                    // 翻哪段对话。
-                });
             });
+        let panel = area.response.rect;
+        // 记下这一帧的实际高度 —— 下一帧的滑入距离就是它（见字段 `hist_h`）。
+        // 这里**不**按 `hist_t` 判断：位置偏移不影响 `rect` 的高度，随时记都是准的。
+        self.hist_h = panel.height().max(96.0);
+
+        // 点面板外面、或按 Esc → 收起。按钮自己那一下不算「外面」（见 `bar_hist_rect`）。
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let clicked_outside = ctx.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer.interact_pos().is_some_and(|p| {
+                    !panel.contains(p) && !self.bar_hist_rect.is_some_and(|r| r.contains(p))
+                })
+        });
+        if esc || clicked_outside {
+            self.show_history = false;
+        }
+
         if want_refresh {
             self.refresh_history();
         }
@@ -834,85 +934,166 @@ impl App {
 
     // ─────────────────────────── 绘制 ───────────────────────────
 
-    fn top_bar(&mut self, ctx: &egui::Context) {
-        let frame = Frame::side_top_panel(&ctx.style())
-            .fill(P::panel())
-            .inner_margin(Margin::symmetric(20, 0));
+    /// 浮在对话之上的一排按钮 —— 原来的顶栏（2026-10-04 拆掉了面板本身）。
+    ///
+    /// 位置逐像素照搬旧顶栏算出来的落点：左上 `(20, 7)`、右上同样内缩 20，
+    /// 配 36px 热区 ⇒ 按钮中心 y = 25 = 旧顶栏 50px 高的中线。
+    ///
+    /// 每枚按钮自带一块底色（[`P::panel`]，就是旧顶栏的填充色），所以它们浮在
+    /// 对话文字上也不会糊成一片。悬停时底色升一档（`surface_hi`），
+    /// 与列表行、菜单行的悬停语言一致。
+    ///
+    /// 两处与旧顶栏不同的：
+    /// - 「新建对话」默认**不显示**，随历史浮层一起从历史按钮背后向右滑出；
+    /// - 状态与 token 从「顶栏左侧的一块空位」变成一枚跟着按钮走的胶囊
+    ///   （顶栏没了，它们总得有个落脚处，否则任务进度与 token 账本就无处可看）。
+    fn toolbar(&mut self, ctx: &egui::Context) {
         let mut want_toggle = false;
-        egui::TopBottomPanel::top("aox-top")
-            .exact_height(50.0)
-            .frame(frame)
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    // 历史侧边栏的开关放在最左：面板就在左边，开关也跟着在左边，
-                    // 不必让眼睛横跨整个顶栏去找它。
-                    if history_icon(ui, self.show_history).clicked() {
-                        self.show_history = !self.show_history;
-                        if self.show_history {
-                            self.refresh_history();
-                        }
-                    }
-                    ui.add_space(2.0);
-                    // 「+」紧挨着列表图标：一个管「翻哪段」，一个管「开一段」，
-                    // 放在一起才是完整的一组。
-                    let locked = self.busy || self.switching;
-                    if plus_icon(ui, locked).clicked() && !locked {
-                        self.new_conversation();
-                    }
-                    // 左侧到这里为止 —— 原先那枚状态圆点与「就绪」字样都去掉了：
-                    // 空闲时它只是常驻噪音，忙碌时活动流里其实写得更细。
-                    // 唯一保留的是任务执行中的那几秒，那会儿进度确实值得一个位置。
-                    // （品牌名也不在这里：原生标题栏本来就写着「AOX · 模型」，
-                    // 紧挨着两行再写一次是重复。）
-                    if self.busy {
-                        ui.add_space(12.0);
-                        ui.label(RichText::new(&self.status).color(P::text()).size(14.0));
-                        ui.add_space(7.0);
-                        ui.label(
-                            RichText::new(format!("{:.1}s", self.live.as_ref().map_or(0.0, |l| {
-                                l.started.elapsed().as_secs_f32()
-                            })))
-                            .color(P::text_faint())
-                            .size(13.5),
-                        );
-                        // 累计 token 实时滚动 = 已完成各轮（精确）＋ 本轮进行中的估算。
-                        // 所以整个对话的账在任务执行期间也是一路在涨的，而不是
-                        // 每轮归零。带 `~` 是因为后半截还在估，一轮结束后由顶栏
-                        // 那枚精确的总数接手。
-                        let base = self.usage_sum().total.unwrap_or(0);
-                        let est = self.live.as_ref().map_or(0, |l| l.out.tokens());
-                        let shown = base + est;
-                        if shown > 0 {
-                            ui.add_space(7.0);
-                            ui.label(
-                                RichText::new(format!("Σ ~{} tok", thousands(shown)))
-                                    .color(P::text_faint())
-                                    .size(13.5),
-                            );
-                        }
-                    } else {
-                        // 空闲时只剩一个总 token，鼠标移上去就有明细
-                        self.token_chip(ui, ctx);
-                    }
+        let mut want_new = false;
+        let mut toggle_hist = false;
+        let ease = ease_out_cubic(self.hist_t);
+        let locked = self.busy || self.switching;
 
-                    // 右上角只留三个图标：活动流开关 + 明暗切换 + 关于。
-                    // 原来那排「模型 / 工具 N / 插件 N / 演示」的胶囊全部去掉——
-                    // 这些信息要么在活动流里能看到，要么属于看一眼就够的诊断数据。
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if theme_toggle(ui, theme::mode() == theme::Mode::Dark).clicked() {
-                            want_toggle = true;
-                        }
-                        ui.add_space(2.0);
-                        if flow_toggle(ui, activity::lock(&self.act).is_open()).clicked() {
-                            activity::toggle(ctx, &self.act);
-                        }
-                        ui.add_space(2.0);
-                        if about_icon(ui).clicked() {
-                            self.about_open = true;
-                        }
-                    });
+        // ── 「新建对话」：从历史按钮背后向右滑出 ──
+        //
+        // 先声明它、后声明历史按钮：两者重叠的那一小段由历史按钮压在上面
+        //（同一图层里后声明的在上）。不过真正让它读作「从背后钻出来」的是**裁剪**
+        // —— 左边界切掉的部分根本画不出来。层序只是保险。
+        if self.hist_t > 0.0 {
+            let x_end = BAR_LEFT + BAR_BTN + 2.0;
+            let slide = (BAR_BTN + 10.0) * (1.0 - ease);
+            egui::Area::new(egui::Id::new("aox-bar-new"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(Pos2::new(x_end - slide, BAR_TOP))
+                // 滑出途中位置会压到历史按钮上，别让 Area 把它拉回屏幕内。
+                .constrain_to(loose_rect())
+                .show(ctx, |ui| {
+                    ui.set_clip_rect(Rect::from_min_max(
+                        Pos2::new(x_end, BAR_TOP - 6.0),
+                        Pos2::new(x_end + BAR_BTN + 6.0, BAR_TOP + BAR_BTN + 6.0),
+                    ));
+                    if plus_icon(ui, locked).clicked() && !locked {
+                        want_new = true;
+                    }
+                });
+        }
+
+        // ── 左上：历史按钮（位置不变）＋ 状态 / token 胶囊 ──
+        egui::Area::new(egui::Id::new("aox-bar-left"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(Pos2::new(BAR_LEFT, BAR_TOP))
+            .constrain_to(loose_rect())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if history_icon(ui, self.show_history).clicked() {
+                        toggle_hist = true;
+                    }
+                    // 「+」住在另一个 `Area` 里（它要单独做滑出裁剪），这里替它把位置
+                    // 让出来：展开时撑开 38px，收起时不占位。于是那枚 token 胶囊会被
+                    // 「挤」到右边去 —— 正好是「按钮从左边钻出来」该有的连带效果。
+                    //
+                    // 38 = 「+」的 36 + 与它之间留的 2。少了这段，胶囊会直接压在
+                    // 「+」身上：两者底色同色，实机上看起来就是「+ 和胶囊共用一块底」，
+                    // 于是那枚按钮像是没长出来（截图比对才发现，肉眼扫一眼容易放过）。
+                    ui.add_space(8.0 + 38.0 * ease);
+                    // 一个 token 都没有、又没在跑任务时，这枚胶囊连壳都不该出现
+                    //（`token_chip` 此时什么都不画，硬套一层 Frame 会剩个空框）。
+                    if self.busy || self.usage_sum().total.is_some() {
+                        Frame::NONE
+                            .fill(P::panel())
+                            .corner_radius(CornerRadius::same(10))
+                            .inner_margin(Margin::symmetric(12, 6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if self.busy {
+                                        ui.label(
+                                            RichText::new(&self.status).color(P::text()).size(14.0),
+                                        );
+                                        ui.add_space(7.0);
+                                        let secs = self
+                                            .live
+                                            .as_ref()
+                                            .map_or(0.0, |l| l.started.elapsed().as_secs_f32());
+                                        ui.label(
+                                            RichText::new(format!("{secs:.1}s"))
+                                                .color(P::text_faint())
+                                                .size(13.5),
+                                        );
+                                        // 累计 token 实时滚动 = 已完成各轮（精确）＋ 本轮估算。
+                                        // 所以整个对话的账在任务执行期间也一路上涨，而不是每轮归零。
+                                        // 带 `~` 是因为后半截还在估；一轮结束后由那枚精确的总数接手。
+                                        let base = self.usage_sum().total.unwrap_or(0);
+                                        let est =
+                                            self.live.as_ref().map_or(0, |l| l.out.tokens());
+                                        let shown = base + est;
+                                        if shown > 0 {
+                                            ui.add_space(7.0);
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Σ ~{} tok",
+                                                    thousands(shown)
+                                                ))
+                                                .color(P::text_faint())
+                                                .size(13.5),
+                                            );
+                                        }
+                                    } else {
+                                        // 空闲时只剩一个总 token，鼠标移上去就有明细
+                                        self.token_chip(ui, ctx);
+                                    }
+                                });
+                            });
+                    }
                 });
             });
+        // 这一栏按钮的矩形记一笔：历史浮层要靠它排除「点在按钮上」那一下
+        //（不然按钮的开关动作会被浮层自己的「点外面就收起」当场抵消）。
+        self.bar_hist_rect =
+            Some(Rect::from_min_size(Pos2::new(BAR_LEFT, BAR_TOP), Vec2::splat(BAR_BTN)));
+
+        // ── 右上：活动流 / 明暗 / 关于（位置不变）──
+        //
+        // 从右往左排：最右是明暗切换（与旧顶栏一致），左边依次是活动流、关于。
+        egui::Area::new(egui::Id::new("aox-bar-right"))
+            .order(egui::Order::Foreground)
+            // `pivot` 这一行不能省：`anchor` 给的是**屏幕上的锚点**，而 Area 默认拿
+            // 自己的**左上角**去对齐它 —— 于是整排按钮被摆在「右边缘再往右 20px」，
+            // 112px 里有 92px 露在窗口外，实机上三个图标一个都看不见。
+            // 让它拿右上角去对，才是「内缩 20」。
+            //
+            // 这里**不能**放开 `constrain_to`：`anchor` 的参考矩形就是它。
+            // 换成 `Rect::EVERYTHING` 的话右边缘会变成 +∞，位置直接飞出去
+            //（踩过一次：改成 EVERYTHING 后排按钮整个消失）。
+            .pivot(Align2::RIGHT_TOP)
+            .anchor(Align2::RIGHT_TOP, Vec2::new(-BAR_RIGHT, BAR_TOP))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if about_icon(ui).clicked() {
+                        self.about_open = true;
+                    }
+                    ui.add_space(2.0);
+                    // 先把锁收掉再判点击：`is_open()` 这一下要拿锁，而点击分支里的
+                    // `toggle` 自己还会再拿一次 —— 两把锁叠在同一句里就是自锁。
+                    let flow_on = activity::lock(&self.act).is_open();
+                    if flow_toggle(ui, flow_on).clicked() {
+                        activity::toggle(ctx, &self.act);
+                    }
+                    ui.add_space(2.0);
+                    if theme_toggle(ui, theme::mode() == theme::Mode::Dark).clicked() {
+                        want_toggle = true;
+                    }
+                });
+            });
+
+        if toggle_hist {
+            self.show_history = !self.show_history;
+            if self.show_history {
+                self.refresh_history();
+            }
+        }
+        if want_new {
+            self.new_conversation();
+        }
         if want_toggle {
             theme::apply_mode(ctx, theme::toggle_mode());
         }
@@ -1015,7 +1196,9 @@ impl App {
             .auto_shrink([false, false])
             .stick_to_bottom(self.follow || self.force_follow)
             .show(ui, |ui| {
-                ui.add_space(26.0);
+                // 顶部留白 = 旧顶栏那条（50）＋ 原来的 26。顶栏拆掉之后按钮改成浮在
+                // 内容之上，不留白的话第一行字直接顶到按钮底下。
+                ui.add_space(76.0);
                 ui.horizontal(|ui| {
                     ui.add_space(pad);
                     ui.vertical(|ui| {
@@ -1768,7 +1951,24 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
-        self.top_bar(ctx);
+        // 滑出动画推进：把 `hist_t` 朝开关状态挪一格，挪到为止。
+        //
+        // 逐帧推进（而不是「记开始时刻 + 查缓动表」）是为了让中途反向也接得上：
+        // 连点两下开关时，进度从**当前位置**往回走，不会先跳回 0 再重开。
+        let target = if self.show_history { 1.0 } else { 0.0 };
+        if self.hist_t != target {
+            let step = dt.min(0.05) / HIST_ANIM_SECS;
+            self.hist_t = if self.hist_t < target {
+                (self.hist_t + step).min(target)
+            } else {
+                (self.hist_t - step).max(target)
+            };
+            // 动画期间必须自己喊重绘：窗口空闲时 egui 不会自己刷帧，
+            // 少了这一条，滑出会变成一顿一顿的跳格。
+            ctx.request_repaint();
+        }
+
+        self.toolbar(ctx);
 
         if self.native_theme != Some(theme::mode()) {
             self.native_theme = Some(theme::mode());
@@ -1776,9 +1976,9 @@ impl eframe::App for App {
             theme::sync_caption(frame);
         }
 
-        if self.show_history {
-            self.history_panel(ctx);
-        }
+        // 历史浮层：`hist_t` 归零后它自己就不画了，这里**不要**再判 `show_history`
+        // —— 收起的过程也得接着画，判开关会让面板在半路上凭空消失。
+        self.history_overlay(ctx);
         // 活动流在独立窗口里：主窗口每帧把「现在在干什么」同步过去，并重新声明
         // 那个视口（egui 的视口是声明式的，不声明就会被回收）。
         activity::lock(&self.act).tick(self.now(), &self.status, self.busy);
@@ -1866,11 +2066,58 @@ pub(crate) fn column(available: f32) -> (f32, f32) {
 /// 对话流末尾留出这段空白，保证最后一条消息不会被卡片压住。
 const COMPOSER_RESERVE: f32 = 118.0;
 
-/// 侧边栏一次最多列出多少个历史对话。
+/// 历史浮层一次最多列出多少个历史对话。
 ///
 /// 不做分页：几十条已经够「翻回去找刚才那段」了，而列全部意味着每次刷新
 /// 都要扫完整个目录。真要翻更早的，`/history` 与 `history/` 目录都在。
 const HISTORY_LIST_LIMIT: usize = 80;
+
+// ────────────── 浮动按钮条与历史浮层的几何 ──────────────
+//
+// 这几个数原本散在两处：按钮的落点在 `top_bar` 的 `exact_height(50)` +
+// `Margin::symmetric(20, 0)` 里，历史栏的宽度在 `SidePanel::default_width(266)` 里。
+// 顶栏与侧栏都被拆掉之后，它们没有「容器」可依了，于是显式钉在这里 ——
+// 位置照搬拆栏前的结果，逐像素不变。
+
+/// 按钮热区边长（与五枚图标函数里的 `d` 是同一个数）。
+const BAR_BTN: f32 = 36.0;
+/// 按钮条距窗口**左**边。
+const BAR_LEFT: f32 = 20.0;
+/// 按钮条距窗口**右**边。
+const BAR_RIGHT: f32 = 20.0;
+/// 按钮条距窗口上边。`7 + 18 = 25`，正好是旧顶栏 50px 高的一半 ——
+/// 按钮中心线与拆栏之前完全重合。
+const BAR_TOP: f32 = 7.0;
+/// 历史浮层的宽度。
+const HISTORY_W: f32 = 300.0;
+/// 历史浮层里「列表以上」那部分的高度（内边距 + 标题行 + 分隔线）。
+///
+/// 只用来算列表最多能占多高，取整即可 —— 面板的实际高度由内容自己决定，不靠它。
+const HIST_HEAD: f32 = 74.0;
+/// 滑出 / 收起的动画时长（秒）。
+///
+/// 0.24 是「看得出来在动、又不用等」的一档：更短就退回瞬移，更长会觉得
+/// 点完之后界面在迟疑。
+const HIST_ANIM_SECS: f32 = 0.24;
+
+/// 缓出曲线（cubic ease-out）：起步快、收尾慢。
+///
+/// 用它而不是官方的 `ctx.animate_bool_with_time`（那是**线性**插值）：
+/// 匀速位移在起点与终点都是硬拐弯 —— 起手像被弹了一下，停下像撞了墙。
+fn ease_out_cubic(t: f32) -> f32 {
+    let u = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - u * u * u
+}
+
+/// 一个「比窗口大得多」的约束矩形：给需要滑到窗口外的 `Area` 用。
+///
+/// `Area` 默认会把自己的位置拉回约束矩形内，滑出动画的位移会被当场抹平，
+/// 所以那几处要放开。**但不要用 `Rect::EVERYTHING`** —— 里边是 ±∞，
+/// 一旦参与「锚点对齐」之类的运算，位置就变成 NaN 或无穷，Area 直接消失
+///（右上那排按钮栽过一次）。给个有限的宽松框，效果一样，还不会算出怪数。
+fn loose_rect() -> Rect {
+    Rect::from_min_max(Pos2::new(-10_000.0, -10_000.0), Pos2::new(10_000.0, 10_000.0))
+}
 
 /// 历史记录按钮：左侧一条竖线（代表侧边栏）+ 三条短横线。
 ///
@@ -1888,9 +2135,13 @@ fn history_icon(ui: &mut Ui, on: bool) -> egui::Response {
     };
 
     let painter = ui.painter();
-    if hov {
-        painter.circle_filled(rect.center(), d * 0.5, P::surface_hi());
-    }
+    // 常态就铺一块底色（= 旧顶栏的填充色）：顶栏拆掉之后按钮直接浮在对话文字上，
+    // 没有这块底，图标会和正文糊在一起。悬停升一档，与列表行、菜单行同一套语言。
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(10),
+        if hov { P::surface_hi() } else { P::panel() },
+    );
     let r = rect.shrink(10.0);
     // 左边一条短竖线 = 侧边栏本身
     painter.line_segment(
@@ -1926,9 +2177,11 @@ fn plus_icon(ui: &mut Ui, locked: bool) -> egui::Response {
     };
 
     let painter = ui.painter();
-    if hov {
-        painter.circle_filled(rect.center(), d * 0.5, P::surface_hi());
-    }
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(10),
+        if hov { P::surface_hi() } else { P::panel() },
+    );
     let r = rect.shrink(13.0);
     let c = r.center();
     painter.line_segment(
@@ -2111,9 +2364,7 @@ fn theme_toggle(ui: &mut Ui, is_dark: bool) -> egui::Response {
     let fg = if hov { P::text() } else { P::text_dim() };
 
     let painter = ui.painter();
-    if hov {
-        painter.circle_filled(rect.center(), d * 0.5, behind);
-    }
+    painter.rect_filled(rect, CornerRadius::same(10), behind);
     let c = rect.center();
     if is_dark {
         // 太阳：圆 + 八条光芒
@@ -2155,9 +2406,11 @@ fn flow_toggle(ui: &mut Ui, on: bool) -> egui::Response {
     };
 
     let painter = ui.painter();
-    if hov {
-        painter.circle_filled(rect.center(), d * 0.5, P::surface_hi());
-    }
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(10),
+        if hov { P::surface_hi() } else { P::panel() },
+    );
 
     let r = rect.shrink(9.5);
     // 三次贝塞尔：控制点一上一下，得到一条平滑的 S 形
@@ -2213,9 +2466,11 @@ fn about_icon(ui: &mut Ui) -> egui::Response {
     let fg = if hov { P::ink() } else { P::text_dim() };
 
     let painter = ui.painter();
-    if hov {
-        painter.circle_filled(rect.center(), d * 0.5, P::surface_hi());
-    }
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(10),
+        if hov { P::surface_hi() } else { P::panel() },
+    );
     let c = rect.center();
     painter.circle_stroke(c, 8.4, Stroke::new(1.6, fg));
     painter.circle_filled(Pos2::new(c.x, c.y - 3.7), 1.35, fg);
