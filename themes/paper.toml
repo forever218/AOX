@@ -1,0 +1,37 @@
+# 纸 · paper
+#
+# 出厂纸（亮色）的**完整定义** —— 与内置配色逐字节相同，所以：
+#   aox-gui --theme themes/paper.toml
+# 看到的画面应与不指定 --theme 时**完全一样**（可以用来验证主题文件确实被读进去了）。
+#
+# 改任意几行即可微调；只写想改的字段也行（其余继承内置）。
+# 颜色写法："#RRGGBB" / "#RRGGBBAA" / "#RGB"，或数组 [r, g, b] / [r, g, b, a]。
+#
+# 本文件就是一份 `[theme]` 段，可以**整段粘进 config.toml**；
+# 反过来，把 config.toml 里的 [theme] 整段摘出来也能存成主题文件用。
+#
+# 注意明暗：下面 mode 的优先级**低于**你手动点过的那次切换
+# （记录在 <应用根>/.aox-gui-theme）；想让 mode 生效，先删掉那个文件。
+
+[theme]
+mode = "light"
+
+[theme.light]
+bg = "#F2EFE8"
+panel = "#EBE7DE"
+surface = "#FAF8F3"
+surface_hi = "#E4E0D5"
+border = "#DDD7C9"
+border_strong = "#C2BAA8"
+text = "#1A1916"
+text_dim = "#645F55"
+text_faint = "#9B9486"
+ink = "#1A1916"
+ink_soft = "#6B655A"
+user_bg = "#E7E2D6"
+code_bg = "#ECE8DE"
+code_chip = "#E0D9C7"
+quote_bar = "#C2BAA8"
+reverse_bg = "#1A1916"
+on_reverse = "#F7F5F0"
+shadow = "#1A19161A"

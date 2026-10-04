@@ -1,0 +1,26 @@
+name = "house_rules"
+language = "python"
+description = "示例组件：贡献一段系统提示 + 两个钩子，另提供一个用来试能力申请的平凡工具"
+entry = "main.py"
+
+# ── 除工具之外还贡献什么（阶段 6 · 6b）───────────────────────────────────────
+#
+# 这一段**完全不写**就是老插件：只提供工具，行为与 6b 之前逐字节一致。
+#
+#   hooks           要接哪几个钩子点。只认五个名字（= Hook trait 的方法名）：
+#                   before_request / after_reply / before_tool / after_tool / on_error
+#                   写错一个 → **激活即报错**，不会静默不生效。
+#   prompt_segments 要贡献的提示词段 id。正文不写在这儿 —— 宿主会用
+#                   `prompt/segment` 从子进程取回（见 main.py 的 serve(...)）。
+#   caps            能力申请。**非空时，本插件的工具调用一律走「询问」**，
+#                   不会静默搭 [auth] plugin_tools 的便车。
+#   theme           是否贡献主题补丁（`theme/patch` 取回；本期宿主只取回+校验，
+#                   GUI 合并尚未接线）。
+#
+# 也可以改由 initialize 的返回体给出同样的声明 —— 两处都有时**以 initialize 为准**
+# （清单是离线声明，进程实况更准）。见 plugins/sdk/PROTOCOL.md 第 4 节。
+[contributes]
+hooks = ["before_request", "after_tool"]
+prompt_segments = ["rules"]
+caps = ["fs_write"]
+theme = false

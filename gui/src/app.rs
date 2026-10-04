@@ -17,7 +17,6 @@
 //! 底部没有独立的「输入区」栏位：输入框是一枚浮在对话内容之上的卡片，
 //! 滚动时可以一直滑到它下面。
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -153,9 +152,11 @@ pub struct App {
     /// 放在「关于」窗口里——这类「看一眼就够」的诊断数据不该占用主界面。
     runtimes: RuntimeView,
 
-    /// 历史目录（`<应用根>/history`）。GUI 直接读盘，不经过 agent 线程 ——
-    /// 读历史是纯文件操作，没有并发问题，也就不必为它再开一条 channel。
-    history_dir: PathBuf,
+    /// 读历史用的存储实例（`aox::store`，与 agent 线程同一个后端的另一个句柄）。
+    ///
+    /// GUI 直接读盘，不经过 agent 线程 —— 读历史是纯文件操作，没有并发问题，
+    /// 也就不必为它再开一条 channel。`None` 表示「还没启动完成」，此时不读。
+    store: Option<Arc<dyn aox::store::Store>>,
     /// 历史对话列表（最新的在前）。只在展开侧边栏、或本轮结束后刷新。
     history: Vec<aox::history::Summary>,
     /// 当前所在的这段对话的 id（尚未落盘的新对话为 None）。
@@ -194,6 +195,7 @@ pub struct App {
 impl App {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
+        theme_cfg: aox::config::ThemeConfig,
         tx: UnboundedSender<ToAgent>,
         rx: UnboundedReceiver<FromAgent>,
         flags: Arc<SessionFlags>,
@@ -201,8 +203,8 @@ impl App {
         demo: bool,
         prompt: Option<String>,
     ) -> Self {
-        theme::load_pref();
-        theme::apply(&cc.egui_ctx);
+        // 外观全部来自 `[theme]`；明暗优先取上次手动切换的记录（见 theme::apply）。
+        theme::apply(&cc.egui_ctx, &theme_cfg);
         let mut app = Self {
             tx,
             rx,
@@ -228,7 +230,7 @@ impl App {
             config_path: String::new(),
             plugins: Vec::new(),
             runtimes: RuntimeView::default(),
-            history_dir: PathBuf::new(),
+            store: None,
             history: Vec::new(),
             current_history: None,
             switching: false,
@@ -341,7 +343,8 @@ impl App {
                 FromAgent::Boot(b) => {
                     self.model = b.model.clone();
                     self.config_path = b.config_path.clone();
-                    self.history_dir = aox::history::dir(std::path::Path::new(&b.root));
+                    // 界面侧读历史的后端由 bridge 一并送来：与 agent 线程同一个实现。
+                    self.store = Some(b.store.clone());
                     self.refresh_history();
                     if let Some(note) = &b.note {
                         self.log_error = Some(note.clone());
@@ -493,10 +496,10 @@ impl App {
     /// 只在「展开侧边栏」「本轮结束」「切到新对话」时做，而不是每帧 ——
     /// 每帧扫目录会白白打断 UI 的流畅度，而历史列表本来就不需要那么新。
     fn refresh_history(&mut self) {
-        if self.history_dir.as_os_str().is_empty() {
+        let Some(store) = self.store.clone() else {
             return;
-        }
-        let mut items = aox::history::list(&self.history_dir, HISTORY_LIST_LIMIT);
+        };
+        let mut items = store.list(HISTORY_LIST_LIMIT);
         // 正在聊的这一段永远置顶。
         //
         // 盘上的排序键是「最后一次说话的时间」，而刚切进来的这段对话可能三天没动过，
@@ -541,11 +544,12 @@ impl App {
     /// 内容自己读盘重建，而不是让 Agent 把消息发过来：历史文件本来就在本地，
     /// 通道里只传 id 能让职责更干净（Agent 管上下文，界面管展示）。
     fn adopt_conversation(&mut self, id: Option<&str>) {
-        self.items = match id {
-            Some(id) => aox::history::load(&aox::history::file_of(&self.history_dir, id))
+        self.items = match (id, self.store.as_ref()) {
+            (Some(id), Some(store)) => store
+                .load(id)
                 .map(|l| items_from_history(&l))
                 .unwrap_or_default(),
-            None => Vec::new(),
+            _ => Vec::new(),
         };
         // 上一段对话的进行中状态与活动流一起换掉，否则右侧会一边显示新对话，
         // 一边滚着旧对话的工具调用。
@@ -559,15 +563,16 @@ impl App {
         // 活动流同样换掉。它和消息躺在**同一个文件**里，所以「打开这段对话」
         // 就该看到它当时的那条时间轴；新建对话则清空。
         //
+        // 记录先取好再上锁：读存储要走 `self.store`，而锁守卫会长期持有 `self.act`。
+        let rows = match (id, self.store.as_ref()) {
+            (Some(id), Some(store)) => store.load_acts(id),
+            _ => Vec::new(),
+        };
         // `now` 先算好再上锁：`self.now()` 借整个 `self`，读起来容易和锁守卫纠缠。
         let now = self.now();
         let mut act = activity::lock(&self.act);
         match id {
-            Some(id) => {
-                let rows =
-                    aox::history::load_acts(&aox::history::file_of(&self.history_dir, id));
-                act.load_acts(&rows, now);
-            }
+            Some(_) => act.load_acts(&rows, now),
             None => act.reset(),
         }
         drop(act);
@@ -625,9 +630,14 @@ impl App {
                     // 而不是靠面板边界去切。
                     ui.add(
                         Label::new(
-                            RichText::new(self.history_dir.display().to_string())
-                                .color(P::text_faint())
-                                .size(11.5),
+                            RichText::new(
+                                self.store
+                                    .as_ref()
+                                    .map(|s| s.location().display().to_string())
+                                    .unwrap_or_default(),
+                            )
+                            .color(P::text_faint())
+                            .size(11.5),
                         )
                         .truncate(),
                     );
@@ -1076,7 +1086,7 @@ impl App {
                 let w = 640.0_f32.min(ui.available_width() - 8.0);
                 Frame::NONE
                     .fill(P::surface())
-                    .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
+                    .corner_radius(CornerRadius::same(theme::card_radius()))
                     .stroke(Stroke::new(1.0, P::border_strong()))
                     .inner_margin(Margin::symmetric(22, 18))
                     .show(ui, |ui| {
@@ -1116,7 +1126,7 @@ impl App {
         if !l.steps.is_empty() {
             Frame::NONE
                 .fill(P::surface())
-                .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
+                .corner_radius(CornerRadius::same(theme::card_radius()))
                 .stroke(Stroke::new(1.0, P::border()))
                 .inner_margin(Margin::symmetric(20, 16))
                 .show(ui, |ui| {
@@ -1285,7 +1295,7 @@ impl App {
             .frame(
                 Frame::NONE
                     .fill(P::surface())
-                    .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
+                    .corner_radius(CornerRadius::same(theme::card_radius()))
                     .stroke(Stroke::new(1.0, P::border()))
                     .inner_margin(Margin::symmetric(26, 22)),
             )
@@ -1339,6 +1349,28 @@ impl App {
                     ui.add_space(18.0);
                     ui.label(
                         RichText::new(format!("模型  {}", self.model))
+                            .font(theme::mono_font(12.5))
+                            .color(P::text_faint()),
+                    );
+                }
+
+                // 配置层：这份配置是「合」出来的，还是只有 config.toml 一份。
+                // 只显示名字链（去掉 bundle: 前缀），不在这里铺来源树 —— 完整来源树走
+                // CLI 的 `aox --dump-config`。只有一层时不显示，说了等于没说。
+                let layers: Vec<String> = self
+                    .boot
+                    .as_ref()
+                    .map(|b| {
+                        b.config_layers
+                            .iter()
+                            .map(|l| l.strip_prefix("bundle:").unwrap_or(l).to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if layers.len() > 1 {
+                    ui.add_space(18.0);
+                    ui.label(
+                        RichText::new(format!("配置层  {}", layers.join(" → ")))
                             .font(theme::mono_font(12.5))
                             .color(P::text_faint()),
                     );
@@ -1503,14 +1535,17 @@ fn seed_demo(app: &mut App) {
     // 演示模式也从真实的应用根读历史：预览本来就该是真实的样子，
     // 编几条假对话反而会让人以为侧边栏是装饰品。
     let root = aox::paths::resolve_workspace().0;
+    let store = aox::store::default_store(&root, 0);
     app.boot = Some(BootInfo {
         config_path: app.config_path.clone(),
+        // 演示数据也照真实形态给一条层链，好让「关于」窗口那一行在 --demo 里也看得见。
+        config_layers: vec!["bundle:core".into(), "config.toml".into()],
         model: app.model.clone(),
         provider_ready: true,
         note: None,
-        root: root.display().to_string(),
+        store: store.clone(),
     });
-    app.history_dir = aox::history::dir(&root);
+    app.store = Some(store);
     app.refresh_history();
 
     app.items.push(Item::User("做一个插件，统计当前目录下各类文件的数量".into()));
@@ -2434,7 +2469,7 @@ fn user_bubble(ui: &mut Ui, text: &str, max_w: f32) {
                         text,
                         0.0,
                         egui::TextFormat {
-                            font_id: theme::body_font(theme::BODY),
+                            font_id: theme::body_font(theme::body_size()),
                             color: P::text(),
                             ..Default::default()
                         },
@@ -2466,7 +2501,7 @@ fn error_card(ui: &mut Ui, text: &str, width: f32) {
     let inner_w = (width - 40.0).max(140.0);
     Frame::NONE
         .fill(P::surface())
-        .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
+        .corner_radius(CornerRadius::same(theme::card_radius()))
         .stroke(Stroke::new(1.0, P::border_strong()))
         .inner_margin(Margin::symmetric(20, 18))
         .show(ui, |ui| {
@@ -2543,7 +2578,7 @@ fn process_block(ui: &mut Ui, p: &mut Process, width: f32) {
     if p.expanded {
         Frame::NONE
             .fill(P::surface())
-            .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
+            .corner_radius(CornerRadius::same(theme::card_radius()))
             .stroke(Stroke::new(1.0, P::border()))
             .inner_margin(Margin::symmetric(20, 18))
             .show(ui, |ui| {

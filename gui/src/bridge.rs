@@ -93,14 +93,22 @@ pub enum FromAgent {
     Fatal(String),
 }
 
-#[derive(Debug, Clone)]
 pub struct BootInfo {
     pub config_path: String,
+    /// 合成这份配置用到的层（低 → 高，后面的覆盖前面的）。
+    ///
+    /// 只给「关于」窗口显示一行用；完整的来源树走 CLI 的 `--dump-config` ——
+    /// 380px 的小卡片塞不下那张表，塞进去也只是没人看的噪音。
+    pub config_layers: Vec<String>,
     pub model: String,
     pub provider_ready: bool,
     pub note: Option<String>,
-    /// 应用根目录。历史记录落在 `<root>/history`，主线程需要它才能读盘。
-    pub root: String,
+    /// 界面侧读历史用的存储实例（只读用途）。
+    ///
+    /// 与 agent 线程**同一个后端实现**、指向同一处数据 —— 界面不自己拼路径，
+    /// 也不自己判断落盘格式（见 `aox::store`）。正常启动时就是 `rt.store` 的克隆；
+    /// 配置读不出来时用默认后端兜底，至少让侧边栏里的旧对话还看得见。
+    pub store: Arc<dyn aox::store::Store>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -287,14 +295,17 @@ fn boot(
     model: &str,
     ready: bool,
     note: Option<String>,
-    root: &std::path::Path,
+    store: Arc<dyn aox::store::Store>,
+    // 这份配置由哪几层合成（低 → 高）。读不出配置时给空表 —— 不编造不存在的层。
+    layers: Vec<String>,
 ) {
     let _ = tx.send(FromAgent::Boot(Box::new(BootInfo {
         config_path: config_path.display().to_string(),
+        config_layers: layers,
         model: model.to_string(),
         provider_ready: ready,
         note,
-        root: root.display().to_string(),
+        store,
     })));
 }
 
@@ -342,15 +353,14 @@ async fn idle_until_shutdown(
 async fn next_command(
     ui: &mut GuiUi,
     agent: &mut Agent,
-    rt: &Arc<Runtime>,
     tx: &mpsc::UnboundedSender<FromAgent>,
 ) -> Result<Option<String>> {
     loop {
         match ui.rx.recv().await {
             Some(ToAgent::Input(s)) => return Ok(Some(s)),
             Some(ToAgent::Resume(id)) => {
-                let path = aox::history::file_of(&aox::history::dir(&rt.root), &id);
-                let msg = match agent.resume(&path) {
+                // 按 id 让存储缝去开那次对话 —— 界面侧不拼路径（见 `src/store.rs`）。
+                let msg = match agent.resume(&id) {
                     Ok(_) => FromAgent::Switched { opened: Some(id), error: None },
                     Err(e) => FromAgent::Switched { opened: None, error: Some(format!("{e:#}")) },
                 };
@@ -407,9 +417,7 @@ async fn boot_and_run(
     let plugins_dir = aox::paths::arg_value(&args, "--plugins")
         .map(PathBuf::from)
         .unwrap_or(default_plugins);
-    let config_path = aox::paths::arg_value(&args, "--config")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("config.toml"));
+    let config_path = aox::paths::resolve_config_path(&args);
 
     if let Err(e) = aox::plugin::ensure_sdk(&plugins_dir) {
         let _ = tx.send(FromAgent::Event(AgentEvent::Warn(format!(
@@ -418,18 +426,36 @@ async fn boot_and_run(
         ))));
     }
 
-    let config = match aox::config::Config::load(&config_path) {
-        Ok(c) => c,
+    // 配置走**分层合成**（阶段 5）：profile → bundle → patch → config.toml。
+    // 与 CLI 是同一条 `aox::config::layer::resolve` —— 两个前端不各留一套合成规则。
+    let resolved = match aox::config::layer::resolve(
+        &root,
+        &config_path,
+        aox::paths::resolve_manifest_path(&args).as_deref(),
+        aox::paths::resolve_profile(&args).as_deref(),
+    ) {
+        Ok(r) => r,
         Err(e) => {
             // 配置缺失/无效：GUI 照常打开，展示引导信息，输入区会被禁用。
-            boot(&tx, &config_path, "", false, Some(format!("{e:#}")), &root);
+            // 读历史的后端用默认的（此时还没读到配置），免得侧边栏跟着一起空掉。
+            boot(
+                &tx,
+                &config_path,
+                "",
+                false,
+                Some(format!("{e:#}")),
+                aox::store::default_store(&root, 0),
+                Vec::new(),
+            );
             idle_until_shutdown(&mut rx, &tx).await;
             return Ok(());
         }
     };
+    let config_layers = resolved.composed.layer_labels();
+    let config = resolved.config;
 
     let model = config.provider.model.clone();
-    let rt = Runtime::new(config, root.clone(), plugins_dir.clone());
+    let rt = Runtime::new(config, root.clone(), plugins_dir.clone())?;
     for t in aox::tool::meta::meta_tools() {
         rt.register(t).await?;
     }
@@ -460,20 +486,24 @@ async fn boot_and_run(
             ui.emit(AgentEvent::Info(
                 "请在 config.toml 的 [provider] 填写 base_url 与 api_key（或 api_key_env）后重新启动。".into(),
             ));
-            boot(&tx, &config_path, &model, false, Some(format!("{e:#}")), &root);
+            boot(
+                &tx,
+                &config_path,
+                &model,
+                false,
+                Some(format!("{e:#}")),
+                rt.store.clone(),
+                config_layers.clone(),
+            );
             idle_until_shutdown(&mut ui.rx, &tx).await;
             return Ok(());
         }
     };
 
-    let rules = rt.config.agent.rules_file.as_deref().and_then(|p| {
-        let path = PathBuf::from(p);
-        let path = if path.is_absolute() { path } else { rt.root.join(path) };
-        std::fs::read_to_string(path).ok()
-    });
-
-    let mut agent = Agent::new(llm, rt.clone(), rules.as_deref());
-    boot(&tx, &config_path, &model, true, None, &root);
+    // 项目规则文件（RULES.md）现在由 `aox::prompt::build` 统一读取，
+    // 不再是 GUI 与 CLI 各读一遍（见 src/prompt.rs）。
+    let mut agent = Agent::new(llm, rt.clone());
+    boot(&tx, &config_path, &model, true, None, rt.store.clone(), config_layers);
     send_history_current(&tx, &agent);
 
     // 周期性广播插件快照：模型每造出一个新插件，右侧面板立刻可见。
@@ -497,7 +527,7 @@ async fn boot_and_run(
 
     // ---- 驱动循环：与 CLI 的 REPL 一一对应
     loop {
-        let Some(input) = next_command(&mut ui, &mut agent, &rt, &tx).await? else { break };
+        let Some(input) = next_command(&mut ui, &mut agent, &tx).await? else { break };
         let line = input.trim().to_string();
         if line.is_empty() {
             continue;

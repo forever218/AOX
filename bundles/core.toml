@@ -1,0 +1,18 @@
+# core —— 出厂组合的唯一入口。
+#
+# 它自己**不带任何值**，只声明「这一套由哪些 bundle 组成」。每个 bundle 管一块，
+# 顺序即优先级：**后入场的覆盖先入场的**；聚合者（也就是本文件）在它的子 bundle
+# 之后入场，所以 core 自己若写了值，能盖住下面这些。
+#
+# 想改这一套？别改这里 —— 在 aox.toml 的 [profiles.<名>] 里换 bundle 列表，
+# 或者叠一层 patch 文件（见 aox.example.toml）。
+#
+# 这五个名字就是「出厂选择」的全部：换 llm-openai 就是换协议家族，
+# 换 store-jsonl 就是换存储形态，换 loop-standard 就是换循环形态。
+bundles = [
+    "llm-openai",     # 模型端点：OpenAI 兼容协议
+    "tools",          # 工具、插件运行时、以及它们默认的授权档
+    "store-jsonl",    # 存储：一次对话一个文件
+    "loop-standard",  # 循环：标准主循环、不带任何 hook
+    "prompt-core",    # 提示词：内置分段（core / protocol / env / rules）
+]

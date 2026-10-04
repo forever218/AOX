@@ -1,0 +1,15 @@
+# loop-standard —— 标准主循环，不带任何 hook。
+#
+# 这个 bundle **故意不带值**：`[hook]` 整段为空 = 一个钩子都不注册，
+# 主循环走的路与「Loop 缝」之前逐条一致。所以它在 `--dump-config` 里显示 0 个值。
+#
+# 想挂钩子就叠一层 patch（或直接写进 config.toml）：
+#
+#   [hook.tool_args_default.fs_read_file]
+#   encoding = "utf-8"
+#
+# 注意钩子的边界：`[hook]` 只管「放行之后要不要动东西」；
+# 「放不放行」是授权问题，归 [auth]（见 tools.toml）。
+#
+# 「换一种循环形态」—— 裁剪历史、失败重试、把整个请求重写 —— 不是配置能表达的，
+# 那要替换整个 AgentLoop。什么时候做、做成什么样，见 docs/ARCH-ROADMAP.md 阶段 6。

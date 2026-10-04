@@ -1,0 +1,35 @@
+# tools —— 工具、插件运行时，以及它们默认的授权档。
+#
+# 这里写出的每个值都**等于代码里的默认值**（`AuthConfig` / `RuntimesConfig` /
+# `AgentConfig` 上那一份 `#[serde(default)]`）。为什么要重复写一遍？为了让
+# `aox --dump-config` 能显示「这个值来自哪一层」，而不是一律标成「默认（代码）」。
+#
+# 代价是多了一个默认来源（bundle 与代码两处）。防漂移的办法不是靠自觉 ——
+# `layer.rs` 里的 `core_equals_code_defaults` 会逐字段对拍，任何一处改动没同步就红。
+#
+# 工具本身（fs_read / shell_exec / …）与它们的实现不在配置里，在 src/tool/；
+# 这里只管「工具怎么被授权、插件跑在什么解释器上、单次调用限多长」。
+
+[auth]
+# 元工具（create_plugin / remove_plugin 等**改动系统自身**的操作）：ask | auto | deny
+meta_tools = "ask"
+# 模型自己造出来的插件工具：ask | auto | deny
+plugin_tools = "auto"
+# 想按工具名 / 插件名单独放行或拦下，写在 [auth.overrides]：
+#   shell_exec = "ask"    精确命中
+#   fs_*       = "deny"   前缀通配（只看前缀，`fs*` 连 fsx 也一起命中）
+
+[runtimes]
+# 值有两种写法，语义不同：
+#   * 裸命令（下面这种）→ 宿主按「应用目录内置运行时 → PATH」的顺序查找。
+#     内置运行时指 <应用根>/runtime/python/python.exe；用 /runtime install python 可装配。
+#   * 完整路径（如 'C:\Python313\python.exe'）→ 直接采用，绝不被内置运行时顶替。
+python = "python"
+node = "node"
+rustc = "rustc"
+
+[agent]
+# 单次工具调用超时（秒）
+tool_timeout_secs = 60
+# 送回模型的工具结果最大字符数（超出截断）
+max_result_chars = 20000

@@ -1,23 +1,26 @@
 mod agent;
+mod agent_loop;
 mod auth;
 mod config;
 mod history;
+mod hook;
 mod llm;
 mod message;
 mod plugin;
+mod prompt;
 mod runtime;
 mod runtimes;
 mod selftest;
+mod store;
 mod tool;
 mod ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::agent::Agent;
-use crate::config::Config;
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::LlmProvider;
 use crate::runtime::Runtime;
@@ -155,15 +158,23 @@ async fn runtimes_command(rt: &Arc<Runtime>, line: &str) -> Result<String> {
 /// `/history` 子命令：查看 / 切换 / 删除历史对话。
 ///
 /// 解析与文案都在 `crate::history` 里，CLI 与 GUI 共用同一份实现。
+/// 数据一律向**存储缝**（`crate::store::Store`）要 —— 这里不再拼任何文件路径，
+/// 换后端（比如一个库装下所有对话）时这段代码一行都不用改。
 /// 只有 `open` 需要拿到 Agent —— 它要就地换掉上下文，这是唯一一个
 /// 「不是纯查询」的子命令。
-fn history_command(agent: &mut Agent, line: &str, dir: &Path) -> Result<String> {
+fn history_command(agent: &mut Agent, line: &str, store: &dyn store::Store) -> Result<String> {
     Ok(match history::parse_cmd(line)? {
-        history::Cmd::List => history::list_text(dir, agent.history_id()),
-        history::Cmd::Dir => dir.display().to_string(),
+        history::Cmd::List => history::list_text(
+            &store.list(history::DEFAULT_LIST_LIMIT),
+            store.location(),
+            agent.history_id(),
+        ),
+        // 把「用的是哪个后端」一并说出来：以后真加了 sqlite，用户看到这行就知道
+        // 自己改的配置生效了没有，而不用去猜。
+        history::Cmd::Dir => format!("{}（后端 {}）", store.location().display(), store.backend()),
         history::Cmd::Show(key) => {
-            let s = history::resolve(dir, &key)?;
-            let items = history::load(&s.path)?;
+            let s = store.resolve(&key)?;
+            let items = store.load(&s.id)?;
             format!(
                 "{}  {}（{} 条）\n{}",
                 s.time,
@@ -173,8 +184,8 @@ fn history_command(agent: &mut Agent, line: &str, dir: &Path) -> Result<String> 
             )
         }
         history::Cmd::Open(key) => {
-            let s = history::resolve(dir, &key)?;
-            let n = agent.resume(&s.path)?;
+            let s = store.resolve(&key)?;
+            let n = agent.resume(&s.id)?;
             format!(
                 "已切换到「{}」（{} 条消息）。接下来的发言会继续追加到同一个文件。\n  {}",
                 s.title,
@@ -183,9 +194,7 @@ fn history_command(agent: &mut Agent, line: &str, dir: &Path) -> Result<String> 
             )
         }
         history::Cmd::Remove(key) => {
-            let s = history::resolve(dir, &key)?;
-            std::fs::remove_file(&s.path)
-                .with_context(|| format!("无法删除 {}", s.path.display()))?;
+            let s = store.remove(&key)?;
             format!("已删除: {}  {}", s.time, s.title)
         }
     })
@@ -222,8 +231,38 @@ async fn main() -> Result<()> {
         .find(|w| w[0] == "--config")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(|| app_root.join("config.toml"));
-    let config = match Config::load(&config_path) {
-        Ok(c) => c,
+
+    // 组合清单（阶段 5）：配置由 `profile → bundle → patch → config.toml` 合成，
+    // **config.toml 永远是最后一层**，所以以前写的配置一个字都不用改。
+    // 应用根下没有 aox.toml 时，层栈退化成「只有 config.toml 一条」—— 与以前完全等价。
+    let manifest_arg = args
+        .windows(2)
+        .find(|w| w[0] == "--manifest")
+        .map(|w| PathBuf::from(&w[1]));
+    let profile_arg = args.windows(2).find(|w| w[0] == "--profile").map(|w| w[1].clone());
+
+    // `--dump-config`：只把层栈与合成后的树打出来，然后退出。
+    // 特意走 `compose`（不解析 Config）—— 配置坏了的时候，恰恰最需要看这张表。
+    if args.iter().any(|a| a == "--dump-config") {
+        match config::layer::compose(
+            &app_root,
+            &config_path,
+            manifest_arg.as_deref(),
+            profile_arg.as_deref(),
+        ) {
+            Ok(c) => println!("{}", c.dump_text()),
+            Err(e) => println!("[配置错误] {e:#}"),
+        }
+        return Ok(());
+    }
+
+    let resolved = match config::layer::resolve(
+        &app_root,
+        &config_path,
+        manifest_arg.as_deref(),
+        profile_arg.as_deref(),
+    ) {
+        Ok(r) => r,
         Err(e) => {
             if !config_path.exists() {
                 // 首次运行：自动生成模板，避免双击 exe 时窗口一闪而过
@@ -244,9 +283,22 @@ async fn main() -> Result<()> {
             return Ok(());
         }
     };
+    // `/config` 要给人看「这份配置是哪几层合出来的」，所以先把短版面留下来 ——
+    // 配置本体随后就被 Runtime 拿走了。
+    let layer_summary = resolved.composed.layer_summary();
+    let config = resolved.config;
 
     // ---- 组装运行时：元工具 + 恢复持久化插件
-    let rt = Runtime::new(config, app_root.clone(), plugins_dir);
+    // `[store] backend` 写错会在这里失败。按「配置错误」对待：友好提示 + 等按键，
+    // 与上面 TOML 解析失败同一条路径 —— 双击 exe 的用户不会只看到窗口一闪。
+    let rt = match Runtime::new(config, app_root.clone(), plugins_dir) {
+        Ok(rt) => rt,
+        Err(e) => {
+            println!("[配置错误] {e:#}");
+            pause_before_exit();
+            return Ok(());
+        }
+    };
     for t in meta::meta_tools() {
         rt.register(t).await?;
     }
@@ -274,14 +326,9 @@ async fn main() -> Result<()> {
         }
     };
 
-    // ---- 项目规则文件（可选；相对路径基于应用根，避免 CWD 差异）
-    let rules = rt.config.agent.rules_file.as_deref().and_then(|p| {
-        let path = PathBuf::from(p);
-        let path = if path.is_absolute() { path } else { rt.root.join(path) };
-        std::fs::read_to_string(path).ok()
-    });
-
-    let mut agent = Agent::new(llm, rt.clone(), rules.as_deref());
+    // 项目规则文件（RULES.md）不再在这里读：它现在是提示词的 `rules` 段，
+    // 由 `prompt::build` 统一从 `config.agent.rules_file` 取 —— CLI 与 GUI 共用一份实现。
+    let mut agent = Agent::new(llm, rt.clone());
 
     println!("\n{}", ui::style::logo());
     println!(
@@ -327,6 +374,38 @@ async fn main() -> Result<()> {
                     let mut names: Vec<_> = plugins.keys().cloned().collect();
                     names.sort();
                     ui.emit(AgentEvent::Info(format!("插件: {}", names.join(", "))));
+                    // 组件贡献（阶段 6 · 6b）：只列**有贡献**的那些 —— 只提供工具的
+                    // 老插件不在这儿重复出现（上面那行已经说过它们了）。
+                    let mut extra: Vec<String> = Vec::new();
+                    for n in &names {
+                        let Some(h) = plugins.get(n) else { continue };
+                        let c = &h.contributes;
+                        if c.is_empty() {
+                            continue;
+                        }
+                        let mut parts: Vec<String> = Vec::new();
+                        if !c.hooks.is_empty() {
+                            parts.push(format!("钩子 {}", c.hooks.join("/")));
+                        }
+                        if !c.prompt_segments.is_empty() {
+                            parts.push(format!("提示词段 {}", c.prompt_segments.join("/")));
+                        }
+                        if !c.caps.is_empty() {
+                            parts.push(format!("申请能力 {}", c.caps.join("/")));
+                        }
+                        if c.theme {
+                            // 顺带读一下补丁本身：声明了却为 None，说明取回或校验没过
+                            parts.push(if h.theme_patch.is_some() {
+                                "主题补丁 ✓（GUI 合并待接线）".to_string()
+                            } else {
+                                "主题补丁（没取到）".to_string()
+                            });
+                        }
+                        extra.push(format!("  {n} → {}", parts.join("；")));
+                    }
+                    if !extra.is_empty() {
+                        ui.emit(AgentEvent::Info(format!("组件贡献：\n{}", extra.join("\n"))));
+                    }
                 }
             }
             "/demo" => {
@@ -353,6 +432,10 @@ async fn main() -> Result<()> {
             }
             "/expand" => ui.expand_last_turn(),
             "/usage" => ui.show_usage(agent.usage_log()),
+            "/prompt" => ui.emit(AgentEvent::Info(prompt::report(&rt))),
+            "/hook" => ui.emit(AgentEvent::Info(hook::report(&rt))),
+            "/loop" => ui.emit(AgentEvent::Info(agent_loop::report(&rt))),
+            "/config" => ui.emit(AgentEvent::Info(layer_summary.clone())),
             "/new" => {
                 // 与 GUI 顶栏那枚「+」同一条路径。旧对话不需要保存动作 ——
                 // 它一直是边聊边追加的，此刻已经在 history/ 里躺好了。
@@ -368,7 +451,7 @@ async fn main() -> Result<()> {
                 }
             }
             _ if history::is_cmd(line) => {
-                match history_command(&mut agent, line, &history::dir(&rt.root)) {
+                match history_command(&mut agent, line, &*rt.store) {
                     Ok(text) => ui.emit(AgentEvent::Info(text)),
                     Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
                 }
@@ -378,7 +461,7 @@ async fn main() -> Result<()> {
                 for (cmd, desc) in [
                     ("/help", "显示本帮助"),
                     ("/tools", "列出当前所有可用工具"),
-                    ("/plugins", "列出已加载的插件"),
+                    ("/plugins", "列出已加载的插件，以及各自贡献了什么（钩子 / 提示词段 / 能力）"),
                     ("/runtime", "查看插件运行时状态；/runtime install python 装配内置运行时"),
                     (
                         "/history",
@@ -388,6 +471,16 @@ async fn main() -> Result<()> {
                     ("/demo", "预览终端排版与过程折叠效果"),
                     ("/expand", "展开上一次被折叠的工具调用过程"),
                     ("/usage", "回看上一次任务的 token 用量明细"),
+                    ("/prompt", "查看系统提示词的分段拼装结果（config.toml 的 [prompt] 可重排/禁用/追加）"),
+                    ("/hook", "查看生效的循环钩子（来自 config.toml 的 [hook] 与插件的 [contributes]）"),
+                    (
+                        "/loop",
+                        "查看主循环实现与上下文裁剪（config.toml 的 [loop]：impl 换实现、max_rounds 限轮数）",
+                    ),
+                    (
+                        "/config",
+                        "查看这份配置由哪几层合成（应用根下的 aox.toml 可自定义；--dump-config 看每个值的来源）",
+                    ),
                     ("/quit", "退出程序（/exit 等价）"),
                 ] {
                     println!(

@@ -9,15 +9,19 @@
 //! 凡是「前端无关」的能力都应只依赖这里的公开接口，而不要复制实现。
 
 pub mod agent;
+pub mod agent_loop;
 pub mod auth;
 pub mod config;
 pub mod history;
+pub mod hook;
 pub mod llm;
 pub mod message;
 pub mod paths;
 pub mod plugin;
+pub mod prompt;
 pub mod runtime;
 pub mod runtimes;
 pub mod selftest;
+pub mod store;
 pub mod tool;
 pub mod ui;

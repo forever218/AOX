@@ -9,18 +9,53 @@
 //! 同时注册一个真正的「粗体」字族，让 Markdown 的 **加粗** 有实际字重变化。
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use aox::config::{FontsConfig, MetricsConfig, PaletteConfig, RgbColor, ThemeConfig};
 use egui::{
     Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Visuals,
 };
 
 // ─────────────────────────── 字号 / 留白刻度 ───────────────────────────
+//
+// 这些值现在来自 `[theme.metrics]`（默认即原先写死的常量），所以只能是**运行期访问器**
+// 而不是 `const`。`metrics()` 走 `OnceLock`：装配时写一次，之后只读，开销等同常量。
+
+static METRICS: OnceLock<MetricsConfig> = OnceLock::new();
+
+fn metrics() -> &'static MetricsConfig {
+    METRICS.get_or_init(MetricsConfig::default)
+}
 
 /// 正文字号。全套界面以它为基准。
-pub const BODY: f32 = 16.0;
-/// 卡片圆角
-pub const CARD_RADIUS: u8 = 14;
+pub fn body_size() -> f32 {
+    metrics().body_size
+}
+
+/// 标题（Heading）字号。
+pub fn heading_size() -> f32 {
+    metrics().heading_size
+}
+
+/// 按钮文字字号。
+pub fn button_size() -> f32 {
+    metrics().button_size
+}
+
+/// 小字字号。
+pub fn small_size() -> f32 {
+    metrics().small_size
+}
+
+/// 等宽字号（代码块用）。
+pub fn mono_size() -> f32 {
+    metrics().mono_size
+}
+
+/// 卡片圆角。
+pub fn card_radius() -> u8 {
+    metrics().card_radius
+}
 
 /// 自定义粗体字族名。
 const BOLD_FAMILY: &str = "aox-strong";
@@ -121,15 +156,18 @@ fn pref_path() -> Option<std::path::PathBuf> {
     }
 }
 
-/// 读取上次的主题偏好（默认暗色）。
-pub fn load_pref() {
-    if let Some(p) = pref_path() {
-        if let Ok(s) = std::fs::read_to_string(p) {
-            set_mode(match s.trim() {
-                "light" => Mode::Light,
-                _ => Mode::Dark,
-            });
-        }
+/// 读取上次的主题偏好。`None` = 从没记录过（或记录不可辨认），交由上层决定用哪个。
+fn read_pref() -> Option<Mode> {
+    let p = pref_path()?;
+    parse_mode(&std::fs::read_to_string(p).ok()?)
+}
+
+/// `"light"` / `"dark"`（大小写与首尾空白都容忍）。认不出来返回 `None`。
+fn parse_mode(s: &str) -> Option<Mode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "light" => Some(Mode::Light),
+        "dark" => Some(Mode::Dark),
+        _ => None,
     }
 }
 
@@ -218,10 +256,44 @@ const DARK: Palette = Palette {
     shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 96),
 };
 
+/// 叠加了配置覆盖之后的两套配色。`apply` 时写一次，之后只读 —— 所以取色仍是零开销。
+static ACTIVE: OnceLock<(Palette, Palette)> = OnceLock::new();
+
 fn pal() -> &'static Palette {
+    let (light, dark) = ACTIVE.get_or_init(|| (LIGHT, DARK));
     match mode() {
-        Mode::Light => &LIGHT,
-        Mode::Dark => &DARK,
+        Mode::Light => light,
+        Mode::Dark => dark,
+    }
+}
+
+/// 把配置里的逐字段覆盖叠到内置配色上；没写的字段原样保留。
+///
+/// 只覆盖某个字段（例如只改 `text`）是完全安全的：其余 17 项仍是内置值。
+fn merge_palette(base: &Palette, ov: &PaletteConfig) -> Palette {
+    let c = |d: Color32, o: Option<RgbColor>| match o {
+        Some(x) => Color32::from_rgba_unmultiplied(x.r, x.g, x.b, x.a),
+        None => d,
+    };
+    Palette {
+        bg: c(base.bg, ov.bg),
+        panel: c(base.panel, ov.panel),
+        surface: c(base.surface, ov.surface),
+        surface_hi: c(base.surface_hi, ov.surface_hi),
+        border: c(base.border, ov.border),
+        border_strong: c(base.border_strong, ov.border_strong),
+        text: c(base.text, ov.text),
+        text_dim: c(base.text_dim, ov.text_dim),
+        text_faint: c(base.text_faint, ov.text_faint),
+        ink: c(base.ink, ov.ink),
+        ink_soft: c(base.ink_soft, ov.ink_soft),
+        user_bg: c(base.user_bg, ov.user_bg),
+        code_bg: c(base.code_bg, ov.code_bg),
+        code_chip: c(base.code_chip, ov.code_chip),
+        quote_bar: c(base.quote_bar, ov.quote_bar),
+        reverse_bg: c(base.reverse_bg, ov.reverse_bg),
+        on_reverse: c(base.on_reverse, ov.on_reverse),
+        shadow: c(base.shadow, ov.shadow),
     }
 }
 
@@ -397,11 +469,38 @@ fn read_env(key: &str) -> Option<(String, Vec<u8>)> {
     }
 }
 
+/// `[theme.fonts]` 里的字体路径。`apply` 时写一次。
+static FONTS: OnceLock<FontsConfig> = OnceLock::new();
+
+fn fcfg() -> &'static FontsConfig {
+    FONTS.get_or_init(FontsConfig::default)
+}
+
+/// 读一个字体文件（空文件视为无效，与 `read_env` 一致）。
+fn read_font_file(path: &str) -> Option<(String, Vec<u8>)> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        None
+    } else {
+        Some((path.to_string(), bytes))
+    }
+}
+
+/// 一级一级往下找：`[theme.fonts]` 配置 → 环境变量 → 内置候选表。
+///
+/// 上面两级都把「路径不存在 / 文件为空」化简成 `None`，所以配置写错也不会让界面缺字，
+/// 只会安静地退回下一级。
+fn font_source(cfg: Option<&String>, env_key: &str, cands: &[&str]) -> Option<(String, Vec<u8>)> {
+    cfg.and_then(|p| read_font_file(p))
+        .or_else(|| read_env(env_key))
+        .or_else(|| read_first(cands))
+}
+
 /// 装配字体：内建拉丁字体 + 系统中文回退（排在 emoji 字体之前，避免 CJK 落到 emoji 字形上）。
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 
-    let cjk = read_env("AOX_GUI_FONT").or_else(|| read_first(CJK_CANDIDATES));
+    let cjk = font_source(fcfg().cjk.as_ref(), "AOX_GUI_FONT", CJK_CANDIDATES);
     let cjk_name = if let Some((_, bytes)) = cjk {
         fonts.font_data.insert("cjk".to_owned(), Arc::new(FontData::from_owned(bytes)));
         "cjk".to_owned()
@@ -409,7 +508,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         String::new()
     };
 
-    let bold = read_env("AOX_GUI_FONT_BOLD").or_else(|| read_first(BOLD_CANDIDATES));
+    let bold = font_source(fcfg().bold.as_ref(), "AOX_GUI_FONT_BOLD", BOLD_CANDIDATES);
     if let Some((_, bytes)) = bold {
         fonts.font_data.insert("cjk-bold".to_owned(), Arc::new(FontData::from_owned(bytes)));
         let mut fam: Vec<String> = vec!["cjk-bold".to_owned()];
@@ -422,7 +521,7 @@ pub fn install_fonts(ctx: &egui::Context) {
     }
 
     // 衬线：次级标题用。找不到就退回粗体（serif_font 内部处理）。
-    let serif = read_env("AOX_GUI_FONT_SERIF").or_else(|| read_first(SERIF_CANDIDATES));
+    let serif = font_source(fcfg().serif.as_ref(), "AOX_GUI_FONT_SERIF", SERIF_CANDIDATES);
     if let Some((_, bytes)) = serif {
         fonts.font_data.insert("serif".to_owned(), Arc::new(FontData::from_owned(bytes)));
         let mut fam: Vec<String> = vec!["serif".to_owned()];
@@ -435,7 +534,7 @@ pub fn install_fonts(ctx: &egui::Context) {
     }
 
     // 品牌字：首屏大招呼用。找不到就退回衬线（brand_font 内部处理）。
-    let brand = read_env("AOX_GUI_FONT_BRAND").or_else(|| read_first(BRAND_CANDIDATES));
+    let brand = font_source(fcfg().brand.as_ref(), "AOX_GUI_FONT_BRAND", BRAND_CANDIDATES);
     if let Some((_, bytes)) = brand {
         fonts.font_data.insert("brand".to_owned(), Arc::new(FontData::from_owned(bytes)));
         let mut fam: Vec<String> = vec!["brand".to_owned()];
@@ -447,7 +546,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         BRAND_OK.store(true, Ordering::Relaxed);
     }
 
-    let mono = read_env("AOX_GUI_FONT_MONO").or_else(|| read_first(MONO_CANDIDATES));
+    let mono = font_source(fcfg().mono.as_ref(), "AOX_GUI_FONT_MONO", MONO_CANDIDATES);
     let mono_name = if let Some((_, bytes)) = mono {
         fonts.font_data.insert("mono".to_owned(), Arc::new(FontData::from_owned(bytes)));
         Some("mono".to_owned())
@@ -505,7 +604,7 @@ pub fn install_style(ctx: &egui::Context) {
     v.faint_bg_color = P::surface();
     v.code_bg_color = P::code_bg();
     v.window_stroke = Stroke::new(1.0, P::border());
-    v.window_corner_radius = CornerRadius::same(CARD_RADIUS);
+    v.window_corner_radius = CornerRadius::same(card_radius());
     v.hyperlink_color = P::ink();
     v.warn_fg_color = P::warn();
     v.error_fg_color = P::text();
@@ -555,27 +654,45 @@ pub fn install_style(ctx: &egui::Context) {
     style.interaction.selectable_labels = false;
 
     // 留白整体放大一档，是「卡片变大、不再拥挤」的主要来源
-    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-    style.spacing.button_padding = egui::vec2(14.0, 9.0);
-    style.spacing.interact_size.y = 30.0;
-    style.spacing.indent = 22.0;
+    let m = metrics();
+    style.spacing.item_spacing = egui::vec2(m.item_spacing[0], m.item_spacing[1]);
+    style.spacing.button_padding = egui::vec2(m.button_padding[0], m.button_padding[1]);
+    style.spacing.interact_size.y = m.interact_height;
+    style.spacing.indent = m.indent;
     style.spacing.scroll = egui::style::ScrollStyle::thin();
     style.spacing.scroll.bar_width = 8.0;
     style.spacing.scroll.bar_inner_margin = 3.0;
     style.spacing.scroll.bar_outer_margin = 4.0;
     style.spacing.scroll.floating = true;
 
-    style.text_styles.insert(TextStyle::Body, body_font(BODY));
-    style.text_styles.insert(TextStyle::Button, body_font(15.0));
-    style.text_styles.insert(TextStyle::Small, body_font(13.0));
-    style.text_styles.insert(TextStyle::Monospace, mono_font(14.5));
-    style.text_styles.insert(TextStyle::Heading, bold_font(21.0));
+    style.text_styles.insert(TextStyle::Body, body_font(body_size()));
+    style.text_styles.insert(TextStyle::Button, body_font(button_size()));
+    style.text_styles.insert(TextStyle::Small, body_font(small_size()));
+    style.text_styles.insert(TextStyle::Monospace, mono_font(mono_size()));
+    style.text_styles.insert(TextStyle::Heading, bold_font(heading_size()));
 
     ctx.set_style(style);
 }
 
-/// 一次性装配。
-pub fn apply(ctx: &egui::Context) {
+/// 一次性装配：把配置里的外观覆盖叠到内置主题上。
+///
+/// **明暗的优先级**：上次手动切换的记录 > `[theme] mode` > 默认（墨）。
+/// 用户刚点过的那一下最算数；`[theme] mode` 只在「从没切过」时说了算。
+pub fn apply(ctx: &egui::Context, cfg: &ThemeConfig) {
+    set_mode(
+        read_pref()
+            .or_else(|| cfg.mode.as_deref().and_then(parse_mode))
+            .unwrap_or(Mode::Dark),
+    );
+
+    // 三份覆盖都只写一次，之后全程只读 —— 所以 `P::xx()` 取色仍是零开销。
+    let _ = ACTIVE.set((
+        merge_palette(&LIGHT, &cfg.light),
+        merge_palette(&DARK, &cfg.dark),
+    ));
+    let _ = METRICS.set(cfg.metrics.clone());
+    let _ = FONTS.set(cfg.fonts.clone());
+
     install_fonts(ctx);
     install_style(ctx);
     sync_native_theme(ctx);

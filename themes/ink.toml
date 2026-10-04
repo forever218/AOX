@@ -1,0 +1,37 @@
+# 墨 · ink
+#
+# 出厂墨（暗色）的**完整定义** —— 与内置配色逐字节相同，所以：
+#   aox-gui --theme themes/ink.toml
+# 看到的画面应与不指定 --theme 时**完全一样**（可以用来验证主题文件确实被读进去了）。
+#
+# 改任意几行即可微调；只写想改的字段也行（其余继承内置）。
+# 颜色写法："#RRGGBB" / "#RRGGBBAA" / "#RGB"，或数组 [r, g, b] / [r, g, b, a]。
+#
+# 本文件就是一份 `[theme]` 段，可以**整段粘进 config.toml**；
+# 反过来，把 config.toml 里的 [theme] 整段摘出来也能存成主题文件用。
+#
+# 注意明暗：下面 mode 的优先级**低于**你手动点过的那次切换
+# （记录在 <应用根>/.aox-gui-theme）；想让 mode 生效，先删掉那个文件。
+
+[theme]
+mode = "dark"
+
+[theme.dark]
+bg = "#141412"
+panel = "#191917"
+surface = "#20201D"
+surface_hi = "#2A2A26"
+border = "#33332E"
+border_strong = "#4C4C45"
+text = "#EAE7DF"
+text_dim = "#A39F96"
+text_faint = "#716E66"
+ink = "#ECE9E1"
+ink_soft = "#9A968D"
+user_bg = "#252521"
+code_bg = "#10100E"
+code_chip = "#393932"
+quote_bar = "#4C4C45"
+reverse_bg = "#ECE9E1"
+on_reverse = "#141412"
+shadow = "#00000060"

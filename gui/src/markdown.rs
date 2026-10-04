@@ -424,7 +424,7 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
             }
 
             Block::Para(text) => {
-                let job = job_of(&inline(&text), theme::BODY, base, width, false);
+                let job = job_of(&inline(&text), theme::body_size(), base, width, false);
                 wrap_label(ui, job);
                 ui.add_space(BLOCK_GAP);
             }
@@ -439,7 +439,7 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                         let m = marker.clone().unwrap_or_else(|| "•".to_string());
                         ui.label(RichText::new(m).color(P::ink()).size(17.5));
                     });
-                    let job = job_of(&inline(&text), theme::BODY, base, inner_w, false);
+                    let job = job_of(&inline(&text), theme::body_size(), base, inner_w, false);
                     wrap_label(ui, job);
                 });
                 ui.add_space(6.0);
@@ -452,7 +452,7 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                     ui.label(RichText::new("▎").color(P::quote_bar()).size(20.0));
                     ui.add_space(4.0);
                     let spans = inline(&text);
-                    let job = job_of(&spans, theme::BODY, P::text_dim(), inner_w, false);
+                    let job = job_of(&spans, theme::body_size(), P::text_dim(), inner_w, false);
                     wrap_label(ui, job);
                 });
                 ui.add_space(BLOCK_GAP);

@@ -1,0 +1,19 @@
+# prompt-core —— 系统提示词的分段拼装（core / protocol / env / rules）。
+#
+# 段本身与拼装逻辑在 src/prompt.rs；这里写出的都是**等于不写的空值**，
+# 只为让 `--dump-config` 把这个键的存在与来源显示出来。
+#
+# 想看当前实际拼出来的提示词：命令行输入 /prompt。
+
+[prompt]
+# 显式顺序：列出的段按此顺序排到最前，未列出的保持默认序跟在其后。
+# 空数组 = 完全按内置顺序 —— 与内置提示词**逐字节一致**。
+order = []
+# 禁用段（内置段可用 core / protocol / env / rules）。空数组 = 一段都不禁用。
+disable = []
+# 追加自定义段用 [[prompt.segment]]；id 与内置段同名时**整段替换**内置段。
+# 默认没有自定义段，这里就不写空的 segment 数组了，免得 dump 里多一行噪音。
+
+[agent]
+# 项目规则文件（RULES.md），存在则作为提示词的 rules 段注入。
+rules_file = "RULES.md"

@@ -70,6 +70,97 @@ impl HideConsole for std::process::Command {
     fn hide_console(&mut self) {}
 }
 
+/// 插件除工具之外还贡献什么（阶段 6 · 6b）。
+///
+/// 全部字段可缺省 —— 老插件的 `plugin.toml` 里根本没有 `[contributes]`，
+/// 反序列化出来就是「什么都不贡献」，行为与今天逐字节一致。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Contributes {
+    /// 要接哪几个钩子点。**只认 `hook::POINTS` 里那五个名字**（就是 trait 的方法名）；
+    /// 写错一个即**激活失败** —— 与 `[store] backend` / `[loop] impl` 同一条原则：
+    /// 写了却不生效是最难查的一类问题，宁可当场吵。
+    pub hooks: Vec<String>,
+    /// 要贡献的提示词段 id。**正文不写在这里** —— 激活时用 `prompt/segment` 取回，
+    /// 免得提示词内容在两处各存一份、改了清单忘了正文。
+    pub prompt_segments: Vec<String>,
+    /// 是否贡献主题补丁（激活时用 `theme/patch` 取回）。
+    ///
+    /// 本期只做「取回 + 校验 + 展示」，GUI 合并**推迟**：界面主题在建窗口**之前**
+    /// 就定型了（`gui/src/main.rs` 的 `load_theme` 跑在主线程，而插件加载在后台线程），
+    /// 组件补丁天然晚于主题。协议先立好，省得将来再改一遍 RPC。
+    pub theme: bool,
+    /// 能力申请。非空时，**本插件的工具调用一律走 `Ask`**（见 `auth::Policy::level_for`）：
+    /// 声明了要什么能力就得由人点一次头，不许静默搭 `[auth] plugin_tools` 的便车。
+    pub caps: Vec<String>,
+}
+
+impl Contributes {
+    /// 什么都没贡献 —— 用来判断「这个插件是不是只剩工具」。
+    pub fn is_empty(&self) -> bool {
+        self.hooks.is_empty()
+            && self.prompt_segments.is_empty()
+            && !self.theme
+            && self.caps.is_empty()
+    }
+
+    /// 生效值 = 清单 ← `initialize` 覆盖（**后写者胜**，与阶段 5 的层栈同一个思路）。
+    ///
+    /// 为什么不只认一处：清单是**离线声明**（宿主不启动插件也看得见，模型照着它写），
+    /// `initialize` 是**进程实况**（插件自己知道得更准，比如它按环境变量决定接哪些点）。
+    /// 两处都有时以进程为准；只写清单的老插件照旧可用。
+    pub fn overridden_by(self, live: Option<Self>) -> Self {
+        let Some(live) = live else { return self };
+        Self {
+            hooks: if live.hooks.is_empty() { self.hooks } else { live.hooks },
+            prompt_segments: if live.prompt_segments.is_empty() {
+                self.prompt_segments
+            } else {
+                live.prompt_segments
+            },
+            theme: live.theme || self.theme,
+            caps: if live.caps.is_empty() { self.caps } else { live.caps },
+        }
+    }
+
+    /// 校验并规范化：去空白、丢空项、去重；钩子点再按 [`crate::hook::POINTS`] 的固定顺序排。
+    ///
+    /// 认不出的钩子点直接报错（见字段文档）。排序也是为了让「钩子按什么顺序跑」
+    /// 只取决于声明内容、不取决于书写顺序 —— 同一份清单每次给出同一个执行序。
+    pub fn normalize(mut self) -> Result<Self> {
+        let mut hooks: Vec<String> = Vec::new();
+        for p in self.hooks.drain(..) {
+            let p = p.trim().to_string();
+            if p.is_empty() {
+                continue;
+            }
+            if !crate::hook::POINTS.contains(&p.as_str()) {
+                bail!(
+                    "[contributes] hooks 里有认不出的钩子点: {p}（可用的五个: {}）",
+                    crate::hook::POINTS.join(" / ")
+                );
+            }
+            if !hooks.contains(&p) {
+                hooks.push(p);
+            }
+        }
+        hooks.sort_by_key(|p| {
+            crate::hook::POINTS.iter().position(|x| x == p).unwrap_or(usize::MAX)
+        });
+        self.hooks = hooks;
+
+        let mut segs: Vec<String> = Vec::new();
+        for s in self.prompt_segments.drain(..) {
+            let s = s.trim().to_string();
+            if !s.is_empty() && !segs.contains(&s) {
+                segs.push(s);
+            }
+        }
+        self.prompt_segments = segs;
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub name: String,
@@ -77,6 +168,12 @@ pub struct PluginManifest {
     pub description: String,
     /// 脚本插件为入口文件名（main.py）；rust 插件为编译产物文件名
     pub entry: String,
+    /// 除工具之外还贡献什么（阶段 6 · 6b）。缺省 = 只提供工具，与今天一致。
+    ///
+    /// `skip_serializing_if`：`save()` 时不给「什么都没贡献」的插件写一个空的
+    /// `[contributes]` 段 —— 老插件重新落盘后仍与旧格式一致。
+    #[serde(default, skip_serializing_if = "Contributes::is_empty")]
+    pub contributes: Contributes,
 }
 
 impl PluginManifest {
@@ -130,6 +227,16 @@ pub struct PluginHandle {
     pub language: String,
     pub description: String,
     pub tool_defs: Vec<ToolDef>,
+    /// 生效的组件声明（`plugin.toml [contributes]` ← `initialize` 覆盖后的结果）。
+    pub contributes: Contributes,
+    /// 激活时取回并校验过的主题补丁（与 `config.toml [theme]` 同形状）。
+    /// 本期**只存与展示**，GUI 合并推迟（见 [`Contributes::theme`]）。
+    pub theme_patch: Option<Box<crate::config::ThemeConfig>>,
+    /// 钩子 RPC 的失败账 —— 与 [`crate::hook::ComponentHook`] **共享同一对 Arc**：
+    /// 钩子那边只读（展示），这里只写（记账）。钩子不允许抛错（抛了会击穿主循环），
+    /// 所以失败只能这样留痕 —— 静默降级，但不静默消失。
+    pub hook_failures: Arc<std::sync::atomic::AtomicU64>,
+    pub hook_last_error: Arc<std::sync::Mutex<Option<String>>>,
     cfg: RuntimesConfig,
     /// 应用根目录：插件进程的工作目录。插件内相对路径因此与宿主视图一致。
     root: PathBuf,
@@ -312,6 +419,10 @@ async fn spawn_and_init(
         language: manifest.language.clone(),
         description: manifest.description.clone(),
         tool_defs: vec![],
+        contributes: Contributes::default(),
+        theme_patch: None,
+        hook_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        hook_last_error: Arc::new(std::sync::Mutex::new(None)),
         cfg: cfg.clone(),
         root: root.to_path_buf(),
         dir: dir.to_path_buf(),
@@ -324,12 +435,18 @@ async fn spawn_and_init(
         .await
         .map_err(|_| anyhow!("插件 {} initialize 握手超时（{} 秒）", manifest.name, INIT_TIMEOUT.as_secs()))??;
 
-    let tools = result
-        .get("tools")
-        .and_then(|t| t.as_array())
-        .ok_or_else(|| anyhow!("插件 {} initialize 返回缺少 tools 数组", manifest.name))?;
+    // ---- 工具（**老形状一个字段都没动**）----
+    // `tools` 缺席按空处理：只贡献钩子/提示词段、不提供工具的组件，本来就没必要
+    // 造一个空数组。它要是数组但不是数组（类型写错），仍然当场报错。
+    let tools: Vec<Value> = match result.get("tools") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .cloned()
+            .ok_or_else(|| anyhow!("插件 {} initialize 的 tools 不是数组", manifest.name))?,
+    };
     let mut defs = vec![];
-    for t in tools {
+    for t in &tools {
         let name = t
             .get("name")
             .and_then(|n| n.as_str())
@@ -339,16 +456,91 @@ async fn spawn_and_init(
         let parameters = t.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object"}));
         defs.push(ToolDef { name, description, parameters });
     }
-    if defs.is_empty() {
-        bail!("插件 {} 未声明任何工具", manifest.name);
+
+    // ---- 贡献声明：清单 ← `initialize` 覆盖（阶段 6 · 6b）----
+    // 不返回 `contributes` 就是老形状，照旧只用清单（多数插件那份是空的）。
+    let live = match result.get("contributes") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            serde_json::from_value::<Contributes>(v.clone())
+                .with_context(|| format!("插件 {} 的 initialize.contributes 解析失败", manifest.name))?,
+        ),
+    };
+    let contributes = manifest
+        .contributes
+        .clone()
+        .overridden_by(live)
+        .normalize()
+        .with_context(|| format!("插件 {} 的贡献声明有问题", manifest.name))?;
+
+    // **阶段 6 · 6b 放宽的那一处**：以前「未声明任何工具」直接判失败，于是
+    // 「只贡献钩子、不提供工具」的组件根本没有活路。现在改成取并集 ——
+    // 工具与贡献**至少得有一样**；两样都没有才是真的配置错误（它什么都不做）。
+    if defs.is_empty() && contributes.is_empty() {
+        bail!(
+            "插件 {} 既没声明工具，也没在 [contributes] 里声明任何贡献 —— 它什么都不会做",
+            manifest.name
+        );
     }
 
-    Ok(PluginHandle { tool_defs: defs, ..handle })
+    Ok(PluginHandle { tool_defs: defs, contributes, ..handle })
 }
 
-/// 把插件提供的所有工具注册进 Runtime，并把句柄纳入管理。
+/// 组件贡献的提示词段默认排在**所有段之后**（内置 core=10 / protocol=20 /
+/// env=30 / rules=40，配置段缺省 50）。组件是「补一层」，不该插到项目规则前面去。
+const COMPONENT_SEGMENT_ORDER: i32 = 60;
+
+/// 组件贡献出问题时的提示。
+///
+/// 走 stderr 而不是 UI 事件：激活发生在**组装 Runtime 期间**（CLI 还没进 REPL、
+/// GUI 还没建窗口），此刻根本没有 ui 可以发。运行期出的事故另有
+/// [`crate::hook::ComponentHook`] 那本失败账兜底（`/hook` 里看得见）。
+fn component_warn(plugin: &str, why: impl std::fmt::Display) {
+    eprintln!("[组件] {plugin}: {why}");
+}
+
+/// 把插件提供的**工具与贡献**注册进 Runtime，并把句柄纳入管理。
+///
+/// 顺序：**先取贡献内容（要 RPC）→ 再注册工具 → 最后挂贡献**。
+///
+/// 两条错误处理的界线是刻意分开的：
+/// - **工具注册失败 = 整个插件装不上**（与今天一致，回滚已注册的）；
+/// - **贡献内容取不回来 = 只警告那一条**（降级）。一个提示词段取不回来，
+///   不该把插件已经能用的工具一起废掉。
 async fn activate(rt: &Arc<Runtime>, handle: PluginHandle) -> Result<Vec<String>> {
-    let handle = Arc::new(handle);
+    // ---- ① 取回需要 RPC 的贡献（提示词段正文 / 主题补丁）----
+    let mut seg_texts: Vec<(String, String)> = Vec::new();
+    for id in &handle.contributes.prompt_segments {
+        match handle.rpc("prompt/segment", json!({ "id": id })).await {
+            Ok(v) => {
+                let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                if text.trim().is_empty() {
+                    component_warn(&handle.name, format!("提示词段 {id} 的正文为空，跳过"));
+                } else {
+                    seg_texts.push((id.clone(), text));
+                }
+            }
+            Err(e) => component_warn(&handle.name, format!("取提示词段 {id} 失败: {e:#}")),
+        }
+    }
+
+    let mut theme_patch: Option<Box<crate::config::ThemeConfig>> = None;
+    if handle.contributes.theme {
+        match handle.rpc("theme/patch", Value::Null).await {
+            Ok(v) => match serde_json::from_value::<crate::config::ThemeConfig>(v) {
+                Ok(t) => theme_patch = Some(Box::new(t)),
+                Err(e) => component_warn(
+                    &handle.name,
+                    format!("主题补丁不是 [theme] 那个形状，已忽略: {e}"),
+                ),
+            },
+            Err(e) => component_warn(&handle.name, format!("取主题补丁失败: {e:#}")),
+        }
+    }
+
+    let handle = Arc::new(PluginHandle { theme_patch, ..handle });
+
+    // ---- ② 工具：注册失败即整体回滚（与今天一致）----
     let mut registered: Vec<String> = vec![];
     for def in &handle.tool_defs {
         let tool = Arc::new(PluginTool { handle: handle.clone(), def: def.clone() });
@@ -361,6 +553,32 @@ async fn activate(rt: &Arc<Runtime>, handle: PluginHandle) -> Result<Vec<String>
         }
         registered.push(def.name.clone());
     }
+
+    // ---- ③ 贡献：钩子（纯本地注册，不发 RPC）----
+    // 失败账与句柄**共享同一对 Arc**，所以 `/hook` 报告读到的就是这里记下的。
+    if !handle.contributes.hooks.is_empty() {
+        rt.add_hook(Arc::new(crate::hook::ComponentHook::new(
+            handle.name.clone(),
+            handle.contributes.hooks.clone(),
+            handle.contributes.caps.clone(),
+            handle.hook_failures.clone(),
+            handle.hook_last_error.clone(),
+        )));
+    }
+
+    // ---- ④ 贡献：提示词段（正文在 ① 已取回，这里只入注册表）----
+    for (id, body) in seg_texts {
+        rt.add_prompt_segment(crate::prompt::PromptSegment {
+            // 段 id 加插件名前缀：段 id 是全局唯一的，两个组件各写一个 `extra_rules`
+            // 不该互相顶掉（那正是「后注册者胜」会干的事）。
+            id: format!("{}:{id}", handle.name),
+            title: format!("{id}（{}）", handle.name),
+            body,
+            order: COMPONENT_SEGMENT_ORDER,
+            source: crate::prompt::Source::Plugin,
+        });
+    }
+
     rt.plugins.lock().await.insert(handle.name.clone(), handle);
     Ok(registered)
 }
@@ -445,6 +663,9 @@ async fn create_plugin_inner(
         language: language.to_string(),
         description: description.to_string(),
         entry,
+        // `create_plugin` 造出来的插件默认只提供工具；要声明贡献，模型随后改
+        // `plugin.toml`（或直接让 `initialize` 返回 `contributes`）——两条路都认。
+        contributes: Contributes::default(),
     };
     manifest.save(dir)?;
 
@@ -528,24 +749,81 @@ pub const PROTOCOL_DOC: &str = r#"# 插件协议（宿主 <-> 插件子进程）
 
 每条消息是 stdout/stdin 上的「一行 JSON」。stdout 只允许协议消息，日志一律写 stderr。
 
-1. 启动后宿主发送:
+## 1. 握手
+
+宿主发送:
    {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-   插件回复一行:
-   {"jsonrpc":"2.0","id":1,"result":{"name":"<插件名>","tools":[{"name":"<工具名>","description":"<说明>","parameters":<JSON Schema>}]}}
+插件回复一行:
+   {"jsonrpc":"2.0","id":1,"result":{
+      "name":"<插件名>",
+      "tools":[{"name":"<工具名>","description":"<说明>","parameters":<JSON Schema>}],
+      "contributes":{ ... }          // 可选，见 §4
+   }}
 
-2. 工具调用:
-   {"jsonrpc":"2.0","id":N,"method":"tools/call","params":{"name":"<工具名>","arguments":{...}}}
-   插件回复:
-   {"jsonrpc":"2.0","id":N,"result":{"content":"<字符串结果>","is_error":false}}
+`tools` 可以省略（只贡献、不提供工具的组件就没必要写它）。
+`contributes` 省略即老形状 —— 只提供工具的插件一个字段都不用改。
 
-3. 结束: 宿主发送 {"jsonrpc":"2.0","method":"shutdown"}（无 id），插件应退出。
+## 2. 工具调用
+
+宿主: {"jsonrpc":"2.0","id":N,"method":"tools/call","params":{"name":"<工具名>","arguments":{...}}}
+插件: {"jsonrpc":"2.0","id":N,"result":{"content":"<字符串结果>","is_error":false}}
+
+## 3. 结束
+
+宿主发送 {"jsonrpc":"2.0","method":"shutdown"}（无 id），插件应退出。
+
+## 4. 组件贡献（可选，阶段 6 · 6b）
+
+在 plugin.toml 里声明：
+
+    [contributes]
+    hooks = ["before_tool", "on_error"]   # 只认下面五个名字，写错即激活失败
+    prompt_segments = ["extra_rules"]     # 段 id；正文用 prompt/segment 取回
+    theme = true                          # 是否贡献主题补丁
+    caps = ["fs_write"]                   # 能力申请：本插件的工具调用一律走「询问」
+
+也可以改由上面 initialize 的 `contributes` 返回 —— **两处都有时以 initialize 为准**
+（清单是离线声明，进程实况更准）。
+
+**钩子实现不许报错**：宿主把超时（10 秒）、通信失败、以及认不出的返回值一律当作
+「放行」，并把失败记在账上（`/hook` 里看得到）。所以钩子只管返回想表达的意思，
+不必自己兜底 —— 但**也不要**拿它做耗时的事，它挡着主循环。
+
+### 4.1 钩子
+
+宿主: {"jsonrpc":"2.0","id":N,"method":"hooks/<点>","params":{...}}
+插件: {"jsonrpc":"2.0","id":N,"result":{...}}
+
+点               params                              result
+before_request   {"tools":[...]}                     {"verdict":"pass"|"reject","reason":"…","inject":["补充文本"]}
+after_reply      {"text":…,"tool_calls":<条数>}       {"verdict":…,"text":"改写后的正文"}
+before_tool      {"tool":"名字","args":{...}}         {"verdict":…,"args":{改后的参数}}
+after_tool       {"tool":…,"content":…,"is_error":…}  {"verdict":…,"content":…,"is_error":…}
+on_error         {"error":"…"}                        {"action":"propagate"|"retry","note":"给模型的提示"}
+
+`inject` 只接受**用户文本**（字符串数组）—— 钩子这一层只开放「追加」，
+不给「改写历史」的能力（那是 `[loop] max_rounds` 的事）。
+`after_reply` 只能改正文，不能改 `tool_calls`（改了等于伪造模型意图）。
+
+### 4.2 提示词段
+
+宿主: {"jsonrpc":"2.0","id":N,"method":"prompt/segment","params":{"id":"extra_rules"}}
+插件: {"jsonrpc":"2.0","id":N,"result":{"text":"这一段的正文"}}
+
+### 4.3 主题补丁
+
+宿主: {"jsonrpc":"2.0","id":N,"method":"theme/patch","params":null}
+插件: {"jsonrpc":"2.0","id":N,"result":{ ...与 config.toml 的 [theme] 同一形状... }}
+
+本期宿主只**取回并校验**主题补丁（GUI 合并尚未接线，见 `plugin/mod.rs` 的注释）。
 
 Python 插件推荐直接使用同目录下的 plugin_sdk.py。
 "#;
 
 pub const PYTHON_SDK: &str = r#""""
 AOX - Python 插件 SDK
-用法:
+
+最小插件（只提供工具）:
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sdk"))
     from plugin_sdk import serve
@@ -554,11 +832,32 @@ AOX - Python 插件 SDK
         return "结果字符串"
 
     serve("插件名", {
-        "my_tool": ("工具说明", {"type": "object", "properties": {...}}, my_tool),
+        "my_tool": ("工具说明", {"type": "object", "properties": {}}, my_tool),
     })
+
+组件（除工具之外还贡献钩子 / 提示词段 / 主题）:
+    def before_tool(params):
+        # params = {"tool": "工具名", "args": {...}}
+        return {"verdict": "pass", "args": params["args"]}
+
+    serve(
+        "插件名",
+        {},
+        contributes={"hooks": ["before_tool"], "prompt_segments": ["note"], "caps": ["fs_write"]},
+        hooks={"before_tool": before_tool},
+        prompt_segments={"note": "写文件之前先想清楚要写什么。"},
+    )
+
+工具或钩子里抛异常都不会连累宿主：工具异常变成 is_error 结果，
+钩子异常写进 stderr 并按「放行」返回。
 """
 import sys
 import json
+
+
+def _resolve(value):
+    # 允许「值」和「无参函数」两种写法（后者用于每次现算的场景）
+    return value() if callable(value) else value
 
 
 def _send(msg):
@@ -566,9 +865,19 @@ def _send(msg):
     sys.stdout.flush()
 
 
-def serve(plugin_name, tools):
-    """tools: {tool_name: (description, parameters_schema, handler)}。
-    handler 接收 dict 参数，返回值会 str() 后作为 content。"""
+def serve(plugin_name, tools, contributes=None, hooks=None, prompt_segments=None, theme=None):
+    """起服务。参数都可缺省，只写用得上的那些。
+
+    tools:           {工具名: (说明, JSON Schema, handler)}，handler(dict) -> 结果字符串
+    contributes:     贡献声明 dict（hooks / prompt_segments / theme / caps），
+                     等价于写在 plugin.toml 的 [contributes] 里（两处都有时以此为准）
+    hooks:           {点名字: fn(params) -> dict}，点名字见 PROTOCOL.md 的五个
+    prompt_segments: {段 id: 正文}，正文也可以是 fn() -> 正文
+    theme:           主题补丁 dict，也可以是 fn() -> dict
+    """
+    tools = tools or {}
+    hooks = hooks or {}
+    prompt_segments = prompt_segments or {}
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -579,16 +888,19 @@ def serve(plugin_name, tools):
             continue
         mid = req.get("id")
         method = req.get("method")
+        params = req.get("params") or {}
         if method == "initialize":
-            _send({"jsonrpc": "2.0", "id": mid, "result": {
+            result = {
                 "name": plugin_name,
                 "tools": [
                     {"name": n, "description": d, "parameters": s}
                     for n, (d, s, h) in tools.items()
                 ],
-            }})
+            }
+            if contributes:
+                result["contributes"] = contributes
+            _send({"jsonrpc": "2.0", "id": mid, "result": result})
         elif method == "tools/call":
-            params = req.get("params") or {}
             tname = params.get("name")
             args = params.get("arguments") or {}
             try:
@@ -600,6 +912,126 @@ def serve(plugin_name, tools):
             except Exception as e:
                 _send({"jsonrpc": "2.0", "id": mid,
                        "result": {"content": f"{type(e).__name__}: {e}", "is_error": True}})
+        elif method.startswith("hooks/"):
+            point = method[len("hooks/"):]
+            handler = hooks.get(point)
+            if handler is None:
+                # 没声明这个点：直接「放行」，宿主那边连失败账都不会记
+                _send({"jsonrpc": "2.0", "id": mid, "result": {}})
+            else:
+                try:
+                    _send({"jsonrpc": "2.0", "id": mid, "result": handler(params) or {}})
+                except Exception as e:
+                    # 钩子抛异常不连累宿主：写 stderr 留痕，按「放行」返回
+                    sys.stderr.write(f"[hook {point}] {type(e).__name__}: {e}\n")
+                    sys.stderr.flush()
+                    _send({"jsonrpc": "2.0", "id": mid, "result": {}})
+        elif method == "prompt/segment":
+            sid = params.get("id")
+            if sid in prompt_segments:
+                _send({"jsonrpc": "2.0", "id": mid,
+                       "result": {"text": str(_resolve(prompt_segments[sid]))}})
+            else:
+                _send({"jsonrpc": "2.0", "id": mid, "result": {"text": ""}})
+        elif method == "theme/patch":
+            _send({"jsonrpc": "2.0", "id": mid, "result": _resolve(theme) or {}})
         elif method == "shutdown":
             break
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 老清单（没有 `[contributes]`）必须原样能解析 —— 向后兼容是这一阶段的硬指标。
+    #[test]
+    fn old_manifest_without_contributes_still_parses() {
+        let m: PluginManifest = toml::from_str(
+            "name = \"fs\"\nlanguage = \"python\"\ndescription = \"文件读写\"\nentry = \"main.py\"\n",
+        )
+        .unwrap();
+        assert!(m.contributes.is_empty(), "老清单不该凭空长出贡献");
+    }
+
+    /// 新清单能解析出四类声明。
+    #[test]
+    fn manifest_parses_the_contributes_section() {
+        let m: PluginManifest = toml::from_str(
+            "name = \"comp\"\nlanguage = \"python\"\ndescription = \"组件\"\nentry = \"main.py\"\n\n\
+             [contributes]\n\
+             hooks = [\"before_tool\", \"on_error\"]\n\
+             prompt_segments = [\"note\"]\n\
+             theme = true\n\
+             caps = [\"fs_write\"]\n",
+        )
+        .unwrap();
+        assert_eq!(m.contributes.hooks, vec!["before_tool", "on_error"]);
+        assert_eq!(m.contributes.prompt_segments, vec!["note"]);
+        assert!(m.contributes.theme);
+        assert_eq!(m.contributes.caps, vec!["fs_write"]);
+        assert!(!m.contributes.is_empty());
+    }
+
+    /// 空的贡献段不该被**写出来** —— 老插件重新落盘后格式仍与旧版一致。
+    #[test]
+    fn save_omits_an_empty_contributes_section() {
+        let dir = std::env::temp_dir().join("aox-manifest-save-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = PluginManifest {
+            name: "fs".into(),
+            language: "python".into(),
+            description: "d".into(),
+            entry: "main.py".into(),
+            contributes: Contributes::default(),
+        };
+        m.save(&dir).unwrap();
+        let text = std::fs::read_to_string(dir.join("plugin.toml")).unwrap();
+        assert!(!text.contains("contributes"), "空的贡献段不该被写出来: {text}");
+        let _ = std::fs::remove_file(dir.join("plugin.toml"));
+    }
+
+    /// 认不出的钩子点名 = **激活失败**，且错误里要同时给出「是哪个」和「可用哪些」。
+    #[test]
+    fn normalize_rejects_an_unknown_hook_point() {
+        let c = Contributes {
+            hooks: vec!["before_tool".into(), "before_evrything".into()],
+            ..Default::default()
+        };
+        let e = c.normalize().unwrap_err().to_string();
+        assert!(e.contains("before_evrything"), "错误里要点名是哪个: {e}");
+        assert!(e.contains("before_request"), "错误里要列出可用的五个: {e}");
+    }
+
+    /// 规范化：去空白、丢空项、去重；钩子点顺序固定按 `POINTS`，与书写顺序无关。
+    #[test]
+    fn normalize_dedups_and_fixes_the_order() {
+        let c = Contributes {
+            hooks: vec![" on_error ".into(), "before_tool".into(), "on_error".into(), "  ".into()],
+            prompt_segments: vec![" note ".into(), "note".into(), "".into()],
+            ..Default::default()
+        };
+        let c = c.normalize().unwrap();
+        assert_eq!(c.hooks, vec!["before_tool", "on_error"], "按 POINTS 的固定顺序");
+        assert_eq!(c.prompt_segments, vec!["note"]);
+    }
+
+    /// `initialize` 覆盖清单（**后写者胜**），但「清单有、initialize 没提」的字段留给清单。
+    #[test]
+    fn initialize_contributes_wins_over_the_manifest() {
+        let manifest = Contributes {
+            hooks: vec!["before_tool".into()],
+            caps: vec!["fs_read".into()],
+            ..Default::default()
+        };
+
+        // initialize 什么都没说 → 完全用清单
+        assert_eq!(manifest.clone().overridden_by(None).hooks, vec!["before_tool"]);
+
+        // initialize 说了 → 它说的字段以它为准，其余保留清单
+        let live = Contributes { hooks: vec!["on_error".into()], theme: true, ..Default::default() };
+        let eff = manifest.overridden_by(Some(live));
+        assert_eq!(eff.hooks, vec!["on_error"], "进程实况覆盖清单");
+        assert!(eff.theme, "清单没提 theme，取 initialize 的");
+        assert_eq!(eff.caps, vec!["fs_read"], "initialize 没提 caps，保留清单的");
+    }
+}

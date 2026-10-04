@@ -2014,7 +2014,7 @@ fn detail(ui: &mut Ui, st: &mut Activity, h: f32) {
     let inner_h = (h - 34.0).max(80.0);
     Frame::NONE
         .fill(P::surface())
-        .corner_radius(CornerRadius::same(theme::CARD_RADIUS))
+        .corner_radius(CornerRadius::same(theme::card_radius()))
         .stroke(Stroke::new(1.0, P::border()))
         .inner_margin(Margin::symmetric(20, 16))
         .show(ui, |ui| {

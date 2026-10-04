@@ -27,7 +27,7 @@ EnumWindows = user32.EnumWindows
 EnumWindowsProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
 
-def find_window(title_substr: str):
+def find_window(title_substr: str, exact: bool = False):
     found = []
 
     def cb(hwnd, _):
@@ -38,7 +38,8 @@ def find_window(title_substr: str):
             return True
         buf = ctypes.create_unicode_buffer(n + 1)
         user32.GetWindowTextW(hwnd, buf, n + 1)
-        if title_substr.lower() in buf.value.lower():
+        hit = (buf.value == title_substr) if exact else (title_substr.lower() in buf.value.lower())
+        if hit:
             found.append((hwnd, buf.value))
             return False
         return True
@@ -51,6 +52,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="gui/_shot.png")
     ap.add_argument("--title", default="AOX")
+    ap.add_argument(
+        "--exact",
+        action="store_true",
+        help="标题必须完全相等（默认子串匹配）。界面上同时开着「AOX」与「AOX 活动流」"
+        "两个窗口，子串匹配很容易抓到活动流那个 —— 截主窗口时加这个开关。",
+    )
     ap.add_argument("--w", type=int, default=0, help="物理像素宽，0=保持原尺寸")
     ap.add_argument("--h", type=int, default=0)
     ap.add_argument("--wait", type=float, default=25.0)
@@ -59,7 +66,7 @@ def main() -> int:
     deadline = time.time() + a.wait
     win = []
     while time.time() < deadline:
-        win = find_window(a.title)
+        win = find_window(a.title, a.exact)
         if win:
             break
         time.sleep(0.3)

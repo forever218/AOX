@@ -110,6 +110,14 @@ pub fn ensure_writable_root(root: PathBuf) -> PathBuf {
     }
 }
 
+/// 只解析「可写的应用根」，不做插件迁移。
+///
+/// 插件迁移是 `resolve_workspace` 的副作用；只想问「根目录在哪」的调用方（例如
+/// GUI 主线程要先读 `config.toml` 的 `[theme]`）用这个，避免与后台线程重复触发迁移。
+pub fn app_root() -> PathBuf {
+    ensure_writable_root(resolve_app_root(exe_dir().as_deref()))
+}
+
 /// 一步到位：解析出可写的应用根 + 插件目录（可被 --plugins 覆盖）。
 pub fn resolve_workspace() -> (PathBuf, PathBuf) {
     let exe = exe_dir();
@@ -121,7 +129,31 @@ pub fn resolve_workspace() -> (PathBuf, PathBuf) {
     (root, plugins)
 }
 
+/// 解析配置文件路径：`--config <path>` 优先，否则应用根下的 `config.toml`。
+///
+/// CLI、GUI 主线程、GUI 后台驱动线程读的是同一份 —— 规则收在这里，免得散成三份拷贝。
+pub fn resolve_config_path(args: &[String]) -> PathBuf {
+    match arg_value(args, "--config") {
+        Some(p) => PathBuf::from(p),
+        None => app_root().join("config.toml"),
+    }
+}
+
 /// 在命令行参数里取 `--flag <value>` 形式的取值。
 pub fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+/// 解析组合清单路径：`--manifest <path>` 的**显式**覆盖，没给则返回 `None`。
+///
+/// `None` 不等于「文件不存在」—— 前者的意思是「没指定，去应用根下找默认的 `aox.toml`」，
+/// 后者由 `config::layer` 自己判断（默认位置没有就退化成「只有 config.toml 一层」）。
+/// 但显式指定了却不存在，是**报错**：写了 `--manifest` 却没生效，比没有清单更让人困惑。
+pub fn resolve_manifest_path(args: &[String]) -> Option<PathBuf> {
+    arg_value(args, "--manifest").map(PathBuf::from)
+}
+
+/// 解析 `--profile <名>`：临时换一个 profile，不改 `aox.toml`。
+pub fn resolve_profile(args: &[String]) -> Option<String> {
+    arg_value(args, "--profile")
 }

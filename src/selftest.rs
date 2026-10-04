@@ -28,7 +28,7 @@ serve("selftest", {
 pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
     println!("[selftest] 初始化运行时…");
     plugin::ensure_sdk(&plugins_dir)?;
-    let rt = Runtime::new(Config::dummy(), root, plugins_dir);
+    let rt = Runtime::new(Config::dummy(), root, plugins_dir)?;
     for t in meta::meta_tools() {
         rt.register(t).await?;
     }
