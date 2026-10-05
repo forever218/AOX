@@ -45,6 +45,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+use crate::attach;
 use crate::history::{
     unix_now, Loaded, Meta, Summary, UsageRecord, DEFAULT_LIST_LIMIT, HOST_PREFIX,
 };
@@ -235,6 +236,12 @@ fn meta_line(meta: &Meta) -> Value {
 fn message_line(msg: &Message, is_error: Option<bool>) -> Value {
     let mut v = serde_json::to_value(msg).unwrap_or_else(|_| json!({}));
     if let Value::Object(m) = &mut v {
+        // 附件的**载荷（base64）不入档** —— 一张截图就是几 MB，而这是逐条追加的对话
+        // 记录。留下的正文与附件清单照旧，所以「当时发了什么」仍然查得出来。
+        // 完整理由见 `attach::strip_payloads`。
+        if let Some(slim) = m.get("content").and_then(attach::strip_payloads) {
+            m.insert("content".into(), slim);
+        }
         m.insert("kind".into(), json!("message"));
         if let Some(e) = is_error {
             m.insert("is_error".into(), json!(e));
@@ -854,6 +861,39 @@ mod tests {
         }
     }
 
+    /// 带附件的消息落盘时**载荷（base64）必须被摘掉**，但正文与附件清单要留着。
+    ///
+    /// 这条是「对话文件不被一张截图撑胖几 MB」的唯一保险 —— 而它很容易在将来某次
+    /// 「统一走 Message 序列化」的重构里被悄悄取消，所以钉在**文件的实际内容**上，
+    /// 不是钉在内存里的消息上。
+    #[test]
+    fn attachment_payloads_are_not_persisted() {
+        let d = Tmp::new("attach-slim");
+        let s = d.store();
+        let mut log = s.create(Some("deepseek-flash")).unwrap();
+        let id = log.id().to_string();
+
+        let png = d.dir.join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
+        let a = crate::attach::Attachment::probe(&png).unwrap();
+        log.append(&Message::user_with_files("看这张", &[a]).unwrap(), None);
+        drop(log);
+
+        // 直接看文件：一个字都不该有 base64
+        let raw = std::fs::read_to_string(d.dir.join(format!("{id}.jsonl"))).unwrap();
+        assert!(!raw.contains("base64"), "载荷不该进对话文件：{}", &raw[..raw.len().min(400)]);
+        assert!(raw.contains("shot.png"), "附件清单要留着（历史里得看得出带了什么）");
+        assert!(raw.contains("看这张"), "正文当然要留着");
+
+        // 读回来仍然是一条**合法**的用户消息（图片块已整块丢掉，不留假 URL）
+        let items = s.load(&id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].msg.role, "user");
+        assert!(items[0].msg.flat_text().contains("看这张"), "{}", items[0].msg.flat_text());
+        let names = crate::attach::names_from_content(items[0].msg.content.as_ref().unwrap());
+        assert_eq!(names, vec!["shot.png".to_string()], "重开旧对话时要能把胶囊画回来");
+    }
+
     /// 写进去什么，读出来就应该是同样的消息、同样的顺序、同样的 is_error。
     /// 这条是整块功能的地基：文件里混了 `kind` / `is_error` 这些非 wire 字段，
     /// 读回 `Message` 时它们必须被忽略而不是让解析失败。
@@ -875,7 +915,7 @@ mod tests {
         let items = s.load(&id).unwrap();
         assert_eq!(items.len(), 6, "system 不入档，6 条消息应全部读到");
         assert_eq!(items[0].msg.role, "user");
-        assert_eq!(items[0].msg.content.as_deref(), Some("第一行\n第二行 \"引号\" 与中文"));
+        assert_eq!(items[0].msg.content.as_ref().and_then(|v| v.as_str()), Some("第一行\n第二行 \"引号\" 与中文"));
         assert_eq!(items[0].is_error, None);
         assert_eq!(items[1].msg.tool_calls.as_ref().unwrap()[0].function.name, "fs_ls");
         // reasoning_content 必须挺过往返：思考模型要求它原样回传
@@ -938,7 +978,7 @@ mod tests {
 
         let items = s.load(&id).unwrap();
         assert_eq!(items.len(), 1, "只剩「保留我」一条");
-        assert_eq!(items[0].msg.content.as_deref(), Some("保留我"));
+        assert_eq!(items[0].msg.content.as_ref().and_then(|v| v.as_str()), Some("保留我"));
         // meta 行必须还在，否则这个文件就认不出自己是谁了
         let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(raw.lines().count(), 2, "meta + 1 条消息");
@@ -995,7 +1035,7 @@ mod tests {
         std::fs::write(&path, raw).unwrap();
         let items = s.load(&id).unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].msg.content.as_deref(), Some("好行"));
+        assert_eq!(items[0].msg.content.as_ref().and_then(|v| v.as_str()), Some("好行"));
     }
 
     /// 活动流与消息共处一个文件，且互不干扰：
@@ -1080,7 +1120,7 @@ mod tests {
         assert_eq!(s.list(10).len(), 1, "不能多出第二个文件");
         let items = s.load(&id).unwrap();
         assert_eq!(items.len(), 2);
-        assert_eq!(items[1].msg.content.as_deref(), Some("第二句"));
+        assert_eq!(items[1].msg.content.as_ref().and_then(|v| v.as_str()), Some("第二句"));
     }
 
     /// 首行不是 meta（手改过 / 早期版本写的文件）也要能接上：`open` 退回用文件名

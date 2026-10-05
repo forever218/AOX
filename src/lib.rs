@@ -10,6 +10,7 @@
 
 pub mod agent;
 pub mod agent_loop;
+pub mod attach;
 pub mod auth;
 pub mod config;
 pub mod history;

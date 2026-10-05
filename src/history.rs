@@ -239,11 +239,29 @@ pub fn transcript_text(items: &[Loaded]) -> String {
         let m = &it.msg;
         match m.role.as_str() {
             "user" => {
-                let text = m.content.as_deref().unwrap_or("").trim();
+                // 用 `flat_text`：用户消息可能带附件，那时 `content` 是 parts 数组
+                //（正文 + 图片块），直接 `as_deref` 会一个字都显示不出来。
+                let text = m.flat_text();
+                let text = text.trim();
                 if text.starts_with(HOST_PREFIX) {
                     s.push_str(&format!("\n{} {}\n", style::dim("宿主:"), style::dim(text)));
                 } else {
                     s.push_str(&format!("\n{} {}\n", style::bold("你:"), text));
+                }
+                // 附件在 `.jsonl` 里只有一条路径引用（见 `attach` 模块），所以翻历史时
+                // 必须显式列出来 —— 否则一段带图对话回看起来与纯文字对话毫无区别，
+                // 而「当时到底发了什么」正是回看历史要回答的那个问题。
+                let files = m
+                    .content
+                    .as_ref()
+                    .map(crate::attach::names_from_content)
+                    .unwrap_or_default();
+                if !files.is_empty() {
+                    s.push_str(&format!(
+                        "  {} {}\n",
+                        style::dim("附件:"),
+                        style::dim(&files.join("、"))
+                    ));
                 }
             }
             "assistant" => {
@@ -266,7 +284,7 @@ pub fn transcript_text(items: &[Loaded]) -> String {
                 );
                 // 工具结果可能很长（写入前已被 max_result_chars 收过一道），
                 // 展示时再收一道，翻历史才不用在一条结果里滚屏。
-                let body = m.content.as_deref().unwrap_or("").replace('\n', " ⏎ ");
+                let body = m.flat_text().replace('\n', " ⏎ ");
                 s.push_str(&format!("  {} {} {}\n", mark, name, style::dim(&clamp_chars(body.trim(), 300))));
             }
             _ => {}

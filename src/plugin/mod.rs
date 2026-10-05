@@ -399,7 +399,23 @@ fn parse_tool_result(v: Value) -> crate::tool::ToolOutput {
         .map(|s| s.to_string())
         .unwrap_or_else(|| v.to_string());
     let is_error = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
-    crate::tool::ToolOutput { content, is_error }
+    // `"attach": ["<绝对路径>", …]` —— 插件**产出的文件**，宿主会挂给模型看。
+    //
+    // 这是「插件也能上传」的落点：插件是独立进程，调不到宿主的 `attach_file` 工具，
+    // 但它能在自己的返回值里**声明**产出的文件。宿主拿到的是一条路径，走的是与用户拖放
+    // 完全相同的判定（`Attachment::probe`）—— 所以「插件截图 → 模型真的看见那张图」成立，
+    // 而不是只把路径当字符串塞进上下文。协议形状见 `prompt::BUILTIN_PROMPT`。
+    let attach = v
+        .get("attach")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.as_str())
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    crate::tool::ToolOutput { content, is_error, attach }
 }
 
 fn spawn_command(

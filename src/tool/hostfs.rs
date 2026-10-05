@@ -3,7 +3,7 @@
 //! 为什么要宿主自己提供，而不是继续让模型写 `fs` 插件：
 //!
 //! 模型自己写的文件插件**只能在它自己的代码里自律**，宿主看不见它拿什么路径去干了什么。
-//! 而这三个（四个）工具的参数与实现都在宿主手里 —— 所以「路径必须先过工作区判定」
+//! 而这几个工具的参数与实现都在宿主手里 —— 所以「路径必须先过工作区判定」
 //! 这件事**无法被绕过**（除非模型不用它们、改自己造插件，那属于另一类风险，
 //! 见 `docs/SANDBOX.md` 的威胁模型）。
 //!
@@ -17,8 +17,8 @@
 //! 分野见 [`crate::workplace::Access`]）与同一份文案（[`crate::workplace::Reject`]），
 //! 所以不存在「两套规则」。
 //!
-//! **读不设限、写删受限**（2026-10-04 定的语义）：`read_file` / `list_dir` 只把路径
-//! 规格化就去开文件 —— 整个设备都能读；`write_file` / `remove` 才真正过工作区边界。
+//! **读不设限、写删受限**（2026-10-04 定的语义）：`read_file` / `list_dir` / `attach_file`
+//! 只把路径规格化就去开文件 —— 整个设备都能读；`write_file` / `remove` 才真正过工作区边界。
 
 use std::sync::Arc;
 
@@ -29,13 +29,14 @@ use super::{Tool, ToolKind, ToolOutput, HOST_FILE_TOOLS};
 use crate::runtime::Runtime;
 use crate::workplace::PATH_ARG;
 
-/// 四个宿主文件工具。
+/// 五个宿主文件工具。
 pub fn host_file_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadFileTool),
         Arc::new(WriteFileTool),
         Arc::new(ListDirTool),
         Arc::new(RemoveTool),
+        Arc::new(AttachFileTool),
     ]
 }
 
@@ -278,6 +279,73 @@ impl Tool for ListDirTool {
             out.push_str(&format!("  …另有 {} 项未列出（上限 {LIST_LIMIT}）\n", total - LIST_LIMIT));
         }
         ToolOutput::ok(out)
+    }
+}
+
+// ---------------------------------------------------------------- attach_file
+
+/// 把本机文件**挂给模型看** —— 图片会真的进入下一次请求，模型能看见内容。
+///
+/// 为什么需要它：`read_file` 只读文本（二进制直接拒），于是「截图 → 分析」这条路
+/// 只有路径可传，模型手里永远是一串字符。图片的合法落点只有 `user` 消息（端点在
+/// system / assistant 里见到图片直接 400），而工具结果走的是 `tool` 角色 ——
+/// 所以这道工具**不把图片塞进返回值**，只把路径报上去，由主循环另起一条 user 消息注入
+/// （见 `agent_loop` 的收尾一段、`crate::attach`）。
+///
+/// 访问意图是**只读**（见 `tool::host_tool_access`）：挂载只是把文件递出去，不落盘，
+/// 没有「写坏别处」的风险 —— 与 `read_file` 同一档，不受工作区限制。这也是刻意的：
+/// 插件把截图写在工作区里是常态，但用户想把桌面上的图递给模型也该成立。
+pub(crate) struct AttachFileTool;
+
+#[async_trait]
+impl Tool for AttachFileTool {
+    fn name(&self) -> &str {
+        HOST_FILE_TOOLS[4]
+    }
+    fn kind(&self) -> ToolKind {
+        ToolKind::Host
+    }
+    fn description(&self) -> &str {
+        "把一个本机文件挂给模型看（宿主提供）。图片（JPEG/PNG/GIF/WebP）会**真的发给模型**，\
+         模型能看见内容；其它格式也会照发，由端点决定收不收。\
+         截图 / 图表 / 扫描件这类要「看」的东西用它，不要用 read_file（那个只读文本）。"
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                PATH_ARG: {"type": "string", "description": "要挂上的文件路径（绝对路径；不受工作区限制）"}
+            },
+            "required": [PATH_ARG]
+        })
+    }
+
+    async fn call(&self, args: Value, rt: &Arc<Runtime>) -> ToolOutput {
+        let raw = match path_arg(&args) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        // 与 read_file 同一档：只读，只做路径规格化，不过工作区边界。
+        let path = guard_read(rt, raw);
+        match crate::attach::Attachment::probe(path.clone()) {
+            Ok(a) => {
+                let what = match a.kind {
+                    Some(k) => format!("图片（{}）", k.mime()),
+                    None => "文件（非图片，端点可能不支持这个格式）".to_string(),
+                };
+                // 结果里如实说明「挂上了什么、大概多大」：模型因此知道下一步该期待
+                // 「看得见一张图」还是「可能收到一句不支持的报错」。
+                ToolOutput::ok(format!(
+                    "已挂上{}：{}（{} 字节）。它的内容会在你的下一次请求里出现。",
+                    what,
+                    path.display(),
+                    a.size
+                ))
+                // 真正的载荷在这里交给主循环 —— **不塞进返回值**
+                .with_attach(vec![path])
+            }
+            Err(e) => ToolOutput::err(e),
+        }
     }
 }
 

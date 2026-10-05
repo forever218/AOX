@@ -1,5 +1,6 @@
 mod agent;
 mod agent_loop;
+mod attach;
 mod auth;
 mod config;
 mod history;
@@ -373,10 +374,22 @@ async fn main() -> Result<()> {
     }
 
     // ---- REPL
+    //
+    // `pending` 是**命令行版的待上传栏**：`/attach <路径>` 挂上，下一条消息带着一起发。
+    // 与 GUI 的拖放是同一条路（都走 `Attachment::probe`，再经 `Agent::run_turn` 的
+    // `files` 参数成型），所以两端对「什么能挂、什么会被拦」的判断完全一致 ——
+    // 这也是当初把判定收进 `src/attach.rs` 一份实现的原因。
+    let mut pending: Vec<PathBuf> = Vec::new();
     loop {
         let Some(line) = ui.read_user_input().await? else { break };
         let line = line.trim();
-        if line.is_empty() {
+        // 只有附件、没有文字也算一条消息（与 GUI 一致）
+        if line.is_empty() && pending.is_empty() {
+            continue;
+        }
+        if line == "/attach" || line.starts_with("/attach ") {
+            let rest = line["/attach".len()..].trim();
+            attach_command(&mut pending, rest, &mut ui);
             continue;
         }
         match line {
@@ -508,6 +521,10 @@ async fn main() -> Result<()> {
                         "历史对话；list 列表，show <序号> 看全文，open <序号> 接着聊，rm <序号> 删除",
                     ),
                     ("/new", "开一段新对话（当前这段已自动保存进历史）"),
+                    (
+                        "/attach",
+                        "把本机文件挂进待上传栏，随下一条消息一起发给模型；/attach clear 取下全部",
+                    ),
                     ("/demo", "预览终端排版与过程折叠效果"),
                     ("/expand", "展开上一次被折叠的工具调用过程"),
                     ("/usage", "回看上一次任务的 token 用量明细"),
@@ -551,7 +568,7 @@ async fn main() -> Result<()> {
                 }
                 // select! 分支内不能再访问被 turn 借用的 agent/ui，先收集结果再处理
                 let outcome = {
-                    let turn = agent.run_turn(&mut ui, line);
+                    let turn = agent.run_turn(&mut ui, line, &pending);
                     tokio::pin!(turn);
                     tokio::select! {
                         r = &mut turn => TurnOutcome::Done(r),
@@ -559,12 +576,20 @@ async fn main() -> Result<()> {
                     }
                 };
                 match outcome {
+                    // 发出去就取下（一次性）。中断时**留着** —— 那一轮被回滚了，
+                    // 这条消息等于没发过，把附件也一起吞掉只会让用户重新挂一遍。
+                    TurnOutcome::Done(_) => pending.clear(),
+                    TurnOutcome::Interrupted => {}
+                }
+                match outcome {
                     TurnOutcome::Done(Ok(())) => {}
                     TurnOutcome::Done(Err(e)) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
                     TurnOutcome::Interrupted => {
                         ui.abort_turn().await;
                         agent.truncate_messages(mark);
-                        ui.emit(AgentEvent::Warn("已中断当前任务（对话已回滚到任务前状态）".into()));
+                        ui.emit(AgentEvent::Warn(
+                            "已中断当前任务（对话已回滚到任务前状态；待上传栏里的附件仍在）".into(),
+                        ));
                     }
                 }
             }
@@ -577,4 +602,71 @@ async fn main() -> Result<()> {
         h.shutdown().await;
     }
     Ok(())
+}
+
+/// `/attach` —— 命令行版的待上传栏。
+///
+/// | 写法 | 含义 |
+/// |---|---|
+/// | `/attach` | 看现在挂着什么 |
+/// | `/attach clear` | 全部取下 |
+/// | `/attach <路径> [更多…]` | 挂上（下一条消息带着一起发） |
+///
+/// 判定与拦截都走 [`aox::attach`] 那一份实现（与 GUI 拖放同一个函数），所以命令行里
+/// 挂一个 40 MiB 的文件被拦下的理由，和界面上拖进去被拦下的理由**是同一句话**。
+fn attach_command(pending: &mut Vec<PathBuf>, rest: &str, ui: &mut CliUi) {
+    if rest.is_empty() {
+        if pending.is_empty() {
+            ui.emit(AgentEvent::Info(
+                "待上传栏是空的。用法：/attach <文件路径> [更多路径…]（带空格的路径请整体加引号）".into(),
+            ));
+            return;
+        }
+        let list =
+            pending.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n  ");
+        ui.emit(AgentEvent::Info(format!(
+            "待上传（{} 个）：\n  {list}\n下一条消息会带上它们。",
+            pending.len()
+        )));
+        return;
+    }
+    if rest == "clear" {
+        pending.clear();
+        ui.emit(AgentEvent::Info("待上传栏已清空。".into()));
+        return;
+    }
+    // 整串就是一个存在的路径时按**一个**文件算（否则带空格的路径会被拆坏）；
+    // 否则按空白拆（`/attach a.png b.pdf` 这种最常用的写法）。
+    let raw: Vec<String> = if std::path::Path::new(rest).exists() {
+        vec![rest.to_string()]
+    } else {
+        rest.split_whitespace().map(str::to_string).collect()
+    };
+    if raw.is_empty() {
+        ui.emit(AgentEvent::Warn("没给出路径。用法：/attach <文件路径>".into()));
+        return;
+    }
+    let mut added = 0usize;
+    let mut problems: Vec<String> = Vec::new();
+    for r in raw {
+        // 顺手去掉拖进终端时 Shell 自动加的那层引号
+        let r = r.trim_matches(|c| c == '"' || c == '\'').to_string();
+        let path = PathBuf::from(&r);
+        if pending.iter().any(|p| *p == path) {
+            continue;
+        }
+        match attach::Attachment::probe(path.clone()) {
+            Ok(_) => {
+                pending.push(path);
+                added += 1;
+            }
+            Err(e) => problems.push(e),
+        }
+    }
+    if added > 0 {
+        ui.emit(AgentEvent::Info(format!("已挂上 {added} 个文件（共 {} 个），随下一条消息发出。", pending.len())));
+    }
+    for p in problems {
+        ui.emit(AgentEvent::Warn(p));
+    }
 }

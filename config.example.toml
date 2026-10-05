@@ -9,16 +9,16 @@
 
 [provider]
 # OpenAI 兼容协议端点（DeepSeek / Kimi / OpenAI / vLLM / Ollama 均可）
-base_url = "https://api.deepseek.com/v1"
+base_url = "https://api.deepseek.com"
 model = "deepseek-chat"
-# 二选一：直接写 key，或指定环境变量名（推荐）
-# api_key = "sk-..."
-api_key_env = "DEEPSEEK_API_KEY"
+# 二选一：直接写 key，或指定环境变量名
+api_key = "sk-..."
+# api_key_env = "DEEPSEEK_API_KEY"
 # 单次回复的最大输出 token。
-# ⚠️ 思考模式模型（如 deepseek-flash / deepseek-reasoner）的「推理 token」也计入此额度，
-#    给太小会导致正文为空、表现成「任务莫名中断」，建议 ≥ 8192。
-#    注意各家服务端有上限（DeepSeek 为 393216），填超了会被直接 400 拒绝。
-max_tokens = 8192
+# ⚠️ 思考模式模型的「推理 token」也计入此额度，给太小会导致正文为空、
+#    表现成「任务莫名中断」。
+#    DeepSeek 服务端上限为 384K（393216），填超了会被直接 400 拒绝。
+max_tokens = 300000
 temperature = 0.3
 # 是否以 SSE 流式方式请求（默认 true）。
 # 开启后，思考模式模型的推理过程会在等待时实时滚动显示（响应结束即消失）。

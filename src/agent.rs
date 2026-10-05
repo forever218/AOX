@@ -1,8 +1,10 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use serde_json::Value;
 
+use crate::attach;
 use crate::auth::AuthLevel;
 use crate::history::UsageRecord;
 use crate::llm::{LlmProvider, Usage};
@@ -128,6 +130,34 @@ impl Agent {
                 )));
             }
             Err(_) => {}
+        }
+    }
+
+    /// 把一条用户输入（+ 附件路径）变成消息。
+    ///
+    /// 附件在这里、也**只在这里**成型：读盘、base64、组装 parts 全交给
+    /// [`Message::user_with_files`]。GUI 与 CLI 都只把路径递过来，谁也不自己拼 ——
+    /// 否则「内存里有、历史文件里没有」那种错位会从另一个入口回来。
+    ///
+    /// 附件出问题（读不到 / 超限 / 目录）时**不吞也不中断**：能挂的照挂，挂不上的
+    /// 把那句理由拼在正文末尾。这样「附件少了一个」是**对话里看得见**的一件事 ——
+    /// 只闪一个界面提示的话，模型与后翻历史的用户都不知道当时少了东西。
+    fn user_message(&self, input: &str, files: &[PathBuf]) -> Message {
+        if files.is_empty() {
+            return Message::user(input);
+        }
+        let (items, problems) = attach::probe_all(files);
+        let text = if problems.is_empty() {
+            input.to_string()
+        } else {
+            format!(
+                "{input}\n\n（宿主提示）以下附件没能附上：\n{}",
+                problems.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")
+            )
+        };
+        match Message::user_with_files(&text, &items) {
+            Ok(m) => m,
+            Err(e) => Message::user(format!("{text}\n\n（宿主提示）附件没能附上：{e}")),
         }
     }
 
@@ -272,7 +302,11 @@ impl Agent {
     /// **循环本身不在这里** —— 它由 `Runtime.loop_impl`（循环缝，见 `src/agent_loop.rs`）
     /// 提供；本方法只负责「开一轮、开账、把账收口」这三件事。换一个 `[loop] impl`
     /// 就是换一套执行模型，而记账与收尾仍然走同一条路。
-    pub async fn run_turn(&mut self, ui: &mut dyn Ui, input: &str) -> Result<()> {
+    ///
+    /// `files` 是这一条消息带的附件（本机路径）。**只附在这一条上**（一次性）：
+    /// 后续轮次模型要用就顺着消息里的路径引用自己读 —— 附件的字节留在上下文里，
+    /// 每一轮都要为它再付一次 token。
+    pub async fn run_turn(&mut self, ui: &mut dyn Ui, input: &str, files: &[PathBuf]) -> Result<()> {
         // 工作区：`default` 档位在**首条消息**时开一块新地（`started` 保证一段对话只开一次）。
         //
         // 放在整轮最前面（早于 `push_message` 与循环），是为了让**本轮任何工具调用之前**
@@ -294,7 +328,7 @@ impl Agent {
         // 首条消息这一趟把「本对话在哪块地干活」记进存档（`ensure_started` 刚定下根，
         // 所以这条记录里带的是那块地的真实路径）。之后只在切档时才再写。
         self.persist_workplace();
-        self.push_message(Message::user(input), None);
+        self.push_message(self.user_message(input, files), None);
         // 包住整轮：UI 借此显示等待动画，并在结束时把中间过程折叠成一行
         ui.turn_start().await;
         self.begin_turn();

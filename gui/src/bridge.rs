@@ -25,8 +25,12 @@ use aox::ui::{AgentEvent, AuthDecision, Ui};
 
 /// 主线程 → Agent 线程
 pub enum ToAgent {
-    /// 一条用户指令
-    Input(String),
+    /// 一条用户指令 + 这条指令带的附件（本机路径）。
+    ///
+    /// 附件只跟着**这一条**消息走（一次性）：后续轮次里模型如果还需要那份文件，
+    /// 顺着消息里的路径引用自己读（`read_file`）—— 把附件的字节留在上下文里，
+    /// 每一轮都要为它付一次 token。
+    Input(String, Vec<PathBuf>),
     /// 切换到某段历史对话（`id` 即文件名主干）。
     ///
     /// 切换是「就地换掉上下文」，所以必须回到 Agent 所在的线程做，
@@ -237,7 +241,18 @@ impl Ui for GuiUi {
     async fn read_user_input(&mut self) -> Result<Option<String>> {
         loop {
             match self.rx.recv().await {
-                Some(ToAgent::Input(s)) => return Ok(Some(s)),
+                Some(ToAgent::Input(s, files)) => {
+                    // GUI 真正取指令的是 `next_command`（见它的文档），这条 trait 实现只
+                    // 为满足签名而存在。真走到这里就**出声**——静默丢掉附件，等哪天这条路
+                    // 变活了会得到一个「图明明拖了却没发出去」的幽灵 bug。
+                    if !files.is_empty() {
+                        let _ = self.tx.send(FromAgent::Event(AgentEvent::Warn(format!(
+                            "内部错误：这条路径不支持附件，{} 个附件未随消息发出。",
+                            files.len()
+                        ))));
+                    }
+                    return Ok(Some(s));
+                }
                 Some(ToAgent::Shutdown) | None => return Ok(None),
                 Some(ToAgent::Resume(_))
                 | Some(ToAgent::NewConversation)
@@ -384,7 +399,7 @@ async fn idle_until_shutdown(
                     error: Some("模型未就绪，暂时无法切换对话".into()),
                 });
             }
-            ToAgent::Input(_) => {
+            ToAgent::Input(..) => {
                 let _ = tx.send(FromAgent::Event(AgentEvent::Warn(
                     "模型未就绪，这条指令没有发出。".into(),
                 )));
@@ -407,14 +422,17 @@ async fn idle_until_shutdown(
 /// 这里没有走 `Ui::read_user_input()`：那个方法只能吐回用户文本，而切换会话
 /// 必须**就地**改动 `agent`，只有这个线程拿得到它。通道还是同一条，
 /// 顺序自然也就和用户的操作顺序一致。
+///
+/// 返回值带上附件路径：附件要在**Agent 线程**里组进消息（`Message::user_with_files`），
+/// 界面侧不能自己拼 —— 否则「内存里有、历史文件里没有」那种错位就回来了。
 async fn next_command(
     ui: &mut GuiUi,
     agent: &mut Agent,
     tx: &mpsc::UnboundedSender<FromAgent>,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, Vec<PathBuf>)>> {
     loop {
         match ui.rx.recv().await {
-            Some(ToAgent::Input(s)) => return Ok(Some(s)),
+            Some(ToAgent::Input(s, files)) => return Ok(Some((s, files))),
             Some(ToAgent::Resume(id)) => {
                 // 按 id 让存储缝去开那次对话 —— 界面侧不拼路径（见 `src/store.rs`）。
                 let msg = match agent.resume(&id) {
@@ -622,9 +640,10 @@ async fn boot_and_run(
 
     // ---- 驱动循环：与 CLI 的 REPL 一一对应
     loop {
-        let Some(input) = next_command(&mut ui, &mut agent, &tx).await? else { break };
+        let Some((input, files)) = next_command(&mut ui, &mut agent, &tx).await? else { break };
         let line = input.trim().to_string();
-        if line.is_empty() {
+        // 只有附件、没有文字也是合法的一条消息（拖张图直接发送）
+        if line.is_empty() && files.is_empty() {
             continue;
         }
         // 本地命令：/runtime 由宿主自己处理，不发给模型（与 CLI 一致）
@@ -639,7 +658,7 @@ async fn boot_and_run(
             Aborted,
         }
         let outcome = {
-            let turn = agent.run_turn(&mut ui, &line);
+            let turn = agent.run_turn(&mut ui, &line, &files);
             tokio::pin!(turn);
             tokio::select! {
                 r = &mut turn => Outcome::Done(r),

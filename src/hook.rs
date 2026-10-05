@@ -520,7 +520,7 @@ impl Hook for ComponentHook {
         // 只允许改**正文**。工具调用不给改：那是「模型要做什么」的记录，
         // 让组件改它等于伪造模型意图，请求体与落盘历史都会跟着歪。
         if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
-            reply.message.content = Some(t.to_string());
+            reply.message.set_text(t);
         }
         verdict_of(&v)
     }

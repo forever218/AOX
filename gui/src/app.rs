@@ -27,6 +27,7 @@
 //! 底部没有独立的「输入区」栏位：输入框是一枚浮在对话内容之上的卡片，
 //! 滚动时可以一直滑到它下面。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -93,7 +94,11 @@ struct Process {
 
 /// 对话流中的一条记录。
 enum Item {
-    User(String),
+    /// 用户说的话 + 那条消息带的附件**展示名**。
+    ///
+    /// 只留名字不留字节：气泡里要画的是一排小胶囊（文件名.后缀），不是图片本身；
+    /// 真正的附件内容在 `.jsonl` 里只有一条路径引用。
+    User(String, Vec<String>),
     Assistant(String),
     Process(Process),
     Note(NoteKind, String),
@@ -158,6 +163,15 @@ pub struct App {
     auth_reply: Option<oneshot::Sender<AuthDecision>>,
 
     input: String,
+    /// 待上传栏里的附件（用户拖进来 / `attach_file` 挂上来的）。
+    ///
+    /// 存的是 [`aox::attach::Attachment`] 而**不是字节**：一个 30 MB 的截图在栏里
+    /// 挂上半天，界面状态不该一直背着它 —— 内容只在真正发出去的那一刻读
+    /// （`Message::user_with_files` 内部做）。
+    pending: Vec<aox::attach::Attachment>,
+    /// 指针正把文件拖在窗口上方。只用来把输入卡片描边提亮一档 —— 用户得知道
+    /// 「松手会放在哪」，否则拖到窗口右上角松手也生效，反而像是点错了。
+    dragging_files: bool,
     focus_input: bool,
     busy: bool,
     waiting_auth: bool,
@@ -271,6 +285,8 @@ impl App {
             auth: None,
             auth_reply: None,
             input: String::new(),
+            pending: Vec::new(),
+            dragging_files: false,
             focus_input: false,
             busy: false,
             waiting_auth: false,
@@ -937,23 +953,110 @@ impl App {
     }
 
     // ── 输入区 / 键盘 ──
+
+    /// 收下这一帧拖进窗口的文件。
+    ///
+    /// **整个窗口任意位置都接**（用户 2026-10-05 明确要求）—— 所以从 `ctx` 上取，
+    /// 而不是挂在某个控件上：挂控件就只有那一小块热区生效，其余地方拖进来毫无反应。
+    ///
+    /// egui 每帧把「这一帧落下的文件」报一次（`dropped_files`），读完即走，
+    /// 不会重复计数；`hovered_files` 用来把输入卡片描边提亮一档。
+    fn take_dropped(&mut self, ctx: &egui::Context) {
+        let (dropped, hovering) = ctx.input(|i| (i.raw.dropped_files.clone(), !i.raw.hovered_files.is_empty()));
+        self.dragging_files = hovering;
+        if dropped.is_empty() {
+            return;
+        }
+        for f in dropped {
+            // 没有本机路径的（某些平台拖的是内存里的数据）只能放弃 —— 附件是按路径读的
+            let Some(path) = f.path else {
+                self.items.push(Item::Note(
+                    NoteKind::Warn,
+                    format!("拖入的「{}」没有本机路径，无法作为附件。", f.name),
+                ));
+                continue;
+            };
+            match aox::attach::Attachment::probe(&path) {
+                // 同一个文件拖两次 = 一个附件（不要出现两枚一模一样的胶囊）
+                Ok(a) if self.pending.iter().any(|p| p.path == a.path) => {}
+                Ok(a) => self.pending.push(a),
+                // 拦下来的理由照实说（目录 / 读不到 / 图片超过 32 MiB），别只说「失败」
+                Err(e) => self.items.push(Item::Note(NoteKind::Warn, e)),
+            }
+        }
+    }
+
+    /// 待上传栏 —— 输入卡片**上方**那一排小胶囊，每个附件一枚。
+    ///
+    /// 名字过长**中间省略**（`很长的名字…截图.png`）：后缀是这条信息里最有用的一位
+    /// （一眼分得出是图还是文档），所以砍中间、留住尾巴；路径一律不显示 ——
+    /// 一个 `E:\…\…\…` 的前缀会把胶囊撑爆，而用户自己清楚它是从哪拖来的。
+    fn attach_bar(&mut self, ui: &mut Ui) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let mut remove: Option<usize> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(7.0, 7.0);
+            for (i, a) in self.pending.iter().enumerate() {
+                if attach_chip(ui, &a.name) {
+                    remove = Some(i);
+                }
+            }
+        });
+
+        // 挂的是图片、而当前模型多半不支持视觉时，给一句**能忽略**的提示。
+        //
+        // 刻意不拦：用户要的是「照发，由端点报错、模型转述」（见 `attach` 模块文档）。
+        // 这句话只是把「等一会儿会莫名其妙收到一个 400」提前成「现在就能看出来」。
+        if self.pending.iter().any(|a| a.kind.is_some()) && !self.model.to_ascii_lowercase().contains("flash") {
+            ui.add_space(5.0);
+            ui.label(
+                RichText::new(format!(
+                    "当前模型 {}：DeepSeek 侧只有 deepseek-flash 支持图片输入（照发也行，端点会报错）。",
+                    self.model
+                ))
+                .color(P::warn())
+                .size(12.5),
+            );
+        }
+        // 删要等循环走完：`iter()` 还借着 `self.pending`
+        if let Some(i) = remove {
+            self.pending.remove(i);
+        }
+        ui.add_space(8.0);
+    }
+
     fn send(&mut self) {
         if self.demo {
             return;
         }
         let text = self.input.trim().to_string();
-        if text.is_empty() || self.busy || self.waiting_auth {
+        // 只有附件、没有文字也算一条消息 —— 拖一张图进来直接回车是最常见的用法。
+        if (text.is_empty() && self.pending.is_empty()) || self.busy || self.waiting_auth {
             return;
         }
         if self.boot.as_ref().is_some_and(|b| !b.provider_ready) {
             return;
         }
-        self.items.push(Item::User(text.clone()));
+        let files: Vec<PathBuf> = self.pending.iter().map(|a| a.path.clone()).collect();
+        let names: Vec<String> = self.pending.iter().map(|a| a.name.clone()).collect();
+        // 时间轴上只记「发了几个附件」：那是给人扫一眼的流水账，不是文件清单
+        //（附件的真实记录在对话文件里，见 `attach::to_content` 的路径清单）。
+        let label = if names.is_empty() {
+            text.clone()
+        } else if text.is_empty() {
+            format!("（{} 个附件）", names.len())
+        } else {
+            format!("{text}（{} 个附件）", names.len())
+        };
+        self.items.push(Item::User(text.clone(), names));
         self.input.clear();
+        self.pending.clear();
         self.force_follow = true;
         // 开一轮：时间轴上最上面那条「输入」从这一刻起
-        activity::lock(&self.act).round_begin(&text, self.now());
-        let _ = self.tx.send(ToAgent::Input(text));
+        activity::lock(&self.act).round_begin(&label, self.now());
+        let _ = self.tx.send(ToAgent::Input(text, files));
     }
 
     fn stop(&mut self) {
@@ -1201,7 +1304,7 @@ impl App {
         // 先算出每一轮内容的结束下标
         let mut ends: Vec<usize> = Vec::new();
         for (i, it) in self.items.iter().enumerate() {
-            if matches!(it, Item::User(_)) {
+            if matches!(it, Item::User(..)) {
                 if let Some(prev) = ends.len().checked_sub(1) {
                     ends[prev] = i.saturating_sub(1);
                 }
@@ -1247,13 +1350,13 @@ impl App {
                         let started = self
                             .items
                             .iter()
-                            .any(|i| matches!(i, Item::User(_) | Item::Assistant(_)));
+                            .any(|i| matches!(i, Item::User(..) | Item::Assistant(_)));
                         if !started && self.live.is_none() {
                             self.empty_state(ui);
                         }
                         for item in &mut self.items {
                             match item {
-                                Item::User(t) => user_bubble(ui, t, inner * 0.80),
+                                Item::User(t, files) => user_bubble(ui, t, files, inner * 0.80),
                                 Item::Assistant(t) => assistant_block(ui, t, inner),
                                 Item::Process(p) => process_block(ui, p, inner),
                                 Item::Note(k, t) => note_row(ui, *k, t),
@@ -1456,7 +1559,11 @@ impl App {
     fn composer(&mut self, ui: &mut Ui) {
         let (inner, pad) = column(ui.available_width());
         let blocked = self.demo || self.boot.as_ref().is_some_and(|b| !b.provider_ready);
-        let can_send = !self.busy && !blocked && !self.waiting_auth && !self.input.trim().is_empty();
+        // 只有附件、没有文字也允许发送（拖一张图进来按发送是最常见的用法）
+        let can_send = !self.busy
+            && !blocked
+            && !self.waiting_auth
+            && (!self.input.trim().is_empty() || !self.pending.is_empty());
 
         ui.horizontal(|ui| {
             ui.add_space(pad);
@@ -1464,14 +1571,24 @@ impl App {
                 ui.set_width(inner);
                 ui.set_max_width(inner);
 
+                // 待上传栏：输入卡片**上方**那一排小胶囊（用户 2026-10-05 明确要求的位置）。
+                self.attach_bar(ui);
+
                 // 悬浮输入框：没有分隔线、四周也不铺底色，靠大圆角 + 一圈细描边 + 一层淡投影
                 // 浮在对话区之上（这就是「背景掏空」的观感来源）。
                 Frame::NONE
                     .fill(P::surface())
                     .corner_radius(CornerRadius::same(20))
                     .stroke(Stroke::new(
-                        1.0,
-                        if self.busy || self.waiting_auth { P::border_strong() } else { P::border() },
+                        if self.dragging_files { 1.5 } else { 1.0 },
+                        // 文件正拖在窗口上方时描边提亮一档：松手会落在哪，得看得出来
+                        if self.dragging_files {
+                            P::ink()
+                        } else if self.busy || self.waiting_auth {
+                            P::border_strong()
+                        } else {
+                            P::border()
+                        },
                     ))
                     .shadow(egui::Shadow {
                         offset: [0, 5],
@@ -1673,7 +1790,9 @@ impl App {
                         ui.add_space(8.0);
                         if primary_button(ui, "安装 Python 运行时（约 10 MB）").clicked() {
                             // 走与 CLI 完全相同的命令路径（宿主自己处理，不发给模型）
-                            let _ = self.tx.send(ToAgent::Input("/runtime install python".into()));
+                            let _ = self
+                                .tx
+                                .send(ToAgent::Input("/runtime install python".into(), Vec::new()));
                             open = false;
                         }
                     }
@@ -1855,7 +1974,7 @@ fn seed_demo(app: &mut App) {
         },
     ];
 
-    app.items.push(Item::User("做一个插件，统计当前目录下各类文件的数量".into()));
+    app.items.push(Item::User("做一个插件，统计当前目录下各类文件的数量".into(), Vec::new()));
     app.items.push(Item::Process(Process {
         steps: vec![
             StepView {
@@ -1978,6 +2097,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.fit_window(ctx);
         self.pump();
+        // 拖放：整窗口任意位置都接（见 `take_dropped`）。放在 `pump` 之后、绘制之前
+        // —— 这一帧刚收下的附件要能在这一帧就出现在待上传栏里。
+        self.take_dropped(ctx);
 
         // 原生标题栏只留窗口标题本身：图标不设、标题里也不再缀模型名，
         // 免得左上角挤着一行「AOX · xxx」。底色同步见下面 sync_native_theme。
@@ -2329,16 +2451,23 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
         match m.role.as_str() {
             "user" => {
                 flush(&mut out, &mut pending);
-                let text = m.content.clone().unwrap_or_default();
+                // `flat_text` 而不是 `content.clone()`：用户消息可能带附件，那时 content
+                // 是 parts 数组 —— 直接 clone 一个字都显示不出来。宿主自己加的附件清单块
+                // 由 `flat_text` 滤掉（见 `attach::ATTACH_MARK`）。
+                let text = m.flat_text();
                 if text.trim_start().starts_with("（宿主提示）") {
                     out.push(Item::Note(NoteKind::Warn, text.trim().to_string()));
                 } else {
-                    out.push(Item::User(text));
+                    // 胶囊的名字从清单块里还原：`image_url` 块里**没有**文件名字段，
+                    // 清单是唯一来源（见 `attach::names_from_content`）。
+                    let files: Vec<String> =
+                        m.content.as_ref().map(aox::attach::names_from_content).unwrap_or_default();
+                    out.push(Item::User(text, files));
                 }
             }
             "assistant" => {
                 let calls = m.tool_calls.clone().unwrap_or_default();
-                let text = m.content.clone().unwrap_or_default();
+                let text = m.flat_text();
                 if calls.is_empty() {
                     flush(&mut out, &mut pending);
                     if !text.trim().is_empty() {
@@ -2372,7 +2501,7 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
             }
             "tool" => {
                 let name = m.name.clone().unwrap_or_default();
-                let body = m.content.clone().unwrap_or_default();
+                let body = m.flat_text();
                 if let Some(p) = pending.as_mut() {
                     // 同一步可能有多次同名调用，回填到「最后一个还没有结果的同名步骤」
                     if let Some(st) = p
@@ -2641,6 +2770,61 @@ pub(crate) fn danger_button(ui: &mut Ui, text: &str) -> egui::Response {
 }
 
 /// 空状态里的示例问题胶囊。
+/// 一枚附件胶囊（待上传栏里的一格）。返回 `true` 表示用户点了右边的 ×。
+///
+/// 整枚胶囊**不可点**，只有 × 是热区：这个胶囊没有「点开」的去处（附件不是链接），
+/// 让整枚都可点就等于「点一下删一个」，太容易手滑。
+fn attach_chip(ui: &mut Ui, name: &str) -> bool {
+    let mut removed = false;
+    Frame::NONE
+        .fill(P::surface_hi())
+        .corner_radius(CornerRadius::same(13))
+        .stroke(Stroke::new(1.0, P::border()))
+        .inner_margin(Margin::symmetric(11, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 7.0;
+                ui.label(RichText::new(middle_elide(name, 30)).color(P::text_dim()).size(13.0));
+                removed = close_x(ui);
+            });
+        });
+    removed
+}
+
+/// 胶囊右边的 ×。返回 `true` 表示被点了。
+///
+/// 用两条线段手绘而不是打 `×` 字符 —— 与调用流里的 ✓/✗ 同一个理由：
+/// 不赌字体里有没有这个字形（缺字形时画出来是个豆腐块，比不画更糟）。
+fn close_x(ui: &mut Ui) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("移除");
+    let col = if resp.hovered() { P::text() } else { P::text_faint() };
+    let c = rect.center();
+    let s = 3.4;
+    let stroke = Stroke::new(1.4, col);
+    ui.painter().line_segment([c + Vec2::new(-s, -s), c + Vec2::new(s, s)], stroke);
+    ui.painter().line_segment([c + Vec2::new(s, -s), c + Vec2::new(-s, s)], stroke);
+    resp.clicked()
+}
+
+/// 过长时**中间省略**：留住头尾，砍中间。
+///
+/// 为什么砍中间不砍尾巴：这条信息里最有用的一位是**后缀**（`.png` 还是 `.pdf`，
+/// 决定用户要不要先压一下），而尾巴正好是它。`keep` 是保留的字符数（含省略号）。
+fn middle_elide(s: &str, keep: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    // 太短就不用省；`keep` 小到放不下「头 + 省略号 + 尾」时也别硬省（会显示成一团）
+    if chars.len() <= keep || keep < 9 {
+        return s.to_string();
+    }
+    let head = keep / 2;
+    let tail = keep - head - 1; // 减掉的 1 是省略号自己占的那位
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(chars[chars.len() - tail..].iter());
+    out
+}
+
 fn example_chip(ui: &mut Ui, text: &str) -> egui::Response {
     text_button(
         ui,
@@ -2864,7 +3048,7 @@ fn usage_detail(ui: &mut Ui, log: &[UsageRecord]) {
     }
 }
 
-fn user_bubble(ui: &mut Ui, text: &str, max_w: f32) {
+fn user_bubble(ui: &mut Ui, text: &str, files: &[String], max_w: f32) {
     // 内边距会额外占宽度，所以要先把正文的可用宽度扣出来，否则气泡会顶出栏宽被裁
     let inner_w = (max_w - 44.0).max(140.0);
     ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
@@ -2876,6 +3060,22 @@ fn user_bubble(ui: &mut Ui, text: &str, max_w: f32) {
             .show(ui, |ui| {
                 ui.set_max_width(inner_w);
                 ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+                    // 附件胶囊排在正文**上面**：与待上传栏里的位置一致（发出前后同一个观感），
+                    // 而且空正文时（只发了文件）气泡里也有东西可看。
+                    if !files.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(7.0, 7.0);
+                            for name in files {
+                                sent_chip(ui, name);
+                            }
+                        });
+                        if !text.trim().is_empty() {
+                            ui.add_space(8.0);
+                        }
+                    }
+                    if text.trim().is_empty() {
+                        return;
+                    }
                     let mut job = egui::text::LayoutJob::default();
                     job.wrap.max_width = inner_w;
                     job.append(
@@ -2892,6 +3092,21 @@ fn user_bubble(ui: &mut Ui, text: &str, max_w: f32) {
             });
     });
     ui.add_space(18.0);
+}
+
+/// 已经发出去的消息气泡里的附件胶囊 —— 只读（没有 ×）。
+///
+/// 与待上传栏那枚**同一个形状、同一套省略规则**，只少一个 ×：这样「发出去」这个动作
+/// 在视觉上就是「胶囊淡下去、×消失了」，不需要另一种标记去解释。
+fn sent_chip(ui: &mut Ui, name: &str) {
+    Frame::NONE
+        .fill(P::surface())
+        .corner_radius(CornerRadius::same(13))
+        .stroke(Stroke::new(1.0, P::border()))
+        .inner_margin(Margin::symmetric(11, 4))
+        .show(ui, |ui| {
+            ui.label(RichText::new(middle_elide(name, 30)).color(P::text_dim()).size(13.0));
+        });
 }
 
 fn assistant_block(ui: &mut Ui, text: &str, width: f32) {

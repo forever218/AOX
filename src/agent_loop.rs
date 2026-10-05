@@ -27,6 +27,7 @@
 //! 现在这条边界由 `[loop] max_rounds` 补上 —— 裁剪天然属于循环这一层：
 //! 它要同时动内存与对话文件，还要在裁完**重新拼请求**。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -310,6 +311,9 @@ impl AgentLoop for StandardLoop {
                 break; // 任务结束
             }
 
+            // 本次响应里的**工具产出文件**（`attach_file` 挂的、或插件在结果里声明的）。
+            // 收集起来，等这一批工具都跑完再统一注入一条 user 消息 —— 理由见下面那段。
+            let mut produced: Vec<PathBuf> = Vec::new();
             for call in calls {
                 let name = call.function.name.clone();
                 let mut args: Value = match serde_json::from_str(&call.function.arguments) {
@@ -348,13 +352,59 @@ impl AgentLoop for StandardLoop {
                     preview: truncate(&output.content, 300),
                 });
                 let content = cap_chars(&output.content, rt.config.agent.max_result_chars);
+                produced.extend(output.attach.iter().cloned());
                 agent.push_message(
                     Message::tool_result(&call.id, &name, content),
                     Some(output.is_error),
                 );
             }
+
+            // ── 工具产出的文件 → 另起一条 **user** 消息
+            //
+            // 这不是风格选择，是协议硬约束：端点在 `system` / `assistant` 消息里见到图片
+            // 直接 400（官方「使用限制」明写），而 `tool` 角色在 OpenAI 协议里 content
+            // 只能是字符串 —— **图片的合法落点只有 user 消息这一处**。
+            //
+            // 位置也是被这条约束定死的：必须排在刚推入的 tool 结果**之后**（tool 结果要
+            // 紧跟它对应的 assistant.tool_calls，中间插一条别的消息会让参数校验失败），
+            // 又要在下一次请求**之前**（否则这一轮的图赶不上这一轮）。
+            if !produced.is_empty() {
+                let (msg, problems) = produced_files_message(&produced);
+                for p in &problems {
+                    ui.emit(AgentEvent::Warn(format!("工具产出的附件没能传给模型：{p}")));
+                }
+                if let Some(m) = msg {
+                    agent.push_message(m, None);
+                }
+            }
         }
         Ok(())
+    }
+}
+
+/// 组装「工具产出文件」那条 user 消息。
+///
+/// 返回 `(要推入的消息, 要报给用户的说明)`，`None` 表示一个都挂不上。
+///
+/// 抽成**纯函数**（不碰 `Ui`）是为了能直接断言 —— 「必须是 user 消息、必须带 parts 数组」
+/// 这条协议约束值得一条不必真跑一轮循环的测试。
+fn produced_files_message(paths: &[PathBuf]) -> (Option<Message>, Vec<String>) {
+    let (items, mut problems) = crate::attach::probe_all(paths);
+    if items.is_empty() {
+        return (None, problems);
+    }
+    let names = items.iter().map(|a| format!("- {}", a.name)).collect::<Vec<_>>().join("\n");
+    // 措辞说清「该看什么」：不说的话模型常会只根据文件名猜内容，那这张图就白发了
+    let note = format!(
+        "（宿主提示）以下是刚才那次工具调用产出的文件，图片内容已经直接发给你了 —— \
+         请直接看图判断，不要只根据文件名猜：\n{names}"
+    );
+    match Message::user_with_files(&note, &items) {
+        Ok(m) => (Some(m), problems),
+        Err(e) => {
+            problems.push(e);
+            (None, problems)
+        }
     }
 }
 
@@ -423,7 +473,7 @@ mod tests {
         let msgs = body(3); // [sys, u1,a,t,a, u2,a,t,a, u3,a,t,a]
         let cut = trim_point(&msgs, 2).expect("3 轮超过 2 轮上限，应当裁");
         assert_eq!(cut, 5, "第 2 轮的 user 在第 5 位");
-        assert_eq!(msgs[cut].content.as_deref(), Some("问题 2"));
+        assert_eq!(msgs[cut].content.as_ref().and_then(|v| v.as_str()), Some("问题 2"));
         assert_eq!(cut - 1, 4, "丢掉的是完整的一轮（4 条），不含 system");
     }
 
@@ -498,12 +548,12 @@ mod tests {
         assert_eq!(roles[0], "system", "系统提示永远保留");
         assert_eq!(roles[1], "user");
         assert_eq!(
-            agent.messages()[1].content.as_deref(),
+            agent.messages()[1].content.as_ref().and_then(|v| v.as_str()),
             Some("问题 2"),
             "留下的必须是**最新**两轮，不是最老两轮"
         );
         assert_eq!(
-            agent.messages().last().unwrap().content.as_deref(),
+            agent.messages().last().unwrap().content.as_ref().and_then(|v| v.as_str()),
             Some("答复 3"),
             "最后一轮要完整保留到它的最终答复"
         );
@@ -538,5 +588,61 @@ mod tests {
             let lp = build(&cfg).unwrap_or_else(|e| panic!("{name:?} 应可用: {e:#}"));
             assert_eq!(lp.name(), "standard");
         }
+    }
+
+    /// 工具产出的图片必须变成一条 **user** 消息，且 `content` 是 parts 数组。
+    ///
+    /// 这两条都是**协议硬要求**，不是风格：图片出现在 `tool` / `system` / `assistant`
+    /// 消息里端点直接 400；而只有 parts 数组装得下图片，纯字符串装不下。
+    #[test]
+    fn produced_images_become_a_user_message_with_parts() {
+        let d = std::env::temp_dir().join("aox-loop-produced");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let shot = d.join("shot.png");
+        std::fs::write(&shot, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
+
+        let (msg, problems) = produced_files_message(&[shot]);
+        assert!(problems.is_empty(), "{problems:?}");
+        let msg = msg.expect("挂得上的文件必须产出一条消息");
+        assert_eq!(msg.role, "user", "图片只能出现在 user 消息里");
+        let parts = msg.content.as_ref().unwrap().as_array().expect("必须是 parts 数组");
+        assert!(parts.iter().any(|p| p["type"] == "image_url"), "{parts:?}");
+        // 前缀是给界面认的：带这个前缀的消息渲染成提示，而不是一枚用户气泡
+        assert!(msg.flat_text().starts_with("（宿主提示）"), "{}", msg.flat_text());
+        assert!(msg.flat_text().contains("shot.png"), "{}", msg.flat_text());
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 插件报了一条不存在的路径（插件作者最常犯的错）：**不能静默**。
+    ///
+    /// 静默的后果是双向的 —— 作者那边一直等一张永远不会出现的图，模型那边则完全
+    /// 不知道自己缺了东西，于是照着文件名猜内容。
+    #[test]
+    fn a_missing_produced_file_is_reported_not_swallowed() {
+        let missing = std::env::temp_dir().join("aox-loop-no-such-file-xyz.png");
+        let _ = std::fs::remove_file(&missing);
+        let (msg, problems) = produced_files_message(&[missing]);
+        assert!(msg.is_none());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("no-such-file-xyz.png"), "{}", problems[0]);
+    }
+
+    /// 一批里只有一半合格时：合格的要挂上，不合格的要出声 —— 不是整批丢掉。
+    #[test]
+    fn one_bad_file_does_not_sink_the_whole_batch() {
+        let d = std::env::temp_dir().join("aox-loop-mixed");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let good = d.join("good.png");
+        std::fs::write(&good, b"\x89PNG\r\n\x1a\n\x00\x00").unwrap();
+        let missing = d.join("missing.png");
+
+        let (msg, problems) = produced_files_message(&[good, missing]);
+        assert!(msg.is_some(), "合格那个必须照挂");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
