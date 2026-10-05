@@ -76,8 +76,10 @@ pub struct Runtime {
     /// 模型的**文件边界**（工作区，见 `src/workplace.rs`）。
     ///
     /// 与 `sandbox` 并排但管的是另一件事：`sandbox` 限制插件子进程怎么跑，
-    /// `workplace` 限制「这次能碰哪些文件」。默认为 `full`（不受限），
-    /// 所以**不写 `[workplace]` 的用户行为与加这一层之前逐字节一致**。
+    /// `workplace` 限制「这次能碰哪些文件」。`full` 时不受限；`default` / `fixed` 时
+    /// 写入与删除只准落在划定的那块地里（读不设限）。
+    /// **配置默认是 `default`（受限）** —— 2026-10-05 由 `full` 改过来，兑现用户那句
+    /// 「每次启动默认受限」。所以「不写 `[workplace]`」现在**不再**等于「行为不变」。
     ///
     /// 内部是 `std::sync::Mutex`，只在同步上下文读写（判定在工具调用路径上跑）——
     /// 与 `runtimes` / `prompt_segments` 同样的理由：从不跨 `await` 持锁。

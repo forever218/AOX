@@ -255,13 +255,11 @@ fn usage_line(rec: &UsageRecord) -> Value {
     v
 }
 
-/// 工作区一行。`root` **只在有值时才写** —— 与用量记录同一个理由：
-/// 没有的东西不要拿空串去冒充（`full` 档本来就没有根）。
-fn workplace_line(mode: &str, root: Option<&Path>) -> Value {
-    let mut v = json!({ "kind": "workplace", "mode": mode });
-    if let Some(p) = root {
-        v["root"] = json!(p.display().to_string());
-    }
+/// 工作区一行。字段由 [`crate::workplace::Record::to_value`] 决定 —— 那边负责
+/// 「没有的字段不写」（`full` 档就没有根），这里只补上行类型。
+fn workplace_line(rec: &crate::workplace::Record) -> Value {
+    let mut v = rec.to_value();
+    v["kind"] = json!("workplace");
     v
 }
 
@@ -389,7 +387,7 @@ impl Store for JsonlStore {
         load_usage(&file_of(&self.dir, id))
     }
 
-    fn load_workplace(&self, id: &str) -> Option<(String, Option<PathBuf>)> {
+    fn load_workplace(&self, id: &str) -> Option<crate::workplace::Record> {
         // 「最后一条」= 这段对话当前的工作区。
         load_workplaces(&file_of(&self.dir, id)).pop()
     }
@@ -505,8 +503,8 @@ impl Session for JsonlSession {
     ///
     /// 写在对话文件里（而不是另开一个旁路文件），是因为它**属于这段对话**：
     /// 对话被删、被裁剪、被换后端时，这条记录自然跟着走，不会留下孤儿。
-    fn append_workplace(&mut self, mode: &str, root: Option<&Path>) {
-        let _ = write_line_to(&mut self.file, &workplace_line(mode, root));
+    fn append_workplace(&mut self, rec: &crate::workplace::Record) {
+        let _ = write_line_to(&mut self.file, &workplace_line(rec));
     }
 
     /// 用给定的消息列表重写整个文件。
@@ -551,8 +549,8 @@ impl Session for JsonlSession {
                 return;
             }
         }
-        for (mode, root) in &workplaces {
-            if write_line_to(&mut f, &workplace_line(mode, root.as_deref())).is_err() {
+        for rec in &workplaces {
+            if write_line_to(&mut f, &workplace_line(rec)).is_err() {
                 return;
             }
         }
@@ -741,8 +739,9 @@ fn load_usage(path: &Path) -> Vec<UsageRecord> {
 
 /// 读出一个文件里所有的**工作区**记录（按写入顺序）—— 调用方取最后一条 = 当前那块地。
 ///
-/// 与 `load_usage` 一样：坏行跳过，`kind:"workplace"` 之外的行一概不认。
-fn load_workplaces(path: &Path) -> Vec<(String, Option<PathBuf>)> {
+/// 与 `load_usage` 一样：坏行跳过，`kind:"workplace"` 之外的行一概不认；
+/// 单行内部认不出（缺 `mode`）也跳过。
+fn load_workplaces(path: &Path) -> Vec<crate::workplace::Record> {
     let Ok(file) = File::open(path) else { return Vec::new() };
     let mut out = Vec::new();
     for line in BufReader::new(file).lines() {
@@ -755,13 +754,8 @@ fn load_workplaces(path: &Path) -> Vec<(String, Option<PathBuf>)> {
         if !is_kind(&v, "workplace") {
             continue;
         }
-        let Some(mode) = v.get("mode").and_then(Value::as_str) else { continue };
-        let root = v
-            .get("root")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(PathBuf::from);
-        out.push((mode.to_string(), root));
+        let Some(rec) = crate::workplace::Record::from_value(&v) else { continue };
+        out.push(rec);
     }
     out
 }
@@ -1193,13 +1187,13 @@ mod tests {
         assert_eq!(back[0].session_calls, 3);
     }
 
-    /// 工作区记录：**最后一条才算数**，而且要活过「中断回滚」（`rewrite` 重写全文）。
-    ///
-    /// 最后一条 = 这段对话当前在哪块地里干活。回滚丢的是消息，不该顺手把
-    /// 「这段对话用哪块地」也抹掉 —— 抹掉之后重开这段对话就会换一块新地
-    /// （这正是用户报的「每次进入同一个对话都是不同的工作区」）。
+    /// 工作区记录：**最后一条才算数**，要活过「中断回滚」，而且 `own`（本对话自建地）
+    /// 在切到别的档之后**不能丢** —— 丢了「切走再切回默认」就会另建一块，
+    /// `workplace/` 会被空目录堆满。
     #[test]
     fn workplace_record_keeps_the_last_one_across_rewrite() {
+        use crate::workplace::Record;
+
         let d = Tmp::new("workplace");
         let s = d.store();
         let mut log = s.create(None).unwrap();
@@ -1207,26 +1201,32 @@ mod tests {
 
         assert_eq!(s.load_workplace(&id), None, "还没写过就是 None（旧对话文件都走这一支）");
 
-        log.append_workplace("default", None);
+        let own = PathBuf::from(r"C:\tmp\workplace\20261004200000");
+        // ① 首条消息时根还没定
+        log.append_workplace(&Record { mode: "default".into(), root: None, own: None });
         log.append(&Message::user("第一句"), None);
-        // 头一条是「根还没定」，后一条才是落到具体目录 —— 读的必须是后者
-        log.append_workplace("default", Some(Path::new(r"C:\tmp\workplace\20261004200000")));
-        log.append_workplace("fixed", Some(Path::new(r"C:\tmp\picked")));
+        // ② 地建好了
+        log.append_workplace(&Record {
+            mode: "default".into(),
+            root: Some(own.clone()),
+            own: Some(own.clone()),
+        });
+        // ③ 切到完全访问：当前档位没有根了，但 `own` 必须留着
+        log.append_workplace(&Record { mode: "full".into(), root: None, own: Some(own.clone()) });
         drop(log);
 
         let got = s.load_workplace(&id).expect("应当读到最后一条");
-        assert_eq!(got.0, "fixed");
-        assert_eq!(got.1.as_deref(), Some(Path::new(r"C:\tmp\picked")), "取的是最后一条，不是第一条");
+        assert_eq!(got.mode, "full", "取的是最后一条，不是第一条");
+        assert_eq!(got.root, None, "full 档没有根");
+        assert_eq!(got.own.as_ref(), Some(&own), "切档不该把「本对话自建地」弄丢");
 
         // 回滚重写消息：工作区记录必须原样还在
         let mut log = s.open(&id).unwrap();
         log.rewrite(&[Message::system("sys"), Message::user("只剩这句")]);
         drop(log);
-        assert_eq!(
-            s.load_workplace(&id),
-            Some(("fixed".to_string(), Some(PathBuf::from(r"C:\tmp\picked")))),
-            "中断回滚只该丢消息，不该丢掉「这段对话在哪块地」"
-        );
+        let back = s.load_workplace(&id).expect("回滚不该丢掉工作区记录");
+        assert_eq!(back.mode, "full");
+        assert_eq!(back.own.as_ref(), Some(&own), "中断回滚只该丢消息");
         assert_eq!(s.load(&id).unwrap().len(), 1, "消息确实被回滚成 1 条");
     }
 

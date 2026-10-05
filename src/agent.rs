@@ -50,12 +50,12 @@ pub struct Agent {
     /// 内存里留一份，是为了让界面立刻能答「这段对话一共花了多少、哪一轮最贵」，
     /// 而不必每帧读盘；文件那边才是权威 —— 重启后从这里接回来。
     usage_log: Vec<UsageRecord>,
-    /// **本对话已经落盘过**的工作区状态（档位名 + 根）；`None` = 还没写过。
+    /// **本对话已经落盘过**的工作区记录（档位 + 根 + 本对话自建地）；`None` = 还没写过。
     ///
     /// 有了它才能「只在真的变了的时候补一条」：每轮无脑追加会让文件里堆满重复行，
     /// 而读的时候是取最后一条 —— 那种文件后来者根本看不出哪几行才算数。
     /// 新建对话 / 打开旧对话时重置，对齐那一刻文件里的实际情况。
-    workplace_logged: Option<(String, Option<std::path::PathBuf>)>,
+    workplace_logged: Option<crate::workplace::Record>,
     /// 本轮的用量累加器（由 `AgentLoop` 通过 [`Agent::accrue_call`] 驱动）。
     ///
     /// 放在 `Agent` 里而不是循环的局部变量里：循环是可替换的，账不行 ——
@@ -105,7 +105,7 @@ impl Agent {
         if self.workplace_logged.as_ref() == Some(&cur) {
             return;
         }
-        log.append_workplace(&cur.0, cur.1.as_deref());
+        log.append_workplace(&cur);
         self.workplace_logged = Some(cur);
     }
 
@@ -207,9 +207,9 @@ impl Agent {
         // 旧对话文件没有这条记录（那时还没这个功能）：什么都不动，等它下一次落盘时
         // 由 `persist_workplace` 把当前状态记上，从此这段对话也就有了自己的地。
         self.workplace_logged = match self.rt.store.load_workplace(id) {
-            Some((mode, root)) => {
-                self.rt.workplace.restore(&mode, root.clone());
-                Some((mode, root))
+            Some(rec) => {
+                self.rt.workplace.restore(&rec);
+                Some(rec)
             }
             None => None,
         };
@@ -384,11 +384,12 @@ impl Agent {
         // ② 这里拿得到 `Ui`，能给用户发一条 `Warn`（工具自己的 `call` 拿不到 Ui，
         //    所以工具内那层只能把契约塞回给模型 —— 两层是纵深，不是重复）。
         //
-        // `full` 档位（配置默认）在 `workplace_reject` 里**整个短路**：不扫参数、
-        // 不 `canonicalize`。早先这里是「照样调 `check`，反正它返回 `Ok`」——
-        // 而调用方只取 `.err()`，于是 `normalize` 的结果被丢掉，65~224 µs 的系统调用
-        // 白花；这条路径又是**每次工具调用**都要走的，也就是绝大多数用户
-        // （不写 `[workplace]`）走的那条。「不写配置 = 行为不变」要连开销一起不变。
+        // `full` 档位在 `workplace_reject` 里**整个短路**：不扫参数、不 `canonicalize`。
+        // 早先这里是「照样调 `check`，反正它返回 `Ok`」—— 而调用方只取 `.err()`，
+        // 于是 `normalize` 的结果被丢掉，65~224 µs 的系统调用白花；这条路径又是
+        // **每次工具调用**都要走的。
+        // ⚠️ 2026-10-05 起配置默认是受限档（`default`），所以这条短路只对**显式**选了
+        // 完全访问的用户生效 —— 别再用「大多数用户走这条」给短路当理由。
         if let Some(reject) = self.workplace_reject(name, &kind, &args) {
             ui.emit(AgentEvent::Warn(reject.user_text()));
             return ToolOutput::err(reject.model_text());
@@ -465,7 +466,7 @@ impl Agent {
         kind: &ToolKind,
         args: &Value,
     ) -> Option<crate::workplace::Reject> {
-        // `full` 档（配置默认）：**一切放行**。放在 `match` 之前，是为了连
+        // `full` 档：**一切放行**。放在 `match` 之前，是为了连
         // `scan_paths` 那张粗网都不跑 —— 见调用点那一段注释。
         if self.rt.workplace.is_unrestricted() {
             return None;

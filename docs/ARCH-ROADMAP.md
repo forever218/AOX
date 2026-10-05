@@ -1313,4 +1313,32 @@ initialize 的返回里多带一个可选项：
     在对话里发 `/workplace full` ⇒ 文件里真的追加了 `{"kind":"workplace","mode":"full"}`，
     再打开这段对话即报「完全访问」。
   - 体积：`aox.exe` 3,215,360 → **3,218,944 B**、`aox-gui.exe` 6,123,008 → **6,127,616 B**。
+- ✅ **出厂默认改成「默认」档 · 默认档绑自建地 · 对话信息流三项（2026-10-05）**：
+  - **`[workplace]` 的出厂默认 `full` → `default`**（受限）。用户那句「每次进入应用默认还是
+    完全访问」戳中的其实是最初的需求一直没兑现：当初为守住「不写配置 = 行为逐字节不变」，
+    把默认留成 `full`、把「启动即受限」推给 GUI 按钮去表达 —— 而按钮只是如实反映配置，
+    永远不会自己收紧。⚠️ 连带作废一条原则：**「不写 `[workplace]` = 与加这一层之前逐字节
+    一致」不再成立**，要不受限必须显式写 `mode = "full"`。新增回归
+    `config::tests::factory_default_is_the_confined_mode` 钉住这个**产品决定**。
+  - **默认档改成绑「本对话自建的那块地」**：用户报「切完全访问再切回默认又新建一个工作区，
+    无穷无尽地累加」。`State` 新增 `own`（`active` 会被切档覆盖，光看它不知道原来那块是哪块）；
+    `set_mode(Default)` 优先回到 `own`（提示语改成「本对话仍在 … 里」），只有从没建过才回 Pending。
+    存档升级成 `workplace::Record{mode, root, own}`，`own` 在 full/fixed 档下**也要存**
+    （少了它，重开对话再切回默认会另建一块）。回归
+    `switching_back_to_default_reuses_the_conversation_own_dir`（来回切 3 次，目录数必须仍是 1）。
+  - **对话信息流三项**（用户提：「工具行参数长得拉不到底」/「长任务不知道做到哪了」/
+    「回复只在全做完后瞬间出现，之前对话是黑的」）：
+    ① `step_row` 不再内联参数（`StepView.args` 留字段、标 `allow(dead_code)`，排错时对得上 jsonl）；
+    ② 内置提示词加一节「# 阶段性汇报」—— 通道早就有（`agent_loop` 在「带工具调用」时发
+    `InterimText`），缺的只是**让模型开口**；
+    ③ 正文流式打字：`StreamSink::on_content` 的增量**本来就**已送到 GUI
+    （`FromAgent::Content`），但只用来数 token，正文仍等 `AssistantText` ⇒ 现在进 `Live.streaming`，
+    由 `live_block` 实时渲染（阶段说明淡一档、正在打的那句正常色）。
+    打字速度＝模型真实吐字速度，没有本地「调快」旋钮。
+  - 验证：`cargo check --workspace --all-targets` 零警告 · `cargo test --workspace`
+    **133 + 12 全过** · `aox selftest` 全过 · `/prompt` 显示内置段数为 3（新文本落在 protocol 段内）。
+    体积：`aox.exe` 3,218,944 → **3,220,480 B**、`aox-gui.exe` 6,123,520 → **6,125,056 B**。
+  - ⚠️ **GUI 实机截图这次没跑成**：`aox-gui.exe` 进程活着但**不建窗口**（按 PID 枚举顶层窗口数为 0，
+    日志为空），同一个二进制在前几轮还能跑 —— 大概率是本会话桌面/焦点环境的问题，不是程序问题。
+    这三项**需要用户实机过一遍**。
 - **下一步**：②b 的 30 分钟 spike（若通，②a 可降级为备选）。

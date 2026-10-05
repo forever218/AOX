@@ -7,13 +7,14 @@
 //!
 //! | 档位 | 含义 | 判定 |
 //! |------|------|------|
-//! | `full`（配置默认） | 完全访问，与加工作区之前逐字节一致 | 一切放行 |
-//! | `default` | 每段新对话在 `<应用根>/workplace/<YYYYMMDDHHMMSS>/` 开一块地 | 写·删只准这块地；**读不设限** |
-//! | `fixed`（`root = "..."`） | 固定一块地（GUI 的「选择工作区」等价于它） | 同上 |
+//! | `default`（**配置默认**） | 每段新对话在 `<应用根>/workplace/<YYYYMMDDHHMMSS>/` 开一块地 | 写·删只准这块地；**读不设限** |
+//! | `full` | 完全访问，与加工作区之前逐字节一致 | 一切放行 |
+//! | `fixed`（`root = "..."`） | 固定一块地（GUI 的「选择工作区」等价于它） | 同 `default` |
 //!
-//! `full` 是**配置默认**，这是刻意的：不写 `[workplace]` 的用户行为一点都不变。
-//! 用户最初要的「每次启动默认受限」由 GUI 那枚「工作区」按钮去兑现（那一层才是
-//! 用户表达意图的地方），配置这一层只负责「不写就不变」。
+//! **配置默认是 `default`（受限）**，2026-10-05 由 `full` 改过来：用户要的就是
+//! 「每次启动**默认受限**」。于是「不写 `[workplace]` = 行为与加这一层之前一致」这条
+//! 不再成立 —— 不写就是受限档，想要不受限得显式写 `mode = "full"`。
+//! 另外 `/new` 一律回到 `default` 档（见 [`Workplace::reset_for_new_conversation`]）。
 //!
 //! # 读写不对称（本模块最重要的一条）
 //!
@@ -133,6 +134,57 @@ enum Active {
     At(PathBuf),
 }
 
+/// 一段对话的**工作区存档**（`.jsonl` 里 `kind:"workplace"` 那一行）。
+///
+/// 三个字段各回答一个问题：
+/// - `mode` / `root`：**当前**档位与它绑的地（`fixed` 是点名那块；`default` 是自建那块）；
+/// - `own`：本对话「默认」档自己的那块地 —— **即使在 `full` / `fixed` 档下也要留着**，
+///   否则「切走再切回默认」只能重新建一块，工作区就会无限累加。
+///
+/// 为什么存进对话文件而不是另开一个旁路文件：它属于这段对话。对话被删、被裁剪、
+/// 被换后端时，这条记录自然跟着走，不会留下孤儿。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Record {
+    /// `"default"` / `"fixed"` / `"full"`。空串 = 认不出来（调用方应当当没有记录）。
+    pub mode: String,
+    /// 当前档位绑的根；`full` 没有根。
+    pub root: Option<PathBuf>,
+    /// 本对话「默认」档自建的那块地（还没建就是 `None`）。
+    pub own: Option<PathBuf>,
+}
+
+impl Record {
+    /// 写成 `.jsonl` 的一行（`kind` 由存储层补，见 `store::jsonl`）。
+    ///
+    /// 与用量记录同一条规矩：**没有的字段不写**，不用空串或 `null` 去冒充。
+    pub fn to_value(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({ "mode": self.mode });
+        let mut put = |key: &str, p: &Option<PathBuf>| {
+            if let Some(p) = p {
+                v[key] = serde_json::json!(p.display().to_string());
+            }
+        };
+        put("root", &self.root);
+        put("own", &self.own);
+        v
+    }
+
+    /// 从一行读回来；**认不出的行返回 `None`**（缺 `mode`、或值不是字符串）。
+    pub fn from_value(v: &serde_json::Value) -> Option<Self> {
+        let mode = v.get("mode").and_then(|m| m.as_str())?.trim().to_lowercase();
+        if mode.is_empty() {
+            return None;
+        }
+        let path = |key: &str| {
+            v.get(key)
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+        };
+        Some(Self { mode, root: path("root"), own: path("own") })
+    }
+}
+
 /// 运行期的档位与根。跟着 `Runtime` 走，CLI / GUI / selftest 共用同一份实现。
 ///
 /// **不存配置**（曾经存过一份 `cfg`）：档位的判据是状态里的 `picked`，不是配置 ——
@@ -150,6 +202,15 @@ struct State {
     /// 本对话是否已经「开始」（= 已经建过/选定过根）。
     /// `default` 档位靠它保证「一段对话只建一次目录」，而不是每轮都建一个。
     started: bool,
+    /// **本对话「默认」档自己的那块地**（第一次发消息时建的）；`None` = 还没建。
+    ///
+    /// 必须与 `active` 分开记：`active` 会被切档覆盖。切到「完全访问」再切回「默认」时，
+    /// 光看 `active` 已经不知道原来那块地是哪一块，只能重新建 —— 结果是每切一个来回就多
+    /// 一个空目录，攒出一堆 `workplace/<时间戳>/`（用户 2026-10-05 报的）。
+    /// 有了它，「只要档位是默认，就还是本对话第一次建的那一块」才成立。
+    ///
+    /// 新建对话 / 打开另一段对话时清掉（新对话本来就该另开一块地）。
+    own: Option<PathBuf>,
     /// `active` 里的根是**用户点名挑的**（`fixed`，或运行期切档），还是 `default` 档现建的？
     ///
     /// 这条只能记在状态里，**不能拿 `cfg.mode` 推**：配置写 `default` 的用户照样能在运行期
@@ -186,14 +247,16 @@ impl Workplace {
                 Active::At(p)
             }
             other => anyhow::bail!(
-                "[workplace] mode = {other:?} 认不出来。可用值：\"full\"（不受限，默认）、\
-                 \"default\"（每段对话一块新地）、\"fixed\"（配合 root 指定固定目录）"
+                "[workplace] mode = {other:?} 认不出来。可用值：\"default\"（每段对话一块新地，默认）、\
+                 \"full\"（不受限）、\"fixed\"（配合 root 指定固定目录）"
             ),
         };
         Ok(Self {
             state: std::sync::Mutex::new(State {
                 active,
                 started: matches!(mode.as_str(), "full" | "fixed"),
+                // 启动时还没有「本对话自建的地」—— 连这段对话本身都还没开始。
+                own: None,
                 // 只有 `fixed` 档是「用户点名挑的」；`full` 没有根、`default` 的地是现建的。
                 picked: mode == "fixed",
             }),
@@ -224,7 +287,12 @@ impl Workplace {
     /// 不可重入，嵌套调用会**整进程死锁**（[`Workplace::report`] 上一版就是这么挂的）。
     /// 要么在取锁之前调，要么先取到快照。
     pub fn snapshot(&self) -> (Mode, Option<PathBuf>) {
-        let st = self.lock();
+        Self::snapshot_of(&self.lock())
+    }
+
+    /// 「档位 + 根」的**唯一**映射。`snapshot` 与 `persisted` 都读它 ——
+    /// 免得将来两边改岔（一个说「默认」、另一个存成 `fixed`）。
+    fn snapshot_of(st: &State) -> (Mode, Option<PathBuf>) {
         let mode = match &st.active {
             Active::Full => Mode::Full,
             Active::Pending => Mode::Default,
@@ -248,29 +316,32 @@ impl Workplace {
         self.snapshot().0
     }
 
-    /// 把当前状态压成**可存档**的形态：档位名（`default` / `fixed` / `full`）+ 根。
+    /// 把当前状态压成**可存档**的形态（见 [`Record`]）。
     ///
-    /// 与 `snapshot()` 同一套映射（说的是「运行期实际怎么来的」，不是配置），存进这段
-    /// 对话的文件里；打开旧对话时靠 [`Workplace::restore`] 还原 —— 这样「同一个对话
-    /// 每次进去都是不同的工作区」就不会再发生。
-    pub fn persisted(&self) -> (String, Option<PathBuf>) {
-        let (mode, root) = self.snapshot();
-        let name = match mode {
+    /// **一次取锁**把三样一起取到：分两次取会出现「档位是切档之后的、`own` 是切档之前的」
+    /// 这种半截快照，存下去就再也还原不回来了。
+    pub fn persisted(&self) -> Record {
+        let st = self.lock();
+        let (mode, root) = Self::snapshot_of(&st);
+        let mode = match mode {
             Mode::Default => "default",
             Mode::Fixed(_) => "fixed",
             Mode::Full => "full",
         };
-        (name.to_string(), root)
+        Record { mode: mode.to_string(), root, own: st.own.clone() }
     }
 
-    /// 从对话存档里还原工作区（打开旧对话时用）。档位名认不出就退回「默认」。
+    /// 从对话存档里还原工作区（打开旧对话时用）。档位名认不出就退回「默认」，不猜。
     ///
-    /// 关键一条：**`default` 档的根若已存档，就沿用它**（`At` + `picked = false`），
-    /// 而不是等首条消息现建一块新的 —— 后者正是「每次进入同一个对话都是不同的工作区」
-    /// 的原因。只有没存档根（旧对话文件）才回到「还没定」，让首条消息现建。
-    pub fn restore(&self, mode: &str, root: Option<PathBuf>) {
+    /// 两条都关键：
+    /// - **`default` 档的根若已存档就沿用**（`At` + `picked = false`），不要等首条消息
+    ///   现建一块 —— 那是「每次进入同一个对话都是不同的工作区」的原因；
+    /// - **`own` 也要一起还原** —— 少了它，「重开这段对话 → 切完全访问 → 切回默认」
+    ///   又会新建一块，也就是工作区累加的另一半来源。
+    pub fn restore(&self, rec: &Record) {
         let mut st = self.lock();
-        match (mode, root) {
+        st.own = rec.own.clone();
+        match (rec.mode.as_str(), rec.root.clone()) {
             ("full", _) => {
                 st.active = Active::Full;
                 st.started = true;
@@ -284,9 +355,14 @@ impl Workplace {
             }
             // `default` 档的地：沿用存档的根，但档位仍是「默认」。
             ("default", Some(p)) => {
-                st.active = Active::At(normalize(&p));
+                let p = normalize(&p);
+                st.active = Active::At(p.clone());
                 st.started = true;
                 st.picked = false;
+                // 老格式的记录没有 `own` 字段：`root` 就是那块自建地，拿它兜底。
+                if st.own.is_none() {
+                    st.own = Some(p);
+                }
             }
             // `default` 没给根、或档位名认不出：回「还没定」，首条消息现建一块。
             _ => {
@@ -315,6 +391,9 @@ impl Workplace {
         st.started = false;
         st.active = Active::Pending;
         st.picked = false;
+        // 新对话要另开一块地：把「本对话自建的地」也清掉，否则它会去复用**上一段对话**
+        // 那块（那正是「新对话还带着上一个工作区」的另一半来源）。
+        st.own = None;
     }
 
     /// 本对话开始前确保根已定。返回 `Some(目录)` 表示**这正是本次调用建的**
@@ -336,6 +415,9 @@ impl Workplace {
             st.active = Active::At(dir.clone());
             // 现建的地 ⇒ 报「默认」而不是「选择工作区」（判据是 `picked`，见 `State`）。
             st.picked = false;
+            // 记成「本对话自建的地」：此后无论切到哪一档、再切回默认，都是这一块
+            // （切一次就新建一个目录的话，`workplace/` 会被空目录堆满）。
+            st.own = Some(dir.clone());
             st.started = true;
             return Ok(Some(dir));
         }
@@ -386,12 +468,25 @@ impl Workplace {
                 Ok(format!("已切到「选择工作区」：{}", d.display()))
             }
             Mode::Default => {
-                // 档位本身要等下一次 `ensure_started`（首条消息）才落到具体目录上。
-                st.active = Active::Pending;
-                st.started = false;
                 st.picked = false;
                 let _ = app_root;
-                Ok("已切到「默认」：下一条消息发出时会在 workplace/ 下开一块新工作区。".into())
+                // **本对话已经为「默认」建过一块地 ⇒ 回到那一块，不再另建。**
+                // 见 `State::own`：切到「完全访问」再切回来就新建一个目录的话，
+                // `workplace/` 会被空目录堆满（用户 2026-10-05 报的）。
+                // 只有本对话还没建过，才回到「还没定」，等首条消息现建。
+                match st.own.clone() {
+                    Some(p) => {
+                        st.active = Active::At(p.clone());
+                        st.started = true;
+                        Ok(format!("已切到「默认」：本对话仍在 {} 里。", p.display()))
+                    }
+                    None => {
+                        st.active = Active::Pending;
+                        st.started = false;
+                        Ok("已切到「默认」：下一条消息发出时会在 workplace/ 下开一块新工作区。"
+                            .into())
+                    }
+                }
             }
         }
     }
@@ -404,11 +499,14 @@ impl Workplace {
 
     /// 当前是否**不受限**（`full` 档 = 一切放行）。
     ///
-    /// 给判定点做短路用。`full` 是配置默认，而这个默认值下 `check` 算出来的东西
-    /// **整个会被丢掉**（调用方只要 `.err()`），却要实打实付一次到几次 `canonicalize` ——
-    /// 实测 65~224 µs，走的是文件系统。判定在**每一次工具调用**上都跑，
-    /// 默认档位下这份开销纯属白花；调用方先问一句这个，整条路径（含 `scan_paths`
+    /// 给判定点做短路用。这一档下 `check` 算出来的东西**整个会被丢掉**（调用方只要
+    /// `.err()`），却要实打实付一次到几次 `canonicalize` —— 实测 65~224 µs，走的是文件系统。
+    /// 判定在**每一次工具调用**上都跑，而 `full` 档（`mode = "full"`，或界面上切了
+    /// 「完全访问」）下这份开销纯属白花；调用方先问一句这个，整条路径（含 `scan_paths`
     /// 那张粗网）就跳过了。
+    ///
+    /// ⚠️ 2026-10-05 起**配置默认**是 `default`（受限），不再是 `full` —— 所以这条短路
+    /// 现在只对显式选了完全访问的用户生效，别再把「大多数用户走这条」当理由。
     ///
     /// ⚠️ 与 [`Workplace::mode`] 同一个规矩：**不要在持锁的上下文里调它**。
     pub fn is_unrestricted(&self) -> bool {
@@ -474,8 +572,8 @@ impl Workplace {
                 out.push_str(
                     "  档位：完全访问\n  \
                      AOX 可以读写设备上的任何文件，不设边界。\n\n  \
-                     这是默认值（不写 config.toml 的 [workplace] 就是这个）—— \
-                     保持「不写配置 = 行为不变」。\n  想收紧：/workplace default 或 /workplace <目录>\n",
+                     这是**显式**选的（config.toml 里写了 mode = \"full\"，或界面上切过）—— \
+                     配置默认是「默认」档（受限）。\n  想收紧：/workplace default 或 /workplace <目录>\n",
                 );
             }
             Active::Pending => {
@@ -1283,14 +1381,14 @@ mod tests {
         let (m, r) = w.snapshot();
         assert!(matches!(m, Mode::Fixed(_)), "运行期点名挑的地要报「选择工作区」，实际 {m:?}");
         assert_eq!(r, Some(normalize(&d)));
-        assert_eq!(w.persisted().0, "fixed", "存档里也要是 fixed，否则下回打开又变回默认");
+        assert_eq!(w.persisted().mode, "fixed", "存档里也要是 fixed，否则下回打开又变回默认");
 
         // 而 `default` 档现建的地仍然报「默认」（picked=false）
         let w2 = ws("default", None);
         let app2 = std::env::temp_dir().join("aox-ws-origin-default");
         w2.ensure_started(&app2).unwrap().expect("应当建出一块新地");
         assert_eq!(w2.snapshot().0, Mode::Default);
-        assert_eq!(w2.persisted().0, "default");
+        assert_eq!(w2.persisted().mode, "default");
         let _ = std::fs::remove_dir_all(app2.join(WORKPLACE_DIR));
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1331,46 +1429,93 @@ mod tests {
 
     /// `persisted()` 与 `restore()` 必须互为逆运算 —— 打开旧对话就是把存下来的那份放回去。
     ///
-    /// 尤其是 `default` 档带根的那一支：**根要沿用**，否则「同一段对话每次进去都是
-    /// 不同的工作区」（新地由首条消息现建）。
+    /// 关键几点：`default` 档带根的那一支**根要沿用**（否则「同一段对话每次进去都是
+    /// 不同的工作区」）；`own` 也要进存档、并且在 `full` / `fixed` 档下**留着**
+    /// （否则「切走再切回默认」会另建一块）。
     #[test]
     fn persisted_and_restore_round_trip() {
         let base = std::env::temp_dir().join("aox-ws-persist");
         std::fs::create_dir_all(base.join("picked")).unwrap();
         let app = std::env::temp_dir().join("aox-ws-persist-app");
 
-        // ① default：地是现建的 → 存 (default, 那块地) → 还原后仍是「默认」且是同一块地
+        // ① default：地是现建的 → 存档里 mode=default，root 与 own 都是那块地
         let w = ws("default", None);
         let dir = w.ensure_started(&app).unwrap().expect("应当建出一块新地");
         let saved = w.persisted();
-        assert_eq!(saved.0, "default");
+        assert_eq!(saved.mode, "default");
+        assert_eq!(saved.root.as_ref(), Some(&normalize(&dir)));
+        assert_eq!(saved.own.as_ref(), Some(&normalize(&dir)), "自建地也要进存档");
         let fresh = ws("full", None); // 故意从别的档起 —— 还原要能压过它
-        fresh.restore(&saved.0, saved.1.clone());
+        fresh.restore(&saved);
         assert_eq!(fresh.snapshot(), (Mode::Default, Some(normalize(&dir))));
-        assert_eq!(fresh.persisted(), saved);
+        assert_eq!(fresh.persisted(), saved, "往返一圈必须一模一样");
 
-        // ② fixed：点名挑的地
+        // ② fixed：点名挑的地，`own` 为空
         let w = fixed(&base.join("picked").to_string_lossy());
         let saved = w.persisted();
-        assert_eq!(saved.0, "fixed");
+        assert_eq!(saved.mode, "fixed");
+        assert_eq!(saved.own, None);
         let fresh = ws("full", None);
-        fresh.restore(&saved.0, saved.1.clone());
+        fresh.restore(&saved);
         let (m, r) = fresh.snapshot();
         assert!(matches!(m, Mode::Fixed(_)), "{m:?}");
-        assert_eq!(r, saved.1);
+        assert_eq!(r, saved.root);
 
-        // ③ full：没有根
-        let w = ws("full", None);
-        let saved = w.persisted();
-        assert_eq!(saved, ("full".to_string(), None));
+        // ③ full：当前档位没有根，但**自建地要留着** —— 切回默认时靠它找回原来那块
+        let own = normalize(&app.join(WORKPLACE_DIR).join("20260101000000"));
+        let saved = Record { mode: "full".into(), root: None, own: Some(own.clone()) };
         let fresh = fixed(&base.join("picked").to_string_lossy());
-        fresh.restore(&saved.0, saved.1.clone());
+        fresh.restore(&saved);
         assert_eq!(fresh.snapshot(), (Mode::Full, None));
+        assert_eq!(fresh.persisted().own.as_ref(), Some(&own), "full 档下也不许丢自建地");
+        fresh.set_mode(Mode::Default, &base).unwrap();
+        assert_eq!(fresh.snapshot(), (Mode::Default, Some(own)), "切回默认应当回到存档里那块");
 
         // ④ 认不出的档位名（或 default 没给根）⇒ 回「还没定」，让首条消息现建
         let fresh = ws("full", None);
-        fresh.restore("nonsense", None);
+        fresh.restore(&Record { mode: "nonsense".into(), root: None, own: None });
         assert_eq!(fresh.snapshot(), (Mode::Default, None));
+
+        let _ = std::fs::remove_dir_all(app.join(WORKPLACE_DIR));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **切走再切回「默认」要回到本对话原来那块地，不再新建。**
+    ///
+    /// 用户 2026-10-05 报的：「新建对话 → 说第一句（建了一块地）→ 切完全访问 → 切回默认」
+    /// 又开一块新的，于是 `workplace/` 被空目录一块块堆满（「无穷无尽的工作区累加」）。
+    #[test]
+    fn switching_back_to_default_reuses_the_conversation_own_dir() {
+        let app = std::env::temp_dir().join("aox-ws-own");
+        let base = std::env::temp_dir().join("aox-ws-own-base");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let w = ws("default", None);
+        let first = w.ensure_started(&app).unwrap().expect("首条消息应当建出一块地");
+
+        // 来回切几次：每次都必须是同一块，且不再建目录
+        for _ in 0..3 {
+            w.set_mode(Mode::Full, &base).unwrap();
+            assert_eq!(w.snapshot(), (Mode::Full, None));
+            let msg = w.set_mode(Mode::Default, &base).unwrap();
+            assert_eq!(
+                w.snapshot(),
+                (Mode::Default, Some(normalize(&first))),
+                "切回默认应当回到本对话那块地"
+            );
+            assert!(msg.contains("仍在"), "提示语该说「仍在原来那块」，实际：{msg}");
+            // 首条消息那一步不该再建（`started` 仍为真 ⇒ 返回 None）
+            assert!(w.ensure_started(&app).unwrap().is_none(), "不该再建第二块地");
+        }
+
+        let made = std::fs::read_dir(app.join(WORKPLACE_DIR)).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(made, 1, "来回切档不该攒出多个目录，实际 {made} 个");
+
+        // 只有**新对话**才另开一块：`reset_for_new_conversation` 会把自建地清掉
+        w.reset_for_new_conversation();
+        assert_eq!(w.snapshot(), (Mode::Default, None));
+        let second = w.ensure_started(&app).unwrap().expect("新对话应当另建一块");
+        assert_ne!(second, first, "新对话本来就该是另一块地");
 
         let _ = std::fs::remove_dir_all(app.join(WORKPLACE_DIR));
         let _ = std::fs::remove_dir_all(&base);

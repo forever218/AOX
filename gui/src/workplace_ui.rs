@@ -1,9 +1,9 @@
 //! 工作区按钮：输入框**左下角**那枚「工作区 · <档位>」。
 //!
 //! 三档（默认 / 选择工作区 / 完全访问）在**界面这一层**的入口就在这里。配置里的
-//! `[workplace]` 只管「不写就不变」（默认 `full`），真正表达「我这次想收紧」的地方
-//! 是这枚按钮 —— 这也就是 `aox::workplace` 模块文档里那句「用户最初要的『每次启动
-//! 默认受限』由 GUI 那一枚按钮去兑现」的兑现处。
+//! `[workplace] mode` 只定**启动那一刻**的档 —— 出厂默认是 `default`（受限档，
+//! 2026-10-05 由 `full` 改过来，用户要的就是「每次启动默认受限」）；运行期想换档靠这枚
+//! 按钮。切换只作用于**当前这段对话**：档位与根会跟着对话存档，`/new` 一律回到「默认」。
 //!
 //! 本模块负责四件东西：
 //! - [`button`]：那枚按钮本身（手绘文件夹图标 + 当前档位名）；
@@ -78,10 +78,17 @@ impl WorkplaceUi {
     /// 「选择工作区」档位不直接念档位名（那会变成「工作区 · 选择工作区」，读着像结巴），
     /// 而是显示**选中的那个目录名** —— 用户关心的是「我现在被关在哪块地儿」，
     /// 完整路径放在弹出的列表里。
+    ///
+    /// 「默认」档**建好地之后也带上目录名**（`默认 · 20261005162915`）：默认是
+    /// **一段对话里固定的那一块**（切走再切回来还是它，见 `aox::workplace::State::own`），
+    /// 光写「默认」看不出到底是哪一块，也就没法确认它没有一块块地攒（用户 2026-10-05 提的）。
     fn chip_text(&self) -> String {
         match &self.view {
             Some(v) => match &v.mode {
-                Mode::Default => "工作区 · 默认".to_string(),
+                Mode::Default => match &v.root {
+                    Some(p) => format!("工作区 · 默认 · {}", dir_name(p)),
+                    None => "工作区 · 默认".to_string(),
+                },
                 Mode::Fixed(p) => format!("工作区 · {}", dir_name(p)),
                 Mode::Full => "工作区 · 完全访问".to_string(),
             },
@@ -398,13 +405,13 @@ pub fn confirm(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
             ui.label(RichText::new("切换到「完全访问」？").color(P::danger()).size(17.0).strong());
             ui.add_space(10.0);
             ui.label(
-                RichText::new("AOX 将可以读写这台设备上的任何文件，工作区边界不再拦截任何路径。")
+                RichText::new("AOX 将可以读写设备上任何文件，工作区边界不再拦截")
                     .color(P::text_dim())
                     .size(14.0),
             );
             ui.add_space(6.0);
             ui.label(
-                RichText::new("这是整个程序里唯一一个「点下去就越过所有保护」的开关。")
+                RichText::new("潘多拉魔盒正在打开...但这不总是坏事，对吧？")
                     .color(P::text_faint())
                     .size(13.0),
             );

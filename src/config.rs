@@ -386,16 +386,20 @@ impl Default for SandboxConfig {
 /// - `[sandbox]` 管的是**插件子进程**能不能开子进程 / 吃内存 / 碰宿主窗口（进程围栏）；
 /// - `[workplace]` 管的是**模型这次能碰哪些文件**（写入与删除的路径边界；读不设限）。
 ///
-/// 默认 `mode = "full"`（不受限），这是刻意的：**不写 `[workplace]` 配置的用户，行为
-/// 与加这一层之前逐字节一致**。用户最初要的「每次启动默认受限」由 GUI 那枚「工作区」
-/// 按钮去兑现（那一层才是用户表达意图的地方），配置这一层只负责「不写就不变」。
+/// 默认 `mode = "default"`（每段对话在 `workplace/` 下开一块新地）。**2026-10-05 由
+/// `"full"` 改成这个** —— 兑现用户最初那句「每次启动**默认受限**」。
+///
+/// ⚠️ 代价：「不写 `[workplace]` 配置 = 与加这一层之前逐字节一致」这条**不再成立**。
+/// 现在不写就是受限档（写入与删除只准落在 `workplace/<时间戳>/`，读仍然不受限）；
+/// 想要不受限得显式写 `mode = "full"`，或在界面上切「完全访问」（那是一次运行期选择，
+/// 只对当前这段对话有效）。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct WorkplaceConfig {
-    /// `"full"`（不受限，默认）/ `"default"`（每段对话在 `<应用根>/workplace/<时间戳>/`
-    /// 开一块新地）/ `"fixed"`（配合 `root` 指定固定目录）。
+    /// `"default"`（**默认**：每段对话在 `<应用根>/workplace/<时间戳>/` 开一块新地）/
+    /// `"full"`（不受限）/ `"fixed"`（配合 `root` 指定固定目录）。
     ///
-    /// **认不出的值在启动时报错**，不静默退回 `full` —— 与 `[store] backend` /
+    /// **认不出的值在启动时报错**，不静默退回默认档 —— 与 `[store] backend` /
     /// `[loop] impl` 同一条原则：写了却不生效是最难查的一类问题。
     pub mode: String,
     /// `mode = "fixed"` 时的固定工作区目录。相对路径相对**应用根**解释。
@@ -404,7 +408,8 @@ pub struct WorkplaceConfig {
 
 impl Default for WorkplaceConfig {
     fn default() -> Self {
-        Self { mode: "full".into(), root: None }
+        // ⚠️ 出厂默认是 `default`（受限），不是 `full` —— 见上面 `WorkplaceConfig` 的注释。
+        Self { mode: "default".into(), root: None }
     }
 }
 
@@ -987,6 +992,27 @@ api_key = "k"
 
     /// 老配置（完全没写 `[hook]`）必须照常解析，且钩子表为空 ——
     /// 阶段 4 和阶段 2 一样，不能打破任何一份既有的 config.toml。
+    /// 出厂默认是**受限档**（`default`）—— 2026-10-05 由 `full` 改过来。
+    ///
+    /// 这条钉住的是一个**产品决定**：不写 `[workplace]` 的用户，启动就该是受限的
+    /// （写入与删除只准落在 `workplace/<时间戳>/` 里）。改回 `full` 会**静默**把所有人的
+    /// 写边界打开 —— 那是安全方向上的倒退，必须有测试出声，不能靠 review 记得。
+    #[test]
+    fn factory_default_is_the_confined_mode() {
+        assert_eq!(WorkplaceConfig::default().mode, "default");
+        let c: Config = toml::from_str(
+            r#"
+[provider]
+base_url = "https://example.com/v1"
+model = "m"
+api_key = "k"
+"#,
+        )
+        .expect("不写 [workplace] 应能解析");
+        assert_eq!(c.workplace.mode, "default", "不写这一段 = 出厂默认 = 受限档");
+        assert_eq!(c.workplace.root, None);
+    }
+
     #[test]
     fn config_without_hook_section_still_parses() {
         let c: Config = toml::from_str(

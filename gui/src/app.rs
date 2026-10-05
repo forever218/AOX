@@ -73,6 +73,9 @@ impl NoteKind {
 struct StepView {
     name: String,
     plugin: Option<String>,
+    /// 调用参数（JSON 串）。**界面上不显示** —— 行上只留工具名，见 `step_row`；
+    /// 留字段是为了排错时能一眼对上 `history/*.jsonl` 里那一行。
+    #[allow(dead_code)]
     args: String,
     result: Option<(bool, String)>,
 }
@@ -108,7 +111,22 @@ struct Live {
     reasoning_live: bool,
     steps: Vec<StepView>,
     interim: Vec<String>,
+    /// `interim[i]` 说出时**已经跑过多少步调用** —— 用来把实时区切成
+    /// 「调用流 → 阶段回复 → 调用流 → …」的交替段（用户 2026-10-05 提的：原来所有调用
+    /// 挤在顶上、所有回复挤在中间，看不出哪几步属于哪个阶段）。
+    ///
+    /// 存「切点」而不是把 `steps` / `interim` 换成 `Vec<Segment>`：这两样在一轮结束时
+    /// 要原样交给过程卡片，保持扁平就不用动那条提交路径。
+    cuts: Vec<usize>,
     pending_final: Option<String>,
+    /// **正在打字的正文**（这一瞬间还没写完的那一句）。
+    ///
+    /// 与 `pending_final` 的分工：`pending_final` 是「本次响应已经确定的完整正文」，
+    /// 到一轮结束才落成一条消息；`streaming` 是让它在落盘之前就**看得见**（用户 2026-10-05
+    /// 提的「回复只在全部完成后才瞬间出现、之前对话是黑的」）。
+    /// 两者在 `AgentEvent::AssistantText` / `InterimText` 到达时对齐 —— 那时增量已经吐完，
+    /// 用权威文本覆盖一遍，避免打字过程中因为丢帧而与真文本差几个字。
+    streaming: String,
     started: Instant,
     /// 输出侧（思考 + 正文）收到的字符数，用于实时滚动一个在涨的 token 数。
     ///
@@ -434,7 +452,9 @@ impl App {
                         reasoning_live: false,
                         steps: Vec::new(),
                         interim: Vec::new(),
+                        cuts: Vec::new(),
                         pending_final: None,
+                        streaming: String::new(),
                         started: Instant::now(),
                         out: TokenEstimate::default(),
                     });
@@ -448,11 +468,14 @@ impl App {
                     }
                 }
                 FromAgent::Content(d) => {
-                    // 正文增量只为让 token 数字继续涨。正文本身走
-                    // `Event(AssistantText)` 一次性送达，活动流的模型段也由那里推进 ——
-                    // 这里再插一遍会让同一段文字在活动流里出现两次。
+                    // 正文增量有两个用途：① 让 token 数字一直涨；② **即时显示** ——
+                    // 追加到 `streaming`，界面就能一个字一个字地打出来（用户 2026-10-05
+                    // 提的「回复要等全部完成才瞬间出现、在那之前对话是黑的」）。
+                    // 活动流的模型段仍由 `Event(AssistantText)` 推进：那里再插一遍会让
+                    // 同一段文字在时间轴上出现两次。
                     if let Some(l) = self.live.as_mut() {
                         l.out.add(&d);
+                        l.streaming.push_str(&d);
                     }
                 }
                 FromAgent::Usage(rec) => {
@@ -787,9 +810,12 @@ impl App {
                         let at = self.started.elapsed().as_secs_f32();
                         // 模型开始吐正文 = 「模型」那一段开始（若还没开）
                         activity::lock(&self.act).model_begin(at);
-                        if let Some(prev) = l.pending_final.replace(t) {
+                        if let Some(prev) = l.pending_final.replace(t.clone()) {
                             l.interim.push(prev);
                         }
+                        // 增量已经吐完 ⇒ 拿权威文本对齐一次：打字过程中万一丢帧，
+                        // 屏幕上的字会与真文本差几个字，最后一刻必须抹平。
+                        l.streaming = t;
                     }
                     None => self.items.push(Item::Assistant(t)),
                 }
@@ -798,7 +824,12 @@ impl App {
                 if let Some(l) = self.live.as_mut() {
                     let at = self.started.elapsed().as_secs_f32();
                     activity::lock(&self.act).model_begin(at);
+                    // 阶段说明到此定稿：收进 `interim`（它会留在实时区，并在结束后进过程卡片），
+                    // `streaming` 清空 —— 下一段正文从新的一行重新开始打。
+                    l.streaming.clear();
                     l.interim.push(t);
+                    // 记下「这句话之前跑了几步」：实时区据此把它前面那段调用单独画成一张卡。
+                    l.cuts.push(l.steps.len());
                 }
             }
             AgentEvent::ToolCall { name, args } => {
@@ -1317,23 +1348,28 @@ impl App {
 
     fn live_block(&self, ui: &mut Ui, l: &Live, width: f32) {
         let _ = width;
-        // 进行中的工具调用
-        if !l.steps.is_empty() {
-            Frame::NONE
-                .fill(P::surface())
-                .corner_radius(CornerRadius::same(theme::card_radius()))
-                .stroke(Stroke::new(1.0, P::border()))
-                .inner_margin(Margin::symmetric(20, 16))
-                .show(ui, |ui| {
-                    // 用框架内部的可用宽度，避免内容把卡片顶出栏宽
-                    let w = ui.available_width();
-                    ui.set_width(w);
-                    ui.set_max_width(w);
-                    for (i, st) in l.steps.iter().enumerate() {
-                        step_row(ui, i + 1, st, w);
-                    }
-                });
-            ui.add_space(16.0);
+        // 实时区按**阶段**切开：一段调用流 → 一句阶段回复 → 再一段调用流 → …
+        // （用户 2026-10-05 提的：原来所有调用挤在顶上、所有回复挤在中间，
+        // 看不出哪几步属于哪个阶段。）
+        //
+        // `cuts[i]` = 第 i 句阶段回复说出时已经跑过的步数 ⇒ 第 i 段调用就是
+        // `steps[cuts[i-1] .. cuts[i]]`，最后一段一直画到 `steps.len()`。
+        for seg in 0..=l.interim.len() {
+            let from = if seg == 0 { 0 } else { l.cuts.get(seg - 1).copied().unwrap_or(0) };
+            let to = l.cuts.get(seg).copied().unwrap_or(l.steps.len()).min(l.steps.len());
+            if from < to {
+                calls_card(ui, &l.steps[from..to]);
+                ui.add_space(14.0);
+            }
+            if let Some(say) = l.interim.get(seg) {
+                live_plain_text(ui, say, P::text_dim());
+                ui.add_space(14.0);
+            }
+        }
+        // 正在打的那一句接在最后：它还没归属到任何阶段（说完才知道后面还有没有调用）。
+        if !l.streaming.trim().is_empty() {
+            live_plain_text(ui, &l.streaming, P::text());
+            ui.add_space(14.0);
         }
 
         // 等待动画 + 状态
@@ -1364,33 +1400,35 @@ impl App {
             }
         });
 
-        // 实时思考过程（尾部几行，响应结束即消失）
-        if l.reasoning_live && !l.reasoning.is_empty() {
-            ui.add_space(12.0);
-            let tail = tail_lines(&l.reasoning, 4);
-            Frame::NONE
-                .fill(P::code_bg())
-                .corner_radius(CornerRadius::same(12))
-                .stroke(Stroke::new(1.0, P::border()))
-                .inner_margin(Margin::symmetric(16, 13))
-                .show(ui, |ui| {
-                    let w = ui.available_width();
-                    ui.set_width(w);
-                    ui.set_max_width(w);
-                    let mut job = egui::text::LayoutJob::default();
-                    job.wrap.max_width = w;
-                    job.wrap.break_anywhere = true;
-                    job.append(
-                        &tail,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: theme::body_font(14.5),
-                            color: P::text_faint(),
-                            ..Default::default()
-                        },
-                    );
-                    ui.add(Label::new(job));
-                });
+        // 思考框：**固定高度、且常驻**（用户 2026-10-05：「底下的思考框会时不时上下伸缩，
+        // 导致屏幕上下震动」）。伸缩有两个来源，这里一次治掉：
+        //   ① 流式过程中它从一行涨到四行；
+        //   ② 每次响应结束 `reasoning_live` 变 false、文本被清空，整块忽隐忽现。
+        // 所以框只画一次、高度写死，文字画在框内并按框裁掉。代价是非思考模型也会看到
+        // 这个空框 —— 用「一块稳定的空白」换「整块上下跳」，稳定更值。
+        const THINK_LINES: usize = 4;
+        const THINK_LINE_H: f32 = 20.0;
+        ui.add_space(12.0);
+        let w = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(
+            Vec2::new(w, THINK_LINE_H * THINK_LINES as f32 + 26.0),
+            Sense::hover(),
+        );
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(12), P::code_bg());
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(12),
+            Stroke::new(1.0, P::border()),
+            egui::StrokeKind::Inside,
+        );
+        if !l.reasoning.is_empty() {
+            let inner = rect.shrink2(Vec2::new(16.0, 13.0));
+            let tail = tail_lines(&l.reasoning, THINK_LINES);
+            // 先裁再画：文字超过四行时被切掉，而不是把框顶高。
+            let p = painter.with_clip_rect(inner);
+            let g = p.layout(tail, theme::body_font(14.5), P::text_faint(), inner.width());
+            p.galley(inner.left_top(), g, P::text_faint());
         }
         ui.add_space(16.0);
     }
@@ -2962,8 +3000,8 @@ fn process_block(ui: &mut Ui, p: &mut Process, width: f32) {
                 let w = ui.available_width();
                 ui.set_width(w);
                 ui.set_max_width(w);
-                for (i, st) in p.steps.iter().enumerate() {
-                    step_row(ui, i + 1, st, w);
+                for st in &p.steps {
+                    step_row(ui, st);
                 }
                 if !p.interim.is_empty() {
                     ui.add_space(8.0);
@@ -2998,30 +3036,35 @@ fn process_block(ui: &mut Ui, p: &mut Process, width: f32) {
     }
 }
 
-fn step_row(ui: &mut Ui, idx: usize, st: &StepView, width: f32) {
-    let w = width.max(140.0);
+/// 实时区里的一段「模型正在说的话」。
+///
+/// 故意用**普通正文**渲染、不加 Markdown、不加气泡边框：它是同一段文字在落盘之前的临时
+/// 形态，落盘后会换成带 Markdown 的气泡。中途另起一套样式，两段看着就不像同一句话，
+/// 切换时会「跳」一下。`break_anywhere` 开着是为了防止答案里的长路径把版心顶破 ——
+/// 这里只求不溢出，好看与否交给最终那条气泡。
+fn live_plain_text(ui: &mut Ui, text: &str, color: Color32) {
+    let w = ui.available_width();
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = w;
+    job.wrap.break_anywhere = true;
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat { font_id: theme::body_font(15.0), color, ..Default::default() },
+    );
+    ui.add(Label::new(job));
+}
+
+fn step_row(ui: &mut Ui, st: &StepView) {
     ui.horizontal_top(|ui| {
-        ui.label(
-            RichText::new(format!("{idx:>2}"))
-                .color(P::text_faint())
-                .size(13.0)
-                .monospace(),
-        );
-        ui.add_space(5.0);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 20.0), Sense::hover());
-        // 单色方案下的状态区分：成功=实心墨点；失败=空心圆环（一眼能看出「不一样」）
-        let (err, ok) = match &st.result {
-            Some((e, _)) => (*e, !*e),
-            None => (false, false),
-        };
-        if err {
-            ui.painter()
-                .circle_stroke(rect.center(), 4.5, Stroke::new(2.0, P::ink()));
-        } else if ok {
-            ui.painter().circle_filled(rect.center(), 4.0, P::ink());
-        } else {
-            ui.painter()
-                .circle_stroke(rect.center(), 3.5, Stroke::new(1.5, P::text_faint()));
+        // 状态标记（用户 2026-10-05 定的形态）：进行中 = 三点跑马灯（**刻意与思考中那个
+        // 8 点绕圈的 spinner 不同形**）、成功 = ✓、失败 = ✗。
+        // 也不再编号 —— 编号会把「一个阶段的几步调用」读成一份清单，这里要的是
+        // 「一个接着下一个」。
+        match &st.result {
+            None => call_marquee(ui, P::text_dim()),
+            Some((is_err, _)) if *is_err => call_glyph(ui, false, P::ink()),
+            Some(_) => call_glyph(ui, true, P::ink()),
         }
         ui.add_space(4.0);
         ui.label(RichText::new(&st.name).color(P::text()).size(14.5));
@@ -3039,48 +3082,75 @@ fn step_row(ui: &mut Ui, idx: usize, st: &StepView, width: f32) {
                     );
                 });
         }
-        if !st.args.is_empty() && st.args != "{}" {
-            let room = (ui.available_width() - 10.0).max(60.0);
-            let mut job = egui::text::LayoutJob::default();
-            job.wrap.max_width = room;
-            job.wrap.break_anywhere = true;
-            job.append(
-                &st.args,
-                0.0,
-                egui::TextFormat {
-                    font_id: theme::mono_font(13.0),
-                    color: P::text_faint(),
-                    ..Default::default()
-                },
-            );
-            ui.add(Label::new(job));
-        }
+        // 参数**不在这里显示**（用户 2026-10-05 提的）：一串 JSON 会把这一行撑成好几行，
+        // 展开后更是一眼看不到底。行上只留「工具名 + 归属插件」，结果在下一行给一行摘要。
+        // 真要看参数，`history/*.jsonl` 里原样存着。
     });
-    if let Some((err, preview)) = &st.result {
-        ui.horizontal_top(|ui| {
-            ui.add_space(38.0);
-            let mut job = egui::text::LayoutJob::default();
-            job.wrap.max_width = (w - 44.0).max(80.0);
-            job.wrap.break_anywhere = true;
-            job.append(
-                &one_line(preview, 400),
-                0.0,
-                egui::TextFormat {
-                    font_id: theme::body_font(13.5),
-                    color: if *err { P::ink() } else { P::text_faint() },
-                    ..Default::default()
-                },
-            );
-            ui.add(Label::new(job));
-        });
-    }
     ui.add_space(5.0);
 }
 
-fn one_line(s: &str, max: usize) -> String {
-    let joined = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    clamp_str(&joined, max)
+/// 实时区里的一段调用流（某句阶段回复之前的那些调用）。
+///
+/// 实时区**一段一张卡**（见 `live_block` 的切段循环），过程卡片那边则是一张卡装全部 ——
+/// 行渲染共用同一套，只是分组不同。
+fn calls_card(ui: &mut Ui, steps: &[StepView]) {
+    Frame::NONE
+        .fill(P::surface())
+        .corner_radius(CornerRadius::same(theme::card_radius()))
+        .stroke(Stroke::new(1.0, P::border()))
+        .inner_margin(Margin::symmetric(20, 16))
+        .show(ui, |ui| {
+            // 用框架内部的可用宽度，避免内容把卡片顶出栏宽
+            let w = ui.available_width();
+            ui.set_width(w);
+            ui.set_max_width(w);
+            for st in steps {
+                step_row(ui, st);
+            }
+        });
 }
+
+/// 调用流里的「进行中」：三个点，亮点依次后移。
+///
+/// 与 [`spinner_dot`] 那个 8 点绕圈**刻意不同形**（用户要求「有区别于思考中的加载动画」）：
+/// 一眼就能分出「是在调工具」还是「是在想」。
+fn call_marquee(ui: &mut Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 20.0), Sense::hover());
+    // 相位取 `ui.input(|i| i.time)`（egui 自增的秒数）：任何位置都能直接调它，
+    // 不必把 `App` 的 `spin` 一路传进来。
+    let t = ui.input(|i| i.time) as f32;
+    let active = ((t * 3.0) as usize) % 3;
+    let painter = ui.painter();
+    for i in 0..3 {
+        let hot = i == active;
+        let p = Pos2::new(rect.left() + 3.0 + i as f32 * 5.0, rect.center().y);
+        painter.circle_filled(
+            p,
+            if hot { 2.4 } else { 1.8 },
+            color.gamma_multiply(if hot { 1.0 } else { 0.22 }),
+        );
+    }
+}
+
+/// ✓ / ✗。用两条线段手绘 —— 不赌字体里有没有这两个字形（与 `paint_folder` 同一个理由）。
+fn call_glyph(ui: &mut Ui, ok: bool, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 20.0), Sense::hover());
+    let c = rect.center();
+    let s = 4.4;
+    let stroke = Stroke::new(1.8, color);
+    let painter = ui.painter();
+    if ok {
+        painter.line_segment(
+            [Pos2::new(c.x - s, c.y + 0.6), Pos2::new(c.x - 1.4, c.y + s)],
+            stroke,
+        );
+        painter.line_segment([Pos2::new(c.x - 1.4, c.y + s), Pos2::new(c.x + s, c.y - s)], stroke);
+    } else {
+        painter.line_segment([Pos2::new(c.x - s, c.y - s), Pos2::new(c.x + s, c.y + s)], stroke);
+        painter.line_segment([Pos2::new(c.x + s, c.y - s), Pos2::new(c.x - s, c.y + s)], stroke);
+    }
+}
+
 fn clamp_str(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut n = 0usize;
