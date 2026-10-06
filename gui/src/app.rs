@@ -3589,6 +3589,26 @@ fn usage_detail(ui: &mut Ui, log: &[UsageRecord]) {
 fn user_bubble(ui: &mut Ui, text: &str, files: &[String], max_w: f32) {
     // 内边距会额外占宽度，所以要先把正文的可用宽度扣出来，否则气泡会顶出栏宽被裁
     let inner_w = (max_w - 44.0).max(140.0);
+    let body = text.trim();
+
+    // 正文先按 `inner_w` 折一次行，**量出实际用掉的宽度**：短句收窄、长句走满。
+    //
+    // ⚠️ 这一步不能省。`Frame::show` 算自己那块矩形用的是内容的 `min_rect`，而它一开始
+    // 就被撑到「可用宽度」上 —— 只写 `ui.set_max_width(..)` 是把那个宽度**往下夹**，
+    // 不是让它跟着内容缩。结果就是：不论发多长，气泡都一样宽（用户 2026-10-06 报的正是它）。
+    let galley = (!body.is_empty()).then(|| {
+        ui.painter().layout(
+            body.to_owned(),
+            theme::body_font(theme::body_size()),
+            P::text(),
+            inner_w,
+        )
+    });
+    let text_w = galley.as_ref().map_or(0.0, |g| g.size().x);
+    // 带附件时气泡至少要容得下一枚胶囊（取最宽的那枚当下限；真放不下就让它折行）
+    let chips_w = files.iter().map(|n| chip_width(ui, n)).fold(0.0_f32, f32::max);
+    let want = text_w.max(chips_w).min(inner_w);
+
     ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
         Frame::NONE
             .fill(P::user_bg())
@@ -3596,7 +3616,10 @@ fn user_bubble(ui: &mut Ui, text: &str, files: &[String], max_w: f32) {
             .stroke(Stroke::new(1.0, P::border()))
             .inner_margin(Margin::symmetric(20, 15))
             .show(ui, |ui| {
-                ui.set_max_width(inner_w);
+                // 宽度**钉死**（min 与 max 都设成同一个值），这样内容的 `min_rect`
+                // 就是 `want`，气泡于是贴着内容收 —— 短句一个窄条、长句走满版心。
+                ui.set_min_width(want);
+                ui.set_max_width(want);
                 ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
                     // 附件胶囊排在正文**上面**：与待上传栏里的位置一致（发出前后同一个观感），
                     // 而且空正文时（只发了文件）气泡里也有东西可看。
@@ -3630,6 +3653,22 @@ fn user_bubble(ui: &mut Ui, text: &str, files: &[String], max_w: f32) {
             });
     });
     ui.add_space(18.0);
+}
+
+/// 一枚已发出的附件胶囊有多宽（**估**）。
+///
+/// 只用来给气泡定一个宽度**下限** —— 量准它得先真的画一遍，不值当；估偏了也只是气泡
+/// 比胶囊宽或窄一点点，而 `horizontal_wrapped` 会自己折行兜住。
+/// ⚠️ 字号 / 内边距 / 描边必须与 [`sent_chip`] 里的那份一致，改那边记得改这里。
+fn chip_width(ui: &Ui, name: &str) -> f32 {
+    const PAD_X: f32 = 11.0;
+    const STROKE: f32 = 1.0;
+    let g = ui.painter().layout_no_wrap(
+        middle_elide(name, 30),
+        FontId::proportional(13.0),
+        Color32::PLACEHOLDER,
+    );
+    g.size().x + PAD_X * 2.0 + STROKE * 2.0
 }
 
 /// 已经发出去的消息气泡里的附件胶囊 —— 只读（没有 ×）。
