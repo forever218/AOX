@@ -27,7 +27,7 @@ use crate::agent::Agent;
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::LlmProvider;
 use crate::runtime::Runtime;
-use crate::tool::{hostfs, meta};
+use crate::tool::{ask, hostfs, meta};
 use crate::ui::cli::CliUi;
 use crate::ui::{AgentEvent, Ui};
 
@@ -309,6 +309,12 @@ async fn main() -> Result<()> {
     // 参数与实现都在宿主手里，所以「路径必须先过工作区判定」无法被绕过 ——
     // 与 `meta_tools` 同一批注册；默认档位（full）下它们与普通读写工具无异。
     for t in hostfs::host_file_tools() {
+        rt.register(t).await?;
+    }
+    // 交互工具（`ask_user`）：让模型把「选择题」交给界面，而不是写在正文里
+    // 等用户打字（见 `tool::ask`）。它由 Agent 特判处理，注册在这里是为了
+    // **让模型在 tools 列表里看得见它** —— 看不见的工具没人会调用。
+    for t in ask::ask_tools() {
         rt.register(t).await?;
     }
 

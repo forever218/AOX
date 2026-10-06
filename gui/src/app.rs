@@ -27,6 +27,7 @@
 //! 底部没有独立的「输入区」栏位：输入框是一枚浮在对话内容之上的卡片，
 //! 滚动时可以一直滑到它下面。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,7 +41,7 @@ use tokio::sync::oneshot;
 
 use aox::history::UsageRecord;
 use aox::llm::{thousands, TokenEstimate, Usage};
-use aox::ui::{AgentEvent, AuthDecision};
+use aox::ui::{AgentEvent, AuthDecision, ChoiceReply};
 use aox::workplace::Mode;
 
 use crate::activity::{self, ActKind};
@@ -104,6 +105,13 @@ enum Item {
     Assistant(String),
     Process(Process),
     Note(NoteKind, String),
+    /// 上一条消息里带的**图片**，单独成块显示在它下面。
+    ///
+    /// 为什么单开一个 Item 而不是给 `User` / `Note` 加个字段：图片有两个来源
+    /// （用户拖进来的、工具/插件产出的），它们分别落在 `User` 与 `Note` 上；
+    /// 而**画法完全一样**。单开一支之后，渲染只写一遍，也不会因为将来又多一个
+    /// 「带图的消息类型」而再改一次那两个变体（改变体要动所有构造点）。
+    Images(Vec<PathBuf>),
     /// 一轮任务的 token 明细。紧跟在那轮 AI 答复下面 —— 账要贴着它花掉的地方，
     /// 而不是攒到顶栏让人自己去对轮次。
     Usage(String),
@@ -144,6 +152,28 @@ struct Live {
 struct AuthCard {
     tool: String,
     args: String,
+}
+
+/// 一道等用户作答的选择题（`ask_user`）。问题与选项都是模型给的原文。
+///
+/// 带 `Clone`：作答那一行要用 `&mut self.choice_text`，而同一帧还要读题目与选项 ——
+/// 克隆一份小的（一句话 + 最多 6 个短串）比在借用上做体操划算得多。
+#[derive(Clone)]
+struct ChoiceCard {
+    question: String,
+    options: Vec<String>,
+}
+
+/// 一张图片当前处于哪个阶段。
+///
+/// 三个阶段各占一支、而不是用 `Option<TextureHandle>` + 另一个错误表：界面对这三者的
+/// 画法本来就不同（图 / 「正在解码…」/ 一句失败原因），合成一个只会让渲染那边
+/// 再拆回来。
+enum Tex {
+    /// 后台线程正在解码
+    Loading(std::sync::mpsc::Receiver<Result<aox::image::Bitmap, String>>),
+    Ready(egui::TextureHandle),
+    Failed(String),
 }
 
 /// 设置弹窗左侧那几栏。**声明顺序就是列表里从上到下的顺序**。
@@ -193,6 +223,20 @@ pub struct App {
     act: activity::Shared,
     auth: Option<AuthCard>,
     auth_reply: Option<oneshot::Sender<AuthDecision>>,
+    /// 正在等用户作答的一道选择题（`ask_user` 问出来的）。`None` = 没有。
+    choice: Option<ChoiceCard>,
+    /// 选项槽最后那一行**行内输入框**的内容。
+    ///
+    /// 与主输入框 `input` 分开是刻意的：两者的归属不同 —— 这份只对当前这道题有效，
+    /// 作答完就清空。共用一个会出两种 bug：作答时把用户在别处打的草稿吞掉，
+    /// 或者作答完草稿还赖在框里。
+    choice_text: String,
+    /// 回执通道。**与 `auth_reply` 同一套路**：`Some` 期间 agent 线程正阻塞在
+    /// `choose()` 上，所以任何一条收起卡片的路径都必须把它回填掉 ——
+    /// 漏了就会「界面看着没事，模型那边永远等下去」。
+    choice_reply: Option<oneshot::Sender<ChoiceReply>>,
+    /// 已解码 / 正在解码的图片。键是**本机路径**（见 [`Tex`]）。
+    tex: HashMap<PathBuf, Tex>,
 
     input: String,
     /// 待上传栏里的附件（用户拖进来 / `attach_file` 挂上来的）。
@@ -318,6 +362,10 @@ impl App {
             act: activity::new_shared(),
             auth: None,
             auth_reply: None,
+            choice: None,
+            choice_text: String::new(),
+            choice_reply: None,
+            tex: HashMap::new(),
             input: String::new(),
             pending: Vec::new(),
             dragging_files: false,
@@ -589,6 +637,21 @@ impl App {
                         at,
                     );
                 }
+                // `ask_user` 问出来的一道选择题。与授权请求同一套路，但**不阻塞输入**
+                //（用户要能自己打字作答），所以这里不动 `input` / `can_send` 那套开关，
+                // 只把卡片挂上、状态改掉。
+                FromAgent::ChoiceRequest { question, options, reply } => {
+                    self.status = "等你选择".into();
+                    self.choice = Some(ChoiceCard { question: question.clone(), options });
+                    // 上一道题残留的字不能带过来：那会造成「我还没打字，框里却有内容」
+                    self.choice_text.clear();
+                    self.choice_reply = Some(reply);
+                    // 选项槽在输入框上方，用户此刻多半正看着对话末尾 —— 拉到最下面
+                    // 才看得见它。不拉的话表现是「模型问了一句，然后就没反应了」。
+                    self.force_follow = true;
+                    let at = self.now();
+                    activity::lock(&self.act).note(ActKind::Info, "等你选择", &question, at);
+                }
                 FromAgent::Fatal(e) => {
                     self.items.push(Item::Error(e.clone()));
                     self.note_act(ActKind::Error, "致命错误", &e);
@@ -674,6 +737,11 @@ impl App {
         self.waiting_auth = false;
         self.auth = None;
         self.auth_reply = None;
+        // 选项槽跟着一起收。**回执通道丢掉就够了**：对端 `rx.await` 会立刻报错，
+        // 而 `GuiUi::choose` 把「通道断了」映射成 `Cancelled`（见 bridge 里那条注释）——
+        // 于是 agent 线程不会卡在一个永远等不到答案的 `choose()` 上。
+        self.choice = None;
+        self.choice_reply = None;
         // 用量账本跟消息、活动流一起换掉：Agent 那边也把账重新接回来了，
         // 紧接着的 `UsageLog` 会把这一段对话的记录送过来。
         self.usage_log.clear();
@@ -935,6 +1003,16 @@ impl App {
                     self.items.push(Item::Note(NoteKind::Warn, m));
                 }
             }
+            AgentEvent::Images(paths) => {
+                // 工具产出的图片：**当场画出来**。
+                //
+                // 在此之前这套流程有个说不通的结局：模型说「图出来了，直接看上面那张」，
+                // 而人这边什么都没有 —— 图进的是**发给模型的那条请求**，界面只把随行的
+                // 那句话画成了一个小圆点。于是模型看得见、人看不见，而两种前端里
+                // 只有图形界面有这个问题。
+                self.items.push(Item::Images(paths));
+                self.force_follow = true;
+            }
             AgentEvent::Error(m) => {
                 self.note_act(ActKind::Error, "错误", &m);
                 if self.live.is_none() {
@@ -950,6 +1028,13 @@ impl App {
         self.waiting_auth = false;
         self.auth = None;
         self.auth_reply = None;
+        // 一轮结束时理论上不会有挂着的选项槽（模型已经往下走了）。真有就是界面自己
+        // 没清干净 —— 那也一起丢掉：此刻对端已经不在等（那一轮的 `choose()` 早返回了），
+        // `tx.send` 会静默失败。留着它反而危险：下一次 `ChoiceRequest` 之前若有人
+        // 调 `answer_choice`，那一下会打到一个已经没人听的通道上，而界面看起来像
+        // 「我点了、但它没反应」。
+        self.choice = None;
+        self.choice_reply = None;
         self.status = "就绪".into();
         let Some(l) = self.live.take() else { return };
         let elapsed = l.started.elapsed().as_secs_f32();
@@ -1026,6 +1111,57 @@ impl App {
     /// 名字过长**中间省略**（`很长的名字…截图.png`）：后缀是这条信息里最有用的一位
     /// （一眼分得出是图还是文档），所以砍中间、留住尾巴；路径一律不显示 ——
     /// 一个 `E:\…\…\…` 的前缀会把胶囊撑爆，而用户自己清楚它是从哪拖来的。
+    /// 输入框上方那排可点选项（模型用 `ask_user` 问出来的）。
+    ///
+    /// 与「待上传栏」同一处、同一套语言（小圆角块 + 细描边），因为它们回答的是同一类
+    /// 问题：「用户现在要给我什么」。区别只在于一个给的是文件，一个给的是决定。
+    ///
+    /// **竖排**：A / B / C … 一行一个，最后一个永远是「自己输入」。
+    /// 第一版是横排，实机一测就露馅：选项一多，最后一个被挤成 28px 宽的竖条
+    ///（文字一个字一行），而且**点上去没反应** —— 命中区跟着被压缩的内容变了形，
+    /// 画出来的那块与能点的那块对不上（用户 2026-10-06 两个问题一起报的）。
+    /// 竖排还顺带解决了「一眼扫完」：选项本来就是读一个选一个，横排反而要左右找。
+    fn choice_bar(&mut self, ui: &mut Ui) {
+        // 克隆一份而不是借着 `self.choice` 画：最后那一行要用 `&mut self.choice_text`，
+        // 与「读题目和选项」是同一个 self 的两处借用 —— 结构体很小，克隆最省事。
+        let Some(card) = self.choice.clone() else { return };
+        let mut picked: Option<usize> = None;
+        let mut typed: Option<String> = None;
+
+        ui.add_space(6.0);
+        Frame::NONE
+            .fill(P::panel())
+            .corner_radius(CornerRadius::same(14))
+            .stroke(Stroke::new(1.0, P::border()))
+            .inner_margin(Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                let w = ui.available_width();
+                ui.set_width(w);
+                // 问题原文照搬：改写了就不再是模型问的那句，而用户要回答的正是它
+                ui.label(RichText::new(&card.question).color(P::text()).size(14.5));
+                ui.add_space(9.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    for (i, o) in card.options.iter().enumerate() {
+                        if ask_row(ui, w, i, o) {
+                            picked = Some(i);
+                        }
+                    }
+                    // 最后一行是**输入框本身**（见 `ask_input_row`）：作答的地方就在
+                    // 题目旁边，眼睛不用在上下两个框之间来回跑。
+                    typed = ask_input_row(ui, w, &mut self.choice_text);
+                });
+            });
+        ui.add_space(6.0);
+
+        if let Some(i) = picked {
+            self.answer_choice(ChoiceReply::Picked(i));
+        } else if let Some(t) = typed {
+            self.choice_text.clear();
+            self.answer_choice(ChoiceReply::Text(t));
+        }
+    }
+
     fn attach_bar(&mut self, ui: &mut Ui) {
         if self.pending.is_empty() {
             return;
@@ -1067,6 +1203,20 @@ impl App {
             return;
         }
         let text = self.input.trim().to_string();
+
+        // ── 有选项槽挂着：这一句是对那道题的**作答**，不是新一轮任务 ──
+        //
+        // 不说清这一点会很难查：用户打了字按发送，而 agent 线程此刻正阻塞在
+        // `choose()` 上 —— 那条 `Input` 只会排在通道里，表现就是「我打字了它不理我，
+        // 选项槽还挂在那儿」。作答之后输入框清空、选项槽收起，那一轮接着往下走。
+        if self.choice.is_some() {
+            if !text.is_empty() {
+                self.input.clear();
+                self.answer_choice(ChoiceReply::Text(text));
+            }
+            return;
+        }
+
         // 只有附件、没有文字也算一条消息 —— 拖一张图进来直接回车是最常见的用法。
         if (text.is_empty() && self.pending.is_empty()) || self.busy || self.waiting_auth {
             return;
@@ -1086,6 +1236,11 @@ impl App {
             format!("{text}（{} 个附件）", names.len())
         };
         self.items.push(Item::User(text.clone(), names));
+        // 自己拖进来的图**当场**显示，不等宿主那条回执绕一圈回来。
+        let shown: Vec<PathBuf> = files.iter().filter(|p| looks_like_image(p)).cloned().collect();
+        if !shown.is_empty() {
+            self.items.push(Item::Images(shown));
+        }
         self.input.clear();
         self.pending.clear();
         self.force_follow = true;
@@ -1098,6 +1253,86 @@ impl App {
         if self.busy {
             self.flags.request_abort();
             self.status = "正在中断…".into();
+        }
+    }
+
+    /// 把用户的回答交回 agent 线程，并收起选项槽。
+    ///
+    /// 这是**唯一**一处把 `ChoiceReply` 送出去的地方：三条作答路径（点选项、
+    /// 打字发送、以后若加的快捷键）都走它，才不会出现「某条路上忘了回执，
+    /// 于是模型永远等下去」。
+    fn answer_choice(&mut self, reply: ChoiceReply) {
+        if let Some(tx) = self.choice_reply.take() {
+            let _ = tx.send(reply);
+        }
+        self.choice = None;
+        self.choice_text.clear();
+        // 刚作答完，那一轮还在跑（模型要接着做）—— 状态回到「思考中」，
+        // 而不是留在「等你选择」上让人以为还在等他。
+        self.status = "思考中".into();
+    }
+
+    /// 图片解码的收尾与排队：每帧一次。
+    ///
+    /// 排在这里而不是「创建 Item 的那一刻」有两个原因：
+    /// ① Item 有两个来源（历史回放与实时事件），而 `items_from_history` 是个不用
+    ///    `self` 的自由函数，两边各排一次就是把同一件事写两遍；
+    /// ② 扫一遍是**幂等**的 —— 已经有条目的路径不会重复排队，于是不需要「在哪一步
+    ///    之后必须记得调一次」这种约定。
+    fn poll_images(&mut self, ctx: &egui::Context) {
+        // ① 收：解码完的挂成纹理（`try_recv` 不会阻塞界面）
+        let done: Vec<(PathBuf, Result<aox::image::Bitmap, String>)> = self
+            .tex
+            .iter_mut()
+            .filter_map(|(p, t)| match t {
+                Tex::Loading(rx) => rx.try_recv().ok().map(|r| (p.clone(), r)),
+                _ => None,
+            })
+            .collect();
+        for (p, r) in done {
+            let entry = match r {
+                Ok(bm) => Tex::Ready(ctx.load_texture(
+                    // 纹理名只用文件名：它只是调试时的标识，而整条路径又长又含反斜杠
+                    format!("aox-img:{}", p.file_name().unwrap_or_default().to_string_lossy()),
+                    egui::ColorImage::from_rgba_unmultiplied([bm.width, bm.height], &bm.rgba),
+                    egui::TextureOptions::LINEAR,
+                )),
+                // 失败也缓存：否则每帧都会为同一张坏图重开一次解码线程
+                Err(e) => Tex::Failed(e),
+            };
+            self.tex.insert(p, entry);
+        }
+
+        // ② 排：还没排过的进队列
+        let mut want: Vec<PathBuf> = Vec::new();
+        for it in &self.items {
+            if let Item::Images(paths) = it {
+                for p in paths {
+                    // 去重（同一张图可能在一条消息里被列两次），且只挑「像图片」的
+                    if looks_like_image(p) && !self.tex.contains_key(p) && !want.contains(p) {
+                        want.push(p.clone());
+                    }
+                }
+            }
+        }
+        // 一帧最多起 4 条解码线程：一屏二十张图不该一次起二十个线程、更不该同时
+        // 摊开二十份解码后的像素（那可能上 GB）。剩下的下一帧接着排 —— 这不影响
+        // 观感，因为用户本来就一次只看一两张。
+        let queued = want.len();
+        for p in want.into_iter().take(4) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = p.clone();
+            // 解码是同步的、且可能几十毫秒（GDI+ 见 `aox::image`），绝不能占着界面线程
+            std::thread::spawn(move || {
+                let _ = tx.send(aox::image::decode(&path));
+            });
+            self.tex.insert(p, Tex::Loading(rx));
+        }
+
+        // ③ 还有在解 / 还没排完的，就要求下一帧 —— 否则窗口安静下来之后，
+        //    那些图会永远停在「正在解码…」上（egui 只在有输入时才重绘）。
+        if queued > 0 || self.tex.values().any(|t| matches!(t, Tex::Loading(_))) {
+            ctx.request_repaint();
         }
     }
 
@@ -1373,12 +1608,17 @@ impl App {
                         if !started && self.live.is_none() {
                             self.empty_state(ui);
                         }
+                        // 图片渲染要查纹理缓存。`self.items` 与 `self.tex` 是**两个不相干
+                        // 的字段**，所以先取一个只借用 `tex` 的引用，循环里借用
+                        // `items` 就不冲突了（整块 `&mut self` 是不行的）。
+                        let tex = &self.tex;
                         for item in &mut self.items {
                             match item {
                                 Item::User(t, files) => user_bubble(ui, t, files, inner * 0.80),
                                 Item::Assistant(t) => assistant_block(ui, t, inner),
                                 Item::Process(p) => process_block(ui, p, inner),
                                 Item::Note(k, t) => note_row(ui, *k, t),
+                                Item::Images(paths) => images_block(ui, paths, inner, tex),
                                 Item::Usage(t) => usage_row(ui, t),
                                 Item::Error(t) => error_card(ui, t, inner),
                             }
@@ -1578,17 +1818,27 @@ impl App {
     fn composer(&mut self, ui: &mut Ui) {
         let (inner, pad) = column(ui.available_width());
         let blocked = self.demo || self.boot.as_ref().is_some_and(|b| !b.provider_ready);
-        // 只有附件、没有文字也允许发送（拖一张图进来按发送是最常见的用法）
-        let can_send = !self.busy
-            && !blocked
+        // 有选项槽挂着时，**发送的含义变了**：它是「这就是我的回答」，而不是开新一轮
+        //（那一轮正在跑，`busy` 为真）。所以这里要放行 —— 否则用户看着一排选项、
+        // 想自己打字说清楚，而发送键是灰的，只能去点某个都不太对的选项。
+        let choosing = self.choice.is_some();
+        // 只有附件、没有文字也允许发送（拖一张图进来按发送是最常见的用法）。
+        // 作答时不吃这一条：那时必须真的打字，光挂个附件不算回答。
+        let can_send = !blocked
             && !self.waiting_auth
-            && (!self.input.trim().is_empty() || !self.pending.is_empty());
+            && (!self.busy || choosing)
+            && (!self.input.trim().is_empty()
+                || (!choosing && !self.pending.is_empty()));
 
         ui.horizontal(|ui| {
             ui.add_space(pad);
             ui.vertical(|ui| {
                 ui.set_width(inner);
                 ui.set_max_width(inner);
+
+                // 选项槽：模型用 `ask_user` 问出来的选择题。放在待上传栏**之上** ——
+                // 它比「我这次要发什么」更急（用户不答，这一轮就不动）。
+                self.choice_bar(ui);
 
                 // 待上传栏：输入卡片**上方**那一排小胶囊（用户 2026-10-05 明确要求的位置）。
                 self.attach_bar(ui);
@@ -1630,6 +1880,10 @@ impl App {
                                 "模型未配置，无法对话"
                             } else if self.waiting_auth {
                                 "等待授权确认…"
+                            } else if choosing {
+                                // 指向**上面那一行**行内输入框：作答的地方在题目旁边，
+                                // 不要把人往下面这个框引（那是用户 2026-10-06 明确要的）
+                                "在上面那排选项里点一个，或直接在那一行输入…"
                             } else if self.busy {
                                 "正在执行，可点击右侧停止"
                             } else {
@@ -2283,6 +2537,9 @@ impl eframe::App for App {
         // —— 这一帧刚收下的附件要能在这一帧就出现在待上传栏里。
         self.take_dropped(ctx);
 
+        // 图片解码：收尾（挂纹理）与排队（起后台线程）。每帧一次，幂等。
+        self.poll_images(ctx);
+
         // 「跟随系统」的每帧复查：系统换了主题就跟着换（egui 每帧把当前系统主题放在
         // `ctx` 里）。不放在切换那一刻算一次的原因见 `theme::follow_system` 的注释 ——
         // 那样「跟随系统」会退化成「启动时照系统的样子定一次」。
@@ -2653,14 +2910,24 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
                 // 是 parts 数组 —— 直接 clone 一个字都显示不出来。宿主自己加的附件清单块
                 // 由 `flat_text` 滤掉（见 `attach::ATTACH_MARK`）。
                 let text = m.flat_text();
+                // 胶囊的名字、以及要**显示**的图片路径，都从清单块里还原：
+                // `image_url` 块里没有文件名字段（见 `attach::files_from_content`）。
+                let files = m
+                    .content
+                    .as_ref()
+                    .map(aox::attach::files_from_content)
+                    .unwrap_or_default();
                 if text.trim_start().starts_with("（宿主提示）") {
                     out.push(Item::Note(NoteKind::Warn, text.trim().to_string()));
                 } else {
-                    // 胶囊的名字从清单块里还原：`image_url` 块里**没有**文件名字段，
-                    // 清单是唯一来源（见 `attach::names_from_content`）。
-                    let files: Vec<String> =
-                        m.content.as_ref().map(aox::attach::names_from_content).unwrap_or_default();
-                    out.push(Item::User(text, files));
+                    out.push(Item::User(
+                        text,
+                        files.iter().map(|(n, _)| n.clone()).collect(),
+                    ));
+                }
+                let paths: Vec<PathBuf> = files.into_iter().map(|(_, p)| p).collect();
+                if !paths.is_empty() {
+                    out.push(Item::Images(paths));
                 }
             }
             "assistant" => {
@@ -2937,6 +3204,121 @@ pub(crate) fn danger_button(ui: &mut Ui, text: &str) -> egui::Response {
 ///
 /// 整枚胶囊**不可点**，只有 × 是热区：这个胶囊没有「点开」的去处（附件不是链接），
 /// 让整枚都可点就等于「点一下删一个」，太容易手滑。
+/// 选项槽最后那一行：**行内输入**（回车或点右侧箭头作答）。返回用户打的字。
+///
+/// 第一版它只是个「自己输入…」的按钮，点了把焦点交给下面那个大输入框。用户的反馈
+/// （2026-10-06）是「不用下面那个大的主输入框」—— 作答的地方就该在题目旁边，
+/// 眼睛不必在上下两个框之间来回跑；而「点了按钮之后还得自己去找另一个框」这件事
+/// 本身就很容易被当成「点了没反应」。
+///
+/// 回车与发送钮两条路都通：单行输入习惯回车，但鼠标用户不该被逼着碰键盘。
+fn ask_input_row(ui: &mut Ui, w: f32, text: &mut String) -> Option<String> {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(10), P::surface());
+
+    // 右边那枚发送钮（与主输入框那枚同一套画法，只是小一号）
+    let btn = Rect::from_center_size(
+        Pos2::new(rect.right() - 19.0, rect.center().y),
+        Vec2::splat(26.0),
+    );
+    // 左边空出编号列（12 内缩 + 26 列宽），文字与上面的 A / B / C 左对齐
+    let edit_rect = Rect::from_min_max(
+        Pos2::new(rect.left() + 38.0, rect.top() + 7.0),
+        Pos2::new(btn.left() - 6.0, rect.bottom() - 7.0),
+    );
+
+    let resp = ui.put(
+        edit_rect,
+        TextEdit::singleline(text)
+            .frame(false)
+            .desired_width(edit_rect.width())
+            .font(FontId::proportional(13.5))
+            .hint_text(
+                RichText::new("也可以在这里直接输入…").color(P::text_faint()).size(13.0),
+            ),
+    );
+    // 单行 TextEdit 的「回车」标准判据：这一帧**失去焦点**且按下了回车。
+    // 只看 `key_pressed` 不行 —— 那样打字时按回车会误触（它不会失焦）。
+    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+    let typed = text.trim().to_string();
+    let can = !typed.is_empty();
+    let bresp = ui.interact(btn, ui.id().with("aox-ask-send"), Sense::click());
+    let hot = can && pointer_if(ui, &bresp);
+    let p = ui.painter();
+    if can {
+        p.circle_filled(
+            btn.center(),
+            btn.width() * 0.5,
+            if hot { P::ink().gamma_multiply(0.75) } else { P::ink() },
+        );
+    } else {
+        // 空着的时候画个空心圈：让人看得出「这里有个按钮，只是先得写点什么」
+        p.circle_stroke(btn.center(), btn.width() * 0.5, Stroke::new(1.0, P::border()));
+    }
+    paint_arrow_up(p, btn, if can { P::bg() } else { P::text_faint() });
+
+    (can && (enter || bresp.clicked())).then_some(typed)
+}
+
+/// 选项槽里的一行选项：`A` + 正文。返回是否被点。
+fn ask_row(ui: &mut Ui, w: f32, idx: usize, text: &str) -> bool {
+    ask_chip(ui, w, idx, text)
+}
+
+/// 选项槽里的一行：`A` + 正文。
+///
+/// 自绘 + `allocate_exact_size(.., Sense::click())`，**刻意不用 `Frame::show` 之后再
+/// `interact()`**：后者在窄宽度下命中区会跟着内容一起被压扁（第一版就是这样 ——
+/// 画出来是条 28px 宽的竖条，点上去毫无反应）。自绘的话命中区就是这一整行，
+/// 宽度确定、与画出来的完全重合。
+///
+/// 编号列占固定宽度，于是 A / B / C 的文字左边**对得齐** —— 选项槽是一列，不是一堆。
+fn ask_chip(ui: &mut Ui, w: f32, idx: usize, text: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 32.0), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let p = ui.painter();
+    p.rect_filled(
+        rect,
+        CornerRadius::same(10),
+        if resp.hovered() { P::surface_hi() } else { P::surface() },
+    );
+    // 悬停时再描一圈：光靠底色那一档，在浅色主题下几乎看不出鼠标停在哪一行
+    if resp.hovered() {
+        p.rect_stroke(
+            rect,
+            CornerRadius::same(10),
+            Stroke::new(1.0, P::ink()),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    const NUM_W: f32 = 26.0;
+    let g = p.layout_no_wrap(
+        aox::tool::ask::letter(idx).to_string(),
+        FontId::proportional(13.5),
+        P::text_faint(),
+    );
+    p.galley(
+        Pos2::new(rect.left() + 12.0, rect.center().y - g.size().y * 0.5),
+        g,
+        P::text_faint(),
+    );
+    let color = P::text();
+    // 按可用宽度估一个上限再省略：中文按 ~13px、西文按 ~7px 折中取 11px，
+    // 估不准也只是多留或少留一点白 —— 而**不省略**的话长选项会直接冲出这一行。
+    let keep = (((w - NUM_W - 24.0) / 11.0).max(12.0)) as usize;
+    let g = p.layout_no_wrap(middle_elide(text, keep), FontId::proportional(13.5), color);
+    p.galley(
+        Pos2::new(rect.left() + NUM_W + 8.0, rect.center().y - g.size().y * 0.5),
+        g,
+        color,
+    );
+    resp.clicked()
+}
+
 fn attach_chip(ui: &mut Ui, name: &str) -> bool {
     let mut removed = false;
     Frame::NONE
@@ -3275,6 +3657,59 @@ fn sent_chip(ui: &mut Ui, name: &str) {
 fn assistant_block(ui: &mut Ui, text: &str, width: f32) {
     markdown::render(ui, text, P::text());
     let _ = width;
+}
+
+/// 看起来像图片的后缀。**只用来决定「值不值得试着解一下」**，不用来判定格式 ——
+/// 真正说了算的是解码器本身（`aox::image::decode`）。所以后缀不在表里、内容其实是
+/// PNG 的文件不会显示成图，这是这条捷径的代价；而反过来「后缀像图片但内容不是」
+/// 会被解码器拒绝，界面按「显示失败」如实说一句，不会假装成功。
+fn looks_like_image(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| {
+            matches!(
+                e.as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff"
+            )
+        })
+}
+
+/// 一条消息带的图片。按版心宽度缩放、保持长宽比。
+///
+/// 三态各自有各自的画法（见 [`Tex`]）：图 / 「正在解码…」/ 一句失败原因。
+/// **不放大**（`scale` 上限 1.0）：把一张 200×80 的示意图拉满版心只会糊成马赛克，
+/// 而用户看到「它就是这么大」比看到一张虚掉的大图有用。
+fn images_block(ui: &mut Ui, paths: &[PathBuf], inner: f32, tex: &HashMap<PathBuf, Tex>) {
+    for p in paths {
+        if !looks_like_image(p) {
+            // 不是图片（.txt / .zip 之类）：本来就不该有画面，安静跳过。
+            // 它的名字在上面的气泡 / 提示行里已经有了。
+            continue;
+        }
+        ui.add_space(6.0);
+        match tex.get(p) {
+            Some(Tex::Ready(h)) => {
+                let size = h.size_vec2();
+                let scale = (inner.min(760.0) / size.x).min(460.0 / size.y).min(1.0);
+                let show = size * scale.max(0.05);
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(h.id(), show)).corner_radius(12.0));
+            }
+            Some(Tex::Failed(e)) => {
+                ui.label(
+                    RichText::new(format!("显示不了这张图：{e}"))
+                        .color(P::text_faint())
+                        .size(12.5),
+                );
+            }
+            // 排队中 / 正在解码。两者对用户是一回事，不必分开说。
+            _ => {
+                ui.label(RichText::new("正在解码图片…").color(P::text_faint()).size(12.5));
+            }
+        }
+        ui.add_space(2.0);
+    }
+    ui.add_space(4.0);
 }
 
 fn note_row(ui: &mut Ui, kind: NoteKind, text: &str) {

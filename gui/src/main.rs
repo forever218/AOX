@@ -21,6 +21,7 @@ mod app;
 mod bridge;
 mod markdown;
 mod syntax;
+mod svg;
 mod theme;
 mod workplace_ui;
 

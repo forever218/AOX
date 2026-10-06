@@ -369,12 +369,17 @@ impl AgentLoop for StandardLoop {
             // 紧跟它对应的 assistant.tool_calls，中间插一条别的消息会让参数校验失败），
             // 又要在下一次请求**之前**（否则这一轮的图赶不上这一轮）。
             if !produced.is_empty() {
-                let (msg, problems) = produced_files_message(&produced);
+                let (msg, shown, problems) = produced_files_message(&produced);
                 for p in &problems {
                     ui.emit(AgentEvent::Warn(format!("工具产出的附件没能传给模型：{p}")));
                 }
                 if let Some(m) = msg {
                     agent.push_message(m, None);
+                    // 顺带让界面把这几张图**画出来** —— 模型看得见、人看不见，
+                    // 正是「图出来了」这句话最让人困惑的地方。
+                    if !shown.is_empty() {
+                        ui.emit(AgentEvent::Images(shown));
+                    }
                 }
             }
         }
@@ -384,15 +389,19 @@ impl AgentLoop for StandardLoop {
 
 /// 组装「工具产出文件」那条 user 消息。
 ///
-/// 返回 `(要推入的消息, 要报给用户的说明)`，`None` 表示一个都挂不上。
+/// 返回 `(要推入的消息, 真的挂上的路径, 要报给用户的说明)`。
+/// 消息为 `None` 表示一个都挂不上；「真的挂上的路径」给界面拿去**显示**图
+///（见 `AgentEvent::Images`）—— 报出去的必须只是成功的，否则界面会为一条
+/// 本来就被拦下的路径画一行「显示失败」，而那句话上面刚好已经有一条拦截原因。
 ///
 /// 抽成**纯函数**（不碰 `Ui`）是为了能直接断言 —— 「必须是 user 消息、必须带 parts 数组」
 /// 这条协议约束值得一条不必真跑一轮循环的测试。
-fn produced_files_message(paths: &[PathBuf]) -> (Option<Message>, Vec<String>) {
+fn produced_files_message(paths: &[PathBuf]) -> (Option<Message>, Vec<PathBuf>, Vec<String>) {
     let (items, mut problems) = crate::attach::probe_all(paths);
     if items.is_empty() {
-        return (None, problems);
+        return (None, Vec::new(), problems);
     }
+    let shown: Vec<PathBuf> = items.iter().map(|a| a.path.clone()).collect();
     let names = items.iter().map(|a| format!("- {}", a.name)).collect::<Vec<_>>().join("\n");
     // 措辞说清「该看什么」：不说的话模型常会只根据文件名猜内容，那这张图就白发了
     let note = format!(
@@ -400,10 +409,10 @@ fn produced_files_message(paths: &[PathBuf]) -> (Option<Message>, Vec<String>) {
          请直接看图判断，不要只根据文件名猜：\n{names}"
     );
     match Message::user_with_files(&note, &items) {
-        Ok(m) => (Some(m), problems),
+        Ok(m) => (Some(m), shown, problems),
         Err(e) => {
             problems.push(e);
-            (None, problems)
+            (None, Vec::new(), problems)
         }
     }
 }
@@ -602,7 +611,7 @@ mod tests {
         let shot = d.join("shot.png");
         std::fs::write(&shot, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
 
-        let (msg, problems) = produced_files_message(&[shot]);
+        let (msg, _shown, problems) = produced_files_message(&[shot]);
         assert!(problems.is_empty(), "{problems:?}");
         let msg = msg.expect("挂得上的文件必须产出一条消息");
         assert_eq!(msg.role, "user", "图片只能出现在 user 消息里");
@@ -623,7 +632,7 @@ mod tests {
     fn a_missing_produced_file_is_reported_not_swallowed() {
         let missing = std::env::temp_dir().join("aox-loop-no-such-file-xyz.png");
         let _ = std::fs::remove_file(&missing);
-        let (msg, problems) = produced_files_message(&[missing]);
+        let (msg, _shown, problems) = produced_files_message(&[missing]);
         assert!(msg.is_none());
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("no-such-file-xyz.png"), "{}", problems[0]);
@@ -639,7 +648,7 @@ mod tests {
         std::fs::write(&good, b"\x89PNG\r\n\x1a\n\x00\x00").unwrap();
         let missing = d.join("missing.png");
 
-        let (msg, problems) = produced_files_message(&[good, missing]);
+        let (msg, _shown, problems) = produced_files_message(&[good, missing]);
         assert!(msg.is_some(), "合格那个必须照挂");
         assert_eq!(problems.len(), 1, "{problems:?}");
 

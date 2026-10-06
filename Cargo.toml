@@ -49,6 +49,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Security",
+    # 界面显示图片（`src/image.rs`）：GDI+ 解码本机图片文件。用系统自带的那份解码器，
+    # 而不是往二进制里塞一个（`image` 约 +300~500 KB、`png` 约 +100 KB 且只认 PNG）。
+    "Win32_Graphics_GdiPlus",
 ] }
 
 

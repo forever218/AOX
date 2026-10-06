@@ -457,6 +457,18 @@ impl Agent {
             }
         };
         if allowed {
+            // `ask_user`：唯一一道**需要用户当场作答**的工具，在这里分流。
+            //
+            // 三条理由，每条都是硬的：
+            // ① `Tool::call(args, rt)` 拿不到 `Ui`，而「问用户」非它不可 —— 授权那条路
+            //    也是因此才走 Agent（同一段注释在 `tool::ask` 的模块文档里）。
+            // ② 排在授权**之后**：先问「能不能用这个工具」，再问「选哪个」，
+            //    两个弹层不会同时出现。
+            // ③ 排在 `ToolRunning` **之前**：那道事件会带一个「超时上限 Ns」的注记，
+            //    而这道工具等的是**人** —— 想三分钟是完全正常的，给他看倒计时只会催他乱点。
+            if name == crate::tool::ask::ASK_TOOL {
+                return crate::tool::ask::interact(args, ui).await;
+            }
             ui.emit(AgentEvent::ToolRunning {
                 name: name.to_string(),
                 timeout_secs: self.rt.config.agent.tool_timeout_secs,

@@ -26,6 +26,18 @@ pub enum AgentEvent {
     Info(String),
     Warn(String),
     Error(String),
+    /// 宿主刚刚把**工具产出的图片**挂进了对话（见 `crate::attach`）。
+    ///
+    /// 单开一条事件、而不是把路径塞进那条 `Warn` 里：`Warn` 是**给人看的一句话**，
+    /// 而这里是**给人看的画面**。图形界面拿它把图渲染出来；命令行没有可渲染的地方，
+    /// 直接忽略即可（文件名已经在那句话里列出来了）。
+    ///
+    /// `#[allow(dead_code)]` 的理由：`src/main.rs`（CLI bin）会把同一批模块再编译
+    /// 一遍，而它只写 `Images(_)`、从不读里面的路径 —— 于是那个字段在 bin 里被判成
+    /// 死代码，`lib` 侧却明明在用。**不要**为此动模块结构（与 `TRAPS.md` 里记的
+    /// 「bin 与 lib 各编译一遍同名模块」那条同一个原因）。
+    #[allow(dead_code)]
+    Images(Vec<std::path::PathBuf>),
 }
 
 /// 授权询问结果
@@ -34,6 +46,22 @@ pub enum AuthDecision {
     Allow,
     AllowSession,
     Deny,
+}
+
+/// 用户对一次「选项提问」的回答（`ask_user` 的返回值来源）。
+///
+/// 三支对应三种**真实发生过**的情形，措辞也不同（见 `tool::ask::interact`）：
+/// 点了某一项 / 没点、自己打了一段字 / 压根没答。把它们合成 `Option<String>`
+/// 会把「自己打的字」与「点了选项」混成一件事 —— 而模型对这两者的处理不一样
+///（前者要多问一句「你是这个意思吗」，后者直接照做）。
+#[derive(Debug, Clone)]
+pub enum ChoiceReply {
+    /// 点了第 n 项（0 基）
+    Picked(usize),
+    /// 没点选项，直接打了一段字
+    Text(String),
+    /// 没答（界面关掉了，或者断了）
+    Cancelled,
 }
 
 /// UI 抽象层 —— 为后续图形化预留的接口。
@@ -46,6 +74,15 @@ pub trait Ui: Send {
     fn emit(&mut self, event: AgentEvent);
     /// 就一次工具调用向用户请求授权
     async fn authorize(&mut self, tool_name: &str, args: &Value) -> AuthDecision;
+
+    /// 就一道「选择题」问用户一次，等他作答（`ask_user` 的落地）。
+    ///
+    /// 默认实现返回 [`ChoiceReply::Cancelled`]：不覆盖它的 UI 不会因为缺这个能力而崩，
+    /// 只会让 `ask_user` 得到「用户没作答」—— 那正是实情（这个界面确实没法问）。
+    /// 两个前端（CLI / GUI）都实现了它。
+    async fn choose(&mut self, _question: &str, _options: &[String]) -> ChoiceReply {
+        ChoiceReply::Cancelled
+    }
 
     /// 一轮任务开始（用户发出指令，模型+工具循环开始）。
     /// UI 可在此开启等待动画、准备接收本轮事件。

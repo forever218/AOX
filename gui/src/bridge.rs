@@ -21,7 +21,7 @@ use aox::agent::Agent;
 use aox::history::UsageRecord;
 use aox::llm::{LlmProvider, StreamSink};
 use aox::runtime::Runtime;
-use aox::ui::{AgentEvent, AuthDecision, Ui};
+use aox::ui::{AgentEvent, AuthDecision, ChoiceReply, Ui};
 
 /// 主线程 → Agent 线程
 pub enum ToAgent {
@@ -85,6 +85,16 @@ pub enum FromAgent {
     Content(String),
     /// 请求授权（阻塞等待主线程回填）
     AuthRequest { tool: String, args: String, reply: oneshot::Sender<AuthDecision> },
+    /// 一道「选择题」（`ask_user`）：同样阻塞等主线程回填。
+    ///
+    /// 与 `AuthRequest` 分成两条而不是合成一条：它们的**界面形态**与**回答类型**都不同
+    ///（授权是「允许/拒绝」的确认框，选项是「挑一个」的一排按钮），合并只会让两边
+    /// 都要在参数里判断「这次是哪种」，而那正是最容易出错的地方。
+    ChoiceRequest {
+        question: String,
+        options: Vec<String>,
+        reply: oneshot::Sender<ChoiceReply>,
+    },
     /// 工具 / 插件快照（周期性刷新，用于右侧面板实时展示「自我增长」）
     Snapshot(Snapshot),
     /// 插件运行时状态（供「关于」窗口展示）；装配完成后会重发
@@ -339,6 +349,24 @@ impl Ui for GuiUi {
             return AuthDecision::Deny;
         }
         rx.await.unwrap_or(AuthDecision::Deny)
+    }
+
+    /// `ask_user` 的图形版：把问题与选项发给主线程，画成输入框上方那排按钮，等回填。
+    ///
+    /// 三条失败路径（发不出去 / 主线程没回 / 回执通道断了）一律回 `Cancelled`：
+    /// 那比「默认选第一个」安全得多 —— 前者只是没答，模型会按它自己的话往下走并说明，
+    /// 后者是**替用户做了一个他没做过的选择**，而谁都不会发现。
+    async fn choose(&mut self, question: &str, options: &[String]) -> ChoiceReply {
+        let (reply, rx) = oneshot::channel();
+        let sent = self.tx.send(FromAgent::ChoiceRequest {
+            question: question.to_string(),
+            options: options.to_vec(),
+            reply,
+        });
+        if sent.is_err() {
+            return ChoiceReply::Cancelled;
+        }
+        rx.await.unwrap_or(ChoiceReply::Cancelled)
     }
 
     async fn turn_start(&mut self) {
@@ -643,6 +671,11 @@ async fn boot_and_run(
     // 与 CLI 注册的是同一组、同一份实现；默认 `[workplace] mode = "full"` 时
     // 它们的行为与普通读写工具无异 —— 边界只在你收紧档位之后才生效。
     for t in aox::tool::hostfs::host_file_tools() {
+        rt.register(t).await?;
+    }
+    // 交互工具（`ask_user`）：让模型把「选择题」交给界面，而不是写在正文里
+    // 等用户打字。注册在这里的意义是**让模型在 tools 列表里看得见它**。
+    for t in aox::tool::ask::ask_tools() {
         rt.register(t).await?;
     }
 

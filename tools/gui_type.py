@@ -64,11 +64,27 @@ user32.SendInput.argtypes = (wt.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
 user32.SendInput.restype = wt.UINT
 
 
-def find_window(title_substr):
+def find_window(title_substr, pid=0):
+    """找目标窗口，两种定位方式二选一：
+
+    - 按标题：子串匹配；
+    - 按 `pid`（推荐）：主窗口标题改成空串之后按标题找不到它 —— 改成
+      「该进程可见窗口里**面积最大**的那个」，就是主窗口。
+      与 `gui_shot.py` / `gui_click.py` 同一套做法。
+    """
     found = []
 
     def cb(hwnd, _):
         if not user32.IsWindowVisible(hwnd):
+            return True
+        if pid:
+            p = wt.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+            if p.value != pid:
+                return True
+            r = wt.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            found.append(((r.right - r.left) * (r.bottom - r.top), hwnd, f"(pid {pid})"))
             return True
         n = user32.GetWindowTextLengthW(hwnd)
         if n <= 0:
@@ -81,6 +97,9 @@ def find_window(title_substr):
         return True
 
     EnumWindows(EnumWindowsProc(cb), 0)
+    if pid:
+        found.sort(reverse=True)  # 面积大的在前
+        return [(h, label) for _, h, label in found]
     return found
 
 
@@ -107,6 +126,13 @@ def send_vk(vk: int) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--title", default="AOX")
+    ap.add_argument(
+        "--pid",
+        type=int,
+        default=0,
+        help="按进程 id 找主窗口（标题为空串时按标题找不到它）。"
+        "用 tasklist /FI \"IMAGENAME eq aox-gui.exe\" /FO CSV 拿 pid。",
+    )
     ap.add_argument("--left", type=float, help="先点击：距客户区左边多少逻辑像素")
     ap.add_argument("--right", type=float, help="先点击：距客户区右边多少逻辑像素")
     ap.add_argument("--y", type=float, default=0.0, help="先点击：距客户区顶部多少逻辑像素")
@@ -120,7 +146,7 @@ def main() -> int:
     ap.add_argument("--delay", type=float, default=0.02, help="逐字间隔秒数")
     a = ap.parse_args()
 
-    win = find_window(a.title)
+    win = find_window(a.title, a.pid)
     if not win:
         print(f"NOTFOUND: 没有标题包含 {a.title!r} 的可见窗口", file=sys.stderr)
         return 2

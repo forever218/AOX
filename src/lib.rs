@@ -15,6 +15,7 @@ pub mod auth;
 pub mod config;
 pub mod history;
 pub mod hook;
+pub mod image;
 pub mod llm;
 pub mod message;
 pub mod paths;

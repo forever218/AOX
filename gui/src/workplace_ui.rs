@@ -417,7 +417,7 @@ pub fn confirm(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
             );
             ui.add_space(6.0);
             ui.label(
-                RichText::new("潘多拉魔盒正在打开...但这不总是坏事，对吧？")
+                RichText::new("潘多拉魔盒正在打开......虽然这不总是坏事")
                     .color(P::text_faint())
                     .size(13.0),
             );

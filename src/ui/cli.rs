@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 
 use super::spinner::{self, Spinner, Status};
 use super::style as s;
-use super::{AgentEvent, AuthDecision, Ui};
+use super::{AgentEvent, AuthDecision, ChoiceReply, Ui};
 use crate::history::UsageRecord;
 use crate::llm::{thousands, StreamSink};
 
@@ -312,6 +312,10 @@ impl CliUi {
             AgentEvent::Info(m) => self.push_note('i', m),
             AgentEvent::Warn(m) => self.push_note('w', m),
             AgentEvent::Error(m) => self.push_note('e', m),
+            // 工具产出的图片：终端里没有能画图的地方。**静默丢掉**是有意的 ——
+            // 随行的提示语里已经把文件名列出来了（见 `attach` 的路径清单），
+            // 再补一行「有图但显示不了」只是噪音。
+            AgentEvent::Images(_) => {}
         }
     }
 
@@ -417,6 +421,7 @@ impl Ui for CliUi {
             AgentEvent::Info(msg) => println!("{} {}", s::cyan("·"), s::dim(&msg)),
             AgentEvent::Warn(msg) => println!("{} {}", s::yellow("!"), s::yellow(&msg)),
             AgentEvent::Error(msg) => println!("{} {}", s::red("✗"), s::red(&msg)),
+            AgentEvent::Images(_) => {}
         }
     }
 
@@ -487,6 +492,69 @@ impl Ui for CliUi {
             self.start_spinner().await;
         }
         decision
+    }
+
+    /// `ask_user` 的文本版：把选项编号打出来，读一行。
+    ///
+    /// 与授权框同一套外观（`┌─ … │ … └─ >`），也同一套理由：这是在**一轮任务中途**
+    /// 插进来的一次问答，得让用户一眼看出「现在轮到我了」。
+    ///
+    /// 容错刻意放宽：认不出是编号的输入就**当成自由回答**，而不是报「无效输入」重问。
+    /// 用户打「都用 B 方案吧」本来就是一种有效回答 —— 把它退回来说「请输入 A/B/C」，
+    /// 等于逼着他把想说的话翻译成一次点击。
+    async fn choose(&mut self, question: &str, options: &[String]) -> ChoiceReply {
+        let was_running = self.spinner.is_some();
+        self.stop_spinner().await;
+
+        let width = term_width().saturating_sub(2);
+        println!();
+        println!("{}", s::magenta("┌─ 需要你选一个 ────────────────────────────"));
+        for line in question.lines() {
+            println!("{} {}", s::magenta("│"), s::bold_cyan(&clip(line, width)));
+        }
+        println!("{}", s::magenta("│"));
+        for (i, o) in options.iter().enumerate() {
+            println!(
+                "{} {} {}",
+                s::magenta("│"),
+                s::bold_cyan(&format!("{}.", crate::tool::ask::letter(i))),
+                clip(o, width.saturating_sub(3))
+            );
+        }
+        println!(
+            "{} {}",
+            s::magenta("│"),
+            s::dim("回车 = 不作答，直接继续；输入别的字样 = 当成你自己的回答")
+        );
+
+        let mut reply = ChoiceReply::Cancelled;
+        loop {
+            print!("{} ", s::magenta("└─ 请选择 >"));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            match self.read_line().await {
+                Ok(Some(line)) => {
+                    let ans = line.trim();
+                    if ans.is_empty() {
+                        break;
+                    }
+                    // 先认编号（A / a / 1），认不出就当自由回答
+                    if let Some(i) = crate::tool::ask::as_choice(ans, options.len()) {
+                        reply = ChoiceReply::Picked(i);
+                    } else {
+                        reply = ChoiceReply::Text(ans.to_string());
+                    }
+                    break;
+                }
+                // EOF / 读失败：不能死循环，如实回「没作答」
+                _ => break,
+            }
+        }
+
+        if was_running {
+            self.set_label("思考中");
+            self.start_spinner().await;
+        }
+        reply
     }
 }
 

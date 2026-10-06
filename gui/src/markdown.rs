@@ -458,24 +458,31 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                 ui.add_space(BLOCK_GAP);
             }
 
+            // ```` ```svg ````：**画出来**，不当代码显示。
+            //
+            // 走围栏代码块而不是新加一个工具／协议：markdown 本来就有围栏，
+            // 模型本来就擅长写 SVG —— 于是「模型画个流程图」这件事零协议改动就成立了，
+            // 而且它天然进 `.jsonl`（就是正文的一部分），重开对话还在。
+            //
+            // 画失败（解析不了）时 `svg::render` 自己会写一行原因，并且把那一段
+            // **原样留在正文里**（下面的兜底），用户至少还能看到模型写了什么。
+            // ```` ```svg ````：**画出来**，不当代码显示。
+            //
+            // 走围栏代码块而不是新加一个工具／协议：markdown 本来就有围栏，模型本来
+            // 就擅长写 SVG —— 于是「模型画个流程图」这件事零协议改动就成立了，而且它
+            // 天然进 `.jsonl`（正文的一部分），重开对话还在。
+            //
+            // 画不出来时退回**代码块**：那时用户至少还能看到模型写了什么，
+            // 而不是对着一行错误发呆（`svg::render` 自己会补一句原因）。
+            Block::Code { lang, lines } if lang.trim().eq_ignore_ascii_case("svg") => {
+                if crate::svg::render(ui, &lines.join("\n"), width - 20.0) <= 0.0 {
+                    code_block(ui, width, "svg", &lines);
+                }
+                ui.add_space(BLOCK_GAP);
+            }
+
             Block::Code { lang, lines } => {
-                let code = lines.join("\n");
-                Frame::NONE
-                    .fill(P::code_bg())
-                    .corner_radius(CornerRadius::same(12))
-                    .stroke(Stroke::new(1.0, P::border()))
-                    .inner_margin(Margin::symmetric(16, 14))
-                    .show(ui, |ui| {
-                        // 卡片的宽度必须显式锁死，否则代码行的长行会把卡片顶宽、被面板裁掉
-                        let inner = (width - 34.0).max(100.0);
-                        ui.set_width(inner);
-                        ui.set_max_width(inner);
-                        if !lang.is_empty() {
-                            ui.label(RichText::new(lang.to_lowercase()).color(P::text_faint()).size(13.0));
-                            ui.add_space(7.0);
-                        }
-                        wrap_label(ui, code_job(&code, inner, &lang));
-                    });
+                code_block(ui, width, &lang, &lines);
                 ui.add_space(BLOCK_GAP);
             }
 
@@ -626,6 +633,32 @@ fn cells(ui: &mut Ui, widths: &[f32], row: &[String], head: bool, color: Color32
                 wrap_label(ui, job);
             });
     }
+}
+
+
+/// 一块围栏代码：等宽、带 lang 标签、底色一块。
+///
+/// 抽出来是因为它有两个调用点：普通代码块，以及 **SVG 画失败时的兜底**
+///（见那条 `Block::Code { lang, .. } if lang == "svg"` 分支）。抄成两份的话，
+/// 改一次留白就得记得改两处 —— 而漏掉的那一处只有「SVG 恰好画失败」时才看得见。
+fn code_block(ui: &mut Ui, width: f32, lang: &str, lines: &[String]) {
+    let code = lines.join("\n");
+    Frame::NONE
+        .fill(P::code_bg())
+        .corner_radius(CornerRadius::same(12))
+        .stroke(Stroke::new(1.0, P::border()))
+        .inner_margin(Margin::symmetric(16, 14))
+        .show(ui, |ui| {
+            // 卡片的宽度必须显式锁死，否则代码行的长行会把卡片顶宽、被面板裁掉
+            let inner = (width - 34.0).max(100.0);
+            ui.set_width(inner);
+            ui.set_max_width(inner);
+            if !lang.is_empty() {
+                ui.label(RichText::new(lang.to_lowercase()).color(P::text_faint()).size(13.0));
+                ui.add_space(7.0);
+            }
+            wrap_label(ui, code_job(&code, inner, lang));
+        });
 }
 
 #[cfg(test)]

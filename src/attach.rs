@@ -325,6 +325,15 @@ pub fn probe_all(paths: &[PathBuf]) -> (Vec<Attachment>, Vec<String>) {
 /// 图片的 `image_url` 块里没有文件名（协议里就没有这个字段），所以清单是
 /// 「名字」的唯一来源 —— 这也是清单必须留成独立 part 的第二个理由。
 pub fn names_from_content(v: &Value) -> Vec<String> {
+    files_from_content(v).into_iter().map(|(n, _)| n).collect()
+}
+
+/// 从 `content` 里还原附件清单的**名字与路径**。
+///
+/// 与 [`names_from_content`] 同源（同一个清单块），只是多给出路径 —— 界面要拿它
+/// **显示**图片（`gui/src/app.rs` 的解码队列），而 `image_url` 块里没有路径
+///（只有 data URL），清单是唯一来源。
+pub fn files_from_content(v: &Value) -> Vec<(String, PathBuf)> {
     let Some(parts) = v.as_array() else {
         return Vec::new();
     };
@@ -343,8 +352,8 @@ pub fn names_from_content(v: &Value) -> Vec<String> {
             .filter_map(|line| {
                 let line = line.strip_prefix("- ")?;
                 // 「名字 → 路径」：名字里出现 ` → ` 的概率可以忽略，取第一个分隔符最稳
-                let (name, _) = line.split_once(" → ")?;
-                Some(name.trim().to_string())
+                let (name, path) = line.split_once(" → ")?;
+                Some((name.trim().to_string(), PathBuf::from(path.trim())))
             })
             .collect();
     }
