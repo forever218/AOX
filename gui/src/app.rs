@@ -45,6 +45,7 @@ use aox::ui::{AgentEvent, AuthDecision, ChoiceReply};
 use aox::workplace::Mode;
 
 use crate::activity::{self, ActKind};
+use crate::brand;
 use crate::bridge::{
     BootInfo, BootPaths, FromAgent, RuntimeView, SessionFlags, Snapshot, ToAgent, WorkplaceView,
 };
@@ -238,6 +239,12 @@ pub struct App {
     /// 已解码 / 正在解码的图片。键是**本机路径**（见 [`Tex`]）。
     tex: HashMap<PathBuf, Tex>,
 
+    /// 首屏那张插画（亮色 / 暗色各一张，内嵌在二进制里，见 [`crate::brand`]）。
+    ///
+    /// 与 `tex` 分开存：`tex` 的键是路径、由对话内容驱动；这一份是**固定的两张**、
+    /// 与对话无关，混进去只会让「键盘是什么」这件事变含糊。
+    brand: brand::Art,
+
     input: String,
     /// 待上传栏里的附件（用户拖进来 / `attach_file` 挂上来的）。
     ///
@@ -366,6 +373,7 @@ impl App {
             choice_text: String::new(),
             choice_reply: None,
             tex: HashMap::new(),
+            brand: brand::Art::new(),
             input: String::new(),
             pending: Vec::new(),
             dragging_files: false,
@@ -1291,11 +1299,12 @@ impl App {
             .collect();
         for (p, r) in done {
             let entry = match r {
-                Ok(bm) => Tex::Ready(ctx.load_texture(
+                // 上传参数统一在 `crate::tex` 里（那里还写了为什么这些参数错了不会报错）
+                Ok(bm) => Tex::Ready(crate::tex::upload(
+                    ctx,
                     // 纹理名只用文件名：它只是调试时的标识，而整条路径又长又含反斜杠
                     format!("aox-img:{}", p.file_name().unwrap_or_default().to_string_lossy()),
-                    egui::ColorImage::from_rgba_unmultiplied([bm.width, bm.height], &bm.rgba),
-                    egui::TextureOptions::LINEAR,
+                    &bm,
                 )),
                 // 失败也缓存：否则每帧都会为同一张坏图重开一次解码线程
                 Err(e) => Tex::Failed(e),
@@ -1641,33 +1650,31 @@ impl App {
     }
 
     fn empty_state(&mut self, ui: &mut Ui) {
-        ui.add_space(52.0);
-        ui.vertical_centered(|ui| {
-            // 首屏只有一句招呼：艺术体大字，不加分隔线、不加副标题。
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(320.0, 62.0), Sense::hover());
-            ui.painter().text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                "Hi there",
-                theme::brand_font(46.0),
-                P::text(),
-            );
-            // 原有「细横线 + 副标题」的位置整块留白（4 + 1 + 16 + 21 + 40），
-            // 行去掉了但高度照旧 —— 否则下面的预设会整体往上跳一截。
-            ui.add_space(82.0);
+        // 首屏只有那张插画（用户 2026-10-06 给的成对素材：亮色一张、暗色一张）。
+        // 原来那句「Hi there」与下面那几条预设示例都按用户要求删掉了 —— 首屏不再
+        // 替用户想他要说什么，只负责好看。
+        let dark = theme::mode() == theme::Mode::Dark;
+        // 两边各留一点，别让插画贴着对话区的边缘
+        let max_w = (ui.available_width() - 48.0).max(160.0);
+        let art_h = brand::height(dark, max_w);
 
-            let examples = [
-                "看看现在有哪些插件和工具",
-                "写一个插件，统计当前目录下各类文件的数量",
-                "在电脑桌面建一个.docx文档介绍一下你",
-            ];
-            for ex in examples {
-                if example_chip(ui, ex).clicked() {
-                    self.input = ex.to_string();
-                    self.focus_input = true;
-                }
-                ui.add_space(10.0);
-            }
+        // 垂直位置分两种，不是随手取的：
+        // - 正常首屏：居中到「输入框以上那块区域」的正中。输入框是**浮**在底部的，
+        //   `COMPOSER_RESERVE` 正是它占掉的高度，不减掉的话插画会整体偏下。
+        // - 有错误卡片时（模型没配好）：不居中。这时首屏最重要的一条信息是那句错误，
+        //   让插画居中会把卡片挤到下边、甚至顶出可视区。
+        // ⚠️ 这里**不能**用 `ui.available_height()`：`empty_state` 所在的 Ui 是嵌在
+        // `horizontal(...) → vertical(...)` 里的子区域，它在水平布局里被建出来时，
+        // 高度只按「内容到现在为止用掉的那点」算 —— 实测整窗口 828pt 时它只有 30pt，
+        // 于是算出来的余量恰好是 0，插画会一直贴在顶上。用**裁剪区**（ScrollArea 的视口，
+        // 也就是整个内容区）减掉光标当前的 y，才是「下面还剩多少看得见的地方」。
+        let room =
+            (ui.clip_rect().bottom() - ui.next_widget_position().y - COMPOSER_RESERVE).max(0.0);
+        let top = if self.log_error.is_some() { 8.0 } else { ((room - art_h) * 0.5).max(0.0) };
+
+        ui.add_space(top);
+        ui.vertical_centered(|ui| {
+            self.brand.show(ui, max_w);
 
             if let Some(err) = &self.log_error {
                 ui.add_space(38.0);
@@ -2539,6 +2546,9 @@ impl eframe::App for App {
 
         // 图片解码：收尾（挂纹理）与排队（起后台线程）。每帧一次，幂等。
         self.poll_images(ctx);
+        // 首屏插画也在这里推一把：它同样要起后台线程解码、同样要等到解完才能画。
+        // 两张图**一开始就都解**（不是等用着哪张才解），所以放在这里与主题无关。
+        self.brand.poll(ctx);
 
         // 「跟随系统」的每帧复查：系统换了主题就跟着换（egui 每帧把当前系统主题放在
         // `ctx` 里）。不放在切换那一刻算一次的原因见 `theme::follow_system` 的注释 ——
@@ -3109,7 +3119,7 @@ struct Btn {
 ///
 /// 关键在于**绘制顺序**：先量出文字尺寸 → 按尺寸分配热区 → 铺底色 → 最后画字。
 ///
-/// 之前 `flat_button` / `example_chip` 是反过来的：`ui.label()` 先把字画上去，
+/// 之前首屏那几枚示例按钮是反过来的：`ui.label()` 先把字画上去，
 /// 悬停时再补一块底色盖住热区——底色落在文字图层之上，鼠标一放上去字就没了。
 /// 这里改成先底后字，两套主题、所有状态都天然不会互相遮挡。
 fn text_button(ui: &mut Ui, text: &str, b: Btn) -> egui::Response {
@@ -3368,23 +3378,6 @@ fn middle_elide(s: &str, keep: usize) -> String {
     out.push('…');
     out.extend(chars[chars.len() - tail..].iter());
     out
-}
-
-fn example_chip(ui: &mut Ui, text: &str) -> egui::Response {
-    text_button(
-        ui,
-        text,
-        Btn {
-            size: 14.5,
-            pad: Vec2::new(18.0, 9.0),
-            radius: 22,
-            stroke: Stroke::new(1.0, P::border()),
-            fg: P::text_dim(),
-            fg_hover: P::text(),
-            fill: P::surface(),
-            fill_hover: P::surface_hi(),
-        },
-    )
 }
 
 fn icon_button(

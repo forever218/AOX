@@ -47,6 +47,17 @@ pub fn decode(path: &Path) -> Result<Bitmap, String> {
     platform::decode(path)
 }
 
+/// 解内存里的一段图片字节。
+///
+/// 给**内嵌资源**用（首屏那张插画是 `include_bytes!` 进来的，没有文件路径）。
+/// 和 [`decode`] 走的是同一个 GDI+，只是前面多一步「把这段内存包成一个 `IStream`」。
+pub fn decode_bytes(bytes: &[u8]) -> Result<Bitmap, String> {
+    if bytes.is_empty() {
+        return Err("内嵌的图片是空的".into());
+    }
+    platform::decode_bytes(bytes)
+}
+
 /// 把 GDI+ 交出来的 BGRA 缓冲拷成 RGBA。
 ///
 /// 单独抽出来（而不是写在调用点里）是因为它是整个解码里**最容易悄悄错**的一段：
@@ -85,10 +96,12 @@ mod platform {
     use std::path::Path;
     use std::sync::OnceLock;
     use windows_sys::Win32::Graphics::GdiPlus::{
-        GdipBitmapLockBits, GdipBitmapUnlockBits, GdipCreateBitmapFromFile, GdipDisposeImage,
-        GdipGetImageHeight, GdipGetImageWidth, GdiplusStartup, GdiplusStartupInput,
-        GdiplusStartupOutput, BitmapData, GpBitmap, GpImage, ImageLockModeRead, Rect,
+        GdipBitmapLockBits, GdipBitmapUnlockBits, GdipCreateBitmapFromFile,
+        GdipCreateBitmapFromStream, GdipDisposeImage, GdipGetImageHeight, GdipGetImageWidth,
+        GdiplusStartup, GdiplusStartupInput, GdiplusStartupOutput, BitmapData, GpBitmap, GpImage,
+        ImageLockModeRead, Rect,
     };
+    use windows_sys::Win32::UI::Shell::SHCreateMemStream;
 
     /// GDI+ 的状态码 `Ok`。**刻意不写 `use ...GdiPlus::*`**：那个模块里同样导出一个
     /// `Ok`（状态码常量），glob 进来会把 `Result::Ok` 遮住 —— 于是这个文件里所有
@@ -148,6 +161,60 @@ mod platform {
         out
     }
 
+    /// 放掉一个 COM 接口 —— 我们只需要 `IUnknown::Release` 这一个能力。
+    ///
+    /// ⚠️ **`windows-sys` 里没有 `IUnknown`**（那是 `windows` crate 的东西），所以只能
+    /// 自己按 COM 的 ABI 走一遍虚表。这么做是站得住的：`QueryInterface / AddRef / Release`
+    /// 永远是虚表的头三个槽位，这是 COM 的硬约定，不随接口而变。
+    ///
+    /// # Safety
+    ///
+    /// `p` 必须是一个尚未释放的 COM 接口指针（或空指针）。
+    unsafe fn release(p: *mut core::ffi::c_void) {
+        if p.is_null() {
+            return;
+        }
+        let vtbl = *(p as *mut *const usize);
+        let release: extern "system" fn(*mut core::ffi::c_void) -> u32 =
+            std::mem::transmute(*vtbl.add(2));
+        release(p);
+    }
+
+    /// 解内存里的一段图片字节：先用 `SHCreateMemStream` 把它包成 `IStream`，再交给 GDI+。
+    ///
+    /// 为什么不落一个临时文件再走 [`decode`]：那样会在磁盘上留一份可以失败的中间产物
+    ///（杀软、临时目录权限、并发同名），而这里要解的是一段**编译期就固定**的字节
+    /// —— 为它引入文件系统这一层风险不值得。
+    pub fn decode_bytes(bytes: &[u8]) -> Result<Bitmap, String> {
+        ensure_started()?;
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| "这段内嵌图片太大了（超过 4 GB）".to_string())?;
+        // SAFETY: `bytes` 在这次调用期间一直有效（借来的切片），`len` 就是它的字节数。
+        // ⚠️ `cbInit` 绝不能传 0 —— 那时的语义是「pInit 是一段以 0 结尾的字符串」，
+        // 而图片字节里出现 0 是家常便饭。
+        let stream = unsafe { SHCreateMemStream(bytes.as_ptr(), len) };
+        if stream.is_null() {
+            return Err("创建内存流失败".into());
+        }
+
+        let mut img: *mut GpBitmap = std::ptr::null_mut();
+        // SAFETY: `stream` 是上面刚创建、还没释放的 IStream；出参是栈上的指针。
+        let st = unsafe { GdipCreateBitmapFromStream(stream, &mut img) };
+        let out = if st != GP_OK || img.is_null() {
+            Err(format!("解不开这段内嵌的图片（GDI+ status {st}）"))
+        } else {
+            let b = read_pixels(img);
+            // SAFETY: `img` 是上面刚创建、还没释放的位图
+            unsafe { GdipDisposeImage(img as *mut GpImage) };
+            b
+        };
+
+        // SAFETY: `stream` 是上面刚创建、还没释放的接口指针；`GdipCreateBitmapFromStream`
+        // 已经把需要的内容读进位图了，这里放掉它不影响到已经解出来的像素。
+        unsafe { release(stream) };
+        out
+    }
+
     fn read_pixels(img: *mut GpBitmap) -> Result<Bitmap, String> {
         let (mut w, mut h) = (0u32, 0u32);
         // SAFETY: `img` 有效（调用方刚创建）；两个出参是本函数栈上的 u32
@@ -199,6 +266,10 @@ mod platform {
     /// 而「换个平台就多一个解码器依赖」不划算。返回一句实话说清楚。
     pub fn decode(path: &Path) -> Result<Bitmap, String> {
         Err(format!("本平台暂不支持显示图片（{}）", path.display()))
+    }
+
+    pub fn decode_bytes(_bytes: &[u8]) -> Result<Bitmap, String> {
+        Err("本平台暂不支持显示图片".into())
     }
 }
 
@@ -256,5 +327,34 @@ mod tests {
             Ok(_) => panic!("不存在的文件不该解开"),
         };
         assert!(e.contains("不在了"), "{e}");
+    }
+
+    /// 内嵌的插画要解得开，而且**透明必须还在**。
+    ///
+    /// 这条钉的是 GDI+ 最阴的一个坑：带 `tRNS` 的索引色 PNG 有可能被解成不透明 ——
+    /// 表现就是「图上多了一块白底」，而它在暗色模式里会非常刺眼，且很容易被当成
+    /// 「这张图本来就这样」。断言刻意**不写死尺寸也不写死颜色**（换一张插画就全变了），
+    /// 只钉两件不会变的事：解出来的尺寸与 PNG 自己的 IHDR 一致，且确实存在全透明像素。
+    ///
+    /// ⚠️ **两张都要过一遍**：首屏是按主题挑图的，只验其中一张的话，另一张
+    ///（比如暗色那张）解码失败要等用户切到那个主题才看得见 —— 而那时它已经发出去了。
+    #[test]
+    fn an_embedded_png_decodes_with_its_transparency_intact() {
+        let assets: [(&str, &[u8]); 2] = [
+            ("light", include_bytes!("../assets/light.png")),
+            ("dark", include_bytes!("../assets/dark.png")),
+        ];
+        for (name, png) in assets {
+            // PNG 的 IHDR 永远紧跟在 8 字节签名 + 4 字节长度 + 4 字节 "IHDR" 之后
+            let w = u32::from_be_bytes(png[16..20].try_into().unwrap()) as usize;
+            let h = u32::from_be_bytes(png[20..24].try_into().unwrap()) as usize;
+
+            let bm = decode_bytes(png).unwrap_or_else(|e| panic!("{name}.png 应该解得开：{e}"));
+            assert_eq!((bm.width, bm.height), (w, h), "{name}.png 的尺寸要与 PNG 头一致");
+            assert_eq!(bm.rgba.len(), w * h * 4);
+
+            let transparent = bm.rgba.chunks_exact(4).filter(|p| p[3] == 0).count();
+            assert!(transparent > 0, "{name}.png 是透明底的，解出来却一个透明像素都没有");
+        }
     }
 }

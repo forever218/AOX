@@ -18,10 +18,12 @@
 
 mod activity;
 mod app;
+mod brand;
 mod bridge;
 mod markdown;
 mod syntax;
 mod svg;
+mod tex;
 mod theme;
 mod workplace_ui;
 

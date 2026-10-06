@@ -90,10 +90,15 @@ pub fn serif_font(size: f32) -> FontId {
     }
 }
 
-/// 品牌字 FontId（首屏那句大招呼用）。
+/// 品牌字 FontId（原本给首屏那句大招呼用）。
 ///
 /// 比衬线松、带点手写的笔意，免得一行问候看起来像文件抬头；
 /// 找不到艺术体时逐级退回衬线 → 粗体，所以调它总是安全的。
+///
+/// ⚠️ 目前**没有调用方**：首屏那句「Hi there」在 2026-10-06 被换成了插画（用户要求）。
+/// 留着的理由是这个字族本身是**配置项**（`brand` / `AOX_GUI_FONT_BRAND`，字体栈照旧在
+/// `install_fonts` 里装）—— 用户哪天想在某处再用一次艺术体，直接调它就行，不必再实现一遍。
+#[allow(dead_code)]
 pub fn brand_font(size: f32) -> FontId {
     if BRAND_OK.load(Ordering::Relaxed) {
         FontId::new(size, FontFamily::Name(BRAND_FAMILY.into()))
@@ -648,7 +653,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         SERIF_OK.store(true, Ordering::Relaxed);
     }
 
-    // 品牌字：首屏大招呼用。找不到就退回衬线（brand_font 内部处理）。
+    // 品牌字：给艺术体留的那一档（首屏那句招呼已经换成插画了，字族本身是配置项，留着）。
     let brand = font_source(fcfg().brand.as_ref(), "AOX_GUI_FONT_BRAND", BRAND_CANDIDATES);
     if let Some((_, bytes)) = brand {
         fonts.font_data.insert("brand".to_owned(), Arc::new(FontData::from_owned(bytes)));

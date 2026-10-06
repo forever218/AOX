@@ -52,6 +52,9 @@ windows-sys = { version = "0.59", features = [
     # 界面显示图片（`src/image.rs`）：GDI+ 解码本机图片文件。用系统自带的那份解码器，
     # 而不是往二进制里塞一个（`image` 约 +300~500 KB、`png` 约 +100 KB 且只认 PNG）。
     "Win32_Graphics_GdiPlus",
+    # 内嵌的图片资源（首屏那张插画）在内存里、没有文件路径，得先包成一个 IStream
+    # 再交给 GDI+（`SHCreateMemStream`，在 Win32_UI_Shell）。
+    "Win32_UI_Shell",
 ] }
 
 
