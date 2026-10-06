@@ -870,6 +870,27 @@ pub(crate) fn dwm_set_attribute(
     -1
 }
 
+/// `SM_CXICON`：任务栏 / Alt+Tab 用的那档图标的边长（100% 缩放是 32，150% 是 48）。
+///
+/// 拿它是因为它与 `SM_CXSMICON`（标题栏那档）**恰好成 2:1**，而 `window_icon` 只交得出
+/// **一个**尺寸：于是大的那档 1:1 不缩放、小的那档是干净的 2:1 缩小（点阵画法 2:1 缩，
+/// 等于直接还原成小一格的原稿）。
+#[cfg(windows)]
+pub fn system_icon_size() -> i32 {
+    const SM_CXICON: i32 = 11;
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+    // SAFETY: 取一个系统度量，无副作用、无出参。
+    unsafe { GetSystemMetrics(SM_CXICON) }
+}
+
+#[cfg(not(windows))]
+pub fn system_icon_size() -> i32 {
+    32
+}
+
 /// `DWMWA_BORDER_COLOR`
 pub(crate) const DWMWA_BORDER_COLOR: u32 = 34;
 /// `DWMWA_CAPTION_COLOR`
@@ -890,61 +911,6 @@ pub(crate) const DWMWCP_ROUND: i32 = 2;
 /// - `DWMWA_CAPTION_COLOR`(35)：标题栏底色
 /// - `DWMWA_TEXT_COLOR`(36)：标题栏文字色
 /// - `DWMWA_BORDER_COLOR`(34)：窗口外框线
-#[cfg(windows)]
-/// 标题栏左上角那枚小图标的**替身**：一张 1×1 的全透明 PNG。
-///
-/// Windows 在「窗口没设图标、窗口类也没设图标」时会一路回退到 **exe 资源里的
-/// 第一个图标**（实测 `WM_SETICON` 传 0 清不掉）—— 标题栏左上角于是永远杵着
-/// 那枚 AOX 图标。想让它消失，稳的办法只有一个：**给它一个看不见的图标**。
-///
-/// 字节由 `PIL` 生成 `Image.new('RGBA',(1,1),(0,0,0,0))` 得来，紧跟在
-/// `CreateIconFromResourceEx` 能直接消化的 PNG 裸字节。
-const TRANSPARENT_PNG: [u8; 70] = [
-    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
-    0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
-    0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x60,
-    0x60, 0x60, 0x60, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0xA5, 0xF6, 0x45, 0x40, 0x00, 0x00,
-    0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-];
-
-/// 把标题栏左上角那枚**小**图标换成透明。
-///
-/// 只动 `ICON_SMALL`：`ICON_BIG`（任务栏与 Alt+Tab 用的那枚）不碰 ——
-/// 那里还靠 exe 的图标认人，一并抹掉的话任务栏就只剩一块空按钮。
-///
-/// HICON 只造一次、缓存复用，并且**故意不销毁**：`WM_SETICON` 的句柄归应用所有，
-/// 销毁了窗口再画标题栏就是在用悬空句柄 —— 反正只有一个，进程退出时随进程回收。
-#[cfg(windows)]
-fn hide_caption_icon(hwnd: isize) {
-    use std::sync::OnceLock;
-    static ICON: OnceLock<isize> = OnceLock::new();
-
-    #[link(name = "user32")]
-    extern "system" {
-        fn CreateIconFromResourceEx(
-            pb_icon_bits: *const u8,
-            cb_icon_bits: u32,
-            f_icon: i32,
-            dw_version: u32,
-            cx_desired: i32,
-            cy_desired: i32,
-            flags: u32,
-        ) -> isize;
-        fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
-    }
-
-    let icon = *ICON.get_or_init(|| unsafe {
-        CreateIconFromResourceEx(TRANSPARENT_PNG.as_ptr(), 70, 1, 0x0003_0000, 16, 16, 0)
-    });
-    if icon != 0 {
-        const WM_SETICON: u32 = 0x0080;
-        const ICON_SMALL: usize = 0;
-        unsafe { SendMessageW(hwnd, WM_SETICON, ICON_SMALL, icon) };
-    }
-}
-
-#[cfg(not(windows))]
-fn hide_caption_icon(_hwnd: isize) {}
 
 pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
     use raw_window_handle::RawWindowHandle;
@@ -971,7 +937,12 @@ pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
     dwm_set_attribute(hwnd, DWMWA_CAPTION_COLOR, std::ptr::addr_of!(cap).cast(), 4);
     dwm_set_attribute(hwnd, DWMWA_TEXT_COLOR, std::ptr::addr_of!(text).cast(), 4);
     dwm_set_attribute(hwnd, DWMWA_BORDER_COLOR, std::ptr::addr_of!(border).cast(), 4);
-    hide_caption_icon(hwnd);
+    // 标题栏左上角那枚图标**不动**：它现在就是 exe 资源里那份 `assets/aox.ico`
+    //（见 `main.rs` 里 `with_icon(IconData::default())` 那段注释）。
+    // 曾经这里调 `hide_caption_icon(hwnd)` 把它换成一张 1×1 透明图（2026-10-04 用户
+    // 要求「标题栏只剩系统按钮」）；2026-10-06 用户改主意要显示程序图标，于是删掉了
+    // —— 顺带说明：那个做法后来也失效了，因为 eframe 会给自己装一个默认图标（黑底白字
+    // 的「e」）并**在之后**覆盖掉我们设的 HICON，标题栏于是显示的是 eframe 的标志。
 }
 
 #[cfg(not(windows))]

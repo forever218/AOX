@@ -79,12 +79,16 @@ fn main() -> eframe::Result<()> {
         Some(bridge::spawn(from_agent_tx, to_agent_rx, flags.clone()))
     };
 
-    // 标题留空（2026-10-04 用户要求）：原生标题栏不再写「AOX」，加上 hide_caption_icon
-    // 把左上角的图标抹掉，标题栏就只剩系统按钮 —— 与主界面一块底色，认不出「栏」。
-    // 任务栏仍靠 exe 自带的资源图标认出这个程序。
+    // 标题留空（2026-10-04 用户要求）：原生标题栏不再写「AOX」，标题栏就只剩系统按钮
+    // —— 与主界面一块底色，认不出「栏」。
+    //
+    // 图标必须**显式给像素**（`brand::window_icon` 里有完整的来龙去脉）：不给的话
+    // eframe 会装它自带的那个「e」，而「给个空图标、让 Windows 用 exe 资源」那条路
+    // 也不通（winit 会把空图标当真装上，标题栏画出系统通用图标）。
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("")
+            .with_icon(brand::window_icon())
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([1000.0, 640.0]),
         ..Default::default()

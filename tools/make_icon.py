@@ -130,10 +130,10 @@ def shift(mask, dx, dy):
     return out
 
 
-def paint(mask, color, canvas=None):
-    """Magnify a grid mask to FINAL with NEAREST and composite it in colour."""
-    big = mask.resize((FINAL, FINAL), Image.NEAREST)
-    layer = Image.new("RGBA", (FINAL, FINAL), color[:3] + (0,))
+def paint(mask, color, canvas=None, size=FINAL):
+    """Magnify a grid mask to `size` with NEAREST and composite it in colour."""
+    big = mask.resize((size, size), Image.NEAREST)
+    layer = Image.new("RGBA", (size, size), color[:3] + (0,))
     # Solid fill, but only where the mask is on.
     alpha = big.point(lambda v: color[3] if v else 0)
     layer.putalpha(alpha)
@@ -153,16 +153,16 @@ def shrink(mask, size):
     return small.point(lambda v: 255 if v > 0 else 0)
 
 
-def compose(mask, with_shadow=True):
-    """Stack the layers into a 256px RGBA canvas: shadow, outline, letter."""
-    canvas = Image.new("RGBA", (FINAL, FINAL), (0, 0, 0, 0))
+def compose(mask, with_shadow=True, size=FINAL):
+    """Stack the layers into a `size`px RGBA canvas: shadow, outline, letter."""
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     if with_shadow:
         # Shadow first, and two cells out: the outline ring is one cell wide
         # and sits in exactly the same place a one-cell offset would.
         # Anything closer than that gets painted over and never shows.
-        paint(shift(mask, 2, 2), SHADOW, canvas)
-    paint(outline(mask), EDGE + (255,), canvas)
-    paint(mask, ACCENT + (255,), canvas)
+        paint(shift(mask, 2, 2), SHADOW, canvas, size)
+    paint(outline(mask), EDGE + (255,), canvas, size)
+    paint(mask, ACCENT + (255,), canvas, size)
     return canvas
 
 
@@ -198,7 +198,9 @@ def ico_bytes(images):
 
 def build():
     canvas, glyph = build_layers()
-    frames = [canvas]
+    # 不要在这里先把 `canvas` 塞进 `frames`：`ICO_SIZES` 里已经有 256 了，
+    # 那样会写出**两帧一模一样的 256×256**（Windows 可能挑到任意一帧，纯属浪费）。
+    frames = []
     for size in ICO_SIZES:
         s = size[0]
         if s >= GRID:
@@ -208,7 +210,14 @@ def build():
             # with no border on a light taskbar is not a small icon, it is
             # nothing at all -- so the small frames get the outline too and
             # only skip the shadow, which at one pixel would just be a smear.
-            frames.append(compose(shrink(glyph, s), with_shadow=False))
+            #
+            # `size=s` is load-bearing: this branch used to compose at the
+            # default FINAL, so the 16 and 24 frames were written as *256x256*
+            # images. The .ico then had no small frame at all (it ended up
+            # with three 256 entries), and Windows had to scale the 32px frame
+            # down for the title bar -- i.e. exactly the blur this whole file
+            # exists to avoid.
+            frames.append(compose(shrink(glyph, s), with_shadow=False, size=s))
     frames.sort(key=lambda im: im.size[0])
 
     os.makedirs(OUT_DIR, exist_ok=True)
