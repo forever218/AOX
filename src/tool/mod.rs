@@ -96,6 +96,23 @@ pub trait Tool: Send + Sync {
     /// 参数的 JSON Schema（object 类型）
     fn parameters(&self) -> Value;
 
+    /// 这道工具的一次调用算「**读**」还是「**落盘**」（写 / 删）——
+    /// 只用于**工作区边界**的判定（见 `agent::Agent::workplace_reject`）。
+    ///
+    /// 默认 **落盘**，这是刻意的保守方向：宿主猜不出一个工具拿路径去读还是去写，
+    /// 而「少挡一次写」的代价远大于「多挡一次读」。两类工具各自给出更准的答案：
+    ///
+    /// - **宿主文件工具**按名字判（schema 是我们自己的，见 [`host_tool_access`]）；
+    /// - **插件工具**按**插件自己声明的** access 判（见 `plugin::ToolDef::access`）——
+    ///   声明了 `"read"` 才放开，没声明仍是落盘。
+    ///
+    /// 声明是**插件作者的责任**，宿主不替它猜：一个只读工具（扫描 / 统计 / 列目录）
+    /// 补一行声明就能像 `read_file` 一样访问工作区外的路径；不补，它会被那张粗网按
+    /// 写入拦下 —— 拦下时给模型的报错里会写清该怎么补（见 `agent::PLUGIN_READ_HINT`）。
+    fn access(&self) -> crate::workplace::Access {
+        crate::workplace::Access::Write
+    }
+
     fn schema(&self) -> Value {
         json!({
             "type": "function",

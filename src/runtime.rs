@@ -215,6 +215,18 @@ impl Runtime {
         self.tools.read().await.get(name).map(|t| t.kind())
     }
 
+    /// 这道工具的一次调用算「读」还是「落盘」—— 工作区边界用的就是它
+    /// （见 [`crate::tool::Tool::access`] 与 `agent::Agent::workplace_reject`）。
+    ///
+    /// 工具不在表里时返回**落盘**：调用方都是先查过名字的，真出现这种情况说明
+    /// 注册表与调用方对不上，那时保守方向仍然是「宁可多挡一次」。
+    pub async fn tool_access(&self, name: &str) -> crate::workplace::Access {
+        match self.tools.read().await.get(name) {
+            Some(t) => t.access(),
+            None => crate::workplace::Access::Write,
+        }
+    }
+
     /// 这次调用**申请的能力**（来自插件的 `[contributes] caps`，阶段 6 · 6b 起）。
     ///
     /// 只有插件工具可能有 —— 元工具是宿主自己的，不替谁申请能力。

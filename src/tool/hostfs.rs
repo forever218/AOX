@@ -25,7 +25,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolKind, ToolOutput, HOST_FILE_TOOLS};
+use super::{host_tool_access, Tool, ToolKind, ToolOutput, HOST_FILE_TOOLS};
 use crate::runtime::Runtime;
 use crate::workplace::PATH_ARG;
 
@@ -81,6 +81,11 @@ impl Tool for ReadFileTool {
     }
     fn kind(&self) -> ToolKind {
         ToolKind::Host
+    }
+    /// 读 / 写按**名字**分（见 `host_tool_access`）—— 这几道工具的 schema 是我们
+    /// 自己写的，所以一眼可判；插件那条路做不到，只能靠插件声明（见 `Tool::access`）。
+    fn access(&self) -> crate::workplace::Access {
+        host_tool_access(self.name())
     }
     fn description(&self) -> &str {
         "读取一个文本文件并返回其内容（宿主提供）。读取不受工作区限制 —— 设备上的任何文件都能读。"
@@ -150,6 +155,11 @@ impl Tool for WriteFileTool {
     }
     fn kind(&self) -> ToolKind {
         ToolKind::Host
+    }
+    /// 读 / 写按**名字**分（见 `host_tool_access`）—— 这几道工具的 schema 是我们
+    /// 自己写的，所以一眼可判；插件那条路做不到，只能靠插件声明（见 `Tool::access`）。
+    fn access(&self) -> crate::workplace::Access {
+        host_tool_access(self.name())
     }
     fn description(&self) -> &str {
         "把一个字符串写进文本文件（覆盖写，宿主提供，受工作区限制）。路径必须是工作区内的绝对路径；父目录默认自动创建。"
@@ -223,6 +233,11 @@ impl Tool for ListDirTool {
     }
     fn kind(&self) -> ToolKind {
         ToolKind::Host
+    }
+    /// 读 / 写按**名字**分（见 `host_tool_access`）—— 这几道工具的 schema 是我们
+    /// 自己写的，所以一眼可判；插件那条路做不到，只能靠插件声明（见 `Tool::access`）。
+    fn access(&self) -> crate::workplace::Access {
+        host_tool_access(self.name())
     }
     fn description(&self) -> &str {
         "列出目录内容（宿主提供）。列出不受工作区限制。不传 path 时列出当前工作区根。目录名带 `/` 后缀。"
@@ -305,6 +320,11 @@ impl Tool for AttachFileTool {
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
+    /// 读 / 写按**名字**分（见 `host_tool_access`）—— 这几道工具的 schema 是我们
+    /// 自己写的，所以一眼可判；插件那条路做不到，只能靠插件声明（见 `Tool::access`）。
+    fn access(&self) -> crate::workplace::Access {
+        host_tool_access(self.name())
+    }
     fn description(&self) -> &str {
         "把一个本机文件挂给模型看（宿主提供）。图片（JPEG/PNG/GIF/WebP）会**真的发给模型**，\
          模型能看见内容；其它格式也会照发，由端点决定收不收。\
@@ -360,6 +380,11 @@ impl Tool for RemoveTool {
     }
     fn kind(&self) -> ToolKind {
         ToolKind::Host
+    }
+    /// 读 / 写按**名字**分（见 `host_tool_access`）—— 这几道工具的 schema 是我们
+    /// 自己写的，所以一眼可判；插件那条路做不到，只能靠插件声明（见 `Tool::access`）。
+    fn access(&self) -> crate::workplace::Access {
+        host_tool_access(self.name())
     }
     fn description(&self) -> &str {
         "删除一个文件或空目录（宿主提供，受工作区限制）。删非空目录必须显式 recursive = true。"

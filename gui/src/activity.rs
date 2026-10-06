@@ -702,14 +702,20 @@ const WINDOW_TITLE: &str = "AOX 活动流";
 const MIN_W: f32 = 860.0;
 const MIN_H: f32 = 520.0;
 
-/// 顶栏那枚图标的开关。
-pub fn toggle(ctx: &egui::Context, a: &Shared) {
+/// 打开活动流窗口（幂等）。
+///
+/// 刻意**不做成开关**：设置页里那枚按钮写的是「打开活动流」，而**写着「打开」却会
+/// 关掉窗口**是最容易让人以为程序坏了的一种交互。窗口自带关闭按钮（右上角那枚 ×）、
+/// 也支持系统级的 Alt+F4，要关它有正经的路。已经开着时是空操作 ——
+/// egui 的子视口由每帧的 `sync` 声明，窗口会被带到前面来。
+pub fn open(ctx: &egui::Context, a: &Shared) {
     let mut st = lock(a);
-    st.open = !st.open;
     if st.open {
-        st.spin = 0.0;
-        st.forget_placement(); // 重新开一个窗口要重新摆位
+        return;
     }
+    st.open = true;
+    st.spin = 0.0;
+    st.forget_placement(); // 重新开一个窗口要重新摆位
     drop(st);
     ctx.request_repaint();
 }

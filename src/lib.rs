@@ -25,6 +25,7 @@ pub mod runtimes;
 pub mod sandbox;
 pub mod selftest;
 pub mod store;
+pub mod sysinfo;
 pub mod tool;
 pub mod ui;
 pub mod workplace;

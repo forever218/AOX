@@ -156,6 +156,8 @@ pub struct BootInfo {
     pub model: String,
     pub provider_ready: bool,
     pub note: Option<String>,
+    /// 「系统」选项卡要的那几处路径与主机信息（见 [`BootPaths`]）。
+    pub paths: BootPaths,
     /// 界面侧读历史用的存储实例（只读用途）。
     ///
     /// 与 agent 线程**同一个后端实现**、指向同一处数据 —— 界面不自己拼路径，
@@ -164,9 +166,68 @@ pub struct BootInfo {
     pub store: Arc<dyn aox::store::Store>,
 }
 
+/// 「系统」选项卡里那几处路径与主机信息。
+///
+/// 为什么合成一个结构体而不是给 `BootInfo` 再加七八个 `String` 字段：这些值同生共死
+/// （都来自同一个 `Runtime`），而且**将来还会加**（比如日志目录）。打包之后
+/// `boot()` 的签名不会随着「再加一行显示项」继续变长，三个调用点也只需改一处构造。
+#[derive(Debug, Clone, Default)]
+pub struct BootPaths {
+    /// 应用根目录（配置 / 插件 / 历史 / 运行时都挂在它下面）。
+    pub root: String,
+    /// 配置文件（合成链的最后一层）。
+    pub config: String,
+    /// 插件目录。
+    pub plugins: String,
+    /// 历史记录目录（`<root>/history`，由存储后端自己报，界面不拼）。
+    pub history: String,
+    /// 内置运行时目录（`<root>/runtime`）—— 没装任何内置运行时时它也在，只是空的。
+    pub runtime: String,
+    /// 主机信息，例如 `windows x86_64 · 16 核 · 31.7 GB 内存`。
+    pub host: String,
+}
+
+impl BootPaths {
+    /// 从几处路径装配一份（主机信息自己去问核心库）。
+    ///
+    /// 三个启动分支都走它 —— 包括「配置读不出来」与「模型没就绪」两个降级分支：
+    /// 那些分支拿不到完整 `Runtime`，但**路径是知道的**，而「配置文件到底在哪」
+    /// 恰恰是那时候最该显示的东西（用户就是来排查它为什么没读起来）。
+    pub fn new(
+        root: &std::path::Path,
+        config: &std::path::Path,
+        plugins: &std::path::Path,
+        history: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            root: root.display().to_string(),
+            config: config.display().to_string(),
+            plugins: plugins.display().to_string(),
+            history: history.display().to_string(),
+            runtime: root.join("runtime").display().to_string(),
+            host: aox::sysinfo::host_summary(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub plugins: Vec<String>,
+}
+
+/// 一门插件运行时的状态（「系统」选项卡里的一行）。
+///
+/// 结构化而不是预先拼好的字符串：CLI 要的是一行紧凑文本（`runtimes::one_line`），
+/// 而设置页要的是「语言 / 解析到的命令 / 来源」三列 —— 同一份数据两种排法。
+/// 拼成字符串再拆回来是自找麻烦，而这行文字本来就是给人看的，拆不动。
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeItem {
+    pub lang: String,
+    /// 最终使用的命令（绝对路径或裸命令）
+    pub command: String,
+    /// 来源：`config.toml 指定` / `应用目录内置` / `PATH` / `未找到`
+    pub origin: String,
+    pub ok: bool,
 }
 
 /// 运行时状态视图。
@@ -175,9 +236,9 @@ pub struct Snapshot {
 /// 靠解析 `✗ python` 这种文本判断太脆（文案一改就静默失效）。
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeView {
-    /// 每个语言一行的状态文本
-    pub lines: Vec<String>,
-    /// Python 是否缺失——决定「关于」窗口是否显示一键安装入口
+    /// 每个语言一行（结构化，见 [`RuntimeItem`]）。
+    pub items: Vec<RuntimeItem>,
+    /// Python 是否缺失——决定设置页是否显示一键安装入口
     pub python_missing: bool,
 }
 
@@ -308,7 +369,15 @@ impl Ui for GuiUi {
 fn send_runtime_status(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
     let st = aox::runtimes::status(&rt.root, &rt.config.runtimes);
     let view = RuntimeView {
-        lines: st.iter().map(aox::runtimes::one_line).collect(),
+        items: st
+            .iter()
+            .map(|s| RuntimeItem {
+                lang: s.lang.key().to_string(),
+                command: s.command.clone(),
+                origin: s.origin.label().to_string(),
+                ok: s.ok(),
+            })
+            .collect(),
         python_missing: st
             .iter()
             .any(|s| s.lang == aox::runtimes::Lang::Python && !s.ok()),
@@ -363,6 +432,7 @@ fn boot(
     store: Arc<dyn aox::store::Store>,
     // 这份配置由哪几层合成（低 → 高）。读不出配置时给空表 —— 不编造不存在的层。
     layers: Vec<String>,
+    paths: BootPaths,
 ) {
     let _ = tx.send(FromAgent::Boot(Box::new(BootInfo {
         config_path: config_path.display().to_string(),
@@ -370,8 +440,22 @@ fn boot(
         model: model.to_string(),
         provider_ready: ready,
         note,
+        paths,
         store,
     })));
+}
+
+/// 三个启动分支都要的那份路径清单。
+///
+/// 历史目录问存储后端要（`Store::location`）—— 界面不自己拼 `<root>/history`：
+/// 换了后端（这是存储缝存在的意义）之后，拼出来的路径就是假的，而这里会跟着变。
+fn boot_paths(
+    root: &std::path::Path,
+    config: &std::path::Path,
+    plugins: &std::path::Path,
+    store: &Arc<dyn aox::store::Store>,
+) -> BootPaths {
+    BootPaths::new(root, config, plugins, store.location().to_path_buf())
 }
 
 /// 把「本次会话正在写的对话」告诉主线程。
@@ -531,14 +615,17 @@ async fn boot_and_run(
         Err(e) => {
             // 配置缺失/无效：GUI 照常打开，展示引导信息，输入区会被禁用。
             // 读历史的后端用默认的（此时还没读到配置），免得侧边栏跟着一起空掉。
+            let store = aox::store::default_store(&root, 0);
+            let paths = boot_paths(&root, &config_path, &plugins_dir, &store);
             boot(
                 &tx,
                 &config_path,
                 "",
                 false,
                 Some(format!("{e:#}")),
-                aox::store::default_store(&root, 0),
+                store,
                 Vec::new(),
+                paths,
             );
             idle_until_shutdown(&mut rx, &tx).await;
             return Ok(());
@@ -594,6 +681,7 @@ async fn boot_and_run(
             ui.emit(AgentEvent::Info(
                 "请在 config.toml 的 [provider] 填写 base_url 与 api_key（或 api_key_env）后重新启动。".into(),
             ));
+            let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store);
             boot(
                 &tx,
                 &config_path,
@@ -602,6 +690,7 @@ async fn boot_and_run(
                 Some(format!("{e:#}")),
                 rt.store.clone(),
                 config_layers.clone(),
+                paths,
             );
             // 仍是「未就绪」状态，但工作区现状照样发一份：按钮若可见，至少显示的是真档位。
             sync_workplace(&tx, &rt);
@@ -613,7 +702,8 @@ async fn boot_and_run(
     // 项目规则文件（RULES.md）现在由 `aox::prompt::build` 统一读取，
     // 不再是 GUI 与 CLI 各读一遍（见 src/prompt.rs）。
     let mut agent = Agent::new(llm, rt.clone());
-    boot(&tx, &config_path, &model, true, None, rt.store.clone(), config_layers);
+    let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store);
+    boot(&tx, &config_path, &model, true, None, rt.store.clone(), config_layers, paths);
     send_history_current(&tx, &agent);
     // 启动就把工作区现状发过去：按钮上「工作区 · <档位>」的初值，以及三选一列表里
     // 该给哪一项打勾，都靠它。

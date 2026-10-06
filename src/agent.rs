@@ -418,15 +418,19 @@ impl Agent {
         // ② 这里拿得到 `Ui`，能给用户发一条 `Warn`（工具自己的 `call` 拿不到 Ui，
         //    所以工具内那层只能把契约塞回给模型 —— 两层是纵深，不是重复）。
         //
+        // 这次调用算「读」还是「落盘」**由工具自己说**（`Tool::access`：宿主文件工具按
+        // 名字判，插件工具按插件声明的 access 判，没声明就是落盘）。
+        //
         // `full` 档位在 `workplace_reject` 里**整个短路**：不扫参数、不 `canonicalize`。
         // 早先这里是「照样调 `check`，反正它返回 `Ok`」—— 而调用方只取 `.err()`，
         // 于是 `normalize` 的结果被丢掉，65~224 µs 的系统调用白花；这条路径又是
         // **每次工具调用**都要走的。
         // ⚠️ 2026-10-05 起配置默认是受限档（`default`），所以这条短路只对**显式**选了
         // 完全访问的用户生效 —— 别再用「大多数用户走这条」给短路当理由。
-        if let Some(reject) = self.workplace_reject(name, &kind, &args) {
+        let access = self.rt.tool_access(name).await;
+        if let Some(reject) = self.workplace_reject(&kind, access, &args) {
             ui.emit(AgentEvent::Warn(reject.user_text()));
-            return ToolOutput::err(reject.model_text());
+            return ToolOutput::err(reject_text(&kind, &reject));
         }
         // 能力位（阶段 6 · 6b 起真的填上）：插件在 `[contributes] caps` 里声明要什么能力，
         // 这里原样转给策略 —— 声明了能力的插件，它的工具调用一律走 `Ask`
@@ -481,23 +485,24 @@ impl Agent {
     /// - `ToolKind::Meta`（`create_plugin` / `list_plugins` / `remove_plugin`）：
     ///   不声明路径参数，直接放行。
     ///
-    /// - `ToolKind::Host`（宿主文件工具）：schema 是我们自己定义的，直接读 `path` 参数，
-    ///   而且**知道这次是读还是写**（`tool::host_tool_access`）。读（`read_file` /
-    ///   `list_dir`）不受工作区限制 ⇒ 这条路恒等于放行；只有写（`write_file`）与删
-    ///   （`remove`）才真正过边界。`list_dir` 允许**不传** `path`（那时指的是工作区根，
-    ///   位置由宿主自己给），所以缺参不是错误、不放行的是「模型指定的位置」。
+    /// - `ToolKind::Host`（宿主文件工具）：schema 是我们自己定义的，直接读 `path` 参数。
+    ///   读（`read_file` / `list_dir` / `attach_file`）不受工作区限制 ⇒ 这条路恒等于
+    ///   放行；只有写（`write_file`）与删（`remove`）才真正过边界。`list_dir` 允许
+    ///   **不传** `path`（那时指的是工作区根，位置由宿主自己给），所以缺参不是错误、
+    ///   不放行的是「模型指定的位置」。
     ///
     /// - `ToolKind::Plugin`：插件是黑盒，宿主只能按参数名与值形态扫一遍「像路径」的
-    ///   字符串（见 `workplace::scan_paths`）。这张**粗网按「落盘」判**是刻意的：
-    ///   宿主看不出插件拿这个路径去读还是去写，而「少挡一次写」的代价远大于
-    ///   「多挡一次读」—— 保守方向就是把每个像路径的参数都当成潜在的写。
+    ///   字符串（见 `workplace::scan_paths`）。这些参数按**插件声明的** access 判
+    ///   （[`crate::tool::Tool::access`]）：声明了 `"read"` 的按读判（读不设限 ⇒
+    ///   一律放行），没声明的仍按「落盘」—— 宿主看不出它的意图，而「少挡一次写」的
+    ///   代价远大于「多挡一次读」，保守方向就是把每个像路径的参数都当成潜在的写。
     ///   同时它**宁漏勿误伤**：漏判只是少一层粗网，误判会直接拒掉一次合法调用。
     ///
     /// 三条路用的是**同一套** `Workplace` 判定，所以不存在「两套规则」。
     fn workplace_reject(
         &self,
-        name: &str,
         kind: &ToolKind,
+        access: crate::workplace::Access,
         args: &Value,
     ) -> Option<crate::workplace::Reject> {
         // `full` 档：**一切放行**。放在 `match` 之前，是为了连
@@ -509,19 +514,175 @@ impl Agent {
             ToolKind::Meta => None,
             ToolKind::Host => {
                 let raw = args.get(crate::workplace::PATH_ARG).and_then(|v| v.as_str())?;
-                // 读 / 写按**工具名**分：宿主文件工具的 schema 是我们自己的，一目了然。
-                let access = crate::tool::host_tool_access(name);
                 self.rt.workplace.check_access(raw, access).err()
             }
             ToolKind::Plugin(_) => {
                 for (_key, raw) in crate::workplace::scan_paths(args) {
-                    // 粗网统一按「落盘」判 —— 插件的意图宿主看不见。
-                    if let Err(r) = self.rt.workplace.check(&raw) {
+                    // 走 `check_access` 而不是 `check`：粗网本身不预设读或写，
+                    // 由调用方给的 `access` 说了算。传 `Read` 时它恒为 `Ok`，
+                    // 于是「只读工具可以碰工作区外的路径」这件事**自动**成立，
+                    // 与 `read_file` / `list_dir` 用的是同一条判定。
+                    if let Err(r) = self.rt.workplace.check_access(&raw, access) {
                         return Some(r);
                     }
                 }
                 None
             }
         }
+    }
+}
+
+/// 一次越界该给模型看的完整文本。
+///
+/// `kind` 决定要不要附上插件那条**出路**（[`PLUGIN_READ_HINT`]）：只有插件工具需要，
+/// 宿主文件工具不该看到它 —— 那段话会把模型的注意力引到一条对它并不存在的路上
+///（宿主工具没有「声明只读」这回事，它的档位写死在宿主手里）。
+fn reject_text(kind: &ToolKind, reject: &crate::workplace::Reject) -> String {
+    match kind {
+        ToolKind::Plugin(_) => format!("{}\n\n{PLUGIN_READ_HINT}", reject.model_text()),
+        _ => reject.model_text(),
+    }
+}
+
+/// 插件工具的路径参数撞上边界时，多附给模型的那一段。
+///
+/// 只加在 `ToolKind::Plugin` 那一种情形。存在的理由：粗网按写入拦下一个**只读**工具
+/// 是**误伤**，而模型此刻手里只有那份通用报错（「不要重试、要提权就找用户」）——
+/// 于是它要么放弃，要么去请求提权。而这件事根本不需要动边界：**插件补一行声明就行**。
+/// 不给它这条路，一次误伤就会换来一次不必要的权限放宽。
+///
+/// 措辞上要**明确压过**通用报错里的「不要重试」：那一条是给「真的想越界写」准备的，
+/// 这里是另一回事（工具本来就只读），不说清的话模型会照着前一句放弃。
+const PLUGIN_READ_HINT: &str = "【如果这道工具只读，上面那句「不要重试」不适用】\n\
+     如果这道插件工具本来就只是**读**（扫描 / 统计 / 列目录 / 解析文件这类），\
+     那么拦住你的不是权限，而是插件没声明自己是只读的。\n\
+     请让插件在工具声明里补上第 4 位 `\"read\"`，重建插件后即可照常访问工作区外的路径。\
+     Python SDK 的写法是把三元组写成四元组：\n  \
+     \"<工具名>\": (\"<说明>\", <JSON Schema>, <handler>, \"read\")\n\
+     宿主随后就按「读」判 —— 与 read_file / list_dir 同一档，**不需要向用户提权**。\
+     反过来，会写文件 / 删东西的工具**不要**加这一位。";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::Path;
+
+    /// 一道**假**插件工具：类别报 Plugin，`access` 由测试给。
+    ///
+    /// 用它而不是真起一个插件子进程：这条测试要钉的是「边界怎么用声明的 access」，
+    /// 与「插件进程怎么跑起来」无关 —— 后者另有真插件的自检（`selftest`）。
+    struct FakeTool {
+        name: String,
+        access: crate::workplace::Access,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for FakeTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn kind(&self) -> ToolKind {
+            // 插件名随便给：`workplace_reject` 只看「是不是插件」，不看是哪一个。
+            ToolKind::Plugin("fake".into())
+        }
+        fn description(&self) -> &str {
+            "test double"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn access(&self) -> crate::workplace::Access {
+            self.access
+        }
+        async fn call(&self, _args: Value, _rt: &Arc<Runtime>) -> ToolOutput {
+            ToolOutput::ok("test double")
+        }
+    }
+
+    /// 一个工作区固定在 `ws` 的 Agent，并注册一道叫 `tool`、意图为 `access` 的工具。
+    async fn agent_with(ws: &Path, tool: &str, access: crate::workplace::Access) -> Agent {
+        let mut cfg = crate::config::Config::dummy();
+        cfg.workplace = crate::config::WorkplaceConfig {
+            mode: "fixed".into(),
+            root: Some(ws.to_string_lossy().into_owned()),
+        };
+        let rt =
+            Runtime::new(cfg, ws.to_path_buf(), ws.join("plugins")).expect("运行时应当能建起来");
+        rt.register(Arc::new(FakeTool { name: tool.to_string(), access }))
+            .await
+            .expect("注册假工具应当成功");
+        let llm: Arc<dyn LlmProvider> =
+            Arc::new(crate::llm::UnavailableProvider { reason: "test".into() });
+        Agent::new(llm, rt)
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("aox-agent-{tag}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// **A/B 对拍**：同一道工具、同一个工作区**外**的路径，只差一个声明。
+    ///
+    /// 为什么必须两边都断言：只测「声明了 read 就放行」，把整个判定删掉（恒放行）也能过；
+    /// 只测「没声明就拦」，把 access 硬编码成 `Write`、无视声明也能过。
+    /// 两条一起，才证明「这一档**确实由声明决定**」—— 而这正是本次改动的全部内容。
+    #[tokio::test]
+    async fn plugin_read_declaration_controls_the_workplace_gate() {
+        use crate::workplace::Access;
+        let ws = tmp("access");
+        // 工作区**外面**的一个路径。不必真实存在：判定只做路径比较，不碰磁盘。
+        let outside = ws.parent().unwrap().join("aox-agent-outside").join("x.bin");
+        let args = json!({ "path": outside.to_string_lossy(), "limit": 10 });
+        let kind = ToolKind::Plugin("fake".into());
+
+        // ① 声明了只读 ⇒ 放行（与 read_file / list_dir 同一档）
+        let a_read = agent_with(&ws, "fake_scan", Access::Read).await;
+        let access = a_read.rt().tool_access("fake_scan").await;
+        assert_eq!(access, Access::Read, "`tool_access` 要把工具声明的意图透出来");
+        assert!(
+            a_read.workplace_reject(&kind, access, &args).is_none(),
+            "只读工具访问工作区外的路径必须放行 —— 这就是「插件的读也放开」那条需求"
+        );
+
+        // ② 没声明（= 落盘）⇒ 同一个路径被拦
+        let a_write = agent_with(&ws, "fake_scan", Access::Write).await;
+        let access = a_write.rt().tool_access("fake_scan").await;
+        assert_eq!(access, Access::Write, "没声明就是落盘，这是默认档");
+        let rej = a_write
+            .workplace_reject(&kind, access, &args)
+            .expect("没声明只读的插件工具，带区外路径必须被拦下");
+        assert!(rej.model_text().contains("权限边界"), "{}", rej.model_text());
+
+        // 宿主文件工具那条路没被这次改动影响：同一个区外路径仍然被拦（写档）
+        let host_write = a_write
+            .workplace_reject(&ToolKind::Host, Access::Write, &args)
+            .expect("宿主写工具的区外路径必须被拦");
+        assert!(host_write.model_text().contains("权限边界"));
+        // 而读档照旧放行 —— 与 2026-10-04 定的「读不设限」一致
+        assert!(a_write.workplace_reject(&ToolKind::Host, Access::Read, &args).is_none());
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 越界文本里那条**插件专用出路**：插件要看得见，宿主文件工具不该看见。
+    ///
+    /// 两边都断言的道理与上一条相同：只断言「插件有」，把提示无条件加到所有工具上也能过
+    /// —— 而那会让宿主文件工具收到一份指向**不存在机制**的建议（宿主工具没有「声明只读」
+    /// 这回事，它的档位写死在宿主手里），把模型的注意力引到岔路上。
+    #[test]
+    fn the_read_hint_is_attached_only_to_plugin_rejects() {
+        let rej = crate::workplace::Reject::NotStarted;
+        let base = rej.model_text();
+
+        let plugin = reject_text(&ToolKind::Plugin("x".into()), &rej);
+        assert!(plugin.starts_with(&base), "通用部分要原样在前：{plugin}");
+        assert!(plugin.contains(PLUGIN_READ_HINT), "插件那条出路必须附上");
+        assert!(plugin.contains("\"read\""), "要写清补的是哪个字面量：{plugin}");
+
+        let host = reject_text(&ToolKind::Host, &rej);
+        assert_eq!(host, base, "宿主工具不该收到那段插件专用的出路");
     }
 }

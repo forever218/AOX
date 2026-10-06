@@ -44,7 +44,9 @@ use aox::ui::{AgentEvent, AuthDecision};
 use aox::workplace::Mode;
 
 use crate::activity::{self, ActKind};
-use crate::bridge::{BootInfo, FromAgent, RuntimeView, SessionFlags, Snapshot, ToAgent, WorkplaceView};
+use crate::bridge::{
+    BootInfo, BootPaths, FromAgent, RuntimeView, SessionFlags, Snapshot, ToAgent, WorkplaceView,
+};
 use crate::markdown;
 use crate::theme::{self, P};
 use crate::workplace_ui;
@@ -144,6 +146,36 @@ struct AuthCard {
     args: String,
 }
 
+/// 设置弹窗左侧那几栏。**声明顺序就是列表里从上到下的顺序**。
+///
+/// 「额外」放第一个是因为它装的不是设置项（是一个入口），越靠边越不干扰
+/// 真正要找设置的人 —— 但用户明确要求它排在最前，那就排最前，不替他改顺序。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettingsTab {
+    /// 额外：活动流入口这类「不属于某一项设置」的东西
+    Extra,
+    /// 外观：明暗 / 跟随系统
+    Appearance,
+    /// 系统：路径与运行时诊断
+    System,
+    /// 关于：版本、协议、链接
+    About,
+}
+
+impl SettingsTab {
+    const ALL: [SettingsTab; 4] =
+        [SettingsTab::Extra, SettingsTab::Appearance, SettingsTab::System, SettingsTab::About];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Extra => "额外",
+            SettingsTab::Appearance => "外观",
+            SettingsTab::System => "系统",
+            SettingsTab::About => "关于",
+        }
+    }
+}
+
 // ─────────────────────────── App ───────────────────────────
 
 pub struct App {
@@ -236,8 +268,10 @@ pub struct App {
     /// 本条消息强制滚到底（用户刚发指令时）
     force_follow: bool,
     /// 活动流是否自动跟随
-    /// 关于窗口是否展开
-    about_open: bool,
+    /// 设置弹窗是否展开（顶栏那三枚按钮（活动流 / 明暗 / 关于）已全部收进它）。
+    settings_open: bool,
+    /// 设置弹窗里正选中哪一栏。
+    settings_tab: SettingsTab,
     log_error: Option<String>,
     /// `--prompt` 传入的首条指令：等模型就绪后自动发送
     pending_prompt: Option<String>,
@@ -311,7 +345,8 @@ impl App {
             // 历史浮层默认收起：主区宽度全部让给对话，需要时再点左上角那枚图标。
             follow: true,
             force_follow: true,
-            about_open: false,
+            settings_open: false,
+            settings_tab: SettingsTab::Extra,
             log_error: None,
             pending_prompt: if demo { None } else { prompt },
             auth_shown_at: Instant::now(),
@@ -1078,38 +1113,56 @@ impl App {
     /// 与列表行、菜单行的悬停语言一致。
     ///
     /// 两处与旧顶栏不同的：
-    /// - 「新建对话」默认**不显示**，随历史浮层一起从历史按钮背后向右滑出；
+    /// - 「新建对话」与「设置」默认**都不显示**，随历史浮层一起从历史按钮背后向右滑出；
     /// - 状态与 token 从「顶栏左侧的一块空位」变成一枚跟着按钮走的胶囊
     ///   （顶栏没了，它们总得有个落脚处，否则任务进度与 token 账本就无处可看）。
+    ///
+    /// **右上那三枚（活动流 / 明暗 / 关于）已全部删掉**（用户 2026-10-05 要求），
+    /// 各自搬进了设置弹窗：活动流 → 「额外」栏，明暗 → 「外观」栏，关于 → 「关于」栏。
     fn toolbar(&mut self, ctx: &egui::Context) {
-        let mut want_toggle = false;
         let mut want_new = false;
+        let mut want_settings = false;
         let mut toggle_hist = false;
         let ease = ease_out_cubic(self.hist_t);
         let locked = self.busy || self.switching;
 
-        // ── 「新建对话」：从历史按钮背后向右滑出 ──
+        // ── 滑出组：「+」在里、「设置」在外 ──
         //
-        // 先声明它、后声明历史按钮：两者重叠的那一小段由历史按钮压在上面
-        //（同一图层里后声明的在上）。不过真正让它读作「从背后钻出来」的是**裁剪**
-        // —— 左边界切掉的部分根本画不出来。层序只是保险。
+        // 每个按钮各自一个 `Area`：滑出裁剪要按各自的右边界切，共用一个 Area 做不到。
+        // `x_end - slide` 是「从历史按钮背后钻出来」的位移；**裁剪左边界固定在自己的
+        // 终点位**，于是位移没走完时露出来的部分不足一整个按钮，读起来就是「还在后面」。
         if self.hist_t > 0.0 {
-            let x_end = BAR_LEFT + BAR_BTN + 2.0;
             let slide = (BAR_BTN + 10.0) * (1.0 - ease);
-            egui::Area::new(egui::Id::new("aox-bar-new"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(Pos2::new(x_end - slide, BAR_TOP))
-                // 滑出途中位置会压到历史按钮上，别让 Area 把它拉回屏幕内。
-                .constrain_to(loose_rect())
-                .show(ctx, |ui| {
-                    ui.set_clip_rect(Rect::from_min_max(
-                        Pos2::new(x_end, BAR_TOP - 6.0),
-                        Pos2::new(x_end + BAR_BTN + 6.0, BAR_TOP + BAR_BTN + 6.0),
-                    ));
-                    if plus_icon(ui, locked).clicked() && !locked {
-                        want_new = true;
-                    }
-                });
+            for (id, slot, icon) in [
+                ("aox-bar-new", 0.0_f32, SlideIcon::Plus),
+                ("aox-bar-settings", 1.0_f32, SlideIcon::Gear),
+            ] {
+                // slot 0 = 紧挨历史按钮；slot 1 = 再往右一格。38 = 36 + 2 的间隙。
+                let x_end = BAR_LEFT + BAR_BTN + 2.0 + slot * (BAR_BTN + 2.0);
+                egui::Area::new(egui::Id::new(id))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(Pos2::new(x_end - slide, BAR_TOP))
+                    // 滑出途中位置会压到左边的按钮上，别让 Area 把它拉回屏幕内。
+                    .constrain_to(loose_rect())
+                    .show(ctx, |ui| {
+                        ui.set_clip_rect(Rect::from_min_max(
+                            Pos2::new(x_end, BAR_TOP - 6.0),
+                            Pos2::new(x_end + BAR_BTN + 6.0, BAR_TOP + BAR_BTN + 6.0),
+                        ));
+                        match icon {
+                            SlideIcon::Plus => {
+                                if plus_icon(ui, locked).clicked() && !locked {
+                                    want_new = true;
+                                }
+                            }
+                            SlideIcon::Gear => {
+                                if gear_icon(ui).clicked() {
+                                    want_settings = true;
+                                }
+                            }
+                        }
+                    });
+            }
         }
 
         // ── 左上：历史按钮（位置不变）＋ 状态 / token 胶囊 ──
@@ -1122,14 +1175,14 @@ impl App {
                     if history_icon(ui, self.show_history).clicked() {
                         toggle_hist = true;
                     }
-                    // 「+」住在另一个 `Area` 里（它要单独做滑出裁剪），这里替它把位置
-                    // 让出来：展开时撑开 38px，收起时不占位。于是那枚 token 胶囊会被
-                    // 「挤」到右边去 —— 正好是「按钮从左边钻出来」该有的连带效果。
+                    // 「+」与「设置」住在另外两个 `Area` 里（各要单独做滑出裁剪），这里替
+                    // 它们把位置让出来：展开时各撑开 38px，收起时不占位。于是那枚 token
+                    // 胶囊会被「挤」到右边去 —— 正好是「按钮从左边钻出来」该有的连带效果。
                     //
-                    // 38 = 「+」的 36 + 与它之间留的 2。少了这段，胶囊会直接压在
-                    // 「+」身上：两者底色同色，实机上看起来就是「+ 和胶囊共用一块底」，
-                    // 于是那枚按钮像是没长出来（截图比对才发现，肉眼扫一眼容易放过）。
-                    ui.add_space(8.0 + 38.0 * ease);
+                    // 38 = 按钮的 36 + 与它之间留的 2。少了这段，胶囊会直接压在按钮身上：
+                    // 两者底色同色，实机上看起来就是「按钮和胶囊共用一块底」，于是那枚
+                    // 按钮像是没长出来（截图比对才发现，肉眼扫一眼容易放过）。
+                    ui.add_space(8.0 + 38.0 * 2.0 * ease);
                     // 一个 token 都没有、又没在跑任务时，这枚胶囊连壳都不该出现
                     //（`token_chip` 此时什么都不画，硬套一层 Frame 会剩个空框）。
                     if self.busy || self.usage_sum().total.is_some() {
@@ -1185,40 +1238,6 @@ impl App {
         self.bar_hist_rect =
             Some(Rect::from_min_size(Pos2::new(BAR_LEFT, BAR_TOP), Vec2::splat(BAR_BTN)));
 
-        // ── 右上：活动流 / 明暗 / 关于（位置不变）──
-        //
-        // 从右往左排：最右是明暗切换（与旧顶栏一致），左边依次是活动流、关于。
-        egui::Area::new(egui::Id::new("aox-bar-right"))
-            .order(egui::Order::Foreground)
-            // `pivot` 这一行不能省：`anchor` 给的是**屏幕上的锚点**，而 Area 默认拿
-            // 自己的**左上角**去对齐它 —— 于是整排按钮被摆在「右边缘再往右 20px」，
-            // 112px 里有 92px 露在窗口外，实机上三个图标一个都看不见。
-            // 让它拿右上角去对，才是「内缩 20」。
-            //
-            // 这里**不能**放开 `constrain_to`：`anchor` 的参考矩形就是它。
-            // 换成 `Rect::EVERYTHING` 的话右边缘会变成 +∞，位置直接飞出去
-            //（踩过一次：改成 EVERYTHING 后排按钮整个消失）。
-            .pivot(Align2::RIGHT_TOP)
-            .anchor(Align2::RIGHT_TOP, Vec2::new(-BAR_RIGHT, BAR_TOP))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if about_icon(ui).clicked() {
-                        self.about_open = true;
-                    }
-                    ui.add_space(2.0);
-                    // 先把锁收掉再判点击：`is_open()` 这一下要拿锁，而点击分支里的
-                    // `toggle` 自己还会再拿一次 —— 两把锁叠在同一句里就是自锁。
-                    let flow_on = activity::lock(&self.act).is_open();
-                    if flow_toggle(ui, flow_on).clicked() {
-                        activity::toggle(ctx, &self.act);
-                    }
-                    ui.add_space(2.0);
-                    if theme_toggle(ui, theme::mode() == theme::Mode::Dark).clicked() {
-                        want_toggle = true;
-                    }
-                });
-            });
-
         if toggle_hist {
             self.show_history = !self.show_history;
             if self.show_history {
@@ -1228,8 +1247,8 @@ impl App {
         if want_new {
             self.new_conversation();
         }
-        if want_toggle {
-            theme::apply_mode(ctx, theme::toggle_mode());
+        if want_settings {
+            self.settings_open = true;
         }
     }
 
@@ -1665,152 +1684,307 @@ impl App {
         });
     }
 
-    /// 关于：一枚居中的小卡片。点背景、按 Esc 或点「关闭」都收起。
+    /// 设置：一枚居中的大卡片，左栏选、右栏看。
     ///
-    /// 刻意不写版本史、构建时间、依赖清单这些看起来「专业」的噪音，
-    /// 只留版本号、一句话定位和项目地址。
-    fn about_overlay(&mut self, ctx: &egui::Context) {
-        if !self.about_open {
+    /// 取代了原来右上那三枚按钮（活动流 / 明暗 / 关于）与那枚 380px 的「关于」小卡片
+    /// ——「把三个按钮全删掉，收进一个设置弹窗」是用户 2026-10-05 的要求。
+    /// 所以四个栏目里三个都是**搬家**：「额外」收活动流入口、「外观」收明暗切换、
+    /// 「关于」收版本与协议；只有「系统」是新写的（那些路径以前半藏在关于卡片里，
+    /// 现在成体系地列全）。
+    ///
+    /// 点背景、按 Esc 或点「关闭」都收起（前两条由 `Modal` 自带）。
+    fn settings_overlay(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
             return;
         }
         let mut open = true;
-        let resp = egui::Modal::new(egui::Id::new("aox-about"))
+        let resp = egui::Modal::new(egui::Id::new("aox-settings"))
             .frame(
                 Frame::NONE
                     .fill(P::surface())
                     .corner_radius(CornerRadius::same(theme::card_radius()))
                     .stroke(Stroke::new(1.0, P::border()))
-                    .inner_margin(Margin::symmetric(26, 22)),
+                    .inner_margin(Margin::symmetric(20, 18)),
             )
             .show(ctx, |ui| {
-                ui.set_width(380.0);
+                // 高度写死：两栏的切换不该让卡片跟着内容忽大忽小 ——
+                // 从「系统」（一大列路径）切到「额外」（一个按钮）时整块缩水很难看。
+                ui.set_width(SETTINGS_W);
+                ui.set_height(SETTINGS_H);
+                ui.horizontal_top(|ui| {
+                    // 这一排的横向间距**一律由下面的 `add_space` 手写**。
+                    //
+                    // 不归零的话 `item_spacing`（主题里是 8）会叠加在每次 allocate 之间：
+                    // 左栏与竖线之间多 8、竖线与会话之间又多 8 —— 总宽悄悄变成 716，
+                    // 比 `SETTINGS_W` 多 16。于是卡片比设计宽 16px，而「右栏到底多宽」
+                    // 从可算变成了要猜（这正是第一版被量出来的 758.7 而不是 740）。
+                    ui.spacing_mut().item_spacing.x = 0.0;
 
-                // 刊头：衬线体的 AOX + 版本号，底下一条细线，和空状态同一个语汇
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("AOX GUI").font(theme::serif_font(26.0)).color(P::text()));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                .color(P::text_faint())
-                                .size(13.5),
-                        );
+                    // ── 左：栏目 ──
+                    ui.vertical(|ui| {
+                        ui.set_width(SETTINGS_NAV_W);
+                        ui.set_height(SETTINGS_H);
+                        for tab in SettingsTab::ALL {
+                            if tab_row(ui, tab, self.settings_tab == tab).clicked() {
+                                self.settings_tab = tab;
+                            }
+                        }
                     });
-                });
-                ui.add_space(9.0);
-                let (rule, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-                ui.painter()
-                    .hline(rule.x_range(), rule.center().y, Stroke::new(1.0, P::border()));
 
-                ui.add_space(13.0);
-                ui.label(
-                    RichText::new("AOX 的图形化应用，基于 Rust 编写。")
-                        .color(P::text_dim())
-                        .size(15.0),
-                );
-
-                ui.add_space(14.0);
-                let link = ui.add(
-                    Label::new(
-                        RichText::new(aox::ui::style::PROJECT_URL)
-                            .color(P::text())
-                            .size(14.5)
-                            .underline(),
-                    )
-                    .sense(Sense::click()),
-                );
-                if link.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                if link.clicked() {
-                    ui.ctx()
-                        .open_url(egui::OpenUrl::new_tab(aox::ui::style::PROJECT_URL));
-                }
-
-                // 当前模型：原先缀在窗口标题里，标题去掉「· xxx」之后挪到这儿，
-                // 和下面的运行时信息同属「看一眼就够」的诊断数据。
-                if !self.model.is_empty() {
-                    ui.add_space(18.0);
-                    ui.label(
-                        RichText::new(format!("模型  {}", self.model))
-                            .font(theme::mono_font(12.5))
-                            .color(P::text_faint()),
+                    // 一条竖线把「选什么」与「看什么」分开。与「关于」里那条横线
+                    // 同一套语汇（1px、border 色），只是转了个方向。
+                    //
+                    // 高度**写常量**而不是 `ui.available_height()`：在水平布局里后者会
+                    // 随左边那一栏已经占掉的高度变化，竖线于是时高时矮。常量还顺带
+                    // 把「这条线要贯穿整张卡片」这件事写明。
+                    let (rule, _) =
+                        ui.allocate_exact_size(Vec2::new(1.0, SETTINGS_H), Sense::hover());
+                    ui.painter().vline(
+                        rule.center().x,
+                        rule.y_range(),
+                        Stroke::new(1.0, P::border()),
                     );
-                }
-
-                // 配置层：这份配置是「合」出来的，还是只有 config.toml 一份。
-                // 只显示名字链（去掉 bundle: 前缀），不在这里铺来源树 —— 完整来源树走
-                // CLI 的 `aox --dump-config`。只有一层时不显示，说了等于没说。
-                let layers: Vec<String> = self
-                    .boot
-                    .as_ref()
-                    .map(|b| {
-                        b.config_layers
-                            .iter()
-                            .map(|l| l.strip_prefix("bundle:").unwrap_or(l).to_string())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if layers.len() > 1 {
                     ui.add_space(18.0);
-                    ui.label(
-                        RichText::new(format!("配置层  {}", layers.join(" → ")))
-                            .font(theme::mono_font(12.5))
-                            .color(P::text_faint()),
-                    );
-                }
 
-                // 插件运行时：这类「看一眼就够」的诊断信息放在关于窗口里，
-                // 主界面不额外加胶囊。缺 Python 时才多出一个安装入口。
-                if !self.runtimes.lines.is_empty() {
-                    ui.add_space(18.0);
-                    let (rule, _) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), 1.0),
-                        Sense::hover(),
-                    );
-                    ui.painter()
-                        .hline(rule.x_range(), rule.center().y, Stroke::new(1.0, P::border()));
-
-                    ui.add_space(12.0);
-                    ui.label(RichText::new("插件运行时").color(P::text_dim()).size(14.0));
-                    ui.add_space(6.0);
-                    for l in &self.runtimes.lines {
-                        ui.label(
-                            RichText::new(l)
-                                .font(theme::mono_font(12.5))
-                                .color(P::text_faint()),
-                        );
-                    }
-                    if self.runtimes.python_missing {
-                        ui.add_space(10.0);
-                        ui.label(
-                            RichText::new("本机没有 Python，文件读写、系统信息等能力不可用。")
-                                .color(P::text_dim())
-                                .size(13.5),
-                        );
-                        ui.add_space(8.0);
-                        if primary_button(ui, "安装 Python 运行时（约 10 MB）").clicked() {
-                            // 走与 CLI 完全相同的命令路径（宿主自己处理，不发给模型）
-                            let _ = self
-                                .tx
-                                .send(ToAgent::Input("/runtime install python".into(), Vec::new()));
-                            open = false;
-                        }
-                    }
-                }
-
-                ui.add_space(20.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if flat_button(ui, "关闭").clicked() {
-                            open = false;
-                        }
+                    // ── 右：内容 ──
+                    ui.vertical(|ui| {
+                        ui.set_width(SETTINGS_RIGHT_W);
+                        // 高度也写死。理由：`ScrollArea` 取的是「可用高度 ∩ max_height」，
+                        // 而在这个水平布局里，「可用高度」会被同一排的其它子项影响
+                        // （竖线那一下 allocate 就把它吃掉过一次）。写死之后
+                        // 「内容 + 间隙 + 底部按钮」三段的高度都可算，卡片高度就不会
+                        // 随栏目内容变化 —— 那是「切栏目时卡片忽大忽小」的来源。
+                        ui.set_height(SETTINGS_H);
+                        // 底部那 SETTINGS_FOOT_H 留给「关闭」：不扣掉的话内容一长
+                        // 就把按钮顶出卡片
+                        ScrollArea::vertical()
+                            .id_salt("aox-settings-body")
+                            .max_height(SETTINGS_H - SETTINGS_FOOT_H)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                // ⚠️ 这一行是**整个弹窗稳不稳的关键**，别删。
+                                //
+                                // `ScrollArea` 的内宽 = 外宽 − 滚动条占位，而那个占位是
+                                // **逐帧动画**的（`animate_bool_responsive` ×
+                                // `spacing.scroll.allocated_width()`，本项目是 6px）。
+                                // 只要内容宽度还跟着 `available_width()` 走，滚动条每呼吸
+                                // 一次，行宽就变一次、换行的文字就重新折一次行 —— 界面表现
+                                // 就是「整个面板在抖、字发虚」，而且**只在有重绘时发生**
+                                // （鼠标一动就重绘，所以看起来是「鼠标一移就抖」）。
+                                //
+                                // 钉死之后：内容宽度是常量，折行稳定，滚动条只影响它自己
+                                // 那 6px 的浮动条（浮在内容右侧，不压字）。
+                                let content_w =
+                                    SETTINGS_RIGHT_W - ui.spacing().scroll.allocated_width();
+                                ui.set_width(content_w);
+                                match self.settings_tab {
+                                    SettingsTab::Extra => self.tab_extra(ui),
+                                    SettingsTab::Appearance => self.tab_appearance(ui),
+                                    SettingsTab::System => self.tab_system(ui),
+                                    SettingsTab::About => self.tab_about(ui),
+                                }
+                            });
+                        ui.add_space(6.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if flat_button(ui, "关闭").clicked() {
+                                open = false;
+                            }
+                        });
                     });
                 });
             });
         // 点背景、按 Esc 也算关闭
         if resp.should_close() || !open {
-            self.about_open = false;
+            self.settings_open = false;
         }
+    }
+
+    /// 「额外」栏：活动流入口。
+    ///
+    /// 这一栏刻意只有**一个入口、没有设置项** —— 它排在最前是因为用户这么要求，
+    /// 但里面确实只有「打开活动流」这一件事（原先它占着右上角一枚图标）。
+    fn tab_extra(&mut self, ui: &mut Ui) {
+        // 先把锁收掉再判：`is_open()` 这一下要拿锁，而点击分支里的 `open()` 自己还会
+        // 再拿一次 —— 两把锁叠在同一句里就是自锁（顶栏那版踩过）。
+        let on = activity::lock(&self.act).is_open();
+        if activity_open_button(ui, on).clicked() {
+            activity::open(ui.ctx(), &self.act);
+        }
+        ui.add_space(9.0);
+        ui.label(RichText::new("观测Agent内部循环逻辑").color(P::text_faint()).size(13.0));
+    }
+
+    /// 「外观」栏：明暗三档（含跟随系统）。
+    ///
+    /// 选哪一档只改 `theme::Pref`；「跟随系统」的实际取值由 `theme::effective` 从系统
+    /// 主题算出来，并且**每帧复查**（见 `theme::follow_system`）——
+    /// 不复查的话，「跟随系统」就只是「启动时照系统的样子定一次」。
+    fn tab_appearance(&mut self, ui: &mut Ui) {
+        let cur = theme::pref();
+        for p in theme::Pref::ALL {
+            if choice_row(ui, p.label(), cur == p).clicked() {
+                theme::apply_pref(ui.ctx(), p);
+            }
+        }
+    }
+
+    /// 「系统」栏：这台机器、这份配置、这些目录。
+    ///
+    /// 顺序照用户点的单子排：系统信息 → 运行时环境 → 模型 → 配置 → 工作空间 →
+    /// 历史 → 插件 → 运行时目录。
+    fn tab_system(&self, ui: &mut Ui) {
+        let p = self.boot.as_ref().map(|b| b.paths.clone()).unwrap_or_default();
+
+        kv_row(ui, "系统信息", &p.host);
+
+        // 运行时环境：**内置还是系统 PATH** —— 逐语言一行，来源直接写在方括号里。
+        // 不画 ✓/✗：手写字体里那两个字形不一定有（调用流那两枚就是手绘的），
+        // 而「未找到」这个词本身已经把结论说清楚了。
+        for (i, it) in self.runtimes.items.iter().enumerate() {
+            kv_row_colored(
+                ui,
+                if i == 0 { "运行时环境" } else { "" },
+                &format!("{}  {}  [{}]", it.lang, it.command, it.origin),
+                if it.ok { P::text_faint() } else { P::warn() },
+            );
+        }
+
+        if !self.model.is_empty() {
+            kv_row(ui, "所用模型", &self.model);
+        }
+        if !p.config.is_empty() {
+            kv_row(ui, "配置文件", &p.config);
+        }
+        // 这份配置由哪几层合出来：`core → patch → config.toml`。
+        //
+        // 只显示名字链、不铺来源树（完整的那张表走 CLI 的 `aox --dump-config`）；
+        // **只有一层时不显示** —— 说「就一层」等于没说话。这条判据是从原来那张
+        // 「关于」小卡片里搬过来的，一字未改。
+        let layers: Vec<String> = self
+            .boot
+            .as_ref()
+            .map(|b| {
+                b.config_layers
+                    .iter()
+                    .map(|l| l.strip_prefix("bundle:").unwrap_or(l).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if layers.len() > 1 {
+            kv_row(ui, "配置层", &layers.join(" → "));
+        }
+        if !p.root.is_empty() {
+            kv_row(ui, "应用根目录", &p.root);
+        }
+        kv_row(ui, "工作空间", &self.workplace_line());
+        if !p.history.is_empty() {
+            kv_row(ui, "历史记录", &p.history);
+        }
+        if !p.plugins.is_empty() {
+            kv_row(ui, "插件目录", &p.plugins);
+        }
+        if !p.runtime.is_empty() {
+            // 「如果是内置的话」——目录在不在，一眼看得出来用没用内置运行时
+            let note = if std::path::Path::new(&p.runtime).is_dir() {
+                ""
+            } else {
+                "（尚未装配内置运行时）"
+            };
+            kv_row(ui, "运行时目录", &format!("{}{note}", p.runtime));
+        }
+
+        // 本机没有 Python 时给一个一键安装入口。原来它长在「关于」卡片里，
+        // 而现在「关于」只管版本与协议 —— 装运行时是系统层面的事，放这一栏才对。
+        if self.runtimes.python_missing {
+            ui.add_space(14.0);
+            ui.label(
+                RichText::new("本机没有 Python，文件读写、系统信息等能力不可用。")
+                    .color(P::text_dim())
+                    .size(13.5),
+            );
+            ui.add_space(8.0);
+            if primary_button(ui, "安装 Python 运行时（约 10 MB）").clicked() {
+                // 走与 CLI 完全相同的命令路径（宿主自己处理，不发给模型）
+                let _ = self.tx.send(ToAgent::Input("/runtime install python".into(), Vec::new()));
+            }
+        }
+    }
+
+    /// 工作空间那一行：「路径 + 档位」。
+    ///
+    /// 工作空间是**跟着对话走**的（`/new` 一律回默认档），所以这里显示的是**当前这段
+    /// 对话**的那块地 —— 这也是为什么它能显示而不用等磁盘扫描：现状由 bridge 主动推。
+    fn workplace_line(&self) -> String {
+        use aox::workplace::Mode;
+        let Some(v) = self.ws.view() else {
+            // 刚启动的头一两帧还没收到回执。不猜一个目录，如实说还不知道。
+            return "（还没收到回执）".into();
+        };
+        let name = match &v.mode {
+            Mode::Default => "默认档".to_string(),
+            Mode::Full => "完全访问档（写入不受限）".to_string(),
+            Mode::Fixed(p) => format!("固定档 {}", p.display()),
+        };
+        match &v.root {
+            Some(r) => format!("{}（{name}）", r.display()),
+            // `default` 档要等第一条消息才开地。这里刻意与「不受限」分开说 —— 两件事。
+            None => format!("（{name} · 还没开地）"),
+        }
+    }
+
+    /// 「关于」栏：版本、协议、链接。
+    ///
+    /// 协议正文**直接嵌入仓库里那份 `LICENSE`**，不手抄一行 —— 手抄的那份一旦与文件
+    /// 不一致，「关于」里写的就不是真正生效的那份协议了，而这种错没人会去核对。
+    fn tab_about(&self, ui: &mut Ui) {
+        // 刊头：衬线体的 AOX GUI + 版本号，底下一条细线（与首屏空状态同一个语汇）
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("AOX GUI").font(theme::serif_font(24.0)).color(P::text()));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .color(P::text_faint())
+                        .size(13.5),
+                );
+            });
+        });
+        ui.add_space(9.0);
+        let (rule, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().hline(rule.x_range(), rule.center().y, Stroke::new(1.0, P::border()));
+
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("基于 Rust 编写的 AOX 图形化应用，遵循开源协议 ISC。")
+                .color(P::text_dim())
+                .size(14.0),
+        );
+
+        ui.add_space(16.0);
+        ui.label(RichText::new("ISC 协议全文").color(P::text_faint()).size(12.5));
+        ui.add_space(6.0);
+        // 协议正文装在一个带底色的框里。**可选中**：要引用某一条款时能直接复制，
+        // 而不是照着屏幕重打一遍。
+        Frame::NONE
+            .fill(P::code_bg())
+            .corner_radius(CornerRadius::same(12))
+            .stroke(Stroke::new(1.0, P::border()))
+            .inner_margin(Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.add(
+                    Label::new(
+                        RichText::new(LICENSE_TEXT.trim_end())
+                            .font(theme::mono_font(12.0))
+                            .color(P::text_faint()),
+                    )
+                    .selectable(true)
+                    .wrap_mode(egui::TextWrapMode::Wrap),
+                );
+            });
+
+        ui.add_space(16.0);
+        link_row(ui, "作者博客", "https://2am.top");
+        link_row(ui, "项目地址", "https://github.com/forever218/AOX");
     }
 
     fn auth_overlay(&mut self, ctx: &egui::Context) {
@@ -1928,6 +2102,14 @@ fn seed_demo(app: &mut App) {
         model: app.model.clone(),
         provider_ready: true,
         note: None,
+        // 演示模式也给一份真实的路径清单：设置页的「系统」栏本来就是「看一眼就够」
+        // 的诊断数据，用假路径预览毫无意义（而真路径在演示模式里同样读得到）。
+        paths: BootPaths::new(
+            &root,
+            std::path::Path::new(&app.config_path),
+            &root.join("plugins"),
+            store.location().to_path_buf(),
+        ),
         store: store.clone(),
     });
     app.store = Some(store);
@@ -2101,6 +2283,11 @@ impl eframe::App for App {
         // —— 这一帧刚收下的附件要能在这一帧就出现在待上传栏里。
         self.take_dropped(ctx);
 
+        // 「跟随系统」的每帧复查：系统换了主题就跟着换（egui 每帧把当前系统主题放在
+        // `ctx` 里）。不放在切换那一刻算一次的原因见 `theme::follow_system` 的注释 ——
+        // 那样「跟随系统」会退化成「启动时照系统的样子定一次」。
+        theme::follow_system(ctx);
+
         // 原生标题栏只留窗口标题本身：图标不设、标题里也不再缀模型名，
         // 免得左上角挤着一行「AOX · xxx」。底色同步见下面 sync_native_theme。
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
@@ -2181,7 +2368,7 @@ impl eframe::App for App {
             self.send_ws(mode);
         }
 
-        self.about_overlay(ctx);
+        self.settings_overlay(ctx);
         self.auth_overlay(ctx);
     }
 
@@ -2239,12 +2426,10 @@ const HISTORY_LIST_LIMIT: usize = 80;
 // 顶栏与侧栏都被拆掉之后，它们没有「容器」可依了，于是显式钉在这里 ——
 // 位置照搬拆栏前的结果，逐像素不变。
 
-/// 按钮热区边长（与五枚图标函数里的 `d` 是同一个数）。
+/// 按钮热区边长（与三枚图标函数里的 `d` 是同一个数）。
 const BAR_BTN: f32 = 36.0;
 /// 按钮条距窗口**左**边。
 const BAR_LEFT: f32 = 20.0;
-/// 按钮条距窗口**右**边。
-const BAR_RIGHT: f32 = 20.0;
 /// 按钮条距窗口上边。`7 + 18 = 25`，正好是旧顶栏 50px 高的一半 ——
 /// 按钮中心线与拆栏之前完全重合。
 const BAR_TOP: f32 = 7.0;
@@ -2259,6 +2444,19 @@ const HIST_HEAD: f32 = 74.0;
 /// 0.24 是「看得出来在动、又不用等」的一档：更短就退回瞬移，更长会觉得
 /// 点完之后界面在迟疑。
 const HIST_ANIM_SECS: f32 = 0.24;
+
+/// 顶栏滑出组里的两枚按钮 —— 只有它俩要做「从历史按钮背后钻出来」的裁剪。
+///
+/// 用一个枚举而不是写两段几乎一样的 `Area`：两枚按钮的位移、裁剪、留白
+/// 必须逐像素一致，抄成两份的话下次改一处就会两边不齐（那种错很难在看代码时发现，
+/// 只有截图对比才看得出来）。
+#[derive(Clone, Copy)]
+enum SlideIcon {
+    /// 新建对话
+    Plus,
+    /// 设置
+    Gear,
+}
 
 /// 缓出曲线（cubic ease-out）：起步快、收尾慢。
 ///
@@ -2521,56 +2719,18 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
     out
 }
 
-/// 明暗切换按钮：暗色模式显示太阳（点了变亮），亮色模式显示月亮。
-fn theme_toggle(ui: &mut Ui, is_dark: bool) -> egui::Response {
-    let d = 36.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
-    let hov = pointer_if(ui, &resp);
-    // 未悬停时按钮是「透明」的，所以月牙的缺口要用它背后的面板色来盖
-    let behind = if hov { P::surface_hi() } else { P::panel() };
-    let fg = if hov { P::text() } else { P::text_dim() };
-
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(10), behind);
-    let c = rect.center();
-    if is_dark {
-        // 太阳：圆 + 八条光芒
-        painter.circle_stroke(c, 5.2, Stroke::new(1.7, fg));
-        for i in 0..8 {
-            let a = std::f32::consts::TAU * i as f32 / 8.0;
-            let (s, co) = a.sin_cos();
-            painter.line_segment(
-                [
-                    Pos2::new(c.x + co * 8.2, c.y + s * 8.2),
-                    Pos2::new(c.x + co * 11.2, c.y + s * 11.2),
-                ],
-                Stroke::new(1.7, fg),
-            );
-        }
-    } else {
-        // 月亮：实心圆，再用背景色盖掉右上角形成月牙
-        painter.circle_filled(c, 8.6, fg);
-        painter.circle_filled(Pos2::new(c.x + 4.8, c.y - 3.8), 7.6, behind);
-    }
-    resp.on_hover_text(if is_dark { "切换到纸色（亮）" } else { "切换到墨色（暗）" })
-}
-
-/// 活动流开关：一条「流程图」式的流线箭头。
+/// 设置：一个齿轮（36px 热区、单色描边、悬停换色 —— 与历史 / 「+」同一套画法）。
 ///
-/// 从右下绕到左上的一条 S 形曲线，起点一个节点圆、终点一个箭头——
-/// 就是「信息从这里流到那里」的图形说法。面板开着时是实的墨色，关掉时退成浅灰，
-/// 不用看文字也知道现在是什么状态。
-fn flow_toggle(ui: &mut Ui, on: bool) -> egui::Response {
+/// 齿轮画成 **8 齿的多边形 + 中间一个孔**，而不是「圆圈 + 八条放射线」：
+/// 后者与 [`theme_toggle`] 画太阳的手法一模一样，缩在 36px 里两者会读成同一个图形
+/// （都是「圆 + 八条线」）。齿用**折线**描出来才有轮廓感，一眼分得开。
+///
+/// 齿廓自己算：外圈齿顶与齿谷交替取点，绕一圈闭合。8 齿 × 4 点 = 32 个点。
+fn gear_icon(ui: &mut Ui) -> egui::Response {
     let d = 36.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
     let hov = pointer_if(ui, &resp);
-    let fg = if hov {
-        P::ink()
-    } else if on {
-        P::text()
-    } else {
-        P::text_faint()
-    };
+    let fg = if hov { P::ink() } else { P::text_dim() };
 
     let painter = ui.painter();
     painter.rect_filled(
@@ -2579,12 +2739,44 @@ fn flow_toggle(ui: &mut Ui, on: bool) -> egui::Response {
         if hov { P::surface_hi() } else { P::panel() },
     );
 
-    let r = rect.shrink(9.5);
-    // 三次贝塞尔：控制点一上一下，得到一条平滑的 S 形
-    let a = Pos2::new(r.left(), r.bottom());
-    let b = Pos2::new(r.left(), r.top() + r.height() * 0.12);
-    let c = Pos2::new(r.right(), r.bottom() - r.height() * 0.12);
-    let e = Pos2::new(r.right(), r.top());
+    const TEETH: usize = 8;
+    let c = rect.center();
+    let r_out = 9.6_f32;
+    let r_in = 6.9_f32;
+    // 一圈分成 TEETH 段，每段里「齿顶 → 齿谷 → 齿谷 → 齿顶」四点。
+    let step = std::f32::consts::TAU / TEETH as f32;
+    let tooth = step * 0.22; // 齿顶占的那段角（其余是齿谷）
+    let mut pts: Vec<Pos2> = Vec::with_capacity(TEETH * 4);
+    for k in 0..TEETH {
+        let a0 = step * k as f32;
+        for (ang, r) in [
+            (a0 - tooth, r_in),
+            (a0, r_out),
+            (a0 + tooth, r_out),
+            (a0 + tooth * 2.0, r_in),
+        ] {
+            let (s, co) = ang.sin_cos();
+            pts.push(Pos2::new(c.x + co * r, c.y + s * r));
+        }
+    }
+    pts.push(pts[0]); // 闭合
+    painter.add(egui::Shape::line(pts, Stroke::new(1.5, fg)));
+    // 中心孔 —— 有它才像齿轮，没有就是个八角星
+    painter.circle_stroke(c, 2.5, Stroke::new(1.5, fg));
+
+    resp.on_hover_text("设置")
+}
+
+/// 那条「信息从这里流到那里」的 S 形流线。
+///
+/// 从原来顶栏那枚 `flow_toggle` 里**抽出来**的：那枚按钮已经删掉（活动流改从设置页
+/// 打开），但这条曲线还要在设置页的「打开活动流」按钮上出现 —— 同一个图形只该有一份画法。
+fn draw_flow_curve(painter: &egui::Painter, rect: Rect, fg: Color32) {
+    // 控制点一上一下，得到一条平滑的 S 形
+    let a = Pos2::new(rect.left(), rect.bottom());
+    let b = Pos2::new(rect.left(), rect.top() + rect.height() * 0.12);
+    let c = Pos2::new(rect.right(), rect.bottom() - rect.height() * 0.12);
+    let e = Pos2::new(rect.right(), rect.top());
 
     let at = |t: f32| {
         let u = 1.0 - t;
@@ -2613,39 +2805,10 @@ fn flow_toggle(ui: &mut Ui, on: bool) -> egui::Response {
     };
     let n = Vec2::new(-dir.y, dir.x);
     painter.add(egui::Shape::convex_polygon(
-        vec![
-            e + dir * 5.2,
-            e - dir * 2.2 + n * 4.0,
-            e - dir * 2.2 - n * 4.0,
-        ],
+        vec![e + dir * 5.2, e - dir * 2.2 + n * 4.0, e - dir * 2.2 - n * 4.0],
         fg,
         Stroke::NONE,
     ));
-
-    resp.on_hover_text(if on { "隐藏活动流" } else { "显示活动流" })
-}
-
-/// 关于：一个 ⓘ 圈。和另外两个图标同一套画法（36px 热区、单色描边）。
-fn about_icon(ui: &mut Ui) -> egui::Response {
-    let d = 36.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
-    let hov = pointer_if(ui, &resp);
-    let fg = if hov { P::ink() } else { P::text_dim() };
-
-    let painter = ui.painter();
-    painter.rect_filled(
-        rect,
-        CornerRadius::same(10),
-        if hov { P::surface_hi() } else { P::panel() },
-    );
-    let c = rect.center();
-    painter.circle_stroke(c, 8.4, Stroke::new(1.6, fg));
-    painter.circle_filled(Pos2::new(c.x, c.y - 3.7), 1.35, fg);
-    painter.line_segment(
-        [Pos2::new(c.x, c.y - 0.3), Pos2::new(c.x, c.y + 4.4)],
-        Stroke::new(1.8, fg),
-    );
-    resp.on_hover_text("关于 AOX GUI")
 }
 
 /// 悬停在可点区域上时切到「手型」光标，并返回是否悬停。
@@ -3389,4 +3552,233 @@ fn tail_lines(s: &str, n: usize) -> String {
 fn compact_json(v: &serde_json::Value) -> String {
     let s = serde_json::to_string(v).unwrap_or_else(|_| v.to_string());
     clamp_str(&s, 300)
+}
+
+// ────────────── 设置弹窗 ──────────────
+
+/// 设置弹窗的**内容区**尺寸（不含内边距 20/18）。
+///
+/// 比原来那枚 380px 的「关于」小卡片大一圈：它要装一张两栏的表，右栏还是路径清单
+/// （`E:\rustapp\workplace\2026-10-05-…` 这种值短不了）。
+const SETTINGS_W: f32 = 700.0;
+/// 高度写死，理由是「切栏目时卡片不该忽大忽小」——见 `settings_overlay` 的注释。
+const SETTINGS_H: f32 = 470.0;
+/// 左栏（栏目列表）宽度。
+const SETTINGS_NAV_W: f32 = 132.0;
+/// 右栏宽度 = 总宽 − 左栏 − 竖线 1px − 间距 18px。
+const SETTINGS_RIGHT_W: f32 = SETTINGS_W - SETTINGS_NAV_W - 19.0;
+/// 底部「关闭」那一行占掉的高度（含它与内容之间的间隙）。
+const SETTINGS_FOOT_H: f32 = 44.0;
+/// 「名字 + 值」那一行里左列（名字）占的宽度。固定住值才会左右对齐成一条线。
+const KV_KEY_W: f32 = 84.0;
+
+/// 开源协议正文。**直接嵌入仓库里那份 `LICENSE`** —— 不手抄：手抄的那份迟早与文件
+/// 不一致，而「关于」里写的必须是真正生效的那一份。
+const LICENSE_TEXT: &str = include_str!("../../LICENSE");
+
+/// 左栏里的一行栏目。
+///
+/// 选中态用两件事说：「底升一档 + 文字转主色」加左侧一小段竖线。只靠底色的话，
+/// 在这个色阶很窄的单色方案里（`surface_hi` 与 `surface` 只差一档）几乎看不出来。
+fn tab_row(ui: &mut Ui, tab: SettingsTab, selected: bool) -> egui::Response {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let fg = if selected { P::ink() } else { P::text_dim() };
+
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, CornerRadius::same(9), P::surface_hi());
+        painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(rect.left() + 6.0, rect.center().y - 7.0),
+                Vec2::new(2.0, 14.0),
+            ),
+            CornerRadius::same(1),
+            fg,
+        );
+    } else if resp.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(9), P::panel());
+    }
+
+    let g = painter.layout_no_wrap(tab.label().to_string(), egui::FontId::proportional(14.5), fg);
+    painter.galley(Pos2::new(rect.left() + 18.0, rect.center().y - g.size().y * 0.5), g, fg);
+    resp
+}
+
+/// 单选行（「外观」那一栏用）：右侧一个圆点，选中的是实心。
+///
+/// 圆点而不是勾：勾的形状在这个界面里已经被「工作区档位」用掉了（那是「当前生效的
+/// 档位」），再用一次会读成同一件事。实心 / 空心是「选中 / 未选中」最省解释的画法。
+fn choice_row(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let painter = ui.painter();
+    if resp.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(9), P::surface_hi());
+    }
+    let fg = if selected { P::text() } else { P::text_dim() };
+    let g = painter.layout_no_wrap(label.to_string(), egui::FontId::proportional(14.5), fg);
+    painter.galley(Pos2::new(rect.left() + 4.0, rect.center().y - g.size().y * 0.5), g, fg);
+
+    let dot = Pos2::new(rect.right() - 12.0, rect.center().y);
+    if selected {
+        painter.circle_filled(dot, 5.0, P::ink());
+    } else {
+        painter.circle_stroke(dot, 5.0, Stroke::new(1.5, P::border_strong()));
+    }
+    resp
+}
+
+/// 「打开活动流」按钮：左边那条流线 + 右边文字。
+///
+/// 为什么不是一枚纯文字按钮：那条流线是活动流**唯一的视觉身份**（原来顶栏那枚图标就是
+/// 它），丢掉之后这一栏就只剩四个中文字，得先读一遍才知道点开是什么。
+///
+/// 已经开着时整枚按钮淡一档：一个写着「打开」的按钮再点一下**不该把窗口关掉**，
+/// 所以那时它不可点（`activity::open` 里也是这么做的，见它的注释）。
+fn activity_open_button(ui: &mut Ui, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(196.0, 42.0), Sense::click());
+    let hot = resp.hovered() && !on;
+    if hot {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let fg = if on { P::text_faint() } else { P::text() };
+
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(12),
+        if hot { P::surface_hi() } else { P::panel() },
+    );
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(12),
+        Stroke::new(1.0, P::border()),
+        egui::StrokeKind::Inside,
+    );
+    // 图标：18px 见方的流线，靠左内缩 22
+    let icon =
+        Rect::from_center_size(Pos2::new(rect.left() + 22.0, rect.center().y), Vec2::splat(18.0));
+    draw_flow_curve(painter, icon, fg);
+    let g = painter.layout_no_wrap("打开活动流".to_string(), egui::FontId::proportional(14.5), fg);
+    painter.galley(Pos2::new(rect.left() + 42.0, rect.center().y - g.size().y * 0.5), g, fg);
+    resp
+}
+
+/// 「名字 + 值」一行（「系统」那一栏全是这种行）。
+fn kv_row(ui: &mut Ui, key: &str, val: &str) {
+    kv_row_colored(ui, key, val, P::text_faint());
+}
+
+/// 同上，但值可以换个颜色（「运行时环境」用它把「未找到」标出来）。
+fn kv_row_colored(ui: &mut Ui, key: &str, val: &str, color: Color32) {
+    ui.horizontal_top(|ui| {
+        let (r, _) = ui.allocate_exact_size(Vec2::new(KV_KEY_W, 19.0), Sense::hover());
+        if !key.is_empty() {
+            let p = ui.painter();
+            let g = p.layout_no_wrap(key.to_string(), egui::FontId::proportional(13.5), P::text_dim());
+            p.galley(Pos2::new(r.left(), r.top() + 1.0), g, P::text_dim());
+        }
+        // 值一律等宽：它们是路径、命令、版本号，不是散文。可选中 —— 路径经常是要
+        // 复制到别处去用的（终端、资源管理器），只读的显示等于让人照着敲一遍。
+        ui.add(
+            Label::new(RichText::new(val).font(theme::mono_font(12.5)).color(color))
+                .selectable(true)
+                .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+    });
+    ui.add_space(4.0);
+}
+
+/// 「名字 + 可点链接」一行（「关于」那一栏用）。
+fn link_row(ui: &mut Ui, key: &str, url: &str) {
+    ui.horizontal_top(|ui| {
+        let (r, _) = ui.allocate_exact_size(Vec2::new(KV_KEY_W, 19.0), Sense::hover());
+        let p = ui.painter();
+        let g = p.layout_no_wrap(key.to_string(), egui::FontId::proportional(13.5), P::text_dim());
+        p.galley(Pos2::new(r.left(), r.top() + 1.0), g, P::text_dim());
+
+        let resp = ui.add(
+            Label::new(RichText::new(url).color(P::text()).size(13.5).underline())
+                .sense(Sense::click())
+                .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+    });
+    ui.add_space(4.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 把「设置弹窗为什么必须**钉死**内容宽度」这件事钉成一条可执行的说明。
+    ///
+    /// 这一条测的是 **egui 的一个行为**，不是我们的代码：`ScrollArea` 会按
+    /// `animate_bool_responsive` **逐帧动画**地给滚动条分配宽度，于是它内部的内容宽度
+    /// 会连续变化。凡是拿 `available_width()` 当尺寸的控件都会跟着变宽变窄、换行的文字
+    /// 会每帧重新折行 —— 这正是 2026-10-05 那次「鼠标一动，设置面板就轻微震动、
+    /// 字发虚」的根因（没有重绘动画就不推进，所以它只在鼠标移动时才现形）。
+    ///
+    /// 为什么值得单独钉住：那个行为在源码里只体现为两行减法
+    /// （`current_bar_use = 动画量 × allocated_width()`），翻代码完全看不出它会牵动布局；
+    /// 而一旦有人把 `settings_overlay` 里的 `ui.set_width(content_w)` 当成多余的删掉，
+    /// 抖动会原样回来 —— 手动测又未必碰得到。所以这条测试的**失败信息**里写清了
+    /// 该去哪一段注释核对。
+    #[test]
+    fn egui_animates_the_scroll_bar_allocation() {
+        let ctx = egui::Context::default();
+        // 与本项目 `theme::install_style` 一致：浮动样式 + 占位宽度（thin() 给 6px）
+        ctx.style_mut(|s| s.spacing.scroll = egui::style::ScrollStyle::thin());
+        assert!(
+            ctx.style().spacing.scroll.allocated_width() > 0.0,
+            "前提：样式里滚动条要占位，否则这条测试什么也证明不了"
+        );
+
+        let mut widths: Vec<f32> = Vec::new();
+        for frame in 0..8 {
+            let input = egui::RawInput {
+                // 动画靠 `time` 推进：不给时间变化，`animate_bool` 就永远停在起点
+                time: Some(frame as f64 * 0.05),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ScrollArea::vertical()
+                        .id_salt("aox-test-scroll")
+                        .max_height(80.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            widths.push(ui.available_width());
+                            // 内容明显高于视口，逼出滚动条
+                            for _ in 0..40 {
+                                ui.label("x");
+                            }
+                        });
+                });
+            });
+        }
+
+        let first = widths[0];
+        let changed = widths.iter().any(|w| (w - first).abs() > 0.5);
+        assert!(
+            changed,
+            "egui 不再逐帧改滚动条占位了？那 `App::settings_overlay` 里 \
+             `ui.set_width(content_w)` 那一段的**理由注释**要跟着更新 —— \
+             它存在的唯一目的就是躲开这个动画（不是多余的）。实测宽度序列：{widths:?}"
+        );
+    }
 }

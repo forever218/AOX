@@ -112,6 +112,11 @@ pub fn mono_font(size: f32) -> FontId {
 
 // ─────────────────────────── 明暗模式 ───────────────────────────
 
+/// **实际生效**的配色（两档）。
+///
+/// 与 [`Pref`] 分开是有意的：`Mode` 回答「现在用的是哪套色」，永远只有亮 / 暗两种；
+/// 而用户能选的还有第三种 —— 「跟着系统走」。把那一档塞进 `Mode`，满仓的
+/// `mode() == Mode::Dark` 就都要多想一层「那 System 算哪种」，而且答案还随系统变。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     /// 纸
@@ -120,7 +125,40 @@ pub enum Mode {
     Dark,
 }
 
+/// 用户在设置页里选的**偏好**（三档）。落盘的就是它。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pref {
+    Light,
+    Dark,
+    /// 跟随系统：系统换主题就跟着换（见 [`follow_system`]）。
+    System,
+}
+
+impl Pref {
+    /// 设置页里那一行的名字。
+    pub fn label(self) -> &'static str {
+        match self {
+            Pref::Light => "亮色 · 纸",
+            Pref::Dark => "暗色 · 墨",
+            Pref::System => "跟随系统",
+        }
+    }
+
+    /// 落盘用的字面量。
+    fn key(self) -> &'static str {
+        match self {
+            Pref::Light => "light",
+            Pref::Dark => "dark",
+            Pref::System => "system",
+        }
+    }
+
+    /// 设置页里的排列顺序：跟随系统在最前（它是「不用管」的那一档）。
+    pub const ALL: [Pref; 3] = [Pref::System, Pref::Dark, Pref::Light];
+}
+
 static MODE: AtomicU8 = AtomicU8::new(1); // 默认暗（墨）
+static PREF: AtomicU8 = AtomicU8::new(1); // 默认偏好也是暗
 
 pub fn mode() -> Mode {
     if MODE.load(Ordering::Relaxed) == 0 {
@@ -134,14 +172,69 @@ pub fn set_mode(m: Mode) {
     MODE.store(if m == Mode::Light { 0 } else { 1 }, Ordering::Relaxed);
 }
 
-/// 切换并返回新模式。
-pub fn toggle_mode() -> Mode {
-    let m = match mode() {
-        Mode::Light => Mode::Dark,
-        Mode::Dark => Mode::Light,
-    };
-    set_mode(m);
-    m
+/// 当前偏好（设置页据此画选中态）。
+pub fn pref() -> Pref {
+    match PREF.load(Ordering::Relaxed) {
+        0 => Pref::Light,
+        2 => Pref::System,
+        _ => Pref::Dark,
+    }
+}
+
+fn set_pref(p: Pref) {
+    PREF.store(
+        match p {
+            Pref::Light => 0,
+            Pref::System => 2,
+            Pref::Dark => 1,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// 由「用户偏好 + 系统当前主题」算出**实际**该用哪套色。
+///
+/// 抽成纯函数是为了能直接断言 —— 「跟随系统」这一档的全部逻辑就是这张真值表，
+/// 而它恰好是最容易被写成「跟随 == 总是暗」的那种东西（拿不到系统主题时悄悄退回暗，
+/// 于是「跟随系统」看起来永远不生效）。
+pub fn effective(p: Pref, system: Option<egui::Theme>) -> Mode {
+    match p {
+        Pref::Light => Mode::Light,
+        Pref::Dark => Mode::Dark,
+        // 后端没报系统主题时退回暗 —— 与加这一档之前的默认一致。
+        Pref::System => match system {
+            Some(egui::Theme::Light) => Mode::Light,
+            _ => Mode::Dark,
+        },
+    }
+}
+
+/// 用户在设置页里选了哪一档：立刻生效 + 落盘。
+pub fn apply_pref(ctx: &egui::Context, p: Pref) {
+    set_pref(p);
+    set_mode(effective(p, ctx.system_theme()));
+    install_style(ctx);
+    sync_native_theme(ctx);
+    save_pref();
+}
+
+/// 「跟随系统」的每帧检查：系统换了主题就跟着换。返回是否真的换了。
+///
+/// 为什么不是只在切换那一刻算一次：系统主题是**运行期会变**的（用户在系统设置里
+/// 切了深色），而 egui 每帧都把当前值放在 `ctx` 里。不查的话，「跟随系统」就只是
+/// 「启动时照系统的样子定一次」。
+pub fn follow_system(ctx: &egui::Context) -> bool {
+    if pref() != Pref::System {
+        return false;
+    }
+    let want = effective(Pref::System, ctx.system_theme());
+    if mode() == want {
+        return false;
+    }
+    set_mode(want);
+    install_style(ctx);
+    sync_native_theme(ctx);
+    true
 }
 
 // 主题偏好落盘位置：应用根目录下的一个小文件。
@@ -157,23 +250,28 @@ fn pref_path() -> Option<std::path::PathBuf> {
 }
 
 /// 读取上次的主题偏好。`None` = 从没记录过（或记录不可辨认），交由上层决定用哪个。
-fn read_pref() -> Option<Mode> {
+fn read_pref() -> Option<Pref> {
     let p = pref_path()?;
-    parse_mode(&std::fs::read_to_string(p).ok()?)
+    parse_pref(&std::fs::read_to_string(p).ok()?)
 }
 
-/// `"light"` / `"dark"`（大小写与首尾空白都容忍）。认不出来返回 `None`。
-fn parse_mode(s: &str) -> Option<Mode> {
+/// `"light"` / `"dark"` / `"system"`（大小写与首尾空白都容忍）。认不出来返回 `None`。
+fn parse_pref(s: &str) -> Option<Pref> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "light" => Some(Mode::Light),
-        "dark" => Some(Mode::Dark),
+        "light" => Some(Pref::Light),
+        "dark" => Some(Pref::Dark),
+        "system" => Some(Pref::System),
         _ => None,
     }
 }
 
+/// 落盘写的是**偏好**而不是生效模式。
+///
+/// 这一点必须说清：写生效模式的话，「跟随系统」会在第一次跟随之后被自己抹掉 ——
+/// 系统是亮的就写入 `"light"`，下次启动就再也不跟随了。
 fn save_pref() {
     if let Some(p) = pref_path() {
-        let _ = std::fs::write(p, if mode() == Mode::Light { "light" } else { "dark" });
+        let _ = std::fs::write(p, pref().key());
     }
 }
 
@@ -696,11 +794,14 @@ pub fn install_style(ctx: &egui::Context) {
 /// **明暗的优先级**：上次手动切换的记录 > `[theme] mode` > 默认（墨）。
 /// 用户刚点过的那一下最算数；`[theme] mode` 只在「从没切过」时说了算。
 pub fn apply(ctx: &egui::Context, cfg: &ThemeConfig) {
-    set_mode(
-        read_pref()
-            .or_else(|| cfg.mode.as_deref().and_then(parse_mode))
-            .unwrap_or(Mode::Dark),
-    );
+    // 偏好顺序：上次在设置页里选的（`.aox-gui-theme`）→ `config.toml` 的 `[theme] mode`
+    // → 出厂默认（暗）。注意 `config.toml` 那一层只是**起步值**，用户一旦在设置页里
+    // 选过就以那个为准 —— 否则「改配置才能换主题」，设置页等于摆设。
+    let pref = read_pref()
+        .or_else(|| cfg.mode.as_deref().and_then(parse_pref))
+        .unwrap_or(Pref::Dark);
+    set_pref(pref);
+    set_mode(effective(pref, ctx.system_theme()));
 
     // 三份覆盖都只写一次，之后全程只读 —— 所以 `P::xx()` 取色仍是零开销。
     let _ = ACTIVE.set((
@@ -713,14 +814,6 @@ pub fn apply(ctx: &egui::Context, cfg: &ThemeConfig) {
     install_fonts(ctx);
     install_style(ctx);
     sync_native_theme(ctx);
-}
-
-/// 切换主题：重算样式并记住偏好。
-pub fn apply_mode(ctx: &egui::Context, m: Mode) {
-    set_mode(m);
-    install_style(ctx);
-    sync_native_theme(ctx);
-    save_pref();
 }
 
 /// 让操作系统的窗口装饰（标题栏、边框）跟随应用主题。
@@ -878,3 +971,48 @@ pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
 
 #[cfg(not(windows))]
 pub fn sync_caption(_handle: &dyn raw_window_handle::HasWindowHandle) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 「跟随系统」这一档的全部逻辑就是这张真值表。
+    ///
+    /// 单独立一条测试，是因为它最容易被写成一句 `_ => Mode::Dark` 就算完 ——
+    /// 那样「跟随系统」在系统是亮色时也永远显示暗色，而**看代码完全看不出来**：
+    /// 分支在、赋值也对，只是判断依据错了。
+    #[test]
+    fn effective_follows_the_system_only_when_asked_to() {
+        use egui::Theme;
+        assert_eq!(effective(Pref::Light, Some(Theme::Dark)), Mode::Light, "选了亮就一直是亮");
+        assert_eq!(effective(Pref::Dark, Some(Theme::Light)), Mode::Dark, "选了暗就一直是暗");
+        assert_eq!(effective(Pref::System, Some(Theme::Light)), Mode::Light);
+        assert_eq!(effective(Pref::System, Some(Theme::Dark)), Mode::Dark);
+        // 后端没报系统主题：退回暗（与加这一档之前的默认一致），而不是随机或 panic
+        assert_eq!(effective(Pref::System, None), Mode::Dark);
+    }
+
+    #[test]
+    fn pref_parsing_accepts_the_three_forms_and_rejects_junk() {
+        assert_eq!(parse_pref("light"), Some(Pref::Light));
+        assert_eq!(parse_pref("  DARK \n"), Some(Pref::Dark));
+        assert_eq!(parse_pref("System"), Some(Pref::System));
+        assert_eq!(parse_pref("paper"), None);
+        assert_eq!(parse_pref(""), None);
+    }
+
+    /// 落盘写的是**偏好**，不是生效模式。
+    ///
+    /// 这条钉住一个很隐蔽的退化：写成生效模式的话，「跟随系统」会在第一次跟随之后
+    /// 被自己抹掉 —— 系统此刻是亮的就写入 `"light"`，下次启动再也不跟随了。
+    /// 所以这里断言的是 `Pref::key()` 这一串，而不是 `mode()`。
+    #[test]
+    fn the_persisted_string_is_the_preference_not_the_effective_mode() {
+        assert_eq!(Pref::System.key(), "system");
+        assert_eq!(parse_pref(Pref::System.key()), Some(Pref::System));
+        for p in Pref::ALL {
+            assert_eq!(parse_pref(p.key()), Some(p), "{p:?} 落盘后必须能读回来");
+        }
+    }
+}
+

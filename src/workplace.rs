@@ -67,10 +67,16 @@ pub const PATH_ARG: &str = "path";
 ///
 /// 刻意保守：漏判只是「少一层粗网」，而误判会直接拒掉一次合法调用，那更烦人。
 ///
+/// 这张网**只负责「哪些值是路径」**，「拿它去读还是去写」由工具自己声明
+/// （[`crate::tool::Tool::access`]，插件侧是 `initialize` 里的 `"access": "read"`）：
+/// 声明了读的按读判（`check_access(Read)` 恒为 `Ok`，于是粗网对它是空操作），
+/// 没声明的按落盘判。所以插件作者的义务有两条 —— **（可选）声明路径参数、
+/// （按需）声明只读**；两条都不做，它就只能被当写拦下。
+///
 /// 这里**没有**给插件注入「工作区根」的机制（比如一个 `AOX_WORKSPACE_ROOT` 环境变量）：
 /// `default` 档位的根是**首条消息时**才建的，而插件进程在启动 / 被创建的那一刻就已经
 /// 拉起来了 —— 那一刻还没有值可注，注进去只能是个过期或空的东西。所以插件要守边界，
-/// 正确做法是**声明路径参数**，让宿主这层粗网来判（它判不准也只多拒一次，不会漏放行）。
+/// 正确做法是**声明**，让宿主这层粗网来判（它判不准也只多拒一次，不会漏放行）。
 const PATH_KEYS: &[&str] = &[
     "path", "paths", "file", "files", "filename", "filepath", "file_path", "dir", "dirs", "directory",
     "folder", "root", "src", "dst", "dest", "destination", "target", "cwd", "workdir", "working_dir",

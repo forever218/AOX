@@ -48,6 +48,28 @@ serve("selftest_spawn", {
 })
 "#;
 
+/// 只读声明自检插件：两道工具**故意只差第 4 位**。
+///
+/// 用一对「只差一个变量」的工具去验，是因为这次改动的全部内容就是那一位 ——
+/// 只声明一边的话，SDK 把 access 发错了（比如发成常量）也照样能过。
+const READ_DECL_SOURCE: &str = r#"
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sdk"))
+from plugin_sdk import serve
+
+def probe(args):
+    return "PROBE: {}".format(args.get("path", ""))
+
+serve("selftest_read", {
+    "selftest_read_scan": ("只读扫描（声明了 read）",
+                           {"type": "object", "properties": {"path": {"type": "string"}}},
+                           probe, "read"),
+    "selftest_read_write": ("未声明（应当按可能落盘判）",
+                            {"type": "object", "properties": {"path": {"type": "string"}}},
+                            probe),
+})
+"#;
+
 pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
     println!("[selftest] 初始化运行时…");
     plugin::ensure_sdk(&plugins_dir)?;
@@ -421,6 +443,39 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
         }
         let _ = std::fs::remove_dir_all(&ws_root);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    // 插件声明的**工作区意图**（工具声明的第 4 位）一路从 SDK 到注册表。
+    //
+    // 这一段补的是别处测不到的**中间那一跳**：解析规则（`plugin::parse_access` 的单测）、
+    // 边界怎么用它（`agent` 的单测）各自都覆盖了，但「插件在 initialize 里写的 access
+    // 最终有没有变成注册表上的意图」只能在这里验 —— 它横跨 Python SDK、协议解析、
+    // ToolDef、PluginTool 四层，任何一层漏了都会静默退回「落盘」。
+    println!("[selftest] 回归：插件声明的 read 意图…");
+    {
+        let tools =
+            plugin::create_plugin(&rt, "selftest_read", "python", "只读声明自检", READ_DECL_SOURCE)
+                .await?;
+        for t in ["selftest_read_scan", "selftest_read_write"] {
+            if !tools.contains(&t.to_string()) {
+                bail!("{t} 未注册（已注册: {tools:?}）");
+            }
+        }
+        // A：声明了 read ⇒ 注册表上的意图必须是 Read
+        let a = rt.tool_access("selftest_read_scan").await;
+        if a != crate::workplace::Access::Read {
+            bail!(
+                "声明了 \"read\" 的工具在注册表上不是只读（拿到了 {a:?}）—— \
+                 先查 Python SDK 的 `_tool_entry` 有没有把第 4 位发出来"
+            );
+        }
+        // B：没声明 ⇒ 仍是落盘。老插件的行为一个字节都不许变 ——
+        //    这条如果松了，等于悄悄放开了所有已有的写类插件。
+        let b = rt.tool_access("selftest_read_write").await;
+        if b != crate::workplace::Access::Write {
+            bail!("没声明 access 的工具被当成了只读（拿到了 {b:?}）—— 这会静默放松写边界");
+        }
+        println!("[selftest]   声明 read → Read；未声明 → Write: 对拍通过");
     }
 
     println!("[selftest] 全部通过 ✔");

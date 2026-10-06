@@ -873,14 +873,22 @@ mod tests {
         let mut log = s.create(Some("deepseek-flash")).unwrap();
         let id = log.id().to_string();
 
-        let png = d.dir.join("shot.png");
+        let png = d.0.join("shot.png");
         std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
         let a = crate::attach::Attachment::probe(&png).unwrap();
         log.append(&Message::user_with_files("看这张", &[a]).unwrap(), None);
         drop(log);
 
-        // 直接看文件：一个字都不该有 base64
-        let raw = std::fs::read_to_string(d.dir.join(format!("{id}.jsonl"))).unwrap();
+        // 直接看文件：一个字都不该有 base64。
+        // 目录问后端要（`location()`），不自己拼 `<root>/history` —— 那正是本测试
+        // 要顺带钉住的一点：换后端时这里跟着变。文件名同样不拼，扫目录取唯一那份。
+        let file = std::fs::read_dir(s.location())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .expect("对话文件应当已经写出来");
+        let raw = std::fs::read_to_string(file).unwrap();
         assert!(!raw.contains("base64"), "载荷不该进对话文件：{}", &raw[..raw.len().min(400)]);
         assert!(raw.contains("shot.png"), "附件清单要留着（历史里得看得出带了什么）");
         assert!(raw.contains("看这张"), "正文当然要留着");

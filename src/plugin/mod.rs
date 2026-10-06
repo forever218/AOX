@@ -2,7 +2,9 @@
 //!
 //! 协议：
 //!   1. 宿主启动插件后发送 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-//!      插件回复 result: {"name":..., "tools":[{"name","description","parameters"}]}
+//!      插件回复 result: {"name":..., "tools":[{"name","description","parameters","access"}]}
+//!      `access` 可缺省：写 "read" 表示这道工具**只读**（工作区边界按读判 —— 读不设限），
+//!      其余一律按「可能落盘」判。见 [`ToolDef::access`]。
 //!   2. 宿主发送 {"jsonrpc":"2.0","id":N,"method":"tools/call","params":{"name","arguments"}}
 //!      插件回复 result: {"content":"...","is_error":false}
 //!   3. 宿主可发送通知 {"jsonrpc":"2.0","method":"shutdown"}，插件应自行退出。
@@ -208,6 +210,20 @@ pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    /// 这道工具**声明的意图**：只读还是可能落盘。
+    ///
+    /// 插件在 `initialize` 的工具对象里用 `"access": "read"` 声明（缺省 = 落盘）。
+    /// 宿主只拿它做一件事：判**工作区边界**时按哪一档走 —— 读不设限、写删必须在区内。
+    ///
+    /// 为什么这件事必须由插件自己说：插件是**黑盒**，宿主看不见它拿那个路径去干什么，
+    /// 只能按参数名扫「像路径」的字符串（`workplace::scan_paths`）。那张粗网对写是对的
+    /// （保守），对读就是误伤 —— 一个扫描 D 盘的只读工具会被按写入拦下。
+    /// 声明这一位，就是把这个「宿主猜不出来」的信息补上。
+    ///
+    /// ⚠️ 它是**声明，不是强制**：插件仍可以声明 `read` 之后去写。宿主这层边界防的是
+    /// 「模型顺手写到区外」，不是防一个存心作恶的插件进程（那属于另一类威胁模型，
+    /// 见 `docs/SANDBOX.md`）。所以这里不做校验，只如实采信。
+    pub access: crate::workplace::Access,
 }
 
 struct RpcChannel {
@@ -365,6 +381,10 @@ impl crate::tool::Tool for PluginTool {
     fn parameters(&self) -> Value {
         self.def.parameters.clone()
     }
+    /// 按**插件声明的**意图判（见 [`ToolDef::access`]）—— 没声明就是落盘。
+    fn access(&self) -> crate::workplace::Access {
+        self.def.access
+    }
 
     async fn call(&self, args: Value, rt: &Arc<Runtime>) -> crate::tool::ToolOutput {
         use crate::tool::ToolOutput;
@@ -521,7 +541,8 @@ async fn spawn_and_init(
             .to_string();
         let description = t.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
         let parameters = t.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object"}));
-        defs.push(ToolDef { name, description, parameters });
+        let access = parse_access(t);
+        defs.push(ToolDef { name, description, parameters, access });
     }
 
     // ---- 贡献声明：清单 ← `initialize` 覆盖（阶段 6 · 6b）----
@@ -551,6 +572,19 @@ async fn spawn_and_init(
     }
 
     Ok(PluginHandle { tool_defs: defs, contributes, ..handle })
+}
+
+/// 从一条工具声明里取「工作区意图」。
+///
+/// **只认 `"read"`**（大小写与首尾空白容忍），其余 —— 写 `"write"`、拼错成 `"ReadOnly"`、
+/// 类型写成数字、干脆没有这个字段 —— 一律落到「落盘」。这个不对称是刻意的：
+/// 认错方向的两个后果差着量级，**拼错只让工具被多挡一次（用户看得见、模型能改），
+/// 而放错会让一次越界写直接落盘**（不可逆）。所以宁可少认，不可多认。
+fn parse_access(t: &Value) -> crate::workplace::Access {
+    match t.get("access").and_then(|a| a.as_str()).map(str::trim) {
+        Some(s) if s.eq_ignore_ascii_case("read") => crate::workplace::Access::Read,
+        _ => crate::workplace::Access::Write,
+    }
 }
 
 /// 组件贡献的提示词段默认排在**所有段之后**（内置 core=10 / protocol=20 /
@@ -823,12 +857,24 @@ pub const PROTOCOL_DOC: &str = r#"# 插件协议（宿主 <-> 插件子进程）
 插件回复一行:
    {"jsonrpc":"2.0","id":1,"result":{
       "name":"<插件名>",
-      "tools":[{"name":"<工具名>","description":"<说明>","parameters":<JSON Schema>}],
+      "tools":[{"name":"<工具名>","description":"<说明>","parameters":<JSON Schema>,"access":"<read|write>"}],
       "contributes":{ ... }          // 可选，见 §4
    }}
 
 `tools` 可以省略（只贡献、不提供工具的组件就没必要写它）。
 `contributes` 省略即老形状 —— 只提供工具的插件一个字段都不用改。
+
+`access` 也可以省略，省略 = `"write"`：
+
+  - `"read"`  —— 这道工具**只读**（扫描 / 统计 / 列目录 / 解析文件）。
+                宿主的工作区边界按「读」判，而**读不设限**：它可以访问工作区外的路径，
+                与宿主自带的 read_file / list_dir 同一档，不需要用户提权。
+  - `"write"` —— 可能落盘（默认）。带路径的参数必须落在本次对话的工作区内，否则整次调用
+                被拦下（宿主只能按参数名扫「像路径」的字符串，判不出你拿它去读还是去写，
+                所以没声明的一律按最保守的档走）。
+
+只有**真的不写文件、不删东西**的工具才该声明 `"read"`。声明不实不会被宿主拦住
+（插件进程内部宿主看不见），但那等于把这道工具的工作区边界自己撤了。
 
 ## 2. 工具调用
 
@@ -932,10 +978,33 @@ def _send(msg):
     sys.stdout.flush()
 
 
+def _tool_entry(name, spec):
+    """一条工具声明 → 协议里的 JSON。
+
+    spec 是 (说明, JSON Schema, handler)，**第 4 位可选**写 access：
+
+      "read"  → 这道工具**只读**。宿主的工作区边界会按「读」判 —— 读不设限，
+                于是扫描 / 统计 / 列目录可以访问工作区外的路径
+                （与宿主自带的 read_file / list_dir 同一档，不需要用户提权）。
+      不写 / 其它 → 可能落盘：带路径的参数必须落在本次对话的工作区内。
+
+    只有**真的不写文件、不删东西**的工具才该写 "read"。声明不实不会被宿主拦住
+    （它看不见插件进程内部），但那就等于把这道工具的工作区边界自己撤了。
+    """
+    return {
+        "name": name,
+        "description": spec[0],
+        "parameters": spec[1],
+        "access": spec[3] if len(spec) > 3 else "write",
+    }
+
+
 def serve(plugin_name, tools, contributes=None, hooks=None, prompt_segments=None, theme=None):
     """起服务。参数都可缺省，只写用得上的那些。
 
-    tools:           {工具名: (说明, JSON Schema, handler)}，handler(dict) -> 结果字符串
+    tools:           {工具名: (说明, JSON Schema, handler[, "read"])}，
+                     handler(dict) -> 结果字符串。
+                     第 4 位写 "read" = 这道工具只读（见 _tool_entry）
     contributes:     贡献声明 dict（hooks / prompt_segments / theme / caps），
                      等价于写在 plugin.toml 的 [contributes] 里（两处都有时以此为准）
     hooks:           {点名字: fn(params) -> dict}，点名字见 PROTOCOL.md 的五个
@@ -959,10 +1028,7 @@ def serve(plugin_name, tools, contributes=None, hooks=None, prompt_segments=None
         if method == "initialize":
             result = {
                 "name": plugin_name,
-                "tools": [
-                    {"name": n, "description": d, "parameters": s}
-                    for n, (d, s, h) in tools.items()
-                ],
+                "tools": [_tool_entry(n, spec) for n, spec in tools.items()],
             }
             if contributes:
                 result["contributes"] = contributes
@@ -1100,5 +1166,29 @@ mod tests {
         assert_eq!(eff.hooks, vec!["on_error"], "进程实况覆盖清单");
         assert!(eff.theme, "清单没提 theme，取 initialize 的");
         assert_eq!(eff.caps, vec!["fs_read"], "initialize 没提 caps，保留清单的");
+    }
+
+    /// 声明的**读取意图**怎么解析。
+    ///
+    /// 这条钉的是一个**不对称**：认错方向的两个后果差着量级 —— 该认成读的没认成，
+    /// 工具被多挡一次（用户看得见、模型能改）；该认成写的认成了读，一次越界写就直接
+    /// 落盘了（不可逆）。所以只认 `"read"`，其余一律落到最保守的「落盘」。
+    #[test]
+    fn access_declaration_is_read_only_when_it_exactly_says_so() {
+        use crate::workplace::Access;
+        let read = |v: serde_json::Value| parse_access(&json!({"access": v}));
+
+        assert_eq!(read(json!("read")), Access::Read);
+        // 大小写与首尾空白容忍：这是「同一个词写歪了」，不该罚
+        assert_eq!(read(json!(" read ")), Access::Read);
+        assert_eq!(read(json!("READ")), Access::Read);
+
+        // 其余全部落到落盘 —— 每一条都可能是插件作者的手滑，多挡一次不会出事
+        assert_eq!(read(json!("write")), Access::Write);
+        assert_eq!(read(json!("readonly")), Access::Write, "只认 read 这一个词");
+        assert_eq!(read(json!("read_only")), Access::Write);
+        assert_eq!(read(json!(1)), Access::Write, "类型不对也保守");
+        assert_eq!(read(json!(null)), Access::Write);
+        assert_eq!(parse_access(&json!({})), Access::Write, "缺字段 = 老插件，行为不变");
     }
 }
