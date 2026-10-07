@@ -1,41 +1,46 @@
-//! 最简 SVG 渲染：`<rect>` / `<line>` / `<text>` 三种形状，外加 `viewBox` 与几个
-//! 填充 / 描边属性。
+//! A minimal SVG renderer: the three shapes `<rect>` / `<line>` / `<text>`, plus `viewBox` and a
+//! couple of fill / stroke attributes.
 //!
-//! 模型在正文里写 ```` ```svg ```` 围栏，这一段就把它在对话里**画出来**
-//!（见 `markdown.rs` 里那一条分支）。零协议改动 —— markdown 本来就有围栏代码块，
-//! 而模型本来就擅长写 SVG。
+//! When the model writes a ```` ```svg ```` fence in its reply, this draws it **inside the chat**
+//! (see the matching branch in `markdown.rs`). Zero protocol change — markdown already has fenced
+//! code blocks, and the model is already good at writing SVG.
 //!
-//! # 为什么不做 HTML
+//! # Why not HTML
 //!
-//! 「用 HTML 直接在界面上渲染」听起来只差一步，实际差的是一个**排版引擎**（盒模型、
-//! 行内流、层叠、字体度量……）。SVG 不一样：它是一堆绝对坐标的图形，不需要排版 ——
-//! 而流程图、结构图、时序图正好就是「一堆绝对坐标的图形」。
+//! "Render HTML directly in the UI" sounds one step away, but what's actually missing is a **layout
+//! engine** (box model, inline flow, stacking, font metrics...). SVG is different: it is a pile of
+//! absolutely-positioned shapes that need no layout — and flowcharts, structure diagrams and
+//! sequence diagrams are exactly "a pile of absolutely-positioned shapes".
 //!
-//! # 为什么只有三种形状
+//! # Why only three shapes
 //!
-//! 这是用户选的范围（2026-10-06）：方框、连线、文字，够画流程图式的图。
-//! 圆角、曲线、旋转、椭圆、渐变都不支持。箭头用两条短线拼（`<line>` 画不出三角形）。
+//! This is the scope the user chose (2026-10-06): boxes, connectors, text — enough for
+//! flowchart-style diagrams. Rounded corners, curves, rotation, ellipses and gradients are all
+//! unsupported. Arrows are pieced together from two short lines (`<line>` can't draw a triangle).
 //!
-//! # 两个刻意的偏离
+//! # Two deliberate deviations
 //!
-//! 1. **没写 `fill` / `stroke` 时用当前主题的颜色**，而不是 SVG 规范里的黑色。
-//!    深色主题下黑色方框直接看不见，而「没写颜色」在模型生成的流程图里恰恰最常见。
-//! 2. **认不出的元素直接跳过、不算错**：模型很容易顺手写 `<defs>` / `<style>` /
-//!    `<marker>`（它们本来就是 SVG 的常规组成部分）。为此整张图不显示，得不偿失。
+//! 1. **With no `fill` / `stroke` written, use the current theme's color**, not the black of the SVG
+//!    spec. Under a dark theme a black box is simply invisible, and "no color written" is exactly
+//!    what's most common in model-generated flowcharts.
+//! 2. **Skip unrecognized elements instead of erroring**: the model easily writes `<defs>` /
+//!    `<style>` / `<marker>` on the side (they're regular SVG parts anyway). Hiding the whole
+//!    diagram over that is not worth it.
 
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use crate::theme::P;
 
-// ─────────────────────────── 数据 ───────────────────────────
+// ─────────────────────────── Data ───────────────────────────
 
-/// 颜色取值。三支而不是 `Option<Color32>`：`none`（明确不要填充）与「没写」
-/// （用主题色）是两件事，混成一个 `None` 就再也分不开了。
+/// A paint value. Three variants rather than `Option<Color32>`: `none` (explicitly no fill) and
+/// "not written" (use the theme color) are two different things; merging them into one `None`
+/// makes them impossible to tell apart again.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Paint {
     None,
     Custom(Color32),
-    /// 属性没写 ⇒ 渲染时用当前主题对应的颜色
+    /// Attribute not written ⇒ use the color matching the current theme at render time
     Auto,
 }
 
@@ -70,18 +75,18 @@ pub struct Drawing {
     shapes: Vec<Shape>,
 }
 
-// ─────────────────────────── 解析 ───────────────────────────
+// ─────────────────────────── Parsing ───────────────────────────
 
-/// 解析一段 SVG。失败给的是**给人看的一句话**（会显示在对话里）。
+/// Parse an SVG. On failure it returns **a human-readable sentence** (shown in the chat).
 pub fn parse(src: &str) -> Result<Drawing, String> {
     let mut shapes: Vec<Shape> = Vec::new();
     let mut vb: Option<(f32, f32)> = None;
 
     for (name, attrs, body) in tags(src) {
         match name.as_str() {
-            // 根：尺寸只认这三样，顺序是 viewBox → width/height。都没有则最后按
-            // 形状的实际范围兜底（见函数尾）—— 模型偶尔会忘写 viewBox，
-            // 而那时「什么都不画」是最差的反应。
+            // Root: only these three sizes are read, in order viewBox → width/height. If none,
+            // fall back to the shapes' actual bounds at the end (see function tail) — models
+            // occasionally forget viewBox, and "draw nothing" is the worst reaction then.
             "svg" => {
                 vb = parse_viewbox(&attrs).or_else(|| {
                     let w = num(&attrs, "width");
@@ -96,7 +101,7 @@ pub fn parse(src: &str) -> Result<Drawing, String> {
                 let w = num(&attrs, "width").unwrap_or(0.0);
                 let h = num(&attrs, "height").unwrap_or(0.0);
                 if w <= 0.0 || h <= 0.0 {
-                    continue; // 没有面积的方框画不出来，也没什么可说的
+                    continue; // A box with no area can't be drawn, and there's nothing to say about it
                 }
                 shapes.push(Shape::Rect {
                     x: num(&attrs, "x").unwrap_or(0.0),
@@ -105,8 +110,8 @@ pub fn parse(src: &str) -> Result<Drawing, String> {
                     h,
                     rx: num(&attrs, "rx").unwrap_or(0.0),
                     fill: paint(&attrs, "fill"),
-                    // 方框没写 stroke 时**默认描边**：只填一块纯色、没有边，
-                    // 在浅色底上几乎看不出是个框。
+                    // When a box has no stroke written, **default to stroking**: filling a flat
+                    // color with no edge is nearly invisible as a box on a light background.
                     stroke: stroke_of(&attrs, Paint::Auto),
                     sw: num(&attrs, "stroke-width").unwrap_or(1.5),
                 });
@@ -117,7 +122,7 @@ pub fn parse(src: &str) -> Result<Drawing, String> {
                     y1: num(&attrs, "y1").unwrap_or(0.0),
                     x2: num(&attrs, "x2").unwrap_or(0.0),
                     y2: num(&attrs, "y2").unwrap_or(0.0),
-                    // 线只可能是描边出来的：没写 stroke 就用主题色，绝不用 `none`
+                    // A line can only be stroked: with no stroke written, use the theme color, never `none`
                     stroke: match paint(&attrs, "stroke") {
                         Paint::None => Paint::Auto,
                         p => p,
@@ -143,30 +148,32 @@ pub fn parse(src: &str) -> Result<Drawing, String> {
                     },
                 });
             }
-            // 认不出的元素（`defs` / `style` / `marker` / `g` / `path` …）跳过。
-            // 见模块文档第 2 条偏离：为此让整张图不显示，得不偿失。
+            // Unrecognized elements (`defs` / `style` / `marker` / `g` / `path` ...) are skipped.
+            // See deviation #2 in the module docs: hiding the whole diagram over that is not worth it.
             _ => {}
         }
     }
 
     if shapes.is_empty() {
-        return Err("这段 SVG 里没有能画的东西（只认 rect / line / text）".into());
+        return Err(aox::i18n::t("nothing drawable in this SVG (only rect / line / text are supported)").into());
     }
     let (vb_w, vb_h) = vb.unwrap_or_else(|| bbox(&shapes));
     if vb_w <= 0.0 || vb_h <= 0.0 {
-        return Err("这段 SVG 的尺寸是 0（检查 viewBox）".into());
+        return Err(aox::i18n::t("this SVG's size is 0 (check the viewBox)").into());
     }
     Ok(Drawing { vb_w, vb_h, shapes })
 }
 
-/// 尺寸兜底：形状实际占多大。加一点边距，否则贴着边的线会被裁掉一半。
+/// Size fallback: how much space the shapes actually occupy. Add a little margin, otherwise a line
+/// hugging the edge gets half clipped off.
 fn bbox(shapes: &[Shape]) -> (f32, f32) {
     let (mut mx, mut my) = (1.0f32, 1.0f32);
     for s in shapes {
         let (x, y) = match s {
             Shape::Rect { x, y, w, h, .. } => (x + w, y + h),
             Shape::Line { x1, y1, x2, y2, .. } => (x1.max(*x2), y1.max(*y2)),
-            // 文字的宽度得估：`font-size` 的 0.6 倍 × 字数（只用来兜底，估不准也没关系）
+            // Text width must be estimated: `font-size` × 0.6 × char count (only for fallback;
+            // accuracy doesn't matter)
             Shape::Text { x, y, text, size, .. } => {
                 (*x + text.chars().count() as f32 * size * 0.6, *y + size * 0.3)
             }
@@ -184,7 +191,8 @@ fn parse_viewbox(attrs: &Attrs) -> Option<(f32, f32)> {
         .filter(|s| !s.is_empty())
         .filter_map(|s| s.parse().ok())
         .collect();
-    // 只看后两位（宽、高）：前面两位是原点，我们不做平移 —— 形状本来就用同一套坐标
+    // Only look at the last two (width, height): the first two are the origin, and we do no
+    // translation — the shapes already use the same coordinate system.
     match n.len() {
         4 if n[2] > 0.0 && n[3] > 0.0 => Some((n[2], n[3])),
         _ => None,
@@ -193,7 +201,7 @@ fn parse_viewbox(attrs: &Attrs) -> Option<(f32, f32)> {
 
 fn num(attrs: &Attrs, key: &str) -> Option<f32> {
     let raw = attrs.get(key)?;
-    // `px` / `pt` 后缀容错：模型常带单位，而 SVG 里这些都是「用户单位」
+    // Tolerate `px` / `pt` suffixes: models often carry units, and in SVG these are all "user units"
     let raw = raw.trim().trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '%');
     raw.trim().parse().ok()
 }
@@ -205,7 +213,8 @@ fn paint(attrs: &Attrs, key: &str) -> Paint {
     }
 }
 
-/// 方框的描边缺省。与 `paint` 分开只为写明「默认是 Auto 而不是 None」这件事。
+/// The stroke default for a box. Kept separate from `paint` only to spell out that "the default is
+/// Auto, not None".
 fn stroke_of(attrs: &Attrs, default: Paint) -> Paint {
     match attrs.get("stroke") {
         None => default,
@@ -228,7 +237,8 @@ impl Paint {
         if let Some(c) = named(s) {
             return Some(Paint::Custom(c));
         }
-        // 认不出来（`url(#g1)` 渐变之类）就当没写：显示主题色，总比整张图不画强
+        // Unrecognized (a gradient `url(#g1)` and the like) counts as not written: showing the
+        // theme color beats not drawing the diagram at all.
         Some(Paint::Auto)
     }
 }
@@ -257,10 +267,10 @@ fn rgb_func(s: &str) -> Option<Color32> {
     (n.len() == 3).then(|| Color32::from_rgb(n[0], n[1], n[2]))
 }
 
-/// 只认最常见的几个名字。
+/// Only the most common names are recognized.
 ///
-/// 不引一张 147 个名字的表：那玩意儿会占掉这个模块一半的字节，而模型画流程图
-/// 用的颜色翻来覆去就是这几个（其余一律走 `#rrggbb`）。
+/// No 147-name table: that would eat half this module's bytes, while the colors models use for
+/// flowcharts are just these few over and over (everything else goes through `#rrggbb`).
 fn named(s: &str) -> Option<Color32> {
     let c = match s.to_ascii_lowercase().as_str() {
         "black" => (0, 0, 0),
@@ -278,15 +288,16 @@ fn named(s: &str) -> Option<Color32> {
     Some(Color32::from_rgb(c.0, c.1, c.2))
 }
 
-// ─────────────────────────── 极简 XML 扫描 ───────────────────────────
+// ─────────────────────────── Minimal XML scan ───────────────────────────
 
 type Attrs = std::collections::HashMap<String, String>;
 
-/// 把一段 SVG 扫成 `(元素名, 属性, 文本内容)`。
+/// Scan a stretch of SVG into `(element name, attributes, text content)`.
 ///
-/// 手写而不是引 `quick-xml`：这里要认的东西少到可怜（无命名空间、无实体、无 CDATA、
-/// 属性值只可能是引号包起来的一串字符），而为一个「画方框」的功能加一个 XML 库
-/// 不合算 —— 与 `attach::b64_encode` 手写是同一个取舍。
+/// Hand-written rather than pulling in `quick-xml`: what has to be recognized here is pitiably
+/// little (no namespaces, no entities, no CDATA, attribute values are only ever a quoted run of
+/// characters), so adding an XML library for a "draw a box" feature doesn't pay — the same
+/// trade-off as hand-writing `attach::b64_encode`.
 fn tags(src: &str) -> Vec<(String, Attrs, String)> {
     let b: Vec<char> = src.chars().collect();
     let mut out = Vec::new();
@@ -296,7 +307,7 @@ fn tags(src: &str) -> Vec<(String, Attrs, String)> {
             i += 1;
             continue;
         }
-        // 注释 / 声明 / DOCTYPE：跳到 `>`（注释要跳到 `-->`）
+        // Comment / declaration / DOCTYPE: jump to `>` (a comment must jump to `-->`)
         if b[i..].starts_with(&['<', '!', '-', '-']) {
             i = match find(&b, i, "-->") {
                 Some(j) => j + 3,
@@ -317,14 +328,15 @@ fn tags(src: &str) -> Vec<(String, Attrs, String)> {
         let (name, attrs) = split_tag(inner.trim().trim_end_matches('/'));
         let mut body = String::new();
         let mut next = gt + 1;
-        // ⚠️ **只有 `<text>` 收正文**。
+        // ⚠️ **Only `<text>` collects body text**.
         //
-        // 其余元素（`<svg>` / `<g>` / `<defs>` …）的内容要继续当元素扫 —— 对它们也
-        // 做「跳到闭合标签」就等于把整棵子树吃掉，一个形状都解析不出来。
-        // 这个错第一版就犯了，表现是「什么都画不出来」而代码看起来毫无问题。
+        // For every other element (`<svg>` / `<g>` / `<defs>` ...) the content must keep being
+        // scanned for elements — treating them as "jump to the closing tag" would swallow the whole
+        // subtree and parse not a single shape. This mistake was made in the first version, and it
+        // showed up as "nothing gets drawn" while the code looked perfectly fine.
         //
-        // 闭合标签本身（`</svg>`）会被 `split_tag` 切成一个叫 `/svg` 的名字，
-        // 在匹配里自然落进「认不出的元素」那一支，无害。
+        // The closing tag itself (`</svg>`) gets sliced by `split_tag` into a name `/svg`, which
+        // naturally falls into the "unrecognized element" arm and is harmless.
         if !self_closing && name == "text" {
             if let Some(end) = find(&b, next, &format!("</{name}")) {
                 body = b[next..end].iter().collect();
@@ -333,7 +345,8 @@ fn tags(src: &str) -> Vec<(String, Attrs, String)> {
                     None => b.len(),
                 };
             } else {
-                // 没闭合：把剩下的都当正文（模型偶尔漏闭合结尾）
+                // Not closed: treat everything remaining as body text (the model occasionally
+                // omits the closing tag)
                 body = b[next..].iter().collect();
                 next = b.len();
             }
@@ -367,11 +380,11 @@ fn split_tag(s: &str) -> (String, Attrs) {
     (name, attrs)
 }
 
-/// 按「引号里的内容不切」来拆属性。
+/// Split attributes by "don't cut inside quotes".
 ///
-/// 不能对空白直接 `split_whitespace`：`text-anchor="middle"` 没事，但正文里很可能有
-/// `font-family="Microsoft YaHei"` 这种带空格的属性值 —— 一拆就把属性撕成两半，
-/// 后面每一项都跟着错位。
+/// Can't just `split_whitespace` on whitespace: `text-anchor="middle"` is fine, but body text
+/// often has attribute values with spaces like `font-family="Microsoft YaHei"` — cutting there
+/// tears the attribute in half and shifts every following item.
 fn split_attrs(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -404,18 +417,19 @@ fn split_attrs(s: &str) -> Vec<String> {
     out
 }
 
-// ─────────────────────────── 绘制 ───────────────────────────
+// ─────────────────────────── Drawing ───────────────────────────
 
-/// 把一段 SVG 画进 `ui`。返回占用的高度（0 = 没画出来）。
+/// Draw a stretch of SVG into `ui`. Returns the height it occupies (0 = nothing drawn).
 ///
-/// 宽度按 `max_w` 收（不放大）：一张 200 宽的示意图拉满版心只会糊，
-/// 而「它就是这么大」比一张虚掉的大图有用 —— 与 `images_block` 同一条判据。
+/// The width is squeezed to `max_w` (never enlarged): stretching a 200-wide diagram to fill the
+/// column only blurs it, and "it's just this big" is more useful than a fuzzy large image — the
+/// same criterion as `images_block`.
 pub fn render(ui: &mut Ui, src: &str, max_w: f32) -> f32 {
     let d = match parse(src) {
         Ok(d) => d,
         Err(e) => {
             ui.label(
-                egui::RichText::new(format!("图没画出来：{e}"))
+                egui::RichText::new(aox::tf!("the diagram failed to render: {}", e))
                     .color(P::text_faint())
                     .size(12.5),
             );
@@ -426,13 +440,15 @@ pub fn render(ui: &mut Ui, src: &str, max_w: f32) -> f32 {
     let size = Vec2::new(d.vb_w * scale, d.vb_h * scale);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
 
-    // 一块浅底 + 裁切：与代码块同一套语汇，而裁切保证越出 viewBox 的线不会画到别处去
+    // A light backing plus clipping: the same vocabulary as code blocks, and clipping guarantees a
+    // line escaping the viewBox doesn't get drawn elsewhere
     let p = ui.painter().with_clip_rect(rect);
     p.rect_filled(rect, CornerRadius::same(12), P::code_bg());
 
     let px = |x: f32| rect.left() + x * scale;
     let py = |y: f32| rect.top() + y * scale;
-    // 线宽也跟着缩，但**不细过 1 像素** —— 缩到 0.4px 时线会时隐时现
+    // The stroke width scales too, but **never thinner than 1 pixel** — down at 0.4px a line
+    // flickers in and out
     let lw = |w: f32| (w * scale).max(1.0);
 
     for s in &d.shapes {
@@ -462,8 +478,9 @@ pub fn render(ui: &mut Ui, src: &str, max_w: f32) -> f32 {
             }
             Shape::Text { x, y, text, size, fill, anchor } => {
                 let a = match anchor {
-                    // SVG 的 `y` 是**基线**，egui 只有包围盒锚点 —— 用 BOTTOM 近似。
-                    // 有下伸部分（gjpqy）时略偏上，画流程图够用。
+                    // SVG's `y` is the **baseline**, while egui only has bounding-box anchors —
+                    // approximate with BOTTOM. With descenders (gjpqy) it sits slightly high, which
+                    // is good enough for flowcharts.
                     Anchor::Start => Align2::LEFT_BOTTOM,
                     Anchor::Middle => Align2::CENTER_BOTTOM,
                     Anchor::End => Align2::RIGHT_BOTTOM,
@@ -489,7 +506,7 @@ mod tests {
     use super::*;
 
     fn shapes(src: &str) -> Vec<Shape> {
-        parse(src).expect("应当解析成功").shapes
+        parse(src).expect("should parse successfully").shapes
     }
 
     #[test]
@@ -498,7 +515,7 @@ mod tests {
             r##"<svg viewBox="0 0 200 100">
                  <rect x="10" y="20" width="80" height="30" rx="4" fill="#eee" stroke="#333" stroke-width="2"/>
                  <line x1="90" y1="35" x2="140" y2="35" stroke="black"/>
-                 <text x="100" y="80" font-size="12" text-anchor="middle">开始</text>
+                 <text x="100" y="80" font-size="12" text-anchor="middle">Start</text>
                </svg>"##,
         );
         assert_eq!(s.len(), 3);
@@ -508,20 +525,20 @@ mod tests {
                 assert_eq!(*fill, Paint::Custom(Color32::from_rgb(0xee, 0xee, 0xee)));
                 assert_eq!(*sw, 2.0);
             }
-            other => panic!("第一个应当是 rect：{other:?}"),
+            other => panic!("the first one should be a rect: {other:?}"),
         }
         match &s[2] {
             Shape::Text { text, size, anchor, .. } => {
-                assert_eq!(text, "开始");
+                assert_eq!(text, "Start");
                 assert_eq!(*size, 12.0);
                 assert_eq!(*anchor, Anchor::Middle);
             }
-            other => panic!("第三个应当是 text：{other:?}"),
+            other => panic!("the third one should be text: {other:?}"),
         }
     }
 
-    /// 认不出的元素要**跳过而不是报错**：模型很容易顺手写 `<defs>` / `<style>`。
-    /// 为此让整张图不显示是最差的一种反应。
+    /// Unrecognized elements must be **skipped rather than erroring**: the model easily writes
+    /// `<defs>` / `<style>` on the side. Hiding the whole diagram over that is the worst reaction.
     #[test]
     fn unknown_elements_are_skipped_not_fatal() {
         let s = shapes(
@@ -532,10 +549,10 @@ mod tests {
                  <line x1="0" y1="0" x2="9" y2="9" stroke="red"/>
                </svg>"#,
         );
-        assert_eq!(s.len(), 2, "只该留下那个 rect 与 line");
+        assert_eq!(s.len(), 2, "only that rect and line should remain");
     }
 
-    /// 一段完全没有可画内容的 SVG 要**说清为什么**，而不是画一个空框。
+    /// A stretch of SVG with nothing drawable in it must **say why**, not draw an empty frame.
     #[test]
     fn a_drawing_with_nothing_in_it_says_so() {
         let e = parse(r#"<svg viewBox="0 0 10 10"><path d="M0 0 L1 1"/></svg>"#).unwrap_err();
@@ -552,40 +569,40 @@ mod tests {
         );
         assert_eq!(Paint::from_str("rgb(1, 2, 3)"), Some(Paint::Custom(Color32::from_rgb(1, 2, 3))));
         assert_eq!(Paint::from_str("Black"), Some(Paint::Custom(Color32::from_rgb(0, 0, 0))));
-        // 认不出来的（渐变引用）退回「没写」，而不是把整张图判死
+        // Unrecognized (a gradient reference) falls back to "not written" rather than condemning the whole diagram
         assert_eq!(Paint::from_str("url(#g1)"), Some(Paint::Auto));
     }
 
-    /// 属性值里带空格时**不能撕开**：`font-family="Microsoft YaHei"` 一撕，
-    /// 后面每一个属性都跟着错位。
+    /// Attribute values with spaces must **not be torn apart**: `font-family="Microsoft YaHei"`
+    /// torn apart shifts every following attribute.
     #[test]
     fn attribute_values_may_contain_spaces() {
         let (name, attrs) = split_tag(r#"text x="1" font-family="Microsoft YaHei" y="2""#);
         assert_eq!(name, "text");
         assert_eq!(attrs.get("font-family").map(String::as_str), Some("Microsoft YaHei"));
-        assert_eq!(attrs.get("y").map(String::as_str), Some("2"), "后面的属性不能跟着错位");
+        assert_eq!(attrs.get("y").map(String::as_str), Some("2"), "the attributes after it must not go out of alignment");
     }
 
     #[test]
     fn viewbox_wins_over_width_height_and_units_are_tolerated() {
         let d = parse(r#"<svg width="100px" height="50px" viewBox="0 0 800 400"><rect width="1" height="1"/></svg>"#).unwrap();
-        assert_eq!((d.vb_w, d.vb_h), (800.0, 400.0), "viewBox 优先");
+        assert_eq!((d.vb_w, d.vb_h), (800.0, 400.0), "viewBox wins");
         let d = parse(r#"<svg width="100px" height="50px"><rect width="1" height="1"/></svg>"#).unwrap();
-        assert_eq!((d.vb_w, d.vb_h), (100.0, 50.0), "带 px 后缀也要认");
+        assert_eq!((d.vb_w, d.vb_h), (100.0, 50.0), "a px suffix must be recognized too");
     }
 
-    /// 忘了写 viewBox 时按形状兜底 —— 「什么都不画」是最差的反应。
+    /// When viewBox is forgotten, fall back to the shapes — "draw nothing" is the worst reaction.
     #[test]
     fn a_missing_viewbox_falls_back_to_the_shape_bounds() {
         let d = parse(r#"<svg><rect x="0" y="0" width="60" height="40"/></svg>"#).unwrap();
-        assert!(d.vb_w > 60.0 && d.vb_h > 40.0, "兜底尺寸要包住形状：{}×{}", d.vb_w, d.vb_h);
+        assert!(d.vb_w > 60.0 && d.vb_h > 40.0, "the fallback size must enclose the shapes: {}×{}", d.vb_w, d.vb_h);
     }
 
     #[test]
     fn comments_and_declarations_do_not_trip_the_scanner() {
         let s = shapes(
             r#"<?xml version="1.0"?>
-               <!-- 说明：这是个流程图 -->
+               <!-- note: this is a flowchart -->
                <svg viewBox="0 0 10 10"><rect width="5" height="5"/></svg>"#,
         );
         assert_eq!(s.len(), 1);

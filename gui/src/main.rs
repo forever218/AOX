@@ -1,18 +1,19 @@
-// AOX GUI —— 极简图形界面前端。
+// AOX GUI — a minimal graphical front-end.
 //
-// 与 CLI 版本（`aox`）共用同一套核心库（`aox::agent` / `aox::llm` / `aox::plugin` /
-// `aox::ui`），Agent 主循环、插件宿主、Provider、授权策略全部复用，GUI 只负责「呈现 + 输入」。
+// It shares the same core library with the CLI build (`aox`) (`aox::agent` / `aox::llm` /
+// `aox::plugin` / `aox::ui`): the agent main loop, plugin host, provider and authorization policy
+// are all reused, and the GUI only handles "presentation + input".
 //
-// 架构：
-//   egui 主线程（本线程）  <--channel-->  后台 tokio 线程（驱动 aox::agent::Agent）
-//   `App` 实现 `eframe::App`；`bridge::GuiUi` 实现 `aox::ui::Ui`。
+// Architecture:
+//   egui main thread (this thread)  <--channel-->  background tokio thread (drives aox::agent::Agent)
+//   `App` implements `eframe::App`; `bridge::GuiUi` implements `aox::ui::Ui`.
 //
-// 常用参数（与 CLI 一致）：
-//   --config <path>   指定配置文件
-//   --theme  <path>   指定主题文件（整份取代 config.toml 的 [theme]）
-//   --plugins <path>  指定插件目录
-//   --prompt <text>   启动后自动发送第一条指令
-//   --demo            演示模式：不连模型，只预览界面排布与事件流
+// Common arguments (same as the CLI):
+//   --config <path>   specify the config file
+//   --theme  <path>   specify a theme file (wholly replaces the `[theme]` in config.toml)
+//   --plugins <path>  specify the plugin directory
+//   --prompt <text>   automatically send the first instruction after startup
+//   --demo            demo mode: don't connect to the model, just preview the layout and event flow
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -31,19 +32,22 @@ use tokio::sync::mpsc;
 
 use bridge::{FromAgent, SessionFlags, ToAgent};
 
-/// 取外观配置：`--theme <file>` 优先（**整份取代** `[theme]`），否则读合成后的 `[theme]`。
+/// Read appearance config: `--theme <file>` wins (**wholly replaces** `[theme]`), otherwise read
+/// the composed `[theme]`.
 ///
-/// 这里刻意**不报错、不退出**：配置缺失或写坏时窗口照常打开，只用内置外观。
-/// 「配置有问题」由后台线程统一提示；主线程的职责是别让窗口打不开。
+/// Deliberately **no error, no exit** here: when config is missing or broken the window still opens,
+/// just using the built-in appearance. "Config has a problem" is reported uniformly by the
+/// background thread; the main thread's job is to not let the window fail to open.
 ///
-/// 读配置走的是与后台线程**同一条**分层合成（profile → bundle → patch → config.toml）——
-/// 否则某个 patch 里写的 `[theme]` 会在「建窗口之前」这一步被漏掉，
-/// 表现成「我在 patch 里改了颜色，界面却没变」。
+/// Reading config goes through the **same** layered composition as the background thread
+/// (profile → bundle → patch → config.toml) — otherwise a `[theme]` written in some patch would be
+/// missed at this "before the window is built" step, showing up as "I changed the color in a patch
+/// but the UI didn't change".
 fn load_theme(args: &[String]) -> aox::config::ThemeConfig {
     if let Some(p) = aox::paths::arg_value(args, "--theme") {
         match aox::config::ThemeConfig::load(std::path::Path::new(&p)) {
             Ok(c) => return c,
-            Err(e) => eprintln!("[theme] {e:#}；改用配置里的 [theme]"),
+            Err(e) => eprintln!("{}", aox::tf!("[theme] {}; falling back to the [theme] in config", format!("{e:#}"))),
         }
     }
     let path = aox::paths::resolve_config_path(args);
@@ -63,28 +67,31 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let demo = args.iter().any(|a| a == "--demo");
     let prompt = aox::paths::arg_value(&args, "--prompt");
-    // 外观必须在建窗口之前算好：`theme::apply` 在 `App::new` 里、第一帧之前跑。
+    // Appearance must be computed before building the window: `theme::apply` runs inside
+    // `App::new`, before the first frame.
     let theme_cfg = load_theme(&args);
 
-    // 双向 channel：主线程 ↔ Agent 驱动线程
+    // Bidirectional channels: main thread ↔ agent driver thread
     let (to_agent_tx, to_agent_rx) = mpsc::unbounded_channel::<ToAgent>();
     let (from_agent_tx, from_agent_rx) = mpsc::unbounded_channel::<FromAgent>();
     let flags = SessionFlags::new();
 
-    // 后台线程：建 tokio 运行时 → 装载运行时与插件 → 驱动 Agent 循环。
-    // 演示模式不启动，避免空转。
+    // Background thread: build the tokio runtime → load runtimes and plugins → drive the agent loop.
+    // Demo mode doesn't start it, to avoid spinning idle.
     let driver = if demo {
         None
     } else {
         Some(bridge::spawn(from_agent_tx, to_agent_rx, flags.clone()))
     };
 
-    // 标题留空（2026-10-04 用户要求）：原生标题栏不再写「AOX」，标题栏就只剩系统按钮
-    // —— 与主界面一块底色，认不出「栏」。
+    // Leave the title empty (user request, 2026-10-04): the native title bar no longer says "AOX",
+    // so it holds only the system buttons — the same base color as the main UI, so no "bar" is
+    // discernible.
     //
-    // 图标必须**显式给像素**（`brand::window_icon` 里有完整的来龙去脉）：不给的话
-    // eframe 会装它自带的那个「e」，而「给个空图标、让 Windows 用 exe 资源」那条路
-    // 也不通（winit 会把空图标当真装上，标题栏画出系统通用图标）。
+    // The icon must be **given explicit pixels** (`brand::window_icon` has the full story): without
+    // it eframe installs its own "e", and the route of "pass an empty icon and let Windows use the
+    // exe resource" doesn't work either (winit installs the empty icon for real, and the title bar
+    // paints a system generic icon).
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("")

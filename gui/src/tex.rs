@@ -1,28 +1,32 @@
-//! 把解好的位图挂成 egui 纹理 —— 只有一个函数，但**两个地方**要用它。
+//! Turn a decoded bitmap into an egui texture — a single function, but **two** call sites
+//! need it.
 //!
-//! 两个调用点：对话里显示图片（`app::App::poll_images`）与首屏那张插画
-//! （[`crate::brand::Art`]）。都是「`aox::image::Bitmap` → `TextureHandle`」这一步。
+//! Those two call sites are: showing an image inside the conversation
+//! (`app::App::poll_images`) and the illustration on the first screen ([`crate::brand::Art`]).
+//! Both are exactly the same step: `aox::image::Bitmap` → `TextureHandle`.
 //!
-//! 为什么值得单开一个模块而不是各写一遍：这一步里**每一个参数错了都不会报错**
-//! —— 少写 `from_rgba_unmultiplied` 就会把整张图当成预乘色（暗部发灰）、
-//! 用 `NEAREST` 采样就会让缩放后的线稿发毛。抄成两份时，只有「恰好同时看着两处」
-//! 才会发现漏改，而那几乎不会发生。
+//! Why this deserves its own module instead of being written twice: **every argument here
+//! fails silently**. Drop `from_rgba_unmultiplied` and the whole image is treated as
+//! premultiplied (shadows go grey); use `NEAREST` sampling and a scaled line drawing turns
+//! fuzzy. With two copies, you would only notice the missed edit if you happened to be
+//! looking at both places at once — which almost never happens.
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 
 use aox::image::Bitmap;
 
-/// 挂在 `ctx` 上、名为 `name` 的一张纹理。
+/// A texture named `name`, uploaded onto `ctx`.
 ///
-/// `name` 只给人看（调试器 / `ctx.texture_ui`），不参与任何判等 —— 调用方给个
-/// 眼熟的名字就行，不必保证唯一。
+/// `name` is for humans only (debugger, `ctx.texture_ui`); it takes no part in any equality
+/// check. Callers just need something recognisable — uniqueness is not required.
 pub fn upload(ctx: &Context, name: impl Into<String>, bm: &Bitmap) -> TextureHandle {
     ctx.load_texture(
         name,
-        // `Bitmap` 交出来的是**未预乘**的 RGBA（GDI+ 锁出来的原始值，见 `aox::image`），
-        // 正好对上这个构造函数的语义。
+        // `Bitmap` hands out **unpremultiplied** RGBA (the raw values GDI+ locks, see
+        // `aox::image`), which is exactly what this constructor expects.
         ColorImage::from_rgba_unmultiplied([bm.width, bm.height], &bm.rgba),
-        // 插画会被缩放到版心里；`NEAREST` 会让线稿的边发毛，必须线性。
+        // Illustrations get scaled into the layout box; `NEAREST` would fray the edges of
+        // line art, so it has to be linear.
         TextureOptions::LINEAR,
     )
 }

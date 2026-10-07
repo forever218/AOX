@@ -1,5 +1,5 @@
-//! 终端排版：ANSI 配色 + Markdown 渲染。
-//! 非 TTY（重定向到文件）或设置了 NO_COLOR 时自动降级为纯文本。
+//! Terminal formatting: ANSI colors + Markdown rendering.
+//! Automatically degrades to plain text when not a TTY (redirected to a file) or NO_COLOR is set.
 
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
-    // FORCE_COLOR=1 可强制开启（用于重定向到文件后查看效果）
+    // FORCE_COLOR=1 forces it on (to preview the effect after redirecting to a file)
     let forced = std::env::var_os("FORCE_COLOR").is_some();
     let ok = (std::io::stdout().is_terminal() || forced) && std::env::var_os("NO_COLOR").is_none();
     ENABLED.store(ok, Ordering::Relaxed);
@@ -19,7 +19,7 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-/// 用 ANSI 参数包装文本（spec 例如 "1;36"）
+/// Wrap text with ANSI parameters (spec e.g. "1;36")
 pub fn paint(s: &str, spec: &str) -> String {
     if enabled() {
         format!("\x1b[{spec}m{s}\x1b[0m")
@@ -56,18 +56,19 @@ pub fn bold_white(s: &str) -> String {
     paint(s, "1;97")
 }
 
-/// 项目主页（启动横幅里展示，终端支持时可点击跳转）
+/// Project homepage (shown in the startup banner; clickable when the terminal supports it)
 pub const PROJECT_URL: &str = "https://github.com/forever218/AOX";
 
-/// 当前终端是否支持 OSC 8 超链接。
+/// Whether the current terminal supports OSC 8 hyperlinks.
 ///
-/// 传统 conhost 不认这个序列，会把转义字节当普通字符吐到屏幕上，
-/// 所以必须探测后再用；探测不准时宁可退回纯文本 URL。
+/// Legacy conhost doesn't recognize this sequence and would spew the escape bytes onto the screen
+/// as plain characters, so we must probe before using it; when probing is uncertain we fall back to
+/// the plain-text URL.
 fn osc8_supported() -> bool {
     if !enabled() {
-        return false; // 重定向到文件 / NO_COLOR
+        return false; // redirected to a file / NO_COLOR set
     }
-    // 显式开关：AOX_HYPERLINK=0 关闭，=1 强制开启
+    // Explicit switch: AOX_HYPERLINK=0 disables, =1 forces on
     match std::env::var("AOX_HYPERLINK").ok().as_deref() {
         Some("0") | Some("false") => return false,
         Some("1") | Some("true") => return true,
@@ -75,8 +76,9 @@ fn osc8_supported() -> bool {
     }
     #[cfg(windows)]
     {
-        // Windows Terminal 注入 WT_SESSION；VS Code / WezTerm 等注入 TERM_PROGRAM。
-        // 两者都没有 = 老 conhost（双击 exe，或 Git Bash 跑在传统控制台里）→ 降级。
+        // Windows Terminal injects WT_SESSION; VS Code / WezTerm etc. inject TERM_PROGRAM.
+        // Neither present = legacy conhost (double-clicking the exe, or Git Bash in a classic
+        // console) → degrade.
         std::env::var_os("WT_SESSION").is_some() || std::env::var_os("TERM_PROGRAM").is_some()
     }
     #[cfg(not(windows))]
@@ -87,17 +89,17 @@ fn osc8_supported() -> bool {
     }
 }
 
-/// OSC 8 超链接：终端支持时可点击跳转，否则原样返回纯文本。
+/// OSC 8 hyperlink: clickable when the terminal supports it, otherwise returns the plain text unchanged.
 pub fn link(text: &str, url: &str) -> String {
     if osc8_supported() {
-        // ST 用 ESC\ 而非 BEL，兼容性更好
+        // ST uses ESC\ rather than BEL, for better compatibility
         format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
     } else {
         text.to_string()
     }
 }
 
-/// AOX 启动 logo（ANSI Shadow 风格）
+/// AOX startup logo (ANSI Shadow style)
 pub const LOGO: &str = r" █████╗  ██████╗ ██╗  ██╗
 ██╔══██╗██╔═══██╗╚██╗██╔╝
 ███████║██║   ██║ ╚███╔╝
@@ -112,7 +114,7 @@ pub fn logo() -> String {
     LOGO.lines().map(|l| paint(l, "1;36")).collect::<Vec<_>>().join("\n")
 }
 
-/// 渲染 Markdown（标题、代码块、行内代码、列表、引用、表格）
+/// Render Markdown (headings, code blocks, inline code, lists, quotes, tables)
 pub fn render_markdown(md: &str) -> String {
     if !enabled() {
         return md.trim_end().to_string();
@@ -121,12 +123,12 @@ pub fn render_markdown(md: &str) -> String {
     use termimad::{Alignment, MadSkin};
 
     let mut skin = MadSkin::default_dark();
-    // 标题默认居中，命令行里左对齐更清爽
+    // Headings are centered by default; left-aligned reads cleaner in the terminal
     for h in skin.headers.iter_mut() {
         h.align = Alignment::Left;
     }
-    skin.set_headers_fg(Color::AnsiValue(45)); // 标题：青
-    skin.bold.set_fg(Color::AnsiValue(255)); // 加粗：亮白
+    skin.set_headers_fg(Color::AnsiValue(45)); // heading: cyan
+    skin.bold.set_fg(Color::AnsiValue(255)); // bold: bright white
     skin.bold.add_attr(Attribute::Bold);
     skin.italic.add_attr(Attribute::Italic);
     skin.inline_code.set_fgbg(Color::AnsiValue(114), Color::AnsiValue(236));
@@ -145,7 +147,7 @@ fn enable_windows_vt() {
         ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
     };
     unsafe {
-        // 输出改为 UTF-8，避免中文/制表符乱码
+        // Switch output to UTF-8, to avoid mojibake in CJK text / tabs
         SetConsoleOutputCP(65001);
         let h = GetStdHandle(STD_OUTPUT_HANDLE);
         let mut mode = 0u32;

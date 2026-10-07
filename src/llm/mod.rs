@@ -6,68 +6,72 @@ use serde_json::Value;
 
 use crate::message::Message;
 
-/// 一次模型调用的完整结果。
+/// The complete result of one model call.
 ///
-/// 除了 assistant 消息本身，还带上协议层的元信息：`finish_reason` 能区分
-/// 「正常结束 / 调用了工具 / 被 max_tokens 截断」，是诊断「任务莫名中断」的关键。
+/// Besides the assistant message itself it carries protocol-level metadata: `finish_reason`
+/// distinguishes "finished normally / called a tool / was cut off by max_tokens", which is the key
+/// to diagnosing "the task stopped for no apparent reason".
 #[derive(Debug, Clone)]
 pub struct ChatReply {
     pub message: Message,
     /// stop | tool_calls | length | content_filter | ...
     pub finish_reason: Option<String>,
-    /// 本次调用消耗的 token（端点未返回 usage 时各项均为 None）
+    /// Tokens consumed by this call (each field is `None` when the endpoint does not return usage)
     pub usage: Usage,
 }
 
 impl ChatReply {
-    /// 是否因为 max_tokens 用尽被截断（推理 token 也算在内，思考模型尤其容易触发）
+    /// Whether it was truncated because max_tokens ran out (reasoning tokens count too; thinking models hit this especially easily)
     pub fn truncated(&self) -> bool {
         self.finish_reason.as_deref() == Some("length")
     }
 
-    /// 模型既没给正文也没要求调用工具 —— 这一轮等于什么都没做。
+    /// The model neither produced body text nor asked to call a tool — this turn did nothing at all.
     pub fn is_empty(&self) -> bool {
         let no_text = self.message.text().is_none();
         let no_calls = self.message.tool_calls.as_ref().is_none_or(|c| c.is_empty());
         no_text && no_calls
     }
 
-    /// 供诊断信息使用的简述：finish_reason + 推理 token 消耗。
+    /// A short summary for diagnostics: finish_reason + reasoning-token spend.
     pub fn diag(&self) -> String {
         match self.usage.reasoning {
-            Some(n) => format!("finish_reason={:?}, 推理 token={n}", self.finish_reason),
+            Some(n) => crate::tf!("finish_reason={}, reasoning tokens={}", format!("{:?}", self.finish_reason), n),
             None => format!("finish_reason={:?}", self.finish_reason),
         }
     }
 }
 
-// ────────────────────────────── token 账 ──────────────────────────────
+// ────────────────────────────── token accounting ──────────────────────────────
 
-/// 一次模型调用消耗的 token —— 服务端报什么就记什么，缺哪项就是 `None`。
+/// The tokens one model call consumed — record whatever the server reports, and `None` for whatever
+/// is missing.
 ///
-/// 各家 OpenAI 兼容端点给的字段小有出入，这里做一次归一化：缓存命中有
-/// `prompt_tokens_details.cached_tokens`（OpenAI/DeepSeek 新版）与
-/// `prompt_cache_hit_tokens`（DeepSeek 旧版）两种写法，两种都收。
+/// Different OpenAI-compatible endpoints differ slightly in the fields they return, so this
+/// normalises once: a cache hit may appear as either
+/// `prompt_tokens_details.cached_tokens` (newer OpenAI/DeepSeek) or `prompt_cache_hit_tokens`
+/// (older DeepSeek), and both forms are accepted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Usage {
-    /// 输入（prompt）token
+    /// Input (prompt) tokens
     pub prompt: Option<u64>,
-    /// 输出（completion）token
+    /// Output (completion) tokens
     pub completion: Option<u64>,
-    /// 合计
+    /// Total
     pub total: Option<u64>,
-    /// 其中「思考」用掉的 token（已经包含在 completion 里，不是额外的一份）
+    /// The tokens spent on "thinking" among those (already included in completion, not a separate share)
     pub reasoning: Option<u64>,
-    /// 输入里命中缓存的 token
+    /// Input tokens that hit the cache
     pub cached: Option<u64>,
-    /// 输入里未命中缓存的 token（DeepSeek 独有）
+    /// Input tokens that missed the cache (DeepSeek only)
     pub cache_miss: Option<u64>,
 }
 
 impl Usage {
-    /// 解析响应里的 usage。传进来的既可能是**整个响应体**，也可能已经是
-    /// `usage` 对象本身 —— 有 `usage` 键就自己下钻一层，省得每个调用点都写一遍
-    /// `pointer`。传 `Value::Null` 也不会出错，取不到就是全 `None`。
+    /// Parse the `usage` from a response. What's passed in may be **the whole response body** or
+    /// already the `usage` object itself — if there's a `usage` key it drills down one level itself,
+    /// saving every call site from writing the `pointer` by hand. Passing `Value::Null` is fine too;
+    /// nothing found means all `None`.
     pub fn parse(v: &Value) -> Self {
         let v = v.get("usage").unwrap_or(v);
         let get = |p: &str| v.pointer(p).and_then(Value::as_u64);
@@ -80,8 +84,8 @@ impl Usage {
                 .or_else(|| get("/prompt_cache_hit_tokens")),
             cache_miss: get("/prompt_cache_miss_tokens"),
         };
-        // 不少自建端点只给 prompt/completion、不给 total，这里补齐，
-        // 省得下游每处展示都要写一遍 fallback。
+        // Plenty of self-hosted endpoints give only prompt/completion and no total; fill it in here,
+        // so every downstream display doesn't have to write the same fallback.
         if u.total.is_none() {
             u.total = match (u.prompt, u.completion) {
                 (Some(a), Some(b)) => Some(a + b),
@@ -91,12 +95,13 @@ impl Usage {
         u
     }
 
-    /// 一项都没拿到（端点压根不返回 usage）
+    /// Not a single field was obtained (the endpoint doesn't return usage at all)
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
 
-    /// 累加另一次调用的用量：某一项两边都有数字时才相加，否则保留有值的那边。
+    /// Accumulate another call's usage: a field is summed only when both sides have a number,
+    /// otherwise the side that has a value is kept.
     pub fn accrue(&mut self, other: &Usage) {
         fn add(a: &mut Option<u64>, b: Option<u64>) {
             if let Some(b) = b {
@@ -112,11 +117,12 @@ impl Usage {
     }
 }
 
-/// 流式过程中的 token 估算器（增量喂入，不重扫全文）。
+/// A token estimator for the streaming process (fed incrementally, never rescanning the whole text).
 ///
-/// 流式响应里服务端**直到最后一帧**才给 usage，中途想显示一个在涨的数字
-/// 就只能自己估：ASCII 约 4 字符 1 token，CJK 等宽字符约 1 字符 1 token。
-/// 这是个粗估，收尾时会用服务端返回的精确值顶掉。
+/// In a streaming response the server provides usage **only on the very last frame**, so to show a
+/// number ticking up mid-stream it has to be estimated: roughly 4 ASCII characters per token, and
+/// about 1 token per full-width CJK character. It is a rough estimate, and at the end the server's
+/// exact value overrides it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TokenEstimate {
     ascii: u64,
@@ -124,7 +130,8 @@ pub struct TokenEstimate {
 }
 
 impl TokenEstimate {
-    /// 喂一段新来的增量文本。会被高频调用，所以只做加法、不重扫。
+    /// Feed a newly arrived delta of text. It is called at high frequency, so it only adds and never
+    /// rescans.
     pub fn add(&mut self, delta: &str) {
         for ch in delta.chars() {
             if ch.is_ascii() {
@@ -135,13 +142,13 @@ impl TokenEstimate {
         }
     }
 
-    /// 估算的 token 数（输出侧：思考 + 正文）
+    /// The estimated token count (output side: thinking + body text)
     pub fn tokens(&self) -> u64 {
         self.ascii / 4 + self.wide
     }
 }
 
-/// 千分位写法：`12345` → `12,345`。用得上的地方都在这儿，别各写各的。
+/// Thousands separators: `12345` → `12,345`. Everything that needs this lives here, so don't reinvent it.
 pub fn thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
@@ -154,37 +161,42 @@ pub fn thousands(n: u64) -> String {
     out
 }
 
-/// 流式增量的接收端。
+/// The sink for streaming deltas.
 ///
-/// Provider 在逐块解析 SSE 响应时**同步**调用这些回调（不跨线程），
-/// 因此实现方应尽量轻量：UI 通常只是把文本塞进一个共享缓冲区，由渲染线程去画。
+/// The provider calls these callbacks **synchronously** as it parses the SSE response chunk by chunk
+/// (no cross-thread work), so implementations should stay lightweight: the UI usually just stuffs
+/// the text into a shared buffer for the render thread to draw.
 ///
-/// 方法取 `&self`（内部可变性）：这样接收端可以以共享引用传递，
-/// 既免去借用冲突，也方便同一实现被多处复用。
+/// Methods take `&self` (interior mutability): this lets the sink be passed by shared reference,
+/// avoiding borrow conflicts and making the same implementation reusable in multiple places.
 pub trait StreamSink: Send + Sync {
-    /// 思考模式模型的推理过程增量（deepseek-flash / deepseek-reasoner 等）。
-    /// 一次响应内可能被高频调用，每次只给一小段（甚至一个字）。
+    /// Deltas of a thinking-mode model's reasoning process (deepseek-flash / deepseek-reasoner, etc.).
+    /// May be called at high frequency within one response, each time giving only a small fragment (even a single character).
     fn on_reasoning(&self, _delta: &str) {}
 
-    /// 正式正文的增量。
+    /// Deltas of the actual body text.
     ///
-    /// 与 `on_reasoning` 分开是有用的：推理过程要「即时显示、即时消失」，
-    /// 正文却要留在屏幕上。实时 token 滚动则两者都要数 —— 输出侧的消耗
-    /// 本来就包含推理，所以实现方通常把两个回调都喂给同一个估算器。
+    /// Keeping it separate from `on_reasoning` is useful: the reasoning process should "show
+    /// instantly, vanish instantly", whereas the body text stays on screen. The live token counter,
+    /// by contrast, has to count both — output-side spend already includes reasoning — so an
+    /// implementation normally feeds both callbacks into the same estimator.
     fn on_content(&self, _delta: &str) {}
 
-    /// 本次响应结束（无论成功还是出错）。UI 应在此撤掉临时展示的思考过程，
-    /// 实现「即时显示、即时消失」。
+    /// This response ended (whether it succeeded or failed). The UI should tear down the temporarily
+    /// displayed reasoning process here, realising "show instantly, vanish instantly".
     fn on_finish(&self) {}
 }
 
-/// 模型提供方抽象。未来接入 Anthropic / 本地推理等，只需再实现一个 Provider。
+/// The model-provider abstraction. Wiring up Anthropic / local inference in the future just means
+/// implementing one more Provider.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
-    /// 发送完整对话历史与当前工具 schema 列表，返回模型回复（可能含 tool_calls）。
+    /// Send the full conversation history and the current tool schema list, and return the model's
+    /// reply (which may contain tool_calls).
     ///
-    /// `sink` 为可选的流式增量接收端：传入时 Provider 会尽量以流式方式请求，
-    /// 并把模型的思考过程实时推给它；传 None 则只是安静地等待完整响应。
+    /// `sink` is an optional streaming-delta sink: when passed, the Provider requests in streaming
+    /// mode where possible and pushes the model's reasoning process to it in real time; passing None
+    /// just means waiting quietly for the complete response.
     async fn chat(
         &self,
         messages: &[Message],
@@ -193,7 +205,7 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<ChatReply>;
 }
 
-/// 配置无效时的占位 Provider：REPL 仍可启动（查看工具、排版预览），真正对话时才报错。
+/// A placeholder Provider used when config is invalid: the REPL can still start (inspect tools, preview formatting), and only errors when an actual conversation begins.
 pub struct UnavailableProvider {
     pub reason: String,
 }
@@ -206,7 +218,7 @@ impl LlmProvider for UnavailableProvider {
         _tools: &[Value],
         _sink: Option<&(dyn StreamSink + Send + Sync)>,
     ) -> Result<ChatReply> {
-        anyhow::bail!("模型不可用：{}", self.reason)
+        anyhow::bail!(crate::tf!("model unavailable: {}", self.reason))
     }
 }
 
@@ -233,7 +245,7 @@ mod tests {
         assert!(!u.is_empty());
     }
 
-    /// DeepSeek 旧版把缓存命中摊在顶层的两个字段上，不在 details 里
+    /// Older DeepSeek spreads the cache hit across two top-level fields, not inside details
     #[test]
     fn usage_reads_flat_cache_fields() {
         let u = Usage::parse(&json!({
@@ -246,14 +258,16 @@ mod tests {
         assert_eq!(u.cache_miss, Some(232));
     }
 
-    /// 不少自建端点只给 prompt/completion。合计可以推出来，就不该让界面空着
+    /// Plenty of self-hosted endpoints give only prompt/completion. The total can be inferred, so it
+    /// must not be left blank in the interface
     #[test]
     fn usage_infers_missing_total() {
         let u = Usage::parse(&json!({"prompt_tokens": 10, "completion_tokens": 5}));
         assert_eq!(u.total, Some(15));
     }
 
-    /// 流式的收尾 chunk 只有 usage、没 choices；传整个响应体或裸对象都得能解析
+    /// The final streaming chunk has only usage and no choices; passing the whole response body or
+    /// the bare object must both parse
     #[test]
     fn usage_accepts_wrapper_or_bare_object() {
         let wrapped = Usage::parse(&json!({"choices": [], "usage": {"prompt_tokens": 7}}));
@@ -270,12 +284,13 @@ mod tests {
         assert_eq!(a.prompt, Some(30));
         assert_eq!(a.completion, Some(12));
         assert_eq!(a.total, Some(42));
-        // 对方没报的那一项不该被清零，也不可能被凭空造出来
+        // A field the other side did not report must not be zeroed, nor can it be invented out of thin air
         assert_eq!(a.reasoning, None);
     }
 
-    /// CJK 一个字约一个 token，ASCII 约四个 —— 两边的权重必须差出量级，
-    /// 否则中文对话的实时数字会低到看不出在涨。
+    /// One CJK character is about one token and ASCII about four — the weights on the two sides must
+    /// differ by an order of magnitude, otherwise the live number in a Chinese conversation is too
+    /// low to look like it's moving.
     #[test]
     fn estimate_weights_cjk_above_ascii() {
         let mut e = TokenEstimate::default();
@@ -283,7 +298,7 @@ mod tests {
         assert_eq!(e.tokens(), 1);
         e.add("中文");
         assert_eq!(e.tokens(), 3);
-        // 增量累加而不是重扫：分片顺序不影响结果
+        // Incremental accumulation rather than rescanning: the order of the fragments doesn't matter
         let mut a = TokenEstimate::default();
         let mut b = TokenEstimate::default();
         for piece in ["hel", "lo 世", "界"] {

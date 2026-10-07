@@ -1,17 +1,21 @@
-//! 存储缝（Store 缝）。
+//! The storage seam (the `Store` seam).
 //!
-//! 把「对话历史落在哪儿、以什么格式落、怎么读回来」从调用方手里拿走。
-//! 调用方（`Agent` / CLI / GUI）只认两个 trait，不再自己拼路径：
+//! It takes "where conversation history lives, in what format it is written, and how it is
+//! read back" out of the caller's hands. Callers (`Agent` / CLI / GUI) deal with only two
+//! traits and no longer build paths themselves:
 //!
-//! - [`Store`]：后端级（一个目录 / 一个库）。`Runtime` 持一份 `Arc<dyn Store>`。
-//! - [`Session`]：一段**打开的对话**（写入端），由 [`Store::create`] / [`Store::open`] 造出来。
+//! - [`Store`]: backend-level (one directory / one database). `Runtime` holds an `Arc<dyn Store>`.
+//! - [`Session`]: one **open conversation** (the write side), produced by [`Store::create`] /
+//!   [`Store::open`].
 //!
-//! **接口上刻意不出现路径**：`dir` / `file_of` 这类「id ↔ 文件名」的映射属于 jsonl 后端的
-//! 实现细节（见 [`jsonl`]）。一旦让路径参数出现在 trait 上，将来换后端（例如 sqlite 用一个库
-//! 装下所有对话）就实现不出来 —— 那是「抽缝」最容易走歪的一步。所以调用方一律按 **id** 说话。
+//! **Paths are deliberately absent from the interface**: mappings like `dir` / `file_of`
+//! ("id ↔ filename") are implementation details of the jsonl backend (see [`jsonl`]). The moment a
+//! path parameter appears on a trait, switching backends later (e.g. sqlite holding all
+//! conversations in one database) becomes impossible — that is the easiest way for a "seam" to go
+//! wrong. So callers always speak in terms of **id**.
 //!
-//! 本期只有 jsonl 一种后端，但 `config.toml [store] backend` 这个入口先立好，
-//! 让「换个后端」将来是改配置而不是改代码。
+//! Only the jsonl backend exists for now, but the `config.toml [store] backend` entry is set up
+//! early so that "switching backends" later means changing config, not code.
 
 pub mod jsonl;
 
@@ -24,109 +28,128 @@ use serde_json::Value;
 use crate::history::{Loaded, Summary, UsageRecord};
 use crate::message::Message;
 
-/// 一段打开的对话（写入端）。
+/// One open conversation (the write side).
 ///
-/// 方法与原先 `history::Log` 一一对应，语义完全相同：追加失败不报错
-/// （历史记录不该让正在跑的对话出问题），`rewrite` 要保住活动流与用量行。
+/// Its methods correspond one-to-one with the old `history::Log` and have exactly
+/// the same semantics: a failed append does not error (history must not break a
+/// running conversation), and `rewrite` must preserve the activity stream and
+/// usage lines.
 pub trait Session: Send {
-    /// 对话 id（= 文件名主干）。
+    /// The conversation id (== the filename stem).
     fn id(&self) -> &str;
-    /// 落盘位置。**只给界面显示用** —— 调用方不要拿它去拼别的路径。
+    /// Where it lands on disk. **For display only** — callers must not use it to
+    /// build other paths.
     ///
-    /// `allow(dead_code)`：`src/main.rs` 与 `src/lib.rs` 各自编译同一批模块
-    /// （见 lib.rs 开头），CLI 那一份只按 id 说话，用不到它；留着是给
-    /// 「显示这次对话落在哪」与测试断言用的（与 `Runtime::add_prompt_segment` 同情形）。
+    /// `allow(dead_code)`: `src/main.rs` and `src/lib.rs` each compile the same set
+    /// of modules (see the top of lib.rs); the CLI build unit speaks only in ids
+    /// and has no use for it. It is kept for "show where this conversation lands"
+    /// and for test assertions (the same situation as `Runtime::add_prompt_segment`).
     #[allow(dead_code)]
     fn path(&self) -> &Path;
-    /// 追加一条消息（`role == "system"` 会被跳过，系统提示每轮都在变）。
+    /// Append a message (`role == "system"` is skipped; the system prompt changes every round).
     fn append(&mut self, msg: &Message, is_error: Option<bool>);
-    /// 追加一条活动流记录。
+    /// Append an activity-stream record.
     fn append_act(&mut self, act: &Value);
-    /// 追加一轮的 token 账。
+    /// Append one round's token ledger.
     fn append_usage(&mut self, rec: &UsageRecord);
-    /// 追加一条「本对话的工作区」记录（当前档位 + 绑的根 + 本对话默认档自建的那块地）。
+    /// Append a "this conversation's workplace" record (the current mode + bound
+    /// root + the plot this conversation's default tier created for itself).
     ///
-    /// 每段对话首条消息写一条、每次切档再写一条；读的时候**取最后一条**。
-    /// 存它是为了两件事：① 打开旧对话时把当时那块地还回来；
-    /// ② 「切到完全访问再切回默认」不必另建一块（见 [`crate::workplace::Record`]）。
+    /// One record is written for the first message of each conversation and
+    /// another on every mode switch; when reading, **take the last one**. It is
+    /// stored for two reasons: ① restore that plot when reopening an old
+    /// conversation; ② so that "switch to full access and back to default" need
+    /// not create another plot (see [`crate::workplace::Record`]).
     fn append_workplace(&mut self, rec: &crate::workplace::Record);
-    /// 用给定消息列表重写整个文件（中断回滚）；活动流与用量原样保留。
+    /// Rewrite the whole file with the given message list (interrupt rollback);
+    /// the activity stream and usage are preserved as-is.
     fn rewrite(&mut self, msgs: &[Message]);
 }
 
-/// 存储后端（目录级）。
+/// The storage backend (directory-level).
 pub trait Store: Send + Sync {
-    /// 后端名，即 `config.toml [store] backend` 的那个值。
+    /// The backend name, i.e. the value of `config.toml [store] backend`.
     fn backend(&self) -> &'static str;
-    /// 数据位置（给界面显示「历史存在哪」）。
+    /// The data location (for the UI to show "where history is kept").
     fn location(&self) -> &Path;
-    /// 新建一段对话并写好头部记录。
+    /// Create a new conversation and write the header record.
     fn create(&self, model: Option<&str>) -> Result<Box<dyn Session>>;
-    /// 接上一段已存在的对话（按 id 继续写）。
+    /// Continue an existing conversation (keep writing by id).
     fn open(&self, id: &str) -> Result<Box<dyn Session>>;
-    /// 列出对话，**最近聊过的在前**。
+    /// List conversations, **most recently used first**.
     fn list(&self, limit: usize) -> Vec<Summary>;
-    /// 把「列表里的序号」或「id / id 前缀」解析成一项。
+    /// Resolve "the index in the list" or "id / id prefix" into one entry.
     fn resolve(&self, key: &str) -> Result<Summary>;
-    /// 读出整个对话的消息（坏行跳过）。
+    /// Read the whole conversation's messages (bad lines skipped).
     fn load(&self, id: &str) -> Result<Vec<Loaded>>;
-    /// 读出活动流记录（负载原样返回）。
+    /// Read the activity-stream records (payload returned as-is).
     ///
-    /// `allow(dead_code)`：读时间轴的是 GUI（lib 的消费者），CLI 那一份编译单元
-    /// 里没有调用方（见 lib.rs 开头对两套编译的说明）。
+    /// `allow(dead_code)`: the timeline is read by the GUI (a consumer of the lib); the CLI build
+    /// unit has no caller for it (see the top of lib.rs for the two-build explanation).
     #[allow(dead_code)]
     fn load_acts(&self, id: &str) -> Vec<Value>;
-    /// 读出逐轮 token 用量。
+    /// Read the per-round token usage.
     fn load_usage(&self, id: &str) -> Vec<UsageRecord>;
-    /// 读出本对话**最后一条**工作区记录；从没写过就是 `None`（旧对话文件都没有）。
+    /// Read this conversation's **last** workplace record; `None` if one was
+    /// never written (old conversation files have none).
     ///
-    /// `None` 时的语义由调用方定：`Agent::resume` 选择**不动**当前状态 ——
-    /// 不知道那段对话当时用哪块地，就不该替用户猜。
+    /// What `None` means is up to the caller: `Agent::resume` chooses to **leave**
+    /// the current state alone — if we don't know which plot that conversation
+    /// used, we should not guess on the user's behalf.
     fn load_workplace(&self, id: &str) -> Option<crate::workplace::Record>;
-    /// 删除一段对话，返回被删掉的那一项。
+    /// Delete a conversation and return the entry that was removed.
     fn remove(&self, key: &str) -> Result<Summary>;
-    /// 只保留最新的 `keep` 个对话（`0` = 不限制），返回删除数。
+    /// Keep only the newest `keep` conversations (`0` = no limit) and return the
+    /// number deleted.
     ///
-    /// 日常路径不需要调用方调它 —— 新建对话时后端会按 `config.toml [history] keep`
-    /// 自动裁剪。留在 trait 上是给「手动清理」这类入口预留的，也是「换后端也能保留
-    /// 同一个语义」的保证。`allow(dead_code)`：眼下确实没有调用方。
+    /// The everyday path does not need a caller to invoke it — creating a new
+    /// conversation makes the backend trim automatically per `config.toml
+    /// [history] keep`. It stays on the trait as a slot reserved for entries like
+    /// "manual cleanup", and as a guarantee that "switching backends preserves the
+    /// same semantics". `allow(dead_code)`: there really is no caller right now.
     #[allow(dead_code)]
     fn prune(&self, keep: usize) -> usize;
 }
 
-/// 已知的后端名。加后端时同步改这里与 [`backend`]。
+/// The known backend names. When adding a backend, update here and [`backend`] together.
 pub const BACKENDS: [&str; 1] = ["jsonl"];
 
-/// 默认后端名。`config.toml` 里不写 `[store] backend` 时用的就是它。
+/// The default backend name — used when `config.toml` does not set `[store] backend`.
 pub fn default_backend() -> &'static str {
     BACKENDS[0]
 }
 
-/// 造一个默认后端实例，**不会失败**（后端名写死为 [`default_backend`]）。
+/// Build a default backend instance — **cannot fail** (the backend name is hard-coded to
+/// [`default_backend`]).
 ///
-/// 给「配置还没读出来」与「只想读一读历史」的场景用：GUI 在配置读失败时
-/// 也要把侧边栏里的历史显示出来，那时手里还没有 `Runtime`，也就没有
-/// 配置里的后端名可用 —— 读历史这件事在任何情况下都不该因为别的东西坏了而消失。
+/// For the cases "config not yet read" and "just want to read history": the GUI must still show
+/// history in the sidebar even when config reading fails, and at that point it has no `Runtime`
+/// and thus no backend name from config — reading history must never disappear just because
+/// something else broke.
 pub fn default_store(root: &Path, keep: usize) -> Arc<dyn Store> {
     Arc::new(jsonl::JsonlStore::new(root, keep))
 }
 
-/// 按名字造一个后端。
+/// Build a backend by name.
 ///
-/// **认不出的名字直接报错**，不静默退回 jsonl：配置写错却照常启动，表现就是
-/// 「我明明写了别的后端，怎么还在写 jsonl」——这类问题最难查。
-/// （阶段 2 已经吃过一次「文件写了却不生效」的亏，见 `--theme` 那条。）
+/// **An unrecognized name errors outright** rather than silently falling back to
+/// jsonl: starting up as usual despite a wrong config shows up as "I clearly
+/// configured a different backend, why is it still writing jsonl" — the hardest
+/// class of problem to diagnose. (Phase 2 already got burned once by "the file
+/// was written but didn't take effect"; see the `--theme` entry.)
 pub fn backend(name: &str, root: &Path, keep: usize) -> Result<Arc<dyn Store>> {
     let name = name.trim();
-    // 空值 = 没配 = 用默认后端，不是「写错了」，别把它也判成未知。
+    // Empty = not configured = use the default backend; it's not "written wrong",
+    // so don't classify it as unknown.
     if name.is_empty() || name == default_backend() {
         return Ok(default_store(root, keep));
     }
-    bail!(
-        "未知的存储后端: {name}（当前可用: {}）\n\
-         请检查 config.toml 的 [store] backend，或删掉它使用默认值。",
+    bail!(crate::tf!(
+        "unknown storage backend: {} (currently available: {})\n\
+         check [store] backend in config.toml, or delete it to use the default.",
+        name,
         BACKENDS.join(" / ")
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -134,31 +157,33 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// 认不出的后端名必须**报错**，而不是静默退回 jsonl。
+    /// An unrecognized backend name must **error**, not silently fall back to jsonl.
     ///
-    /// 这条守的是「配置写了却不生效」那类最难查的坑：一旦静默回退，用户看到的
-    /// 就是「我明明配了别的后端，怎么还在写 jsonl」，而启动日志里一句提示都没有。
+    /// This guards the hardest-to-diagnose trap of "config set but not taking effect": once it
+    /// silently falls back, the user sees "I clearly configured a different backend, why is it
+    /// still writing jsonl", with not a single hint in the startup log.
     #[test]
     fn unknown_backend_is_an_error() {
         let root = std::env::temp_dir();
-        // 用 `.err()` 而不是 `.unwrap_err()`：`Arc<dyn Store>` 不是 `Debug`。
+        // Use `.err()` instead of `.unwrap_err()`: `Arc<dyn Store>` is not `Debug`.
         let e = backend("sqlite", &root, 0)
             .err()
-            .expect("未知后端必须报错")
+            .expect("an unknown backend must error")
             .to_string();
-        assert!(e.contains("sqlite"), "报错要带上写错的那个名字: {e}");
-        assert!(e.contains("jsonl"), "报错要告诉用户当前可用的是什么: {e}");
+        assert!(e.contains("sqlite"), "the error must name the wrong one: {e}");
+        assert!(e.contains("jsonl"), "the error must tell the user what is available: {e}");
     }
 
-    /// 留空（没配）与显式写默认名，都应当落到 jsonl 后端，位置在 `<root>/history`。
+    /// Both leaving it empty (unconfigured) and explicitly writing the default
+    /// name should resolve to the jsonl backend, located at `<root>/history`.
     #[test]
     fn default_backend_resolves_to_jsonl() {
         let root: PathBuf = std::env::temp_dir().join("aox-store-default-test");
         assert_eq!(default_backend(), "jsonl");
         for name in ["", "jsonl", "  jsonl  "] {
-            let s = backend(name, &root, 0).unwrap_or_else(|e| panic!("{name:?} 应可用: {e:#}"));
+            let s = backend(name, &root, 0).unwrap_or_else(|e| panic!("{name:?} should be usable: {e:#}"));
             assert_eq!(s.backend(), "jsonl");
-            assert!(s.location().ends_with("history"), "位置: {}", s.location().display());
+            assert!(s.location().ends_with("history"), "location: {}", s.location().display());
         }
         assert_eq!(default_store(&root, 0).backend(), "jsonl");
     }

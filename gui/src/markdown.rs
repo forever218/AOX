@@ -1,7 +1,8 @@
-//! 轻量 Markdown 渲染：把模型返回的 Markdown 画成 egui 控件。
+//! Lightweight Markdown rendering: draw the model's Markdown reply as egui widgets.
 //!
-//! 支持：标题、段落、无序/有序列表、引用、围栏代码块、行内代码、**粗体**、*斜体*、
-//! 链接与表格。目标是「好看且不丢内容」，不追求 spec 完整。
+//! Supports: headings, paragraphs, unordered/ordered lists, block quotes, fenced code blocks,
+//! inline code, **bold**, *italic*, links and tables. The goal is "good-looking and loses nothing",
+//! not spec completeness.
 
 use egui::{
     text::LayoutJob, Color32, CornerRadius, FontId, Frame, Label, Margin, RichText, Stroke,
@@ -44,7 +45,7 @@ fn bullet_prefix(s: &str) -> Option<(usize, Option<String>, String)> {
             return Some((indent, None, rest.to_string()));
         }
     }
-    // 有序列表： 12. xxx
+    // Ordered list: 12. xxx
     let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
     if !digits.is_empty() && digits.len() <= 3 {
         let rest = &t[digits.len()..];
@@ -84,7 +85,7 @@ fn parse(md: &str) -> Vec<Block> {
             continue;
         }
 
-        // 围栏代码块
+        // Fenced code block
         if let Some(fence) = t.strip_prefix("```").or_else(|| t.strip_prefix("~~~")) {
             let lang = fence.trim().to_string();
             let mut body = Vec::new();
@@ -131,7 +132,7 @@ fn parse(md: &str) -> Vec<Block> {
             continue;
         }
 
-        // 表格
+        // Table
         if t.contains('|') && i + 1 < lines.len() && is_table_sep(lines[i + 1]) {
             let header = split_row(t);
             i += 2;
@@ -154,7 +155,7 @@ fn parse(md: &str) -> Vec<Block> {
             continue;
         }
 
-        // 普通段落：连续的非空、非块起始行合并
+        // Ordinary paragraph: merge consecutive non-empty, non-block-starting lines
         let mut buf = vec![t.to_string()];
         i += 1;
         while i < lines.len() {
@@ -194,7 +195,7 @@ fn find_pair(chars: &[char], from: usize, target: char) -> Option<usize> {
     None
 }
 
-/// 行内解析：粗体 / 斜体 / 行内代码 / 链接。
+/// Inline parsing: bold / italic / inline code / links.
 fn inline(s: &str) -> Vec<Span> {
     let chars: Vec<char> = s.chars().collect();
     let mut out: Vec<Span> = Vec::new();
@@ -275,15 +276,16 @@ fn inline(s: &str) -> Vec<Span> {
     out
 }
 
-/// 行高系数。
+/// Line-height factor.
 ///
-/// 字号只管"字有多大"，行与行之间留多少由 `TextFormat::line_height` 决定。
-/// 中文正文用 1.3 倍行高偏挤 —— 满行时上下几乎黏住，所以这里给到 1.5。
-/// 附带好处：行内代码的芯片底色是按字形矩形画的，行距一松，芯片之间也就
-/// 再不会上下粘连。
+/// Font size only sets how tall the glyphs are; the gap between lines is governed by
+/// `TextFormat::line_height`. A 1.3× leading is cramped for CJK body text — at full line
+/// width the rows nearly touch — so we use 1.5 here. A nice side effect: the inline-code
+/// "chip" background is painted per glyph rectangle, and a looser leading means the chips
+/// no longer glue together vertically.
 const LEADING: f32 = 1.5;
 
-/// 块与块之间的呼吸。默认 11 太小，两段话几乎贴在一起。
+/// The breathing room between blocks. The default 11 is too small; two paragraphs nearly touch.
 const BLOCK_GAP: f32 = 15.0;
 
 fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool) -> LayoutJob {
@@ -314,8 +316,9 @@ fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool
             line_height: Some(size * LEADING),
             italics: sp.italic,
             background: if sp.code { P::code_chip() } else { Color32::TRANSPARENT },
-            // 链接加一道下划线：正文里它和普通文字同色，光靠颜色分不出来
-            // （单色方案里「更黑」并不显眼）。代码芯片绝不能加下划线。
+            // Links get an underline: in body text they're the same color as ordinary text, so
+            // color alone can't tell them apart (in a monochrome scheme "blacker" isn't noticeable).
+            // Code chips must never be underlined.
             underline: if sp.link && !sp.code {
                 Stroke::new(1.0, P::ink_soft())
             } else {
@@ -324,9 +327,11 @@ fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool
             ..Default::default()
         };
         if sp.code {
-            // 行内代码做成「芯片」：底色只按字形矩形绘制，代码贴边时会糊成一条高亮，
-            // 所以两侧各补一格空格。空格与代码**同字体同字号** —— 底色是按每段
-            // 字形自己的矩形合并的，字号一旦不同就会断成三块、边缘出现台阶。
+            // Inline code is rendered as a "chip": the background is painted only per glyph
+            // rectangle, so code flush to the edge would smear into one highlight — hence a
+            // space of padding on each side. The padding shares the **same font and size** as
+            // the code: the background is merged from each glyph's own rectangle, so a
+            // different size would split it into three pieces with stepped edges.
             let pad = TextFormat { background: P::code_chip(), ..fmt.clone() };
             job.append(" ", 0.0, pad.clone());
             job.append(&sp.text, 0.0, fmt);
@@ -338,19 +343,20 @@ fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool
     job
 }
 
-/// 围栏代码块：一行一个 LayoutJob section，逐 token 上色。
+/// A fenced code block: one LayoutJob section per line, colored token by token.
 ///
-/// 必须**逐 token 切成多个 section** —— `TextFormat` 是按 section 存的，
-/// 一整段代码塞进一个 section 就只能有一个颜色。空行也要 append 一个 `"\n"`，
-/// 否则那一行的高度会塌掉。
+/// It must be **split into multiple sections per token** — `TextFormat` is stored per section, and
+/// cramming a whole stretch of code into one section allows only a single color. A blank line must
+/// also append a `"\n"`, otherwise that line's height collapses.
 fn code_job(code: &str, wrap: f32, lang: &str) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap.max(60.0);
     job.wrap.break_anywhere = true;
     let base = TextFormat {
         font_id: theme::mono_font(15.0),
-        // 代码的行高比正文再紧一点：1.35 是代码的惯例（VS Code 默认同值），
-        // 再松就该改叫"文档"而不是"代码块"了。
+        // Code line-height is a touch tighter than body text: 1.35 is the convention for code
+        // (VS Code's default is the same value), and any looser and it should be called a
+        // "document" rather than a "code block".
         line_height: Some(15.0 * 1.35),
         ..Default::default()
     };
@@ -373,17 +379,19 @@ fn code_job(code: &str, wrap: f32, lang: &str) -> LayoutJob {
     job
 }
 
-/// 渲染整段 Markdown。
+/// Render a whole stretch of Markdown.
 ///
-/// `base` 是正文颜色（用户气泡里可以用更亮的色）；`width` 是可用的最大宽度。
-/// 统一的文本标签：把换行模式钉死成 `Wrap`。
+/// `base` is the body color (a brighter one may be used inside user bubbles); `width` is the maximum
+/// available width.
+/// The unified text label: pin the wrap mode to `Wrap`.
 ///
-/// 这是本项目最容易踩的 UI 坑：`Ui::wrap_mode()` 在「非换行的水平布局」
-/// （`ui.horizontal*`，其 `main_wrap == false`）里返回 `Extend`，
-/// 而 `Label` 默认 `wrap_mode = None` 会去继承它 —— 于是 epaint 把
-/// `LayoutJob::wrap::max_width` 当成 `f32::INFINITY`，长文本一行到底，
-/// 直接冲出栏位右边界、被 ScrollArea 裁掉（表现为「文字被切」）。
-/// 气泡、列表项、表格单元格里全是这种水平布局，所以这里逐个显式钉死。
+/// This is the UI trap this project trips over most: `Ui::wrap_mode()` returns `Extend` inside a
+/// "non-wrapping horizontal layout" (`ui.horizontal*`, whose `main_wrap == false`), and a `Label`
+/// with the default `wrap_mode = None` inherits it — so epaint treats
+/// `LayoutJob::wrap::max_width` as `f32::INFINITY`, long text runs to the end of a line, punches
+/// straight past the column's right edge and gets clipped by the ScrollArea (showing up as "text
+/// cut off"). Bubbles, list items and table cells are all this kind of horizontal layout, so we pin
+/// it explicitly, one by one, here.
 fn wrap_label(ui: &mut Ui, job: LayoutJob) -> egui::Response {
     ui.add(
         Label::new(job)
@@ -393,10 +401,10 @@ fn wrap_label(ui: &mut Ui, job: LayoutJob) -> egui::Response {
 }
 
 pub fn render(ui: &mut Ui, md: &str, base: Color32) {
-    // 右端边界：以进入本栏时的可用宽度为准，整段渲染期间不再变化。
+    // Right-edge boundary: fixed at the available width when entering this column, and not changed for the rest of the render.
     let width = ui.available_width().max(160.0);
-    // 让这一栏里的所有后代 Ui（含 horizontal / Frame 内部）都默认换行，
-    // 而不是各自退化成 Extend。个别控件仍可自行覆盖。
+    // Make every descendant Ui in this column (including those inside horizontal / Frame) wrap by
+    // default, rather than each degrading to Extend. Individual widgets can still override this.
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
     let blocks = parse(md);
 
@@ -412,8 +420,9 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                 ui.add_space(if level <= 2 { 15.0 } else { 9.0 });
                 let job = job_of(&inline(&text), size, P::text(), width, level <= 2);
                 wrap_label(ui, job);
-                // 一、二级标题各带一条细线：单色方案里「更大更粗」还不够，
-                // 靠一道线把标题与正文分开，扫读时的层次立刻就出来了。
+                // Level-1 and level-2 headings each carry a thin line: in a monochrome scheme,
+                // "bigger and bolder" isn't enough — a line separates the heading from the body, and
+                // the hierarchy pops out immediately when scanning.
                 if level <= 2 {
                     ui.add_space(6.0);
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
@@ -458,22 +467,26 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                 ui.add_space(BLOCK_GAP);
             }
 
-            // ```` ```svg ````：**画出来**，不当代码显示。
+            // ```` ```svg ````: **draw it**, don't show it as code.
             //
-            // 走围栏代码块而不是新加一个工具／协议：markdown 本来就有围栏，
-            // 模型本来就擅长写 SVG —— 于是「模型画个流程图」这件事零协议改动就成立了，
-            // 而且它天然进 `.jsonl`（就是正文的一部分），重开对话还在。
+            // Going through fenced code blocks rather than adding a new tool/protocol: markdown
+            // already has fences, and the model is already good at writing SVG — so "the model draws
+            // a flowchart" works with zero protocol change, and it naturally lands in `.jsonl`
+            // (part of the body text), so it's still there when the conversation is reopened.
             //
-            // 画失败（解析不了）时 `svg::render` 自己会写一行原因，并且把那一段
-            // **原样留在正文里**（下面的兜底），用户至少还能看到模型写了什么。
-            // ```` ```svg ````：**画出来**，不当代码显示。
+            // When drawing fails (unparseable), `svg::render` writes a reason line itself and leaves
+            // that stretch **in the body text as-is** (the fallback below), so the user can at least
+            // still see what the model wrote.
+            // ```` ```svg ````: **draw it**, don't show it as code.
             //
-            // 走围栏代码块而不是新加一个工具／协议：markdown 本来就有围栏，模型本来
-            // 就擅长写 SVG —— 于是「模型画个流程图」这件事零协议改动就成立了，而且它
-            // 天然进 `.jsonl`（正文的一部分），重开对话还在。
+            // Going through fenced code blocks rather than adding a new tool/protocol: markdown
+            // already has fences, and the model is already good at writing SVG — so "the model draws
+            // a flowchart" works with zero protocol change, and it naturally lands in `.jsonl`
+            // (part of the body text), so it's still there when the conversation is reopened.
             //
-            // 画不出来时退回**代码块**：那时用户至少还能看到模型写了什么，
-            // 而不是对着一行错误发呆（`svg::render` 自己会补一句原因）。
+            // When it can't be drawn, fall back to a **code block**: then the user can at least still
+            // see what the model wrote, rather than staring at one error line (`svg::render` adds a
+            // reason itself).
             Block::Code { lang, lines } if lang.trim().eq_ignore_ascii_case("svg") => {
                 if crate::svg::render(ui, &lines.join("\n"), width - 20.0) <= 0.0 {
                     code_block(ui, width, "svg", &lines);
@@ -500,15 +513,15 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
     }
 }
 
-// ────────────────────────────── 表格 ──────────────────────────────
+// ────────────────────────────── Table ──────────────────────────────
 
-/// 单元格左右内边距、上下内边距、列间距、外框圆角。
+/// Cell horizontal/vertical padding, column gap, and outer corner radius.
 const CELL_PAD_X: f32 = 11.0;
 const CELL_PAD_Y: f32 = 8.0;
 const COL_GAP: f32 = 16.0;
 const TABLE_R: u8 = 10;
 
-/// 显示宽度：ASCII 记 1 格，中日韩与全角标点记 2 格。
+/// Display width: ASCII counts as 1 cell, CJK and full-width punctuation count as 2.
 fn disp_width(s: &str) -> f32 {
     s.chars()
         .filter(|c| !c.is_whitespace())
@@ -516,14 +529,16 @@ fn disp_width(s: &str) -> f32 {
         .sum()
 }
 
-/// 列宽分配。
+/// Column width allocation.
 ///
-/// 均分列宽最省事也最难看：内容短的列空一大片，内容长的列被挤成竖条。这里先按
-/// 「该列最长的一格」算理想宽度，再按可用宽度等比缩放；最后用下限兜底 ——
-/// 实在放不下就整体一起缩，宁可让文字换行也不越界。
+/// Evenly dividing the widths is the least effort and the ugliest: short columns leave a big gap,
+/// long ones get squeezed into a vertical strip. Here we first compute an ideal width from "that
+/// column's longest cell", then scale proportionally to the available width; finally a lower bound
+/// catches it — if it really doesn't fit, shrink everything together, preferring wrapped text over
+/// overflowing.
 fn column_widths(header: &[String], rows: &[Vec<String>], avail: f32) -> Vec<f32> {
     const MIN: f32 = 68.0;
-    const CH: f32 = 7.4; // 15px 正文下 ASCII 的近似步进
+    const CH: f32 = 7.4; // approximate ASCII advance at 15px body size
     const PAD: f32 = CELL_PAD_X * 2.0 + 8.0;
     let cols = header.len().max(1);
     let ideal: Vec<f32> = (0..cols)
@@ -532,7 +547,8 @@ fn column_widths(header: &[String], rows: &[Vec<String>], avail: f32) -> Vec<f32
             for r in rows {
                 w = w.max(disp_width(r.get(c).map(|s| s.as_str()).unwrap_or("")) * CH + PAD);
             }
-            // 单列最多吃「两列的份」，免得某一列拿走整行、其余挤成一条缝
+            // A single column takes at most "two columns' worth", so one column doesn't grab the
+            // whole row and squeeze the rest into a sliver
             w.min(avail / cols as f32 * 2.0)
         })
         .collect();
@@ -555,17 +571,19 @@ fn column_widths(header: &[String], rows: &[Vec<String>], avail: f32) -> Vec<f32
     out
 }
 
-/// 表格：完整外框 + 表头色带 + 行分隔线，列宽按内容长度分配。
+/// Table: full outer frame + header band + row separators, with column widths by content.
 ///
-/// 之前只是一张 `Grid`，没有框、没有表头、没有分行线，读起来像几段文字凑在
-/// 一起 —— 表格的全部信息都压在「对齐」上，一旦某格换行就彻底散了。
+/// It used to be just a `Grid` with no frame, no header, no row lines — it read like a few
+/// paragraphs mashed together, with all the table's information resting on "alignment", so a
+/// single wrapped cell would fall apart completely.
 fn table(ui: &mut Ui, width: f32, header: &[String], rows: &[Vec<String>], base: Color32) {
-    // 2 = 外框描边占掉的宽度（egui 的 stroke 宽度算在 Frame 的 margin 里）
+    // 2 = width consumed by the outer stroke (egui counts stroke width inside the Frame's margin)
     let inner = (width - 2.0).max(160.0);
     let avail = (inner - COL_GAP * header.len().saturating_sub(1) as f32).max(80.0);
     let widths = column_widths(header, rows, avail);
 
-    // 行分隔线的位置：每行底部（最后一行不画，交给外框收口）
+    // Positions of the row separators: bottom of each row (the last row isn't drawn; the outer
+    // frame closes it off)
     let mut edges: Vec<f32> = Vec::new();
     let total = rows.len() + 1;
 
@@ -576,8 +594,9 @@ fn table(ui: &mut Ui, width: f32, header: &[String], rows: &[Vec<String>], base:
         .show(ui, |ui| {
             ui.set_width(inner);
             ui.set_max_width(inner);
-            // 列间距自己用 add_space 控制。`horizontal` 还会额外插入 style 的
-            // item_spacing.x，不清零整表就会比预算多出 (列数-1) 个间距、撑出栏位。
+            // The column gap is controlled with add_space ourselves. `horizontal` would additionally
+            // insert the style's item_spacing.x, and without zeroing it the whole table would exceed
+            // its budget by (columns - 1) gaps and push out of the column.
             ui.style_mut().spacing.item_spacing.x = 0.0;
 
             for (ri, row) in std::iter::once(header)
@@ -586,7 +605,7 @@ fn table(ui: &mut Ui, width: f32, header: &[String], rows: &[Vec<String>], base:
             {
                 let head = ri == 0;
                 if head {
-                    // 表头色带：整行一条、只有上圆角，正好贴住外框
+                    // Header band: one strip for the whole row, rounded only on top, so it hugs the outer frame
                     Frame::NONE
                         .fill(P::surface_hi())
                         .corner_radius(CornerRadius { nw: TABLE_R, ne: TABLE_R, sw: 0, se: 0 })
@@ -603,7 +622,7 @@ fn table(ui: &mut Ui, width: f32, header: &[String], rows: &[Vec<String>], base:
                 }
             }
 
-            // 线只落在行与行之间的空隙里，压不到任何文字
+            // Lines sit only in the gaps between rows, never overlapping any text
             let content = ui.min_rect();
             for (i, y) in edges.iter().enumerate() {
                 let col = if i == 0 { P::border_strong() } else { P::border() };
@@ -613,15 +632,16 @@ fn table(ui: &mut Ui, width: f32, header: &[String], rows: &[Vec<String>], base:
     ui.add_space(BLOCK_GAP);
 }
 
-/// 一行单元格。`widths` 里存的是每列**盒子**的宽度（含左右内边距）。
+/// One row of cells. `widths` holds each column's **box** width (including left/right padding).
 fn cells(ui: &mut Ui, widths: &[f32], row: &[String], head: bool, color: Color32) {
     for (ci, cw) in widths.iter().enumerate() {
         if ci > 0 {
             ui.add_space(COL_GAP);
         }
         let txt = row.get(ci).map(|s| s.as_str()).unwrap_or("");
-        // 极窄的列（多列表格撞上窄栏位）连内边距一起让位：「内容 + 内边距」一旦
-        // 超过分配到的列宽，整张表就会撑出栏位、被 ScrollArea 裁掉。
+        // A very narrow column (a multi-column table hitting a narrow column slot) yields its
+        // padding too: once "content + padding" exceeds the allotted column width, the whole table
+        // pushes out of the column and gets clipped by the ScrollArea.
         let pad = CELL_PAD_X.min(cw * 0.22);
         let w = (cw - pad * 2.0).max(12.0);
         Frame::NONE
@@ -636,11 +656,12 @@ fn cells(ui: &mut Ui, widths: &[f32], row: &[String], head: bool, color: Color32
 }
 
 
-/// 一块围栏代码：等宽、带 lang 标签、底色一块。
+/// One fenced code block: monospace, with a lang label and a backing color.
 ///
-/// 抽出来是因为它有两个调用点：普通代码块，以及 **SVG 画失败时的兜底**
-///（见那条 `Block::Code { lang, .. } if lang == "svg"` 分支）。抄成两份的话，
-/// 改一次留白就得记得改两处 —— 而漏掉的那一处只有「SVG 恰好画失败」时才看得见。
+/// Extracted because it has two call sites: an ordinary code block, and **the fallback when SVG
+/// drawing fails** (see the `Block::Code { lang, .. } if lang == "svg"` branch). Copying it into two
+/// places would mean remembering to change both when tweaking the spacing — and the one you miss is
+/// only visible when "SVG happens to fail to draw".
 fn code_block(ui: &mut Ui, width: f32, lang: &str, lines: &[String]) {
     let code = lines.join("\n");
     Frame::NONE
@@ -649,7 +670,8 @@ fn code_block(ui: &mut Ui, width: f32, lang: &str, lines: &[String]) {
         .stroke(Stroke::new(1.0, P::border()))
         .inner_margin(Margin::symmetric(16, 14))
         .show(ui, |ui| {
-            // 卡片的宽度必须显式锁死，否则代码行的长行会把卡片顶宽、被面板裁掉
+            // The card's width must be locked explicitly, otherwise a long code line widens the card
+            // and it gets clipped by the panel
             let inner = (width - 34.0).max(100.0);
             ui.set_width(inner);
             ui.set_max_width(inner);
@@ -666,9 +688,9 @@ mod tests {
     use super::*;
     use egui::{pos2, vec2, Rect};
 
-    /// 复刻 `App::transcript` 的版心骨架，量出：
-    /// - 进入 markdown 时 Ui 认为的可用宽度
-    /// - 渲染完之后内容实际占用的宽度（超出栏宽即被 ScrollArea 裁切）
+    /// Replays the column skeleton of `App::transcript`, measuring:
+    /// - the available width the Ui reports when entering Markdown
+    /// - the width the content actually occupies after rendering (beyond the column it gets clipped by the ScrollArea)
     fn probe(window_w: f32, md: &str) -> (f32, f32, f32) {
         let ctx = egui::Context::default();
         let mut avail = 0.0f32;

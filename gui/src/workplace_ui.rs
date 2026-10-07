@@ -1,36 +1,36 @@
-//! 工作区按钮：输入框**左下角**那枚「工作区 · <档位>」。
+//! Workspace button: the "Workspace · <tier>" chip at the **bottom-left** of the input box.
 //!
-//! 三档（默认 / 选择工作区 / 完全访问）在**界面这一层**的入口就在这里。配置里的
-//! `[workplace] mode` 只定**启动那一刻**的档 —— 出厂默认是 `default`（受限档，
-//! 2026-10-05 由 `full` 改过来，用户要的就是「每次启动默认受限」）；运行期想换档靠这枚
-//! 按钮。切换只作用于**当前这段对话**：档位与根会跟着对话存档，`/new` 一律回到「默认」。
+//! The three tiers (default / choose workspace / full access) enter through **this UI layer** here. The
+//! `[workplace] mode` in config only fixes the tier **at launch** — the factory default is `default` (restricted;
+//! switched from `full` on 2026-10-05 because the user wants "default restricted every launch"); to change tiers at runtime you use this
+//! button. Switching only affects **the current conversation**: the tier and root travel with the conversation save, while `/new` always returns to "default".
 //!
-//! 本模块负责四件东西：
-//! - [`button`]：那枚按钮本身（手绘文件夹图标 + 当前档位名）；
-//! - [`menu`]：点击后**向上**弹出的三选一列表（当前档位打勾，「完全访问」红色加粗）；
-//! - [`confirm`]：切「完全访问」前的红色二次确认 —— 它是整个程序里**唯一**一个
-//!   「点下去就越过所有保护」的开关（所以只有它用得上 [`P::danger`]）；
-//! - [`picker`]：内置的目录选择器。
+//! This module owns four things:
+//! - [`button`]: the button itself (hand-drawn folder icon + current tier name);
+//! - [`menu`]: the three-choice list that pops **upward** on click (current tier checked, "full access" shown red and bold);
+//! - [`confirm`]: the red second confirmation before switching to "full access" — the **only** toggle in the whole
+//!   program that **crosses every protection once clicked** (so only it uses [`P::danger`]);
+//! - [`picker`]: the built-in directory picker.
 //!
-//! # 三条约定
+//! # Three conventions
 //!
-//! **① 状态住在 [`WorkplaceUi`] 里，由 `App` 持有。** 这个模块不碰 `App` 的任何字段。
+//! **① State lives in [`WorkplaceUi`], held by `App`.** This module never touches any field of `App`.
 //!
-//! **② 「进参数、出请求」。** 每个函数返回 `Option<Mode>` 就是「界面要发一条请求给
-//! Agent 线程，请求把档位切成这个」。为什么界面不能自己切档：`Workplace` 住在
-//! `aox::runtime::Runtime` 里，而 `Runtime` 只有 Agent 那个线程拿得到 —— 主线程手里
-//! 只有一条 channel（见 `gui/src/bridge.rs` 的 `ToAgent::Workplace`）。
+//! **② "Take parameters in, emit requests out."** Each function returning `Option<Mode>` means "the UI wants to send a request to
+//! the Agent thread, requesting that the tier be switched to this". Why the UI cannot switch tiers itself: `Workplace` lives inside
+//! `aox::runtime::Runtime`, and only the Agent thread can reach `Runtime` — the main thread holds only a
+//! channel (see `ToAgent::Workplace` in `gui/src/bridge.rs`).
 //!
-//! **③ 现状是「灌」进来的，不是「问」出来的。** 档位名与打勾靠 [`WorkplaceUi::set_view`]
-//! 收到的 `WorkplaceView`（bridge 在启动 / 每轮结束 / 每次切档后重发）。界面自己
-//! 记一份「现在选了哪档」是错的：真正说了算的状态在 Agent 线程那边，两处记必然对不上。
+//! **③ The current state is "pushed in", not "asked for".** The tier name and checkmarks come from the `WorkplaceView` received by
+//! [`WorkplaceUi::set_view`] (the bridge re-sends it at startup / after each turn / after every tier switch). The UI keeping
+//! its own "which tier is selected now" is wrong: the authoritative state is on the Agent thread, and two copies will inevitably drift.
 //!
-//! # 关于目录选择器为什么自己画
+//! # Why the directory picker is hand-drawn
 //!
-//! 没有调系统的目录选择框（Windows 上是 `IFileDialog`，要额外拉 COM + 一堆
-//! `windows-sys` 接口，还得为 macOS / Linux 各写一份）。这个选择器的用途很窄 ——
-//! 挑一个「工作区根」目录，不需要新建、不需要多选、不需要网络位置 —— 用 egui
-//! 自绘一屏足够，而且**主题完全一致**，不会在纸墨界面里弹出一个系统的白色对话框。
+//! We do not call the system directory dialog (on Windows that is `IFileDialog`, which pulls in extra COM + a pile of
+//! `windows-sys` interfaces, and you would have to write another copy for macOS / Linux). This picker has a narrow purpose —
+//! pick a "workspace root" directory, no creation, no multi-select, no network locations — so a single egui-drawn screen
+//! suffices, and it stays **fully on-theme** instead of popping a white system dialog over the paper-and-ink UI.
 
 use std::path::{Path, PathBuf};
 
@@ -44,22 +44,22 @@ use crate::app::{danger_button, flat_button, primary_button};
 use crate::bridge::WorkplaceView;
 use crate::theme::{self, P};
 
-// ─────────────────────────── 状态 ───────────────────────────
+// ─────────────────────────── State ───────────────────────────
 
-/// 工作区按钮 + 它弹出来的那几个面板的全部状态。
+/// All state for the workspace button plus the panels it pops up.
 pub struct WorkplaceUi {
-    /// 当前档位与根（由 bridge 的 `FromAgent::Workplace` 灌进来）。
+    /// Current tier and root (pushed in from the bridge `FromAgent::Workplace`).
     ///
-    /// `None` = 还没收到过回执（刚启动的头一两帧，或根本没能连上 Agent 线程）。
-    /// 这时按钮显示朴素的「工作区」，列表里一项都不打勾 —— 不猜。
+    /// `None` = no receipt received yet (the first frame or two after launch, or never managed to connect to the Agent thread).
+    /// In that case the button shows the plain "Workspace" and no list item is checked — we do not guess.
     view: Option<WorkplaceView>,
-    /// 三选一列表是否展开。
+    /// Whether the three-choice list is expanded.
     open: bool,
-    /// 按钮的矩形。弹出面板要以它为锚点**向上**贴（见 [`menu`] 的坐标换算）。
+    /// The button rectangle. Pop-up panels anchor to it **upward** (see the coordinate math in [`menu`]).
     button_rect: Option<Rect>,
-    /// 「完全访问」的二次确认是否打开。
+    /// Whether the "full access" second confirmation is open.
     confirm_full: bool,
-    /// 目录选择器是否打开。
+    /// Whether the directory picker is open.
     picker: Option<Picker>,
 }
 
@@ -68,37 +68,37 @@ impl WorkplaceUi {
         Self { view: None, open: false, button_rect: None, confirm_full: false, picker: None }
     }
 
-    /// 收到一份「现状」。由 `App::pump` 在 `FromAgent::Workplace` 分支里调。
+    /// Receive a "current state". Called by `App::pump` in the `FromAgent::Workplace` branch.
     pub fn set_view(&mut self, v: WorkplaceView) {
         self.view = Some(v);
     }
 
-    /// 只读地看一眼现状。设置页的「系统」栏要显示「这段对话的工作空间在哪」——
-    /// 那是它唯一需要这个字段的地方，所以给个只读口子，而不是把字段放开。
+    /// Read-only peek at the current state. The settings page "System" section needs to show "where this conversation workspace is" —
+    /// that is the only place it needs this field, so we expose a read-only accessor instead of opening up the field.
     pub fn view(&self) -> Option<&WorkplaceView> {
         self.view.as_ref()
     }
 
-    /// 按钮上那行字。
+    /// The text on the button.
     ///
-    /// 「选择工作区」档位不直接念档位名（那会变成「工作区 · 选择工作区」，读着像结巴），
-    /// 而是显示**选中的那个目录名** —— 用户关心的是「我现在被关在哪块地儿」，
-    /// 完整路径放在弹出的列表里。
+    /// The "choose workspace" tier does not spell out its tier name (that would read "Workspace · Choose workspace", stuttering); instead it
+    /// shows **the selected directory name** — what the user cares about is "which patch of ground am I locked into right now",
+    /// and the full path lives in the pop-up list.
     ///
-    /// 「默认」档**建好地之后也带上目录名**（`默认 · 20261005162915`）：默认是
-    /// **一段对话里固定的那一块**（切走再切回来还是它，见 `aox::workplace::State::own`），
-    /// 光写「默认」看不出到底是哪一块，也就没法确认它没有一块块地攒（用户 2026-10-05 提的）。
+    /// The "default" tier also **carries the directory name once the ground is built** (`Workspace · Default · 20261005162915`): default is
+    /// **one fixed patch for the conversation** (switch away and back and it is still the same one; see `aox::workplace::State::own`),
+    /// and just writing "default" hides which patch it is, so you cannot confirm it is not quietly accumulating patch by patch (raised by the user on 2026-10-05).
     fn chip_text(&self) -> String {
         match &self.view {
             Some(v) => match &v.mode {
                 Mode::Default => match &v.root {
-                    Some(p) => format!("工作区 · 默认 · {}", dir_name(p)),
-                    None => "工作区 · 默认".to_string(),
+                    Some(p) => aox::tf!("Workspace · Default · {}", dir_name(p)),
+                    None => aox::i18n::t("Workspace · Default").to_string(),
                 },
-                Mode::Fixed(p) => format!("工作区 · {}", dir_name(p)),
-                Mode::Full => "工作区 · 完全访问".to_string(),
+                Mode::Fixed(p) => aox::tf!("Workspace · {}", dir_name(p)),
+                Mode::Full => aox::i18n::t("Workspace · Full access").to_string(),
             },
-            None => "工作区".to_string(),
+            None => aox::i18n::t("Workspace").to_string(),
         }
     }
 }
@@ -109,16 +109,16 @@ impl Default for WorkplaceUi {
     }
 }
 
-/// 目录选择器的状态。
+/// State for the directory picker.
 struct Picker {
-    /// 当前正在浏览的目录。
+    /// The directory currently being browsed.
     dir: PathBuf,
-    /// 本机存在哪些盘符（仅 Windows；其它平台为空 —— 从 `/` 走进就行）。
+    /// Which drive letters exist on this machine (Windows only; empty elsewhere — just walk in from `/`).
     drives: Vec<char>,
-    /// 上一次读目录的报错（权限不足之类）。
+    /// The last directory-read error (permission denied, etc.).
     error: Option<String>,
-    /// 当前目录下的子目录。**缓存**，只在打开 / 切目录时重读 ——
-    /// 不然每帧一次 `read_dir`，一个 60fps 的界面每秒白读 60 遍磁盘。
+    /// Subdirectories under the current directory. **Cached**, only re-read on open / directory switch —
+    /// otherwise `read_dir` would run every frame and a 60fps UI would pointlessly hit the disk 60 times per second.
     subdirs: Vec<PathBuf>,
 }
 
@@ -137,8 +137,8 @@ impl Picker {
             Ok(rd) => {
                 for entry in rd.flatten() {
                     let path = entry.path();
-                    // 只看目录：这个选择器要挑的是「一块地」，文件是噪音。
-                    // 顺手跳过 `.` 与 `..`（`read_dir` 本来也不给，但别指望它）。
+                    // Only directories: this picker is choosing "a patch of ground", files are noise.
+                    // Also skip `.` and `..` (read_dir does not hand them out anyway, but do not rely on it).
                     if path.is_dir() {
                         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
                             if name.starts_with('.') {
@@ -148,8 +148,8 @@ impl Picker {
                         self.subdirs.push(path);
                     }
                 }
-                // 大小写不敏感地按名字排：Windows 的 `read_dir` 顺序是文件系统给的，
-                // 看着是乱的。
+                // Case-insensitive sort by name: Windows `read_dir` order is whatever the filesystem returns,
+                // which looks scrambled.
                 self.subdirs.sort_by(|a, b| {
                     let (a, b) = (dir_name(a).to_lowercase(), dir_name(b).to_lowercase());
                     a.cmp(&b).then_with(|| a.cmp(&b))
@@ -165,13 +165,13 @@ impl Picker {
     }
 }
 
-// ─────────────────────────── 按钮 ───────────────────────────
+// ─────────────────────────── Button ───────────────────────────
 
-/// 画那枚按钮（在输入框左下角）。
+/// Draw the button (at the bottom-left of the input box).
 ///
-/// 只做两件事：把当前档位名画出来、把热区记进 `st.button_rect`（弹出面板要用它定位）。
-/// 点击在这里就地翻转 `st.open` —— 面板本身由 [`menu`] 画（它要一个独立 `Area`，
-/// 不能困在输入框那张卡片的裁切区里）。
+/// It does only two things: paint the current tier name, and record the hot-rect into `st.button_rect` (the pop-up panel uses it for positioning).
+/// The click flips `st.open` in place here — the panel itself is drawn by [`menu`] (it needs an independent `Area`
+/// and cannot be trapped inside the input card clip region).
 pub fn button(ui: &mut Ui, st: &mut WorkplaceUi, enabled: bool) {
     let text = st.chip_text();
     let font = egui::FontId::proportional(13.0);
@@ -194,7 +194,7 @@ pub fn button(ui: &mut Ui, st: &mut WorkplaceUi, enabled: bool) {
         radius,
         if hov { P::surface_hi() } else { Color32::TRANSPARENT },
     );
-    // 只在悬停时描边：常态下它就贴在输入卡片里，多一圈边框会让左下角显得吵。
+    // Only stroke on hover: normally it sits inside the input card, and an extra border would make the bottom-left corner noisy.
     if hov {
         painter.rect_stroke(rect, radius, Stroke::new(1.0, P::border()), egui::StrokeKind::Inside);
     }
@@ -209,16 +209,16 @@ pub fn button(ui: &mut Ui, st: &mut WorkplaceUi, enabled: bool) {
 
     if resp.clicked() && enabled {
         st.open = !st.open;
-        // 开列表时把另两个面板收掉：一屏上同时冒三个框没人受得了。
+        // When opening the list, collapse the other two panels: nobody can stand three boxes popping up at once.
         st.confirm_full = false;
         st.picker = None;
     }
     st.button_rect = Some(rect);
 }
 
-// ─────────────────────────── 三选一列表 ───────────────────────────
+// ─────────────────────────── Three-choice list ───────────────────────────
 
-/// 画向上弹出的三选一列表（`st.open` 为假时什么都不做）。
+/// Draw the upward-popping three-choice list (does nothing when `st.open` is false).
 pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     if !st.open {
         return None;
@@ -228,15 +228,15 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
         return None;
     };
 
-    // 锚点定在按钮**左上角再往上 6px**，配合 `pivot(LEFT_BOTTOM)` 就是「面板底边
-    // 压着按钮顶边」—— 于是它是往上长的，不会被窗口底边截断。
+    // Anchor at the button top-left corner, 6px further up; combined with `pivot(LEFT_BOTTOM)` that means "panel bottom edge sits on the button top edge"
+    // — so it grows upward and will not be clipped by the window bottom edge.
     //
-    // ⚠️ **坐标不要做任何换算。** `Area::fixed_pos` 与 `ui.allocate_*` 给出来的矩形
-    // 是**同一套坐标**（客户区局部，原点在客户区左上角）—— egui 自己在 `Area::begin`
-    // 里就是拿 `ctx.content_rect()`（= 客户区矩形）当默认约束矩形的。早先这里按顶栏
-    // 那枚 token 胶囊的写法加过一次「视口原点」（`viewport().inner_rect.left_top()`），
-    // 那是**屏幕（显示器）坐标**，而窗口不在显示器原点时它非零 —— 实机一测面板就整体
-    // 偏了 ~(154, 14) 逻辑像素。
+    // WARNING: **do not apply any coordinate conversion.** The rects from `Area::fixed_pos` and `ui.allocate_*` live in
+    // **the same coordinate space** (client-area local, origin at the client area top-left) — egui itself uses `ctx.content_rect()` (= the client rect)
+    // as the default constraint rect inside `Area::begin`. Earlier here we added a "viewport origin" (`viewport().inner_rect.left_top()`)
+    // following the top-bar token-pill code, but that is
+    // **screen (monitor) coordinates**, and it is non-zero whenever the window is not at the monitor origin — on real hardware the panel ended up
+    // shifted by ~(154, 14) logical pixels.
     let anchor = btn.left_top() - Vec2::new(0.0, 6.0);
 
     let mut req = None;
@@ -256,11 +256,11 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
                 .show(ui, |ui| {
                     ui.set_width(276.0);
 
-                    // ① 默认
+                    // ① Default
                     if row(
                         ui,
-                        "默认",
-                        "每段新对话在 workplace/ 下开一块新地",
+                        aox::i18n::t("Default"),
+                        aox::i18n::t("each new conversation starts a fresh plot under workplace/"),
                         matches!(cur, Some(Mode::Default)),
                         false,
                     )
@@ -269,15 +269,15 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
                         req = Some(Mode::Default);
                     }
 
-                    // ② 选择工作区…（打开目录选择器，本身不是一次切档）
+                    // ② Choose workspace… (opens the directory picker; not itself a tier switch)
                     //
-                    // 不带说明行（2026-10-04 用户要求「只留『默认』那条说明」）：
-                    // 当前选的是哪个目录，按钮上本来就写着「工作区 · <目录名>」，
-                    // 在菜单里再重复一遍只会把菜单撑高。
+                    // No hint line (user asked on 2026-10-04 to "keep only the default hint"): which directory is currently selected is already written on the button as "Workspace · <dir name>",
+                    // which directory is currently selected is already written on the button as "Workspace · <dir name>",
+                    // and repeating it in the menu would only inflate it.
                     let fixed_now = matches!(cur, Some(Mode::Fixed(_)));
-                    if row(ui, "选择工作区…", "", fixed_now, false).clicked() {
+                    if row(ui, aox::i18n::t("Choose workspace…"), "", fixed_now, false).clicked() {
                         st.open = false;
-                        // 打开时就落在当前根上（若已经是固定档），否则落在应用根。
+                        // Open on the current root when already a fixed tier, otherwise on the app root.
                         let start = st
                             .view
                             .as_ref()
@@ -286,9 +286,9 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
                         st.picker = Some(Picker::open(start));
                     }
 
-                    // ③ 完全访问（唯一的危险项：红色 + 加粗）
-                    //    同样不带说明行 —— 红色与加粗本身就是这里的说明。
-                    if row(ui, "完全访问", "", matches!(cur, Some(Mode::Full)), true).clicked() {
+                    // ③ Full access (the only dangerous item: red + bold)
+                    //    Also no hint line — the red and bold already serve as the hint here.
+                    if row(ui, aox::i18n::t("Full access"), "", matches!(cur, Some(Mode::Full)), true).clicked() {
                         st.open = false;
                         st.confirm_full = true;
                     }
@@ -296,8 +296,8 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
         })
         .response;
 
-    // 点面板外面、或按 Esc → 收起。
-    //（与上面同一个坐标空间，所以能直接比 —— 不用再减任何原点。）
+    // Click outside the panel, or press Esc to collapse.
+    // (Same coordinate space as above, so we can compare directly — no origin to subtract.)
     let panel = area.rect;
     let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
     let clicked_outside = ctx.input(|i| {
@@ -315,15 +315,15 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     req
 }
 
-/// 列表里的一行：左侧勾选位 + 标题 + 一行小字说明。
+/// One row in the list: a check slot on the left + a title + a small hint line.
 ///
-/// 手绘的理由与 `app.rs` 里的 `text_button` 一样：**先铺底、再画字**，悬停换色时
-/// 不用重排文字，也不会出现「底色盖住文字」那种老问题。
+/// The hand-drawn reason is the same as `text_button` in `app.rs`: **paint the base first, then the text**, so on hover color change we
+/// do not re-layout the text and we avoid the old problem of "the base color covering the text".
 fn row(ui: &mut Ui, label: &str, hint: &str, checked: bool, danger: bool) -> egui::Response {
     let width = ui.available_width();
-    // 两行（标题 + 说明）与一行（只有标题）两种高度：菜单里**只有「默认」还带说明**
-    // （2026-10-04 用户要求删掉其余两项的说明文字）。单项行若照旧按 46 高排，
-    // 那行字会浮在上半截，看着像没画完。
+    // Two heights: two-line (title + hint) and one-line (title only). In the menu **only "default" still carries a hint**
+    // (user asked on 2026-10-04 to drop the hint text on the other two). A single-line row laid out at the old 46px height
+    // would leave its text floating in the top half, looking unfinished.
     let two_line = !hint.is_empty();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, if two_line { 46.0 } else { 32.0 }), Sense::click());
     if resp.hovered() {
@@ -335,7 +335,7 @@ fn row(ui: &mut Ui, label: &str, hint: &str, checked: bool, danger: bool) -> egu
         painter.rect_filled(rect, CornerRadius::same(8), P::surface_hi());
     }
 
-    // 勾：当前档位才画。位置固定占好，没打勾的行也不会让标题左移。
+    // Check: drawn only for the current tier. The slot is reserved so unchecked rows do not shift the title left.
     if checked {
         let color = if danger { P::danger() } else { P::ink() };
         paint_check(painter, Pos2::new(rect.left() + 17.0, rect.center().y), 5.0, color);
@@ -349,7 +349,7 @@ fn row(ui: &mut Ui, label: &str, hint: &str, checked: bool, danger: bool) -> egu
         egui::FontId::proportional(15.0)
     };
     let g = painter.layout_no_wrap(label.to_owned(), label_font, label_color);
-    // 两行时标题靠上（下面给说明留位），一行时整体居中。
+    // On two-line rows the title sits high (leaving room for the hint below); on one-line rows it is vertically centered.
     let label_y = if two_line { rect.top() + 7.0 } else { rect.center().y - g.size().y * 0.5 };
     painter.galley(Pos2::new(text_x, label_y), g, label_color);
 
@@ -361,10 +361,10 @@ fn row(ui: &mut Ui, label: &str, hint: &str, checked: bool, danger: bool) -> egu
     resp
 }
 
-/// 目录选择器里的一行子目录：手绘文件夹图标 + 名字，整行可点。
+/// One subdirectory row in the directory picker: hand-drawn folder icon + name, whole row clickable.
 ///
-/// 不用 emoji（📁 之类的字形要看系统字体有没有，缺了就是一个豆腐块），
-/// 复用按钮上那枚 [`paint_folder`]——图标语汇全套只有一处实现。
+/// No emoji (glyphs like the folder emoji depend on whether the system font has them; missing, they render as tofu boxes),
+/// reusing the [`paint_folder`] from the button — the whole icon vocabulary has a single implementation.
 fn dir_row(ui: &mut Ui, name: &str) -> egui::Response {
     let width = ui.available_width();
     const HEIGHT: f32 = 26.0;
@@ -387,9 +387,9 @@ fn dir_row(ui: &mut Ui, name: &str) -> egui::Response {
     resp
 }
 
-// ─────────────────────────── 完全访问：二次确认 ───────────────────────────
+// ─────────────────────────── Full access: second confirmation ───────────────────────────
 
-/// 切「完全访问」前的红色确认框。
+/// The red confirmation box shown before switching to "full access".
 pub fn confirm(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     if !st.confirm_full {
         return None;
@@ -407,34 +407,34 @@ pub fn confirm(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
         )
         .show(ctx, |ui| {
             ui.set_width(430.0);
-            // 标题用危险色 + 加粗：这一屏就是要让人停一下。
-            ui.label(RichText::new("切换到「完全访问」？").color(P::danger()).size(17.0).strong());
+            // Title in danger color + bold: this screen is meant to make people pause.
+            ui.label(RichText::new(aox::i18n::t("Switch to \"Full access\"?")).color(P::danger()).size(17.0).strong());
             ui.add_space(10.0);
             ui.label(
-                RichText::new("AOX 将可以读写设备上任何文件，工作区边界不再拦截")
+                RichText::new(aox::i18n::t("AOX will be able to read and write any file on the device; the workspace boundary will no longer stop it."))
                     .color(P::text_dim())
                     .size(14.0),
             );
             ui.add_space(6.0);
             ui.label(
-                RichText::new("潘多拉魔盒正在打开......虽然这不总是坏事")
+                RichText::new(aox::i18n::t("Pandora's box is opening... though that is not always a bad thing"))
                     .color(P::text_faint())
                     .size(13.0),
             );
             ui.add_space(20.0);
             ui.horizontal(|ui| {
-                if danger_button(ui, "确认切换").clicked() {
+                if danger_button(ui, aox::i18n::t("Confirm switch")).clicked() {
                     req = Some(Mode::Full);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if flat_button(ui, "取消").clicked() {
+                    if flat_button(ui, aox::i18n::t("Cancel")).clicked() {
                         keep = false;
                     }
                 });
             });
         });
 
-    // 点背景 / Esc = 取消（`should_close` 是 egui::Modal 给的标准出口）
+    // Click background / Esc = cancel (`should_close` is the standard exit egui::Modal provides).
     if resp.should_close() {
         keep = false;
     }
@@ -444,13 +444,13 @@ pub fn confirm(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     req
 }
 
-// ─────────────────────────── 目录选择器 ───────────────────────────
+// ─────────────────────────── Directory picker ───────────────────────────
 
-/// 内置目录选择器。选定返回 `Set(Mode::Fixed(<目录>))` —— 与 CLI 的
-/// `/workplace <目录>` 是同一条落点（都走 `Workplace::set_mode`）。
+/// Built-in directory picker. On selection returns `Set(Mode::Fixed(<dir>))` — the same landing point as the CLI
+/// `/workplace <dir>` (both go through `Workplace::set_mode`).
 ///
-/// 这里**不挑文件、不新建目录**：这个入口的用途只有一个 —— 挑一块「工作区根」。
-/// 需要新建目录的用户在资源管理器里建好再进来选，比在这里塞一个新建入口清爽。
+/// Here we **do not pick files, do not create directories**: this entry has one purpose only — pick a "workspace root".
+/// Users who need a new directory can make it in the file manager first and then come back to pick it, which is cleaner than stuffing a "create" entry in here.
 pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     let Some(p) = st.picker.as_mut() else {
         return None;
@@ -470,16 +470,16 @@ pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
             ui.set_width(520.0);
 
             ui.horizontal(|ui| {
-                ui.label(RichText::new("选择工作区目录").color(P::text()).size(16.0).strong());
+                ui.label(RichText::new(aox::i18n::t("Choose a workspace directory")).color(P::text()).size(16.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if flat_button(ui, "取消").clicked() {
+                    if flat_button(ui, aox::i18n::t("Cancel")).clicked() {
                         close = true;
                     }
                 });
             });
             ui.add_space(12.0);
 
-            // 当前路径：等宽 + 过长时中间省略（保留头部盘符与尾部目录名 —— 信息量最大的两头）
+            // Current path: monospace + middle-elide when too long (keep the head drive letter and tail dir name — the two ends with the most information).
             Frame::NONE
                 .fill(P::code_bg())
                 .corner_radius(CornerRadius::same(8))
@@ -493,7 +493,7 @@ pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
                     );
                 });
 
-            // 盘符（Windows）：只列出真的存在的，26 次 `is_dir` 已经读过一遍了。
+            // Drive letters (Windows): only list ones that actually exist; the 26 `is_dir` calls already read them once.
             if !p.drives.is_empty() {
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
@@ -518,10 +518,10 @@ pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
 
             ui.add_space(10.0);
 
-            // 上级目录（用 ASCII 的 `..`，不赌字体里有没有箭头字形）
+            // Parent directory (use ASCII `..`; do not gamble on whether the font has an arrow glyph).
             if let Some(parent) = p.dir.parent().map(Path::to_path_buf) {
                 let resp = ui.add(
-                    egui::Label::new(RichText::new("..  上级目录").size(13.5).color(P::text_dim()))
+                    egui::Label::new(RichText::new(aox::i18n::t("..  parent directory")).size(13.5).color(P::text_dim()))
                         .sense(Sense::click()),
                 );
                 if resp.hovered() {
@@ -531,16 +531,16 @@ pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
                     p.goto(parent);
                 }
             } else {
-                ui.label(RichText::new("（已经是顶层）").size(13.0).color(P::text_faint()));
+                ui.label(RichText::new(aox::i18n::t("(already at the top level)")).size(13.0).color(P::text_faint()));
             }
 
             ui.add_space(6.0);
 
-            // 子目录列表
+            // Subdirectory list
             if let Some(e) = &p.error {
-                ui.label(RichText::new(format!("无法读取此目录：{e}")).color(P::text()).size(13.5));
+                ui.label(RichText::new(aox::tf!("cannot read this directory: {}", e)).color(P::text()).size(13.5));
             } else if p.subdirs.is_empty() {
-                ui.label(RichText::new("（此目录下没有子目录）").size(13.0).color(P::text_faint()));
+                ui.label(RichText::new(aox::i18n::t("(no subdirectories here)")).size(13.0).color(P::text_faint()));
             } else {
                 let subs = p.subdirs.clone();
                 let mut goto: Option<PathBuf> = None;
@@ -558,16 +558,16 @@ pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
             }
 
             ui.add_space(18.0);
-            // 按钮落在**右下角**（用户 2026-10-04 提的）：`right_to_left` 的子布局会吃掉
-            // 剩下的横向宽度，于是先放进去的那个控件就贴在最右边；说明文字留在同一行的左侧。
+            // Button sits at the **bottom-right** (raised by the user on 2026-10-04): the `right_to_left` child layout consumes
+            // the remaining horizontal width, so the control placed first ends up flush right; the hint text stays on the left of the same row.
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("选定后，写入与删除都被限制在这个目录里（读取不受限）。")
+                    RichText::new(aox::i18n::t("Once chosen, writes and deletes are confined to this directory (reads are unrestricted)."))
                         .color(P::text_faint())
                         .size(12.5),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if primary_button(ui, "选定此目录").clicked() {
+                    if primary_button(ui, aox::i18n::t("Select this directory")).clicked() {
                         chosen = Some(p.dir.clone());
                     }
                 });
@@ -577,7 +577,7 @@ pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     if resp.should_close() {
         close = true;
     }
-    // `p` 到这里就不再用了 —— 下面可以直接改 `st`。
+    // `p` is no longer used past this point — we can mutate `st` directly below.
     if let Some(dir) = chosen {
         st.picker = None;
         return Some(Mode::Fixed(dir));
@@ -588,16 +588,16 @@ pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     None
 }
 
-// ─────────────────────────── 小工具 ───────────────────────────
+// ─────────────────────────── Helpers ───────────────────────────
 
-/// 目录的显示名（取最后一段；没有就退回去掉末尾分隔符的整串）。
+/// Display name of a directory (take the last segment; if none, fall back to the whole string minus the trailing separator).
 fn dir_name(p: &Path) -> String {
     p.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.display().to_string())
 }
 
-/// 过长路径居中省略：保留头（盘符）与尾（当前目录名）—— 中间那段对辨认没帮助。
+/// Middle-elide an over-long path: keep the head (drive letter) and tail (current dir name) — the middle part does not help identification.
 fn elide_path(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -611,7 +611,7 @@ fn elide_path(s: &str, max: usize) -> String {
     format!("{h}…{t}")
 }
 
-/// 本机存在的盘符（只 Windows 有意义）。
+/// Drive letters present on this machine (meaningful on Windows only).
 fn existing_drives() -> Vec<char> {
     if !cfg!(windows) {
         return Vec::new();
@@ -619,7 +619,7 @@ fn existing_drives() -> Vec<char> {
     ('A'..='Z').filter(|c| Path::new(&format!("{c}:\\")).is_dir()).collect()
 }
 
-/// 勾。
+/// Check mark.
 fn paint_check(painter: &egui::Painter, center: Pos2, s: f32, color: Color32) {
     let stroke = Stroke::new(1.8, color);
     painter.line_segment(
@@ -632,10 +632,10 @@ fn paint_check(painter: &egui::Painter, center: Pos2, s: f32, color: Color32) {
     );
 }
 
-/// 文件夹图标：一个「页签 + 主体」的实心剪影。
+/// Folder icon: a "tab + body" solid silhouette.
 ///
-/// 用**实心**而不是描边：13px 见方的描边文件夹在里面那条页签横线上会糊成一团，
-/// 实心剪影在两种主题下都干净。
+/// Use **solid** rather than stroked: a stroked folder at 13px squares up into a mush on the tab inner horizontal line,
+/// while a solid silhouette stays clean under both themes.
 fn paint_folder(painter: &egui::Painter, rect: Rect, color: Color32) {
     let tab = Rect::from_min_max(
         Pos2::new(rect.left(), rect.top() + rect.height() * 0.10),

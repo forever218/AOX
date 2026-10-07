@@ -1,31 +1,35 @@
-//! GUI 主界面状态与绘制。
+//! GUI main window state and painting.
 //!
-//! 布局（参考主流 AI 编程软件）：
+//! Layout (modelled on the mainstream AI coding tools):
 //! ```text
 //! ┌───────────────────────────────────────────────────────────┐
-//! │ [历史] [+] 状态 · Σ tok              [活动流] [明暗] [关于] │  ← 浮动按钮，无顶栏
-//! │ ┌───────────────┐                                         │
-//! │ │ 历史记录（滑出）│  对话流：用户气泡 / 助手 Markdown         │
-//! │ │  · 这一段      │                ┌──────────────────┐     │
-//! │ │  · 那一段      │                │ 悬浮输入框（覆盖）│     │
-//! │ └───────────────┘                └──────────────────┘     │
+//! │ [History] [+] Status · Σ tok   [Activity] [Theme] [About] │  ← floating buttons, no top bar
+//! │┌─────────────────┐                                        │
+//! ││ History (slide) │   user bubble / assistant Markdown     │
+//! ││  · this thread  │             ┌────────────────────┐     │
+//! ││  · that thread  │             │ Floating input box │     │
+//! │└─────────────────┘             └────────────────────┘     │
 //! └───────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! **没有顶栏**（2026-10-04 用户要求）：原先那条 `TopBottomPanel` 拆掉了，五枚图标变成
-//! 浮在对话内容之上的独立按钮，各带一块与旧顶栏同色的底（[`P::panel`]）。位置按下表复原：
-//! 左上 20/7、右上同样内缩 20 —— 与旧顶栏里 `Margin::symmetric(20, 0)` + 36px 热区
-//! 算出来的落点**逐像素相同**（按钮中心 y = 7 + 18 = 25 = 旧顶栏 50 高的一半）。
+//! **There is no top bar** (user request, 2026-10-04): the old `TopBottomPanel` was removed
+//! and the five icons became standalone buttons floating above the transcript, each with a
+//! backdrop in the old top bar's colour ([`P::panel`]). The positions are restored per the
+//! table below: 20/7 at the top-left, 20 in from the right as well -- **pixel-identical** to
+//! what the old top bar's `Margin::symmetric(20, 0)` + 36px hot zone worked out to (button
+//! centre y = 7 + 18 = 25 = half of the old bar's 50px height).
 //!
-//! **左侧历史栏也不再是布局里的一条 `SidePanel`**，改成从左上按钮**向下滑出**的浮层
-//! （见 [`App::history_overlay`]）；同时「新建对话」那枚「+」从历史按钮**背后向右滑出**
-//! （默认藏起来，见 [`App::toolbar`]）。两者共用同一个进度 `hist_t`，动画时长
-//! [`HIST_ANIM_SECS`]。
+//! **The left history column is no longer a `SidePanel` in the layout either**: it became an
+//! overlay that **slides down** from the top-left button (see [`App::history_overlay`]); and
+//! the "new conversation" "+" **slides out to the right from behind** the history button
+//! (hidden by default, see [`App::toolbar`]). The two share one progress value `hist_t` and
+//! one animation duration [`HIST_ANIM_SECS`].
 //!
-//! 活动流**不在主窗口里**，点那枚图标会以独立窗口打开（见 `activity.rs`）。
+//! The activity stream is **not in the main window**: clicking that icon opens it in its own
+//! window (see `activity.rs`).
 //!
-//! 底部没有独立的「输入区」栏位：输入框是一枚浮在对话内容之上的卡片，
-//! 滚动时可以一直滑到它下面。
+//! There is no separate "input area" row at the bottom: the input box is a card floating
+//! above the transcript, and scrolling can carry it all the way under it.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -53,7 +57,7 @@ use crate::markdown;
 use crate::theme::{self, P};
 use crate::workplace_ui;
 
-// ─────────────────────────── 数据模型 ───────────────────────────
+// ─────────────────────────── data model ───────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum NoteKind {
@@ -63,7 +67,8 @@ pub enum NoteKind {
 }
 
 impl NoteKind {
-    /// 单色方案下没有红黄绿可用了，改用明度层次：正文色 / 次要色 / 更弱色。
+    /// A monochrome scheme has no red/yellow/green left to spend, so we use lightness
+    /// instead: body colour / secondary / weaker.
     fn color(self) -> Color32 {
         match self {
             NoteKind::Info => P::text_dim(),
@@ -73,80 +78,95 @@ impl NoteKind {
     }
 }
 
-/// 一次工具调用（用于折叠展示）。
+/// One tool call (for the collapsed display).
 #[derive(Clone)]
 struct StepView {
     name: String,
     plugin: Option<String>,
-    /// 调用参数（JSON 串）。**界面上不显示** —— 行上只留工具名，见 `step_row`；
-    /// 留字段是为了排错时能一眼对上 `history/*.jsonl` 里那一行。
+    /// Call arguments (a JSON string). **Not shown in the UI** -- the row keeps only the
+    /// tool name, see `step_row`; the field is kept so that when debugging you can line it
+    /// up with the matching row in `history/*.jsonl` at a glance.
     #[allow(dead_code)]
     args: String,
     result: Option<(bool, String)>,
 }
 
-/// 一轮任务的「过程」（结束后折叠成一行）。
+/// The "process" of one turn (collapsed into a single row once it ends).
 struct Process {
     steps: Vec<StepView>,
     interim: Vec<String>,
     reasoning: String,
-    /// 耗时。历史记录里没有时间信息，用 `None` 表示「不显示耗时」。
+    /// Elapsed time. History files carry no timing information, so `None` means "don't
+    /// show a duration".
     elapsed: Option<f32>,
     expanded: bool,
     aborted: bool,
 }
 
-/// 对话流中的一条记录。
+/// One entry in the transcript.
 enum Item {
-    /// 用户说的话 + 那条消息带的附件**展示名**。
+    /// What the user said + the **display names** of the attachments on that message.
     ///
-    /// 只留名字不留字节：气泡里要画的是一排小胶囊（文件名.后缀），不是图片本身；
-    /// 真正的附件内容在 `.jsonl` 里只有一条路径引用。
+    /// Names only, no bytes: what the bubble draws is a row of small chips (`name.ext`),
+    /// not the images themselves; the real attachment content is nothing but a path
+    /// reference in the `.jsonl`.
     User(String, Vec<String>),
     Assistant(String),
     Process(Process),
     Note(NoteKind, String),
-    /// 上一条消息里带的**图片**，单独成块显示在它下面。
+    /// An **image** carried by the previous message, drawn as its own block below it.
     ///
-    /// 为什么单开一个 Item 而不是给 `User` / `Note` 加个字段：图片有两个来源
-    /// （用户拖进来的、工具/插件产出的），它们分别落在 `User` 与 `Note` 上；
-    /// 而**画法完全一样**。单开一支之后，渲染只写一遍，也不会因为将来又多一个
-    /// 「带图的消息类型」而再改一次那两个变体（改变体要动所有构造点）。
+    /// Why a separate Item rather than a field on `User` / `Note`: images have two sources
+    /// (dragged in by the user, produced by a tool/plugin) which land on `User` and `Note`
+    /// respectively, yet **the drawing is exactly the same**. With a variant of its own the
+    /// rendering is written once, and it won't need changing again when a future
+    /// "message type with images" shows up (changing a variant touches every construction
+    /// site).
     Images(Vec<PathBuf>),
-    /// 一轮任务的 token 明细。紧跟在那轮 AI 答复下面 —— 账要贴着它花掉的地方，
-    /// 而不是攒到顶栏让人自己去对轮次。
+    /// One turn's token breakdown. It sits right under that turn's AI reply -- the bill
+    /// belongs next to where it was spent, not piled into a top bar for the user to match
+    /// up with turns by themselves.
     Usage(String),
-    /// 错误卡片（不可恢复）
+    /// Error card (unrecoverable)
     Error(String),
 }
 
-/// 进行中的一轮任务。
+/// A turn in progress.
 struct Live {
     status: String,
     reasoning: String,
     reasoning_live: bool,
     steps: Vec<StepView>,
     interim: Vec<String>,
-    /// `interim[i]` 说出时**已经跑过多少步调用** —— 用来把实时区切成
-    /// 「调用流 → 阶段回复 → 调用流 → …」的交替段（用户 2026-10-05 提的：原来所有调用
-    /// 挤在顶上、所有回复挤在中间，看不出哪几步属于哪个阶段）。
+    /// How many call steps had **already run** when `interim[i]` was spoken -- used to
+    /// split the live area into alternating segments "call stream -> interim reply ->
+    /// call stream -> ..." (user request, 2026-10-05: previously all the calls were crammed
+    /// at the top and all the replies in the middle, so you couldn't tell which steps
+    /// belonged to which stage).
     ///
-    /// 存「切点」而不是把 `steps` / `interim` 换成 `Vec<Segment>`：这两样在一轮结束时
-    /// 要原样交给过程卡片，保持扁平就不用动那条提交路径。
+    /// We store "cut points" rather than replacing `steps` / `interim` with
+    /// `Vec<Segment>`: at the end of a turn these two have to be handed to the process card
+    /// as-is, and keeping them flat means that commit path doesn't have to change.
     cuts: Vec<usize>,
     pending_final: Option<String>,
-    /// **正在打字的正文**（这一瞬间还没写完的那一句）。
+    /// **The body text being typed** (the sentence that isn't finished yet at this
+    /// instant).
     ///
-    /// 与 `pending_final` 的分工：`pending_final` 是「本次响应已经确定的完整正文」，
-    /// 到一轮结束才落成一条消息；`streaming` 是让它在落盘之前就**看得见**（用户 2026-10-05
-    /// 提的「回复只在全部完成后才瞬间出现、之前对话是黑的」）。
-    /// 两者在 `AgentEvent::AssistantText` / `InterimText` 到达时对齐 —— 那时增量已经吐完，
-    /// 用权威文本覆盖一遍，避免打字过程中因为丢帧而与真文本差几个字。
+    /// Division of labour with `pending_final`: `pending_final` is "the complete body text
+    /// this response has settled on", which only turns into a message at the end of a turn;
+    /// `streaming` is what makes it **visible** before it hits disk (user request,
+    /// 2026-10-05: the reply only popped in all at once when everything was finished, and
+    /// until then the conversation was blank).
+    /// The two are reconciled when `AgentEvent::AssistantText` / `InterimText` arrive --
+    /// by then the deltas are done, so the authoritative text overwrites once and a few
+    /// dropped frames can't leave the screen a few characters off.
     streaming: String,
     started: Instant,
-    /// 输出侧（思考 + 正文）收到的字符数，用于实时滚动一个在涨的 token 数。
+    /// Characters received on the output side (reasoning + body), used to scroll a live
+    /// token count that keeps climbing.
     ///
-    /// 流式过程中服务端还没报数，只能估；一轮结束时会用 `TurnUsage` 里的精确值顶掉。
+    /// During streaming the server hasn't reported yet, so this can only be an estimate;
+    /// at the end of a turn the exact value from `TurnUsage` replaces it.
     out: TokenEstimate,
 }
 
@@ -155,41 +175,47 @@ struct AuthCard {
     args: String,
 }
 
-/// 一道等用户作答的选择题（`ask_user`）。问题与选项都是模型给的原文。
+/// A multiple-choice question waiting on the user (`ask_user`). The question and the
+/// options are the model's own words.
 ///
-/// 带 `Clone`：作答那一行要用 `&mut self.choice_text`，而同一帧还要读题目与选项 ——
-/// 克隆一份小的（一句话 + 最多 6 个短串）比在借用上做体操划算得多。
+/// `Clone` is derived because the answer row needs `&mut self.choice_text` while the same
+/// frame still has to read the question and the options -- cloning something small (one
+/// sentence plus at most 6 short strings) beats gymnastics with borrows.
 #[derive(Clone)]
 struct ChoiceCard {
     question: String,
     options: Vec<String>,
 }
 
-/// 一张图片当前处于哪个阶段。
+/// Which stage an image is currently in.
 ///
-/// 三个阶段各占一支、而不是用 `Option<TextureHandle>` + 另一个错误表：界面对这三者的
-/// 画法本来就不同（图 / 「正在解码…」/ 一句失败原因），合成一个只会让渲染那边
-/// 再拆回来。
+/// The three stages each get a variant rather than one `Option<TextureHandle>` plus a
+/// separate error table: the UI already draws all three differently (the image /
+/// "decoding..." / a one-line failure reason), and merging them would only make the
+/// renderer split them apart again.
 enum Tex {
-    /// 后台线程正在解码
+    /// A background thread is decoding
     Loading(std::sync::mpsc::Receiver<Result<aox::image::Bitmap, String>>),
     Ready(egui::TextureHandle),
     Failed(String),
 }
 
-/// 设置弹窗左侧那几栏。**声明顺序就是列表里从上到下的顺序**。
+/// The columns down the left of the settings dialog. **Declaration order is the order
+/// they appear in the list, top to bottom.**
 ///
-/// 「额外」放第一个是因为它装的不是设置项（是一个入口），越靠边越不干扰
-/// 真正要找设置的人 —— 但用户明确要求它排在最前，那就排最前，不替他改顺序。
+/// "Extra" comes first because what it holds isn't a setting (it's an entrance), and the
+/// further from the middle it sits the less it gets in the way of someone actually
+/// looking for settings -- but the user explicitly asked for it first, so first it is; we
+/// don't reorder on their behalf.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SettingsTab {
-    /// 额外：活动流入口这类「不属于某一项设置」的东西
+    /// Extra: things like the activity-stream entrance that "belong to no setting"
     Extra,
-    /// 外观：明暗 / 跟随系统
+    /// Appearance: light/dark / follow system
     Appearance,
-    /// 系统：路径与运行时诊断
+    /// System: paths and runtime diagnostics
     System,
-    /// 关于：版本、协议、链接
+    /// About: version, license, links
     About,
 }
 
@@ -199,10 +225,10 @@ impl SettingsTab {
 
     fn label(self) -> &'static str {
         match self {
-            SettingsTab::Extra => "额外",
-            SettingsTab::Appearance => "外观",
-            SettingsTab::System => "系统",
-            SettingsTab::About => "关于",
+            SettingsTab::Extra => aox::i18n::t("Extra"),
+            SettingsTab::Appearance => aox::i18n::t("Appearance"),
+            SettingsTab::System => aox::i18n::t("System"),
+            SettingsTab::About => aox::i18n::t("About"),
         }
     }
 }
@@ -220,126 +246,157 @@ pub struct App {
 
     items: Vec<Item>,
     live: Option<Live>,
-    /// 活动流的共享状态。住在独立窗口里（`activity.rs`），主窗口只管往里写。
+    /// The activity stream's shared state. It lives in its own window (`activity.rs`); the
+    /// main window only writes into it.
     act: activity::Shared,
     auth: Option<AuthCard>,
     auth_reply: Option<oneshot::Sender<AuthDecision>>,
-    /// 正在等用户作答的一道选择题（`ask_user` 问出来的）。`None` = 没有。
+    /// A multiple-choice question waiting on the user (asked via `ask_user`). `None` = none.
     choice: Option<ChoiceCard>,
-    /// 选项槽最后那一行**行内输入框**的内容。
+    /// Contents of the **inline input box** on the last row of the option slot.
     ///
-    /// 与主输入框 `input` 分开是刻意的：两者的归属不同 —— 这份只对当前这道题有效，
-    /// 作答完就清空。共用一个会出两种 bug：作答时把用户在别处打的草稿吞掉，
-    /// 或者作答完草稿还赖在框里。
+    /// Keeping it separate from the main input box `input` is deliberate: they belong to
+    /// different things -- this one applies only to the current question and is cleared
+    /// once answered. Sharing one would cause two bugs: swallowing a draft the user typed
+    /// elsewhere while answering, or leaving that draft stuck in the box afterwards.
     choice_text: String,
-    /// 回执通道。**与 `auth_reply` 同一套路**：`Some` 期间 agent 线程正阻塞在
-    /// `choose()` 上，所以任何一条收起卡片的路径都必须把它回填掉 ——
-    /// 漏了就会「界面看着没事，模型那边永远等下去」。
+    /// The reply channel. **Same pattern as `auth_reply`**: while it is `Some` the agent
+    /// thread is blocked in `choose()`, so every path that dismisses the card has to fill
+    /// it in -- miss one and the UI looks fine while the model waits forever.
     choice_reply: Option<oneshot::Sender<ChoiceReply>>,
-    /// 已解码 / 正在解码的图片。键是**本机路径**（见 [`Tex`]）。
+    /// Decoded / decoding images. The key is the **local path** (see [`Tex`]).
     tex: HashMap<PathBuf, Tex>,
 
-    /// 首屏那张插画（亮色 / 暗色各一张，内嵌在二进制里，见 [`crate::brand`]）。
+    /// The empty-state illustration (one light, one dark, embedded in the binary -- see
+    /// [`crate::brand`]).
     ///
-    /// 与 `tex` 分开存：`tex` 的键是路径、由对话内容驱动；这一份是**固定的两张**、
-    /// 与对话无关，混进去只会让「键盘是什么」这件事变含糊。
+    /// Stored separately from `tex`: `tex` is keyed by path and driven by the conversation,
+    /// whereas this is **two fixed images** unrelated to it. Mixing them in would only blur
+    /// what the map is keyed on.
     brand: brand::Art,
 
     input: String,
-    /// 待上传栏里的附件（用户拖进来 / `attach_file` 挂上来的）。
+    /// Attachments in the pending-upload bar (dragged in by the user / attached via
+    /// `attach_file`).
     ///
-    /// 存的是 [`aox::attach::Attachment`] 而**不是字节**：一个 30 MB 的截图在栏里
-    /// 挂上半天，界面状态不该一直背着它 —— 内容只在真正发出去的那一刻读
-    /// （`Message::user_with_files` 内部做）。
+    /// What is stored is [`aox::attach::Attachment`], **not the bytes**: a 30 MB screenshot
+    /// can sit in that bar for ages, and UI state shouldn't carry it the whole time -- the
+    /// content is read only at the moment it is actually sent (inside
+    /// `Message::user_with_files`).
     pending: Vec<aox::attach::Attachment>,
-    /// 指针正把文件拖在窗口上方。只用来把输入卡片描边提亮一档 —— 用户得知道
-    /// 「松手会放在哪」，否则拖到窗口右上角松手也生效，反而像是点错了。
+    /// The pointer is dragging files over the window. Used only to brighten the input
+    /// card's border by one step -- the user needs to know "where it will land if I let
+    /// go", otherwise letting go at the top-right corner works too and reads as a mistake.
     dragging_files: bool,
     focus_input: bool,
     busy: bool,
     waiting_auth: bool,
     status: String,
     spin: f32,
-    /// 当前对话**逐轮**的 token 账。
+    /// The current conversation's token ledger, **turn by turn**.
     ///
-    /// 打开一段旧对话时从文件读回来（`FromAgent::UsageLog`），每轮结束再追加一条。
-    /// 空的或全无数字的（端点不返回 usage）就整块不显示 —— 宁可没有，
-    /// 也不要拿一串 0 假装在统计。
+    /// Read back from the file when an old conversation is opened (`FromAgent::UsageLog`),
+    /// then appended to at the end of each turn. If it is empty, or has no numbers at all
+    /// (the endpoint returns no usage), the whole block is hidden -- better nothing than a
+    /// row of zeros pretending to be statistics.
     usage_log: Vec<UsageRecord>,
-    /// 顶栏那枚「Σ 总 token」的面板是否正被指针压着。
+    /// Whether the "Σ total tokens" panel is currently being pressed by the pointer.
     ///
-    /// 单靠 `resp.hovered()` 会在指针从胶囊移向面板的那一瞬断开（两者之间有缝），
-    /// 于是面板一闪就没了。记一个跨帧的状态就稳住了。
+    /// `resp.hovered()` alone breaks the instant the pointer travels from the chip to the
+    /// panel (there is a gap between them) and the panel flashes away. Remembering a
+    /// cross-frame flag holds it steady.
     usage_hover: bool,
 
     model: String,
     config_path: String,
     plugins: Vec<String>,
-    /// 插件运行时状态（每语言一行，由 bridge 发来）。
-    /// 放在「关于」窗口里——这类「看一眼就够」的诊断数据不该占用主界面。
+    /// Plugin runtime status (one row per language, sent by the bridge).
+    /// It lives in the "About" window -- this kind of "one glance is enough" diagnostic
+    /// data shouldn't take up the main UI.
     runtimes: RuntimeView,
 
-    /// 读历史用的存储实例（`aox::store`，与 agent 线程同一个后端的另一个句柄）。
+    /// Store instance used for reading history (`aox::store`: another handle onto the same
+    /// backend the agent thread uses).
     ///
-    /// GUI 直接读盘，不经过 agent 线程 —— 读历史是纯文件操作，没有并发问题，
-    /// 也就不必为它再开一条 channel。`None` 表示「还没启动完成」，此时不读。
+    /// The GUI reads from disk directly instead of going through the agent thread --
+    /// reading history is pure file I/O with no concurrency issues, so there is no reason
+    /// to open another channel for it. `None` means "not finished starting up", and nothing
+    /// is read then.
     store: Option<Arc<dyn aox::store::Store>>,
-    /// 历史对话列表（最新的在前）。只在展开侧边栏、或本轮结束后刷新。
+    /// The conversation list (newest first). Refreshed only when the sidebar is opened or a
+    /// turn ends.
     history: Vec<aox::history::Summary>,
-    /// 当前所在的这段对话的 id（尚未落盘的新对话为 None）。
+    /// The id of the conversation we are currently in (`None` for a new conversation that
+    /// hasn't hit disk yet).
     ///
-    /// 侧边栏据此标「当前」—— 侧边栏是**会话切换器**：点某一条就切过去接着聊，
-    /// 这条自然也就跟着变了。
+    /// The sidebar uses it to mark "current" -- the sidebar **is a conversation switcher**:
+    /// click one and you carry on there, so this naturally follows.
     current_history: Option<String>,
-    /// 正在等 Agent 回执的切换请求（切换前先灰掉列表，避免连点造成来回跳）
+    /// A switch request waiting on the agent's acknowledgement (the list is greyed out
+    /// first so double-clicks can't bounce back and forth)
     switching: bool,
-    /// 左上角那枚「历史记录」按钮的开关。浮层的目标状态就是它。
+    /// The on/off state of the "history" button at the top-left. It is the overlay's
+    /// target state.
     show_history: bool,
-    /// 滑出动画进度：`0` = 完全收起，`1` = 完全展开。
+    /// Slide-out animation progress: `0` = fully collapsed, `1` = fully expanded.
     ///
-    /// 由 `App::update` 每帧朝 `show_history` 逼近，`toolbar` / `history_overlay`
-    /// 都按它算位移。**不要直接用那个布尔量**：那样只有「在」与「不在」两态，
-    /// 中间那两百多毫秒就没有落脚点，滑出会退化成瞬移。
+    /// `App::update` steps it toward `show_history` every frame, and `toolbar` /
+    /// `history_overlay` both derive their offsets from it. **Do not use the boolean
+    /// directly**: that gives you only "there" and "not there", with nowhere to stand for
+    /// the two-hundred-odd milliseconds in between, and the slide-out degrades into a jump
+    /// cut.
     hist_t: f32,
-    /// 历史浮层**上一帧**的实际高度。
+    /// The history overlay's actual height **on the previous frame**.
     ///
-    /// 滑入距离要等于面板自身高度（整块从上方滑进来），而高度由内容（有几条记录）
-    /// 决定 —— 只有画完才知道。于是记一帧：本帧拿它算位移，画完再记下新的那个。
+    /// The slide-in distance has to equal the panel's own height (the whole block slides in
+    /// from above), and that height is set by the content (how many records there are) --
+    /// which is only known once it has been drawn. So we remember one frame: this frame
+    /// uses it for the offset, and after drawing we record the new one.
     hist_h: f32,
-    /// 左上角历史按钮的矩形。只用来回答一个问题：这一下点击算不算「点在浮层外面」。
+    /// The rect of the top-left history button. It answers exactly one question: does this
+    /// click count as "outside the overlay"?
     ///
-    /// 不记的话，点按钮那一帧会同时命中「按钮点击」与「点外部」两条路径 ——
-    /// 打开的动作当场被自己关掉，表现为「点了没反应」。
+    /// Without it, the frame in which the button is clicked hits both the "button clicked"
+    /// and the "clicked outside" paths -- the opening action is cancelled by itself on the
+    /// spot, which shows up as "I clicked and nothing happened".
     bar_hist_rect: Option<Rect>,
 
-    /// 演示模式（--demo）：不连 LLM，只展示界面与事件流的排布
+    /// Demo mode (--demo): no LLM attached, just shows the layout and the shape of the
+    /// event stream
     demo: bool,
-    /// 对话流是否自动跟随到底部
+    /// Whether the transcript auto-follows to the bottom
     follow: bool,
-    /// 本条消息强制滚到底（用户刚发指令时）
+    /// Force a scroll to the bottom for this message (right after the user sends a command)
     force_follow: bool,
-    /// 活动流是否自动跟随
-    /// 设置弹窗是否展开（顶栏那三枚按钮（活动流 / 明暗 / 关于）已全部收进它）。
+    /// Whether the activity stream auto-follows
+    /// Whether the settings dialog is open (the top bar's three buttons -- activity stream /
+    /// theme / about -- have all been folded into it).
     settings_open: bool,
-    /// 设置弹窗里正选中哪一栏。
+    /// Which column is selected in the settings dialog.
     settings_tab: SettingsTab,
     log_error: Option<String>,
-    /// `--prompt` 传入的首条指令：等模型就绪后自动发送
+    /// The initial instruction passed via `--prompt`: sent automatically once the model is
+    /// ready
     pending_prompt: Option<String>,
-    /// 授权弹窗出现的时刻（用于快捷键去抖，避免弹窗刚出现就被误触）
+    /// The moment the authorization dialog appeared (used to debounce the hotkeys, so a
+    /// freshly-shown dialog can't be triggered by a stray keypress)
     auth_shown_at: Instant,
-    /// 首帧窗口尺寸收敛：0=还没试过，>0 表示已尝试的帧数
+    /// First-frame window-size convergence: 0 = not tried yet, >0 = number of frames tried
     fit_tries: u8,
-    /// 上次下发给操作系统的原生标题栏主题。`None` 表示还没下发过。
+    /// The native title-bar theme last pushed to the OS. `None` means it never has been.
     ///
-    /// 创建窗口时下发的 viewport command 有可能在前端事件循环起来之前就被丢掉，
-    /// 所以这里记一笔，保证至少从 `update` 里真正下发一次。
+    /// A viewport command issued while the window is being created can be dropped before
+    /// the front-end event loop comes up, so we record it here to guarantee it really is
+    /// delivered at least once from `update`.
     native_theme: Option<theme::Mode>,
 
-    /// 输入框左下角那枚「工作区」按钮的状态（按钮 / 向上弹出列表 / 确认框 / 目录选择器）。
+    /// State of the "workplace" button at the bottom-left of the input box (button /
+    /// pop-up list / confirmation / directory picker).
     ///
-    /// 状态整体住在 `workplace_ui` 里，这里只持有一个句柄 —— 免得四个布尔量散落在
-    /// `App` 上、各自还要记得互斥关系（见 `workplace_ui::button` 里那段「开一个收两个」）。
+    /// The state as a whole lives inside `workplace_ui`; here we hold only a handle --
+    /// otherwise four booleans would be scattered over `App`, each of which would still
+    /// have to remember the mutual exclusions (see the "open one, close two" bit in
+    /// `workplace_ui::button`).
     ws: workplace_ui::WorkplaceUi,
 }
 
@@ -354,7 +411,8 @@ impl App {
         demo: bool,
         prompt: Option<String>,
     ) -> Self {
-        // 外观全部来自 `[theme]`；明暗优先取上次手动切换的记录（见 theme::apply）。
+        // All appearance comes from `[theme]`; light/dark prefers the record of the last
+        // manual switch (see theme::apply).
         theme::apply(&cc.egui_ctx, &theme_cfg);
         let mut app = Self {
             tx,
@@ -380,7 +438,7 @@ impl App {
             focus_input: false,
             busy: false,
             waiting_auth: false,
-            status: "就绪".into(),
+            status: aox::i18n::t("Ready").into(),
             spin: 0.0,
             usage_log: Vec::new(),
             usage_hover: false,
@@ -394,11 +452,14 @@ impl App {
             switching: false,
             show_history: false,
             hist_t: 0.0,
-            // 面板高度给一个「几条记录的窗口」的初值：第一帧还没画过，没有实测值可用，
-            // 而这一帧的滑入位移必须马上有个数。之后每帧都会被真实高度覆盖。
+            // Seed the panel height with "a window of a few records": the first frame has
+            // never been drawn, so there is no measured value, yet this frame's slide-in
+            // offset needs a number right now. Every later frame overwrites it with the
+            // real height.
             hist_h: 320.0,
             bar_hist_rect: None,
-            // 历史浮层默认收起：主区宽度全部让给对话，需要时再点左上角那枚图标。
+            // The history overlay starts collapsed: the full width goes to the transcript,
+            // and you click the top-left icon when you want it.
             follow: true,
             force_follow: true,
             settings_open: false,
@@ -420,15 +481,17 @@ impl App {
         self.started.elapsed().as_secs_f32()
     }
 
-    /// 首帧把窗口收敛进屏幕，并显式摆正位置。
+    /// On the first frame, converge the window into the screen and place it explicitly.
     ///
-    /// 要解决两件事：
+    /// Two problems to solve:
     ///
-    /// 1. **尺寸**：启动时请求 1380×900 逻辑点，在高 DPI 缩放的小屏上，客户区连同
-    ///    窗口装饰会超出屏幕，窗口下半截（连同输入框）被切掉。
-    /// 2. **位置**：不指定位置就只能听操作系统安排，而 Windows 会把新窗口「级联」
-    ///    到右下角，窗口下沿越过屏幕底边——用户看不到输入框，截图里那条黑带就是
-    ///    屏幕外区域被 `CopyFromScreen` 抓成了黑色。
+    /// 1. **Size**: startup asks for 1380x900 logical points. On a small display with high
+    ///    DPI scaling, the client area together with the window decorations exceeds the
+    ///    screen and the bottom half of the window (input box included) is cut off.
+    /// 2. **Position**: without an explicit position the OS decides, and Windows
+    ///    "cascades" new windows toward the bottom-right, putting the window's bottom edge
+    ///    past the screen -- the user can't see the input box. The black band in the
+    ///    screenshots is the off-screen region that `CopyFromScreen` captured as black.
     fn fit_window(&mut self, ctx: &egui::Context) {
         const TRIES: u8 = 60;
         if self.fit_tries >= TRIES {
@@ -444,13 +507,15 @@ impl App {
                 v.outer_rect.map(|r| r.size()),
             )
         });
-        // 窗口真正创建之前拿不到这些，下一帧再试
+        // None of this is available before the window really exists; try again next frame
         let (Some(mon), Some(inner), Some(outer)) = (mon, inner, outer) else {
             return;
         };
 
-        // 窗口装饰（标题栏 + 边框）占在客户区之外。首帧往往还量不准，给个按逻辑点算
-        // 的下限兜底：标题栏约 30、边框约 8，46 足以覆盖 100%~200% 的缩放。
+        // The window decorations (title bar + border) sit outside the client area. The
+        // first frame usually can't measure them yet, so fall back to a logical-point
+        // floor: about 30 for the title bar and 8 for the border, so 46 covers 100%-200%
+        // scaling.
         let chrome = (outer - inner).max(Vec2::new(18.0, 46.0));
 
         let want = default_window_size(mon, chrome);
@@ -459,10 +524,12 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
         }
 
-        // 居中摆放（外框 = 客户区 + 装饰），保证下沿不越过任务栏
+        // Centre it (outer frame = client area + decorations) so the bottom edge never
+        // crosses the taskbar
         let outer_size = want + chrome;
-        // 可见高度（去掉任务栏）同样只在 default_window_size 里算过一次，
-        // 这里用「默认高度 + 装饰」反推，避免两处各算一遍任务栏高度。
+        // The visible height (taskbar excluded) is likewise computed only once, in
+        // default_window_size; here we derive it from "default height + decorations" so the
+        // taskbar height isn't computed in two places.
         let taskbar = (mon.y * 0.06).clamp(36.0, 72.0);
         let usable_h = (mon.y - taskbar).max(1.0);
         let pos = Vec2::new(
@@ -473,14 +540,15 @@ impl App {
             pos.x, pos.y,
         )));
 
-        // 收敛完就不必再算
+        // Once converged there is nothing left to compute
         self.fit_tries = TRIES;
     }
 
-    /// 往活动流里记一条系统事件（时间轴「系统」行上的一枚短色块）。
+    /// Record a system event into the activity stream (a short bar on the timeline's
+    /// "system" row).
     ///
-    /// **只有一轮任务执行期间才记**：活动流的语义是「这一轮是怎么跑的」，
-    /// 程序闲着的时候它上面不该多出任何东西。
+    /// **Only recorded while a turn is running**: the activity stream means "how this turn
+    /// ran", so nothing extra should appear on it while the program is idle.
     fn note_act(&self, kind: ActKind, title: &str, body: &str) {
         if self.live.is_none() {
             return;
@@ -489,7 +557,8 @@ impl App {
     }
 
     fn plugin_of(&self, tool: &str) -> Option<String> {
-        // 约定：工具名 = "<插件名>_<功能>"；用已知插件列表做前缀匹配
+        // Convention: tool name = "<plugin>_<feature>"; match the prefix against the list
+        // of known plugins
         for p in &self.plugins {
             if tool.starts_with(&format!("{p}_")) {
                 return Some(p.clone());
@@ -501,25 +570,26 @@ impl App {
         None
     }
 
-    // ── 事件泵：把 Agent 线程的消息落到本地状态 ──
+    // ── event pump: land the agent thread's messages into local state ──
     fn pump(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 FromAgent::Boot(b) => {
                     self.model = b.model.clone();
                     self.config_path = b.config_path.clone();
-                    // 界面侧读历史的后端由 bridge 一并送来：与 agent 线程同一个实现。
+                    // The UI-side history backend is shipped along by the bridge: the same
+                    // implementation the agent thread uses.
                     self.store = Some(b.store.clone());
                     self.refresh_history();
                     if let Some(note) = &b.note {
                         self.log_error = Some(note.clone());
                         self.items.push(Item::Error(note.clone()));
                     }
-                    self.status = if b.provider_ready { "就绪".to_string() } else { "未配置模型".to_string() };
+                    self.status = if b.provider_ready { aox::i18n::t("Ready").to_string() } else { aox::i18n::t("No model configured").to_string() };
                     let ready = b.provider_ready;
                     self.boot = Some(*b);
                     if ready {
-                        // --prompt：模型就绪后自动发首条指令
+                        // --prompt: send the first instruction automatically once the model is ready
                         if let Some(p) = self.pending_prompt.take() {
                             self.input = p;
                             self.send();
@@ -528,12 +598,14 @@ impl App {
                 }
                 FromAgent::Snapshot(s) => self.apply_snapshot(s),
                 FromAgent::Runtimes(v) => self.runtimes = v,
-                // 工作区现状：按钮上的档位名与列表里打勾的那一项都靠它。
-                // 启动、每轮结束、每次切档后 bridge 都会重发一份。
+                // Current workplace state: the tier name on the button and the ticked row
+                // in the list both come from it. The bridge re-sends one at startup, at the
+                // end of every turn, and after every tier change.
                 FromAgent::Workplace(v) => self.ws.set_view(*v),
                 FromAgent::HistoryCurrent(id) => {
-                    // 侧边栏开着时要让条数/标题保持最新；关着时只有「换了对话文件」
-                    // 才值得扫一次目录（否则每轮都白读一遍磁盘）。
+                    // Keep counts/titles fresh while the sidebar is open; while it is closed
+                    // only "the conversation file changed" is worth a directory scan
+                    // (otherwise every turn re-reads the disk for nothing).
                     let changed = self.current_history != id;
                     self.current_history = id;
                     if changed || self.show_history {
@@ -543,8 +615,9 @@ impl App {
                 FromAgent::Switched { opened, error } => {
                     self.switching = false;
                     if let Some(e) = error {
-                        // 载入失败时 Agent 的上下文没被动过，所以这里也什么都不改，
-                        // 免得界面已经「跳」过去了、模型却还在原来那段对话里。
+                        // When loading fails the agent's context was never touched, so change
+                        // nothing here either -- otherwise the UI has already "jumped" while
+                        // the model is still in the old conversation.
                         self.items.push(Item::Error(e));
                         continue;
                     }
@@ -554,7 +627,7 @@ impl App {
                 }
                 FromAgent::TurnStart => {
                     self.live = Some(Live {
-                        status: "思考中".into(),
+                        status: aox::i18n::t("Thinking").into(),
                         reasoning: String::new(),
                         reasoning_live: false,
                         steps: Vec::new(),
@@ -566,7 +639,7 @@ impl App {
                         out: TokenEstimate::default(),
                     });
                     self.busy = true;
-                    self.status = "思考中".into();
+                    self.status = aox::i18n::t("Thinking").into();
                 }
                 FromAgent::Status(s) => {
                     self.status = s.clone();
@@ -575,37 +648,44 @@ impl App {
                     }
                 }
                 FromAgent::Content(d) => {
-                    // 正文增量有两个用途：① 让 token 数字一直涨；② **即时显示** ——
-                    // 追加到 `streaming`，界面就能一个字一个字地打出来（用户 2026-10-05
-                    // 提的「回复要等全部完成才瞬间出现、在那之前对话是黑的」）。
-                    // 活动流的模型段仍由 `Event(AssistantText)` 推进：那里再插一遍会让
-                    // 同一段文字在时间轴上出现两次。
+                    // The body delta serves two purposes: (1) keep the token counter climbing;
+                    // (2) **show it immediately** -- appending to `streaming` lets the UI type it
+                    // out character by character (user request, 2026-10-05: the reply only popped
+                    // in once everything was finished, and until then the conversation was
+                    // blank).
+                    // The activity stream's model segment is still advanced by
+                    // `Event(AssistantText)`: inserting it again here would put the same stretch
+                    // of text on the timeline twice.
                     if let Some(l) = self.live.as_mut() {
                         l.out.add(&d);
                         l.streaming.push_str(&d);
                     }
                 }
                 FromAgent::Usage(rec) => {
-                    // 端点没报数就整块不显示，别拿 0 糊弄
+                    // If the endpoint reports no numbers, hide the whole block -- don't fob it off
+                    // with 0s
                     if !rec.is_empty() {
-                        // 明细紧跟在这轮答复后面（此时 turn 已结束，items 末尾正是它），
-                        // 顺带把视图拽到底 —— 凭空多出来的一行没人会自己去找
+                        // The breakdown goes right after this turn's reply (by now the turn has
+                        // ended and the tail of `items` is exactly that), and drag the view to the
+                        // bottom while we're at it -- nobody goes looking for a row that appeared
+                        // out of nowhere.
                         self.items.push(Item::Usage(usage_line(&rec)));
                         self.usage_log.push(*rec);
                         self.force_follow = true;
                     }
                 }
                 FromAgent::UsageLog(log) => {
-                    // 切换对话后由 agent 从文件接回来的整段账本。
-                    // 逐轮明细要重新插回对话流 —— 打开旧对话时，每轮的账该贴回
-                    // 它原来待着的位置，而不是在顶上堆成一坨。
+                    // The whole ledger the agent read back from file after a conversation switch.
+                    // The per-turn breakdowns have to go back into the transcript -- when an old
+                    // conversation is opened, each turn's bill should be stuck back where it was,
+                    // not heaped up at the top.
                     self.usage_log = log;
                     self.rebuild_usage_rows();
                 }
                 FromAgent::Reasoning(d) => {
                     if let Some(l) = self.live.as_mut() {
-                        // 注意：这里不能用 `self.now()`（它借整个 self），
-                        // 而 `l` 正握着 `self.live` 的可变借用
+                        // Careful: `self.now()` cannot be used here (it borrows all of self), while
+                        // `l` is holding a mutable borrow of `self.live`.
                         let at = self.started.elapsed().as_secs_f32();
                         if !l.reasoning_live {
                             l.reasoning_live = true;
@@ -614,15 +694,16 @@ impl App {
                         if l.reasoning.len() < 120_000 {
                             l.reasoning.push_str(&d);
                         }
-                        // 推理也计入输出：服务端的 completion_tokens 本来就含它，
-                        // 只数正文会明显偏低
+                        // Reasoning counts as output too: the server's completion_tokens already
+                        // includes it, so counting only the body would come out noticeably low.
                         l.out.add(&d);
                         activity::lock(&self.act).model_push(&d);
                     }
                             }
                 FromAgent::ReasoningEnd => {
-                    // 思考结束不等于模型这一段结束：它可能接着吐正文、也可能去调工具，
-                    // 那两件事各自会把这一段收掉。
+                    // Reasoning ending does not mean the model's segment has ended: it may go on
+                    // to emit body text or to call a tool, and either of those closes this segment
+                    // on its own.
                     if let Some(l) = self.live.as_mut() {
                         l.reasoning_live = false;
                     }
@@ -640,29 +721,33 @@ impl App {
                     let at = self.now();
                     activity::lock(&self.act).note(
                         ActKind::Auth,
-                        &format!("请求授权 · {tool}"),
+                        &aox::tf!("Request authorization · {}", tool),
                         &args,
                         at,
                     );
                 }
-                // `ask_user` 问出来的一道选择题。与授权请求同一套路，但**不阻塞输入**
-                //（用户要能自己打字作答），所以这里不动 `input` / `can_send` 那套开关，
-                // 只把卡片挂上、状态改掉。
+                // A multiple-choice question asked via `ask_user`. Same pattern as an
+                // authorization request, but it **does not block input** (the user has to be able
+                // to type an answer), so the `input` / `can_send` switches are left alone here --
+                // only the card is hung up and the state changed.
                 FromAgent::ChoiceRequest { question, options, reply } => {
-                    self.status = "等你选择".into();
+                    self.status = aox::i18n::t("Waiting for your choice").into();
                     self.choice = Some(ChoiceCard { question: question.clone(), options });
-                    // 上一道题残留的字不能带过来：那会造成「我还没打字，框里却有内容」
+                    // Left-over text from the previous question must not be carried over: that
+                    // produces "I haven't typed anything yet, but there's text in the box"
                     self.choice_text.clear();
                     self.choice_reply = Some(reply);
-                    // 选项槽在输入框上方，用户此刻多半正看着对话末尾 —— 拉到最下面
-                    // 才看得见它。不拉的话表现是「模型问了一句，然后就没反应了」。
+                    // The option slot sits above the input box and the user is probably looking at
+                    // the end of the transcript right now -- it is only visible once you scroll to
+                    // the bottom. Without the scroll it reads as "the model asked something and then
+                    // nothing happened".
                     self.force_follow = true;
                     let at = self.now();
-                    activity::lock(&self.act).note(ActKind::Info, "等你选择", &question, at);
+                    activity::lock(&self.act).note(ActKind::Info, aox::i18n::t("Waiting for your choice"), &question, at);
                 }
                 FromAgent::Fatal(e) => {
                     self.items.push(Item::Error(e.clone()));
-                    self.note_act(ActKind::Error, "致命错误", &e);
+                    self.note_act(ActKind::Error, aox::i18n::t("Fatal error"), &e);
                     if self.live.is_some() {
                         self.finish_turn(false);
                     }
@@ -672,27 +757,31 @@ impl App {
     }
 
     fn apply_snapshot(&mut self, s: Snapshot) {
-        // 顶栏不再有「插件 N / 工具 N」的胶囊，这里只保留数据本身；
-        // 插件变动由 bridge 的事件流体现，不需要在这里再补一条。
+        // The top bar no longer has a "plugins N / tools N" chip, so only the data itself is
+        // kept here; plugin changes already show up in the bridge's event stream and don't need
+        // another entry here.
         self.plugins = s.plugins;
     }
 
-    // ─────────────────────── 历史记录 ───────────────────────
+    // ─────────────────────── history ───────────────────────
 
-    /// 重新扫描历史目录。
+    /// Rescan the history directory.
     ///
-    /// 只在「展开侧边栏」「本轮结束」「切到新对话」时做，而不是每帧 ——
-    /// 每帧扫目录会白白打断 UI 的流畅度，而历史列表本来就不需要那么新。
+    /// Done only when the sidebar opens, a turn ends, or a new conversation is started, rather
+    /// than every frame -- scanning every frame needlessly interrupts the UI's smoothness, and
+    /// the history list doesn't need to be that fresh anyway.
     fn refresh_history(&mut self) {
         let Some(store) = self.store.clone() else {
             return;
         };
         let mut items = store.list(HISTORY_LIST_LIMIT);
-        // 正在聊的这一段永远置顶。
+        // The conversation being chatted in is always pinned to the top.
         //
-        // 盘上的排序键是「最后一次说话的时间」，而刚切进来的这段对话可能三天没动过，
-        // 于是会排在很下面 —— 可人此刻要找的就是它。置顶是纯展示层的调整，
-        // 不改动文件时间，也不影响 `list()` 给 CLI 的顺序。
+        // The on-disk sort key is "time of the last utterance", and the conversation just
+        // switched into may not have been touched for three days, so it lands far down the
+        // list -- yet that is the one the user is looking for right now. Pinning is a purely
+        // presentational adjustment: it doesn't touch file times and doesn't affect the order
+        // `list()` gives the CLI.
         if let Some(cur) = self.current_history.as_deref() {
             if let Some(i) = items.iter().position(|s| s.id == cur) {
                 let it = items.remove(i);
@@ -702,11 +791,12 @@ impl App {
         self.history = items;
     }
 
-    /// 切换到某段历史对话。
+    /// Switch to a history conversation.
     ///
-    /// 只发请求就返回：真正换上下文发生在 Agent 那个线程里，等
-    /// `FromAgent::Switched` 回来再动界面 —— 这样「切换失败」时界面不会
-    /// 抢先跳过去，留下「界面在这段、模型在那段」的错位。
+    /// Send the request and return: the actual context swap happens on the agent thread, and
+    /// the UI only moves once `FromAgent::Switched` comes back -- that way a failed switch
+    /// doesn't have the UI jump ahead and leave the UI on one conversation while the model is
+    /// on another.
     fn switch_history(&mut self, id: &str) {
         if self.busy || self.switching || Some(id) == self.current_history.as_deref() {
             return;
@@ -715,10 +805,11 @@ impl App {
         let _ = self.tx.send(ToAgent::Resume(id.to_string()));
     }
 
-    /// 开一段新对话。
+    /// Start a new conversation.
     ///
-    /// 旧对话**不需要任何收尾动作**：它是边聊边追加的，此刻已经完整地躺在
-    /// `history/` 里了。所以这里只是让 Agent 松手，界面跟着清空。
+    /// The old conversation **needs no wrap-up at all**: it was appended to as we chatted, so
+    /// it already sits complete in `history/`. So all this does is let go on the agent side,
+    /// with the UI clearing along with it.
     fn new_conversation(&mut self) {
         if self.busy || self.switching || (self.current_history.is_none() && self.items.is_empty()) {
             return;
@@ -727,10 +818,12 @@ impl App {
         let _ = self.tx.send(ToAgent::NewConversation);
     }
 
-    /// 把界面切到 `id` 那段对话（`None` = 全新的空对话）。
+    /// Move the UI to the conversation with id `id` (`None` = a brand-new empty one).
     ///
-    /// 内容自己读盘重建，而不是让 Agent 把消息发过来：历史文件本来就在本地，
-    /// 通道里只传 id 能让职责更干净（Agent 管上下文，界面管展示）。
+    /// The content is rebuilt by reading the disk directly rather than having the agent send
+    /// the messages over: the history file is local anyway, and passing only the id down the
+    /// channel keeps the responsibilities cleaner (the agent owns context, the UI owns
+    /// presentation).
     fn adopt_conversation(&mut self, id: Option<&str>) {
         self.items = match (id, self.store.as_ref()) {
             (Some(id), Some(store)) => store
@@ -739,29 +832,35 @@ impl App {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-        // 上一段对话的进行中状态与活动流一起换掉，否则右侧会一边显示新对话，
-        // 一边滚着旧对话的工具调用。
+        // Swap out the previous conversation's in-progress state along with the activity
+        // stream, otherwise the right side would show the new conversation while scrolling the
+        // old conversation's tool calls.
         self.live = None;
         self.waiting_auth = false;
         self.auth = None;
         self.auth_reply = None;
-        // 选项槽跟着一起收。**回执通道丢掉就够了**：对端 `rx.await` 会立刻报错，
-        // 而 `GuiUi::choose` 把「通道断了」映射成 `Cancelled`（见 bridge 里那条注释）——
-        // 于是 agent 线程不会卡在一个永远等不到答案的 `choose()` 上。
+        // The option slot is folded away too. **Dropping the reply channel is enough**: the
+        // peer's `rx.await` errors out immediately, and `GuiUi::choose` maps "channel closed" to
+        // `Cancelled` (see the comment in bridge) -- so the agent thread doesn't get stuck in a
+        // `choose()` that will never see an answer.
         self.choice = None;
         self.choice_reply = None;
-        // 用量账本跟消息、活动流一起换掉：Agent 那边也把账重新接回来了，
-        // 紧接着的 `UsageLog` 会把这一段对话的记录送过来。
+        // The usage ledger is swapped along with the messages and the activity stream: the
+        // agent side has read its ledger back too, and the `UsageLog` that follows will send
+        // this conversation's records over.
         self.usage_log.clear();
-        // 活动流同样换掉。它和消息躺在**同一个文件**里，所以「打开这段对话」
-        // 就该看到它当时的那条时间轴；新建对话则清空。
+        // The activity stream is swapped too. It lives in the **same file** as the messages, so
+        // "open this conversation" should show the timeline as it was then; a new conversation
+        // clears it.
         //
-        // 记录先取好再上锁：读存储要走 `self.store`，而锁守卫会长期持有 `self.act`。
+        // Fetch the records before taking the lock: reading the store goes through `self.store`,
+        // while the lock guard holds `self.act` for a long time.
         let rows = match (id, self.store.as_ref()) {
             (Some(id), Some(store)) => store.load_acts(id),
             _ => Vec::new(),
         };
-        // `now` 先算好再上锁：`self.now()` 借整个 `self`，读起来容易和锁守卫纠缠。
+        // Compute `now` before taking the lock: `self.now()` borrows all of `self`, which
+        // tangles easily with the lock guard.
         let now = self.now();
         let mut act = activity::lock(&self.act);
         match id {
@@ -773,35 +872,42 @@ impl App {
         self.force_follow = true;
     }
 
-    /// 从左上按钮**向下滑出**的历史浮层（会话切换器）。
+    /// The history overlay (a conversation switcher) that **slides down** from the top-left
+    /// button.
     ///
-    /// 它顶替了原先那条 `SidePanel::left`：内容照搬侧边栏（标题 / 刷新 / 分隔线 /
-    /// 列表 / 空状态），外壳从「布局里的一条栏」换成「浮在对话之上的一层」。
+    /// It replaces what used to be a `SidePanel::left`: the content is lifted from the sidebar
+    /// (title / refresh / separator / list / empty state) while the shell changes from "a column
+    /// in the layout" to "a layer floating above the transcript".
     ///
-    /// # 滑出是怎么做出来的
+    /// # How the slide-out is done
     ///
-    /// 两块拼起来 —— **位置**（整块内容从「目标位置 − 自身高度」滑到目标位置）
-    /// 加上**裁剪**（可视区钉在目标位置上沿）。只做位移的话，面板会先在按钮
-    /// **脸上**冒出来再往下走；有了裁剪，它就是从按钮下沿一点点长出来的。
+    /// Two pieces bolted together -- **position** (the whole block travels from "target
+    /// position - its own height" to the target position) plus **clipping** (the visible region
+    /// pinned to the target position's top edge). With translation alone the panel would first
+    /// pop out **over the button's face** and then travel down; with clipping it grows out of
+    /// the button's bottom edge bit by bit.
     ///
-    /// `Ui::set_clip_rect` 顺带把交互也管住了：egui 给控件的 `interact_rect` 正是
-    /// `clip_rect ∩ rect`，被裁掉的那半截点不到。否则滑出途中鼠标扫过「还没长出来」
-    /// 的区域也会命中一行，凭空切走一段对话。
+    /// `Ui::set_clip_rect` takes care of interaction along the way: the `interact_rect` egui
+    /// gives a widget is exactly `clip_rect ∩ rect`, so the clipped-away half can't be clicked.
+    /// Without it, the mouse sweeping over the "not grown out yet" region during the slide-out
+    /// would still hit a row and switch conversations out of nowhere.
     fn history_overlay(&mut self, ctx: &egui::Context) {
         if self.hist_t <= 0.0 {
             return;
         }
         let ease = ease_out_cubic(self.hist_t);
-        // 切换请求在飞行中、或正在跑任务时不接受点击：这两段时间里发起切换，
-        // 结果会排在后面才生效，点的人只会看到界面「迟疑一下才跳」。
+        // Clicks are refused while a switch request is in flight or a turn is running: a switch
+        // started during either of those takes effect only later in the queue, and all the
+        // clicker sees is the UI "hesitating before it jumps".
         let locked = self.busy || self.switching;
 
-        // 与左上那枚按钮同一条左边线；顶边 = 按钮下沿 + 8。
+        // Same left edge as the top-left button; top edge = the button's bottom edge + 8.
         let x = BAR_LEFT;
         let top = BAR_TOP + BAR_BTN + 8.0;
         let w = HISTORY_W;
-        // 面板高度由内容（有几条记录）定，这里只封顶：超过窗口下沿就会被窗口边界
-        // 硬切一刀。留 22px 给底部的圆角与阴影。
+        // The panel height is set by the content (how many records there are); this only caps
+        // it, since going past the window's lower edge gets sliced off hard by the window
+        // boundary. 22px is left for the bottom corner radius and the shadow.
         let max_h = (ctx.content_rect().bottom() - top - 22.0).clamp(150.0, 620.0);
         let slide = -(1.0 - ease) * self.hist_h;
 
@@ -811,12 +917,14 @@ impl App {
         let area = egui::Area::new(egui::Id::new("aox-history"))
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(x, top + slide))
-            // 滑出途中位置在目标位置**上方**（`top + slide` 会跑到按钮上面去），
-            // 而 Area 默认会把越界的位置拉回屏幕内 —— 位移当场被抹平、动画失效。
-            // 这里放开约束：位置说了算。
+            // Mid-slide the position is **above** the target (`top + slide` ends up over the
+            // button), and an Area pulls out-of-bounds positions back on screen by default --
+            // which flattens the offset on the spot and kills the animation. So the constraint is
+            // released here: the position is in charge.
             .constrain_to(loose_rect())
             .show(ctx, |ui| {
-                // 可视区比面板四周各松一圈，免得把圆角描边和投影切出硬边。
+                // The visible region is loosened a ring beyond the panel on each side, so the
+                // corner stroke and the shadow don't get cut into hard edges.
                 ui.set_clip_rect(Rect::from_min_max(
                     Pos2::new(x - 26.0, top - 2.0),
                     Pos2::new(x + w + 26.0, top + max_h + 30.0),
@@ -837,9 +945,9 @@ impl App {
                         let pw = ui.available_width();
 
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("历史记录").color(P::text_dim()).size(13.0));
+                            ui.label(RichText::new(aox::i18n::t("History")).color(P::text_dim()).size(13.0));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if flat_button(ui, "刷新").clicked() {
+                                if flat_button(ui, aox::i18n::t("Refresh")).clicked() {
                                     want_refresh = true;
                                 }
                             });
@@ -856,14 +964,14 @@ impl App {
                         if self.history.is_empty() {
                             ui.label(
                                 RichText::new(
-                                    "还没有历史记录。\n发出第一条指令后，这段对话会自动保存到这里。",
+                                    aox::i18n::t("No history yet.\nAfter your first message, the conversation is saved here automatically."),
                                 )
                                 .color(P::text_faint())
                                 .size(13.0),
                             );
                             ui.add_space(10.0);
-                            // 目录路径可能很长，用 truncate 让它自己在面板宽度内收口，
-                            // 而不是靠面板边界去切。
+                            // A directory path can be long; use truncate so it closes itself off
+                            // within the panel width instead of being cut by the panel boundary.
                             ui.add(
                                 Label::new(
                                     RichText::new(
@@ -880,13 +988,16 @@ impl App {
                             return;
                         }
 
-                        // 高度**贴合内容**（`auto_shrink` 的第二个分量），只封一个上限：
-                        // 记录少的时候面板就矮，最后一条下面不会拖着一片空。
+                        // Height **hugs the content** (the second component of `auto_shrink`), with
+                        // only an upper cap: with few records the panel is short, and no empty
+                        // stretch trails below the last row.
                         //
-                        // ⚠️ 别改成「按条数算高度」（`rows × 行高`）。上一版就是那么写的，
-                        // 但那个乘积只是**行本身**的高度，滚动区还会另算自己的边距 ——
-                        // 估出来的数对不上面板实际的长相，一条记录的面板底下会多出
-                        // 二十几个逻辑像素的空白（截图比对才看出来）。
+                        // ⚠️ Don't change this to "height from the row count" (`rows * row
+                        // height`). The previous version did exactly that, but that product is the
+                        // height of **the rows alone**, while the scroll area computes its own
+                        // margins on top -- the estimate doesn't match what the panel really looks
+                        // like, and a one-record panel ends up with twenty-odd logical pixels of
+                        // blank underneath it (only a screenshot comparison showed it).
                         ScrollArea::vertical()
                             .max_height((max_h - HIST_HEAD).max(60.0))
                             .auto_shrink([false, true])
@@ -902,11 +1013,13 @@ impl App {
                     });
             });
         let panel = area.response.rect;
-        // 记下这一帧的实际高度 —— 下一帧的滑入距离就是它（见字段 `hist_h`）。
-        // 这里**不**按 `hist_t` 判断：位置偏移不影响 `rect` 的高度，随时记都是准的。
+        // Record this frame's actual height -- that is next frame's slide-in distance (see the
+        // `hist_h` field). This is **not** gated on `hist_t`: the position offset doesn't affect
+        // the `rect`'s height, so recording it at any time is accurate.
         self.hist_h = panel.height().max(96.0);
 
-        // 点面板外面、或按 Esc → 收起。按钮自己那一下不算「外面」（见 `bar_hist_rect`）。
+        // Clicking outside the panel, or pressing Esc, collapses it. The button's own click
+        // doesn't count as "outside" (see `bar_hist_rect`).
         let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let clicked_outside = ctx.input(|i| {
             i.pointer.any_pressed()
@@ -927,21 +1040,24 @@ impl App {
     }
 
     fn on_event(&mut self, ev: AgentEvent) {
-        // 活动流只记「一轮任务怎么跑的」：不在任务里的事件（切换对话、致命错误之后
-        // 残留的尾巴……）一律不进时间轴。
+        // The activity stream records only "how a turn ran": events outside a turn (switching
+        // conversations, the tail left behind after a fatal error, ...) never go on the
+        // timeline.
         let live = self.live.is_some();
         match ev {
             AgentEvent::AssistantText(t) => {
                 match self.live.as_mut() {
                     Some(l) => {
                         let at = self.started.elapsed().as_secs_f32();
-                        // 模型开始吐正文 = 「模型」那一段开始（若还没开）
+                        // The model starting to emit body text = the "model" segment starts (if it
+                        // hasn't already)
                         activity::lock(&self.act).model_begin(at);
                         if let Some(prev) = l.pending_final.replace(t.clone()) {
                             l.interim.push(prev);
                         }
-                        // 增量已经吐完 ⇒ 拿权威文本对齐一次：打字过程中万一丢帧，
-                        // 屏幕上的字会与真文本差几个字，最后一刻必须抹平。
+                        // The deltas are done, so reconcile against the authoritative text once: if a
+                        // frame is dropped while typing, the characters on screen end up a few off the
+                        // real text, and that has to be smoothed out at the very end.
                         l.streaming = t;
                     }
                     None => self.items.push(Item::Assistant(t)),
@@ -951,11 +1067,13 @@ impl App {
                 if let Some(l) = self.live.as_mut() {
                     let at = self.started.elapsed().as_secs_f32();
                     activity::lock(&self.act).model_begin(at);
-                    // 阶段说明到此定稿：收进 `interim`（它会留在实时区，并在结束后进过程卡片），
-                    // `streaming` 清空 —— 下一段正文从新的一行重新开始打。
+                    // The stage note is final here: it goes into `interim` (which stays in the live
+                    // area and ends up in the process card afterwards) and `streaming` is cleared --
+                    // the next stretch of body text starts typing from a fresh line.
                     l.streaming.clear();
                     l.interim.push(t);
-                    // 记下「这句话之前跑了几步」：实时区据此把它前面那段调用单独画成一张卡。
+                    // Record "how many steps ran before this sentence": the live area uses it to
+                    // draw the preceding calls as their own card.
                     l.cuts.push(l.steps.len());
                 }
             }
@@ -971,8 +1089,9 @@ impl App {
                     });
                 }
                 if live {
-                    // 活动流上只开一段色块：调用 → 执行 → 返回 是同一件事，
-                    // 拆成三条就看不出「这一步到底花了多久」。
+                    // Only one bar is opened on the activity stream: call -> execute -> return is a
+                    // single thing, and splitting it into three makes it impossible to see how long
+                    // the step actually took.
                     activity::lock(&self.act).tool_begin(
                         &name,
                         plugin.as_deref().filter(|p| *p != "meta"),
@@ -982,9 +1101,9 @@ impl App {
                 }
             }
             AgentEvent::ToolRunning { name, timeout_secs } => {
-                self.status = format!("执行 {name}");
+                self.status = aox::tf!("Running {}", name);
                 if live {
-                    activity::lock(&self.act).tool_note(&format!("超时上限 {timeout_secs}s"));
+                    activity::lock(&self.act).tool_note(&aox::tf!("Timeout limit {}s", timeout_secs));
                 }
             }
             AgentEvent::ToolResult { name, is_error, preview } => {
@@ -1000,29 +1119,30 @@ impl App {
                 }
             }
             AgentEvent::Info(m) => {
-                self.note_act(ActKind::Info, "信息", &m);
+                self.note_act(ActKind::Info, aox::i18n::t("Info"), &m);
                 if self.live.is_none() {
                     self.items.push(Item::Note(NoteKind::Info, m));
                 }
             }
             AgentEvent::Warn(m) => {
-                self.note_act(ActKind::Warn, "警告", &m);
+                self.note_act(ActKind::Warn, aox::i18n::t("Warning"), &m);
                 if self.live.is_none() {
                     self.items.push(Item::Note(NoteKind::Warn, m));
                 }
             }
             AgentEvent::Images(paths) => {
-                // 工具产出的图片：**当场画出来**。
+                // Images produced by a tool: **drawn right here**.
                 //
-                // 在此之前这套流程有个说不通的结局：模型说「图出来了，直接看上面那张」，
-                // 而人这边什么都没有 —— 图进的是**发给模型的那条请求**，界面只把随行的
-                // 那句话画成了一个小圆点。于是模型看得见、人看不见，而两种前端里
-                // 只有图形界面有这个问题。
+                // Before this, the flow had an ending that made no sense: the model would say "the
+                // image is ready, just look at the one above", and on the human side there was
+                // nothing -- the image went into **the request sent to the model**, and the UI only
+                // drew the accompanying sentence as a tiny dot. So the model could see it and the
+                // person couldn't; of the two front ends, only the graphical one had this problem.
                 self.items.push(Item::Images(paths));
                 self.force_follow = true;
             }
             AgentEvent::Error(m) => {
-                self.note_act(ActKind::Error, "错误", &m);
+                self.note_act(ActKind::Error, aox::i18n::t("Error"), &m);
                 if self.live.is_none() {
                     self.items.push(Item::Note(NoteKind::Error, m));
                 }
@@ -1030,20 +1150,21 @@ impl App {
         }
     }
 
-    /// 一轮结束：把过程折叠成一行，再把最终答复贴到下面。
+    /// A turn ends: collapse the process into one row, then paste the final answer beneath it.
     fn finish_turn(&mut self, aborted: bool) {
         self.busy = false;
         self.waiting_auth = false;
         self.auth = None;
         self.auth_reply = None;
-        // 一轮结束时理论上不会有挂着的选项槽（模型已经往下走了）。真有就是界面自己
-        // 没清干净 —— 那也一起丢掉：此刻对端已经不在等（那一轮的 `choose()` 早返回了），
-        // `tx.send` 会静默失败。留着它反而危险：下一次 `ChoiceRequest` 之前若有人
-        // 调 `answer_choice`，那一下会打到一个已经没人听的通道上，而界面看起来像
-        // 「我点了、但它没反应」。
+        // At the end of a turn there shouldn't be an option slot hanging around (the model has
+        // moved on). If there is, the UI failed to clean up -- so drop it too: the peer isn't
+        // waiting any more (that turn's `choose()` returned long ago) and `tx.send` fails
+        // silently. Keeping it is actually dangerous: if someone calls `answer_choice` before the
+        // next `ChoiceRequest`, that lands on a channel nobody is listening to, and the UI looks
+        // like "I clicked it and nothing happened".
         self.choice = None;
         self.choice_reply = None;
-        self.status = "就绪".into();
+        self.status = aox::i18n::t("Ready").into();
         let Some(l) = self.live.take() else { return };
         let elapsed = l.started.elapsed().as_secs_f32();
 
@@ -1063,15 +1184,17 @@ impl App {
         let at = self.now();
         let pending = {
             let mut act = activity::lock(&self.act);
-            // 一轮结束：把所有还开着的段收掉（不留下一条永远在长、越拖越长的色块）
+            // A turn ends: close every segment still open (don't leave a bar that keeps growing
+            // forever, longer and longer).
             act.end_round(at);
             if aborted {
-                act.note(ActKind::Warn, "任务中断", &format!("已执行 {elapsed:.1}s"), at);
+                act.note(ActKind::Warn, aox::i18n::t("Task interrupted"), &aox::tf!("Ran for {}s", format!("{elapsed:.1}")), at);
             }
-            // 收完就取走这一轮新增的记录，交给 Agent 线程写进**这段对话的文件**。
-            // 交给它而不是界面自己开文件：句柄在它手里，而且「新建对话 / 中断回滚」
-            // 也在那个线程里发生；这条消息排在队尾，所以顺序天然是对的 ——
-            // 不会串到下一段对话里去。
+            // Once closed, take this turn's new records and hand them to the agent thread to
+            // write into **this conversation's file**. Hand them over rather than opening the file
+            // from the UI: the handle is on the agent side, and "new conversation / rollback on
+            // interrupt" also happens on that thread; this message goes to the back of the queue,
+            // so the ordering is naturally right -- it can't leak into the next conversation.
             act.export_acts()
         };
         if !pending.is_empty() {
@@ -1080,15 +1203,17 @@ impl App {
         self.force_follow = true;
     }
 
-    // ── 输入区 / 键盘 ──
+    // ── input area / keyboard ──
 
-    /// 收下这一帧拖进窗口的文件。
+    /// Take the files dropped into the window this frame.
     ///
-    /// **整个窗口任意位置都接**（用户 2026-10-05 明确要求）—— 所以从 `ctx` 上取，
-    /// 而不是挂在某个控件上：挂控件就只有那一小块热区生效，其余地方拖进来毫无反应。
+    /// **Anywhere in the window accepts them** (explicit user request, 2026-10-05) -- hence
+    /// reading from `ctx` rather than hanging it off a widget: hanging it off a widget means
+    /// only that one small hot zone works, and dropping anywhere else does nothing at all.
     ///
-    /// egui 每帧把「这一帧落下的文件」报一次（`dropped_files`），读完即走，
-    /// 不会重复计数；`hovered_files` 用来把输入卡片描边提亮一档。
+    /// egui reports "files dropped this frame" once per frame (`dropped_files`); reading it
+    /// drains it, so nothing is double-counted. `hovered_files` is what brightens the input
+    /// card's border by one step.
     fn take_dropped(&mut self, ctx: &egui::Context) {
         let (dropped, hovering) = ctx.input(|i| (i.raw.dropped_files.clone(), !i.raw.hovered_files.is_empty()));
         self.dragging_files = hovering;
@@ -1096,42 +1221,51 @@ impl App {
             return;
         }
         for f in dropped {
-            // 没有本机路径的（某些平台拖的是内存里的数据）只能放弃 —— 附件是按路径读的
+            // Ones with no local path (some platforms drag in-memory data) have to be given up --
+            // attachments are read by path
             let Some(path) = f.path else {
                 self.items.push(Item::Note(
                     NoteKind::Warn,
-                    format!("拖入的「{}」没有本机路径，无法作为附件。", f.name),
+                    aox::tf!("Dropped \"{}\" has no local path and cannot be used as an attachment.", f.name),
                 ));
                 continue;
             };
             match aox::attach::Attachment::probe(&path) {
-                // 同一个文件拖两次 = 一个附件（不要出现两枚一模一样的胶囊）
+                // The same file dropped twice = one attachment (don't show two identical chips)
                 Ok(a) if self.pending.iter().any(|p| p.path == a.path) => {}
                 Ok(a) => self.pending.push(a),
-                // 拦下来的理由照实说（目录 / 读不到 / 图片超过 32 MiB），别只说「失败」
+                // State the real reason it was rejected (directory / unreadable / image over
+                // 32 MiB), don't just say "failed"
                 Err(e) => self.items.push(Item::Note(NoteKind::Warn, e)),
             }
         }
     }
 
-    /// 待上传栏 —— 输入卡片**上方**那一排小胶囊，每个附件一枚。
+    /// The pending-upload bar -- the row of small chips **above** the input card, one per
+    /// attachment.
     ///
-    /// 名字过长**中间省略**（`很长的名字…截图.png`）：后缀是这条信息里最有用的一位
-    /// （一眼分得出是图还是文档），所以砍中间、留住尾巴；路径一律不显示 ——
-    /// 一个 `E:\…\…\…` 的前缀会把胶囊撑爆，而用户自己清楚它是从哪拖来的。
-    /// 输入框上方那排可点选项（模型用 `ask_user` 问出来的）。
+    /// Over-long names are **elided in the middle** (`a very long name...shot.png`): the
+    /// extension is the single most useful bit here (one glance tells you image or document), so
+    /// cut the middle and keep the tail. Paths are never shown -- an `E:\...\...\...` prefix
+    /// would blow the chip apart, and the user knows where they dragged it from.
+    /// The row of clickable options above the input box (asked by the model via `ask_user`).
     ///
-    /// 与「待上传栏」同一处、同一套语言（小圆角块 + 细描边），因为它们回答的是同一类
-    /// 问题：「用户现在要给我什么」。区别只在于一个给的是文件，一个给的是决定。
+    /// Same place and same language as the pending-upload bar (small rounded blocks + a thin
+    /// stroke), because they answer the same class of question: "what is the user about to give
+    /// me". The only difference is that one gives files and the other gives a decision.
     ///
-    /// **竖排**：A / B / C … 一行一个，最后一个永远是「自己输入」。
-    /// 第一版是横排，实机一测就露馅：选项一多，最后一个被挤成 28px 宽的竖条
-    ///（文字一个字一行），而且**点上去没反应** —— 命中区跟着被压缩的内容变了形，
-    /// 画出来的那块与能点的那块对不上（用户 2026-10-06 两个问题一起报的）。
-    /// 竖排还顺带解决了「一眼扫完」：选项本来就是读一个选一个，横排反而要左右找。
+    /// **Vertical**: A / B / C ... one per row, and the last one is always "type your own".
+    /// The first version was horizontal, and one run on real hardware gave it away: with many
+    /// options the last one got squashed into a 28px-wide sliver (one character per line) and
+    /// **clicking it did nothing** -- the hit zone deformed along with the squashed content, so
+    /// what was drawn and what could be clicked no longer matched (the user reported both
+    /// problems together on 2026-10-06).
+    /// Vertical also settles "read it in one sweep": you read an option and pick it, whereas
+    /// horizontal makes you hunt left and right.
     fn choice_bar(&mut self, ui: &mut Ui) {
-        // 克隆一份而不是借着 `self.choice` 画：最后那一行要用 `&mut self.choice_text`，
-        // 与「读题目和选项」是同一个 self 的两处借用 —— 结构体很小，克隆最省事。
+        // Clone rather than drawing through `self.choice`: the last row needs
+        // `&mut self.choice_text`, which together with "read the question and options" is two
+        // borrows of the same self -- the struct is tiny, so cloning is the least trouble.
         let Some(card) = self.choice.clone() else { return };
         let mut picked: Option<usize> = None;
         let mut typed: Option<String> = None;
@@ -1145,7 +1279,8 @@ impl App {
             .show(ui, |ui| {
                 let w = ui.available_width();
                 ui.set_width(w);
-                // 问题原文照搬：改写了就不再是模型问的那句，而用户要回答的正是它
+                // The question is copied verbatim: rewording it means it is no longer what the
+                // model asked, and that is precisely what the user has to answer
                 ui.label(RichText::new(&card.question).color(P::text()).size(14.5));
                 ui.add_space(9.0);
                 ui.vertical(|ui| {
@@ -1155,8 +1290,9 @@ impl App {
                             picked = Some(i);
                         }
                     }
-                    // 最后一行是**输入框本身**（见 `ask_input_row`）：作答的地方就在
-                    // 题目旁边，眼睛不用在上下两个框之间来回跑。
+                    // The last row is **the input box itself** (see `ask_input_row`): the place to
+                    // answer is right beside the question, so the eyes don't have to run back and
+                    // forth between two boxes.
                     typed = ask_input_row(ui, w, &mut self.choice_text);
                 });
             });
@@ -1184,22 +1320,25 @@ impl App {
             }
         });
 
-        // 挂的是图片、而当前模型多半不支持视觉时，给一句**能忽略**的提示。
+        // When an image is attached and the current model probably has no vision, give a hint
+        // that **can be ignored**.
         //
-        // 刻意不拦：用户要的是「照发，由端点报错、模型转述」（见 `attach` 模块文档）。
-        // 这句话只是把「等一会儿会莫名其妙收到一个 400」提前成「现在就能看出来」。
+        // Deliberately not blocked: what the user wants is "send it anyway, let the endpoint
+        // error and the model relay that" (see the `attach` module docs). This sentence only
+        // moves "you'll mysteriously get a 400 in a while" forward to "you can see it right
+        // now".
         if self.pending.iter().any(|a| a.kind.is_some()) && !self.model.to_ascii_lowercase().contains("flash") {
             ui.add_space(5.0);
             ui.label(
-                RichText::new(format!(
-                    "当前模型 {}：DeepSeek 侧只有 deepseek-flash 支持图片输入（照发也行，端点会报错）。",
+                RichText::new(aox::tf!(
+                    "Current model {}: on the DeepSeek side only deepseek-flash supports image input (sending it anyway is fine; the endpoint will report an error).",
                     self.model
                 ))
                 .color(P::warn())
                 .size(12.5),
             );
         }
-        // 删要等循环走完：`iter()` 还借着 `self.pending`
+        // Deletion waits until the loop is done: `iter()` still borrows `self.pending`
         if let Some(i) = remove {
             self.pending.remove(i);
         }
@@ -1212,11 +1351,14 @@ impl App {
         }
         let text = self.input.trim().to_string();
 
-        // ── 有选项槽挂着：这一句是对那道题的**作答**，不是新一轮任务 ──
+        // ── an option slot is up: this sentence is the **answer** to that question, not a new
+        // turn ──
         //
-        // 不说清这一点会很难查：用户打了字按发送，而 agent 线程此刻正阻塞在
-        // `choose()` 上 —— 那条 `Input` 只会排在通道里，表现就是「我打字了它不理我，
-        // 选项槽还挂在那儿」。作答之后输入框清空、选项槽收起，那一轮接着往下走。
+        // Getting this wrong is hard to debug: the user types and hits send while the agent
+        // thread is blocked in `choose()` -- the `Input` just queues up in the channel and it
+        // looks like "I typed and it ignored me, and the option slot is still sitting there".
+        // After answering, the input box clears and the option slot folds away, and that turn
+        // carries on.
         if self.choice.is_some() {
             if !text.is_empty() {
                 self.input.clear();
@@ -1225,7 +1367,8 @@ impl App {
             return;
         }
 
-        // 只有附件、没有文字也算一条消息 —— 拖一张图进来直接回车是最常见的用法。
+        // Attachments with no text still count as a message -- dragging an image in and hitting
+        // enter is the most common usage.
         if (text.is_empty() && self.pending.is_empty()) || self.busy || self.waiting_auth {
             return;
         }
@@ -1234,17 +1377,19 @@ impl App {
         }
         let files: Vec<PathBuf> = self.pending.iter().map(|a| a.path.clone()).collect();
         let names: Vec<String> = self.pending.iter().map(|a| a.name.clone()).collect();
-        // 时间轴上只记「发了几个附件」：那是给人扫一眼的流水账，不是文件清单
-        //（附件的真实记录在对话文件里，见 `attach::to_content` 的路径清单）。
+        // The timeline records only "how many attachments were sent": that is a glanceable
+        // ledger, not a file listing (the real record of attachments is in the conversation
+        // file, see the path list in `attach::to_content`).
         let label = if names.is_empty() {
             text.clone()
         } else if text.is_empty() {
-            format!("（{} 个附件）", names.len())
+            aox::tf!("({} attachments)", names.len())
         } else {
-            format!("{text}（{} 个附件）", names.len())
+            aox::tf!("{} ({} attachments)", text, names.len())
         };
         self.items.push(Item::User(text.clone(), names));
-        // 自己拖进来的图**当场**显示，不等宿主那条回执绕一圈回来。
+        // Images dragged in by the user are shown **on the spot**, without waiting for the
+        // host's acknowledgement to make a round trip.
         let shown: Vec<PathBuf> = files.iter().filter(|p| looks_like_image(p)).cloned().collect();
         if !shown.is_empty() {
             self.items.push(Item::Images(shown));
@@ -1252,7 +1397,7 @@ impl App {
         self.input.clear();
         self.pending.clear();
         self.force_follow = true;
-        // 开一轮：时间轴上最上面那条「输入」从这一刻起
+        // Open a turn: the top "input" row on the timeline starts from this moment
         activity::lock(&self.act).round_begin(&label, self.now());
         let _ = self.tx.send(ToAgent::Input(text, files));
     }
@@ -1260,35 +1405,37 @@ impl App {
     fn stop(&mut self) {
         if self.busy {
             self.flags.request_abort();
-            self.status = "正在中断…".into();
+            self.status = aox::i18n::t("Interrupting…").into();
         }
     }
 
-    /// 把用户的回答交回 agent 线程，并收起选项槽。
+    /// Hand the user's answer back to the agent thread and fold the option slot away.
     ///
-    /// 这是**唯一**一处把 `ChoiceReply` 送出去的地方：三条作答路径（点选项、
-    /// 打字发送、以后若加的快捷键）都走它，才不会出现「某条路上忘了回执，
-    /// 于是模型永远等下去」。
+    /// This is the **only** place that sends a `ChoiceReply`: all three answering paths
+    /// (clicking an option, typing and sending, and any hotkey added later) go through it, so
+    /// there can be no "one path forgot the reply and the model waits forever".
     fn answer_choice(&mut self, reply: ChoiceReply) {
         if let Some(tx) = self.choice_reply.take() {
             let _ = tx.send(reply);
         }
         self.choice = None;
         self.choice_text.clear();
-        // 刚作答完，那一轮还在跑（模型要接着做）—— 状态回到「思考中」，
-        // 而不是留在「等你选择」上让人以为还在等他。
-        self.status = "思考中".into();
+        // The answer was just given and that turn is still running (the model has more to do),
+        // so the state goes back to "thinking" rather than staying on "waiting for you" and
+        // making it look like it is still waiting.
+        self.status = aox::i18n::t("Thinking").into();
     }
 
-    /// 图片解码的收尾与排队：每帧一次。
+    /// Finishing and queueing image decoding: once per frame.
     ///
-    /// 排在这里而不是「创建 Item 的那一刻」有两个原因：
-    /// ① Item 有两个来源（历史回放与实时事件），而 `items_from_history` 是个不用
-    ///    `self` 的自由函数，两边各排一次就是把同一件事写两遍；
-    /// ② 扫一遍是**幂等**的 —— 已经有条目的路径不会重复排队，于是不需要「在哪一步
-    ///    之后必须记得调一次」这种约定。
+    /// It lives here rather than "at the moment an Item is created" for two reasons:
+    /// (1) Items come from two sources (history replay and live events) and
+    ///     `items_from_history` is a free function with no `self`, so queueing on both sides
+    ///     would mean writing the same thing twice;
+    /// (2) one sweep is **idempotent** -- a path that already has an entry isn't queued again,
+    ///     so no convention like "remember to call this after step X" is needed.
     fn poll_images(&mut self, ctx: &egui::Context) {
-        // ① 收：解码完的挂成纹理（`try_recv` 不会阻塞界面）
+        // ① Collect: finished decodes become textures (`try_recv` doesn't block the UI)
         let done: Vec<(PathBuf, Result<aox::image::Bitmap, String>)> = self
             .tex
             .iter_mut()
@@ -1299,70 +1446,82 @@ impl App {
             .collect();
         for (p, r) in done {
             let entry = match r {
-                // 上传参数统一在 `crate::tex` 里（那里还写了为什么这些参数错了不会报错）
+                // Upload parameters live in one place, `crate::tex` (which also spells out why
+                // getting them wrong doesn't raise an error)
                 Ok(bm) => Tex::Ready(crate::tex::upload(
                     ctx,
-                    // 纹理名只用文件名：它只是调试时的标识，而整条路径又长又含反斜杠
+                    // The texture name uses only the file name: it is a debugging label, and a
+                    // whole path is long and full of backslashes
                     format!("aox-img:{}", p.file_name().unwrap_or_default().to_string_lossy()),
                     &bm,
                 )),
-                // 失败也缓存：否则每帧都会为同一张坏图重开一次解码线程
+                // Failures are cached too: otherwise every frame would spin up another decode
+                // thread for the same broken image
                 Err(e) => Tex::Failed(e),
             };
             self.tex.insert(p, entry);
         }
 
-        // ② 排：还没排过的进队列
+        // ② Queue: ones not yet queued go into the queue
         let mut want: Vec<PathBuf> = Vec::new();
         for it in &self.items {
             if let Item::Images(paths) = it {
                 for p in paths {
-                    // 去重（同一张图可能在一条消息里被列两次），且只挑「像图片」的
+                    // Deduplicate (the same image can be listed twice in one message), and pick
+                    // only the ones that look like images
                     if looks_like_image(p) && !self.tex.contains_key(p) && !want.contains(p) {
                         want.push(p.clone());
                     }
                 }
             }
         }
-        // 一帧最多起 4 条解码线程：一屏二十张图不该一次起二十个线程、更不该同时
-        // 摊开二十份解码后的像素（那可能上 GB）。剩下的下一帧接着排 —— 这不影响
-        // 观感，因为用户本来就一次只看一两张。
+        // At most 4 decode threads per frame: a screen with twenty images shouldn't spin up
+        // twenty threads at once, and even less should it unfurl twenty decoded bitmaps
+        // simultaneously (that can run to gigabytes). The rest are queued on the next frame --
+        // which costs nothing visually, since the user only looks at one or two at a time anyway.
         let queued = want.len();
         for p in want.into_iter().take(4) {
             let (tx, rx) = std::sync::mpsc::channel();
             let path = p.clone();
-            // 解码是同步的、且可能几十毫秒（GDI+ 见 `aox::image`），绝不能占着界面线程
+            // Decoding is synchronous and can take tens of milliseconds (GDI+, see `aox::image`),
+            // so it must never occupy the UI thread
             std::thread::spawn(move || {
                 let _ = tx.send(aox::image::decode(&path));
             });
             self.tex.insert(p, Tex::Loading(rx));
         }
 
-        // ③ 还有在解 / 还没排完的，就要求下一帧 —— 否则窗口安静下来之后，
-        //    那些图会永远停在「正在解码…」上（egui 只在有输入时才重绘）。
+        // ③ Anything still decoding or not yet queued asks for another frame -- otherwise, once
+        //    the window goes quiet those images sit on "decoding..." forever (egui only repaints
+        //    when there is input).
         if queued > 0 || self.tex.values().any(|t| matches!(t, Tex::Loading(_))) {
             ctx.request_repaint();
         }
     }
 
-    // ─────────────────────────── 绘制 ───────────────────────────
+    // ─────────────────────────── painting ───────────────────────────
 
-    /// 浮在对话之上的一排按钮 —— 原来的顶栏（2026-10-04 拆掉了面板本身）。
+    /// The row of buttons floating above the transcript -- the old top bar (the panel itself
+    /// was removed on 2026-10-04).
     ///
-    /// 位置逐像素照搬旧顶栏算出来的落点：左上 `(20, 7)`、右上同样内缩 20，
-    /// 配 36px 热区 ⇒ 按钮中心 y = 25 = 旧顶栏 50px 高的中线。
+    /// The positions are lifted pixel for pixel from what the old top bar worked out to:
+    /// `(20, 7)` at the top-left, 20 in from the right as well, with a 36px hot zone, so the
+    /// button centre is y = 25 = the midline of the old 50px bar.
     ///
-    /// 每枚按钮自带一块底色（[`P::panel`]，就是旧顶栏的填充色），所以它们浮在
-    /// 对话文字上也不会糊成一片。悬停时底色升一档（`surface_hi`），
-    /// 与列表行、菜单行的悬停语言一致。
+    /// Each button carries its own backdrop ([`P::panel`], which is the old top bar's fill), so
+    /// they don't smear into the transcript text behind them. Hover raises the backdrop one step
+    /// (`surface_hi`), the same hover language as list rows and menu rows.
     ///
-    /// 两处与旧顶栏不同的：
-    /// - 「新建对话」与「设置」默认**都不显示**，随历史浮层一起从历史按钮背后向右滑出；
-    /// - 状态与 token 从「顶栏左侧的一块空位」变成一枚跟着按钮走的胶囊
-    ///   （顶栏没了，它们总得有个落脚处，否则任务进度与 token 账本就无处可看）。
+    /// Two things differ from the old top bar:
+    /// - "New conversation" and "Settings" are **both hidden by default**, sliding out to the
+    ///   right from behind the history button along with the history overlay;
+    /// - status and tokens changed from "an empty spot on the left of the top bar" into a chip
+    ///   that travels with the buttons (with the bar gone they had to land somewhere, otherwise
+    ///   task progress and the token ledger would have nowhere to be seen).
     ///
-    /// **右上那三枚（活动流 / 明暗 / 关于）已全部删掉**（用户 2026-10-05 要求），
-    /// 各自搬进了设置弹窗：活动流 → 「额外」栏，明暗 → 「外观」栏，关于 → 「关于」栏。
+    /// **The three on the top-right (activity stream / theme / about) have all been removed**
+    /// (user request, 2026-10-05); each moved into the settings dialog: activity stream ->
+    /// "Extra", theme -> "Appearance", about -> "About".
     fn toolbar(&mut self, ctx: &egui::Context) {
         let mut want_new = false;
         let mut want_settings = false;
@@ -1370,23 +1529,27 @@ impl App {
         let ease = ease_out_cubic(self.hist_t);
         let locked = self.busy || self.switching;
 
-        // ── 滑出组：「+」在里、「设置」在外 ──
+        // ── the slide-out group: "+" innermost, "Settings" outermost ──
         //
-        // 每个按钮各自一个 `Area`：滑出裁剪要按各自的右边界切，共用一个 Area 做不到。
-        // `x_end - slide` 是「从历史按钮背后钻出来」的位移；**裁剪左边界固定在自己的
-        // 终点位**，于是位移没走完时露出来的部分不足一整个按钮，读起来就是「还在后面」。
+        // Each button gets its own `Area`: the slide-out clip has to cut at each button's own
+        // right edge, which a shared Area can't do. `x_end - slide` is the offset that brings it
+        // "out from behind the history button"; the **clip's left edge is pinned at its own end
+        // position**, so while the offset is short of complete only part of a button is exposed,
+        // which reads as "still behind".
         if self.hist_t > 0.0 {
             let slide = (BAR_BTN + 10.0) * (1.0 - ease);
             for (id, slot, icon) in [
                 ("aox-bar-new", 0.0_f32, SlideIcon::Plus),
                 ("aox-bar-settings", 1.0_f32, SlideIcon::Gear),
             ] {
-                // slot 0 = 紧挨历史按钮；slot 1 = 再往右一格。38 = 36 + 2 的间隙。
+                // slot 0 = right next to the history button; slot 1 = one more to the right.
+                // 38 = the 36 button plus a 2px gap.
                 let x_end = BAR_LEFT + BAR_BTN + 2.0 + slot * (BAR_BTN + 2.0);
                 egui::Area::new(egui::Id::new(id))
                     .order(egui::Order::Foreground)
                     .fixed_pos(Pos2::new(x_end - slide, BAR_TOP))
-                    // 滑出途中位置会压到左边的按钮上，别让 Area 把它拉回屏幕内。
+                    // Mid-slide the position overlaps the button to its left; don't let the Area
+                    // pull it back on screen.
                     .constrain_to(loose_rect())
                     .show(ctx, |ui| {
                         ui.set_clip_rect(Rect::from_min_max(
@@ -1409,7 +1572,7 @@ impl App {
             }
         }
 
-        // ── 左上：历史按钮（位置不变）＋ 状态 / token 胶囊 ──
+        // ── top-left: the history button (position unchanged) + the status / token chip ──
         egui::Area::new(egui::Id::new("aox-bar-left"))
             .order(egui::Order::Foreground)
             .fixed_pos(Pos2::new(BAR_LEFT, BAR_TOP))
@@ -1419,16 +1582,20 @@ impl App {
                     if history_icon(ui, self.show_history).clicked() {
                         toggle_hist = true;
                     }
-                    // 「+」与「设置」住在另外两个 `Area` 里（各要单独做滑出裁剪），这里替
-                    // 它们把位置让出来：展开时各撑开 38px，收起时不占位。于是那枚 token
-                    // 胶囊会被「挤」到右边去 —— 正好是「按钮从左边钻出来」该有的连带效果。
+                    // "+" and "Settings" live in two other `Area`s (each needs its own slide-out
+                    // clip), so room is made for them here: 38px each while expanded, nothing while
+                    // collapsed. That "pushes" the token chip to the right -- exactly the knock-on
+                    // effect you want from "buttons emerging from the left".
                     //
-                    // 38 = 按钮的 36 + 与它之间留的 2。少了这段，胶囊会直接压在按钮身上：
-                    // 两者底色同色，实机上看起来就是「按钮和胶囊共用一块底」，于是那枚
-                    // 按钮像是没长出来（截图比对才发现，肉眼扫一眼容易放过）。
+                    // 38 = the button's 36 plus the 2px gap between them. Without that stretch the
+                    // chip sits right on top of the button: they share a backdrop colour, so on real
+                    // hardware it looks like the button and the chip share one fill, and the button
+                    // appears not to have grown out at all (only a screenshot comparison caught it;
+                    // a glance by eye lets it through).
                     ui.add_space(8.0 + 38.0 * 2.0 * ease);
-                    // 一个 token 都没有、又没在跑任务时，这枚胶囊连壳都不该出现
-                    //（`token_chip` 此时什么都不画，硬套一层 Frame 会剩个空框）。
+                    // With not a single token and no turn running, even the chip's shell shouldn't
+                    // appear (`token_chip` draws nothing then, and forcing a Frame around it would
+                    // leave an empty box).
                     if self.busy || self.usage_sum().total.is_some() {
                         Frame::NONE
                             .fill(P::panel())
@@ -1450,9 +1617,11 @@ impl App {
                                                 .color(P::text_faint())
                                                 .size(13.5),
                                         );
-                                        // 累计 token 实时滚动 = 已完成各轮（精确）＋ 本轮估算。
-                                        // 所以整个对话的账在任务执行期间也一路上涨，而不是每轮归零。
-                                        // 带 `~` 是因为后半截还在估；一轮结束后由那枚精确的总数接手。
+                                        // The running total = completed turns (exact) + this turn
+                                        // (estimated). So the whole conversation's bill climbs during a
+                                        // turn instead of resetting each turn. The `~` is there because
+                                        // the second half is still an estimate; once the turn ends the
+                                        // exact total takes over.
                                         let base = self.usage_sum().total.unwrap_or(0);
                                         let est =
                                             self.live.as_ref().map_or(0, |l| l.out.tokens());
@@ -1469,7 +1638,8 @@ impl App {
                                             );
                                         }
                                     } else {
-                                        // 空闲时只剩一个总 token，鼠标移上去就有明细
+                                        // When idle only the total token count remains; hover for the
+                                        // breakdown
                                         self.token_chip(ui, ctx);
                                     }
                                 });
@@ -1477,8 +1647,9 @@ impl App {
                     }
                 });
             });
-        // 这一栏按钮的矩形记一笔：历史浮层要靠它排除「点在按钮上」那一下
-        //（不然按钮的开关动作会被浮层自己的「点外面就收起」当场抵消）。
+        // Record the rect of this row of buttons: the history overlay needs it to rule out "the
+        // click landed on a button" (otherwise the button's toggle is cancelled on the spot by
+        // the overlay's own "click outside collapses it").
         self.bar_hist_rect =
             Some(Rect::from_min_size(Pos2::new(BAR_LEFT, BAR_TOP), Vec2::splat(BAR_BTN)));
 
@@ -1496,10 +1667,11 @@ impl App {
         }
     }
 
-    /// 顶栏左侧那枚「总 token」胶囊：**悬停**即展开合计，不必点。
+    /// The "total tokens" chip: **hovering** expands the total, no click needed.
     ///
-    /// 用悬停而不是点击，是因为这个数字本来就是「瞟一眼」的东西：想确认的人
-    /// 鼠标移过去就有了，而点击反而要求他先认出「这里可以点」。
+    /// Hover rather than click, because this number is a glance-at thing by nature: whoever wants
+    /// to check just moves the mouse over it, whereas a click would first require them to realise
+    /// "this is clickable".
     fn token_chip(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let Some(total) = self.usage_sum().total else { return };
         let resp = ui.add(
@@ -1516,17 +1688,20 @@ impl App {
         if !self.usage_hover {
             return;
         }
-        // 面板就贴在胶囊正下方 6px：指针从胶囊走到面板的路上始终压着其中之一，
-        // 中间不会有一帧落空，也就不会闪。
+        // The panel sits 6px directly below the chip: as the pointer travels from chip to panel
+        // it is always over one of the two, so no frame falls through the gap and nothing
+        // flickers.
         //
-        // ⚠️ **坐标不要做任何换算**：`Area::fixed_pos` 与 `ui.allocate_*` 同处
-        // **客户区局部坐标**（`Area::begin` 拿 `ctx.content_rect()` 当约束）。
-        // 这里曾经加过一次「视口原点」`viewport().inner_rect.left_top()` ——
-        // 那是**屏幕（显示器）坐标**，两者根本不在一个坐标系，换算不来；
-        // 结果是面板随窗口在显示器上的位置整体平移（窗口不在 (0,0) 时实测偏
-        // ~(154,14) 逻辑像素）。同一处错误在 `workplace_ui::menu` 也犯过，已一并修掉。
+        // ⚠️ **Do not convert coordinates here**: `Area::fixed_pos` and `ui.allocate_*` are both
+        // in **client-area local coordinates** (`Area::begin` uses `ctx.content_rect()` as the
+        // constraint). This once had a "viewport origin" term, `viewport().inner_rect.left_top()`,
+        // added -- that is **screen (monitor) coordinates**, a completely different system, and
+        // the conversion is meaningless; the result was the panel shifting wholesale with the
+        // window's position on the monitor (measured ~(154, 14) logical pixels off when the
+        // window wasn't at (0,0)). The same mistake was made in `workplace_ui::menu` and has been
+        // fixed there too.
         let anchor = resp.rect.left_bottom() + egui::vec2(0.0, 6.0);
-        // 分开借：闭包里要写 hover 状态、又要读账本
+        // Separate borrows: the closure writes hover state and reads the ledger
         let log = &self.usage_log;
         let hovering = &mut self.usage_hover;
         egui::Area::new(egui::Id::new("aox-usage-panel"))
@@ -1543,28 +1718,31 @@ impl App {
             });
     }
 
-    /// 整段对话的累计 token（顶栏那枚 Σ 显示的数）。
+    /// The cumulative token count for the whole conversation (the number the Σ shows).
     ///
-    /// 直接取最后一条记录里的 `session_total` —— 那是落盘时就写好的累计值，
-    /// 不用每次把整本账重算一遍。
-    /// 当前对话各轮的**合计**（逐项累加）。
+    /// Taken straight from `session_total` in the last record -- that is a running total written
+    /// at save time, so the whole ledger doesn't have to be recomputed each time.
+    /// The **totals** across this conversation's turns (summed field by field).
     ///
-    /// 顶栏与展开面板都用它 —— 一个数说「花了多少」，一整套说「花在哪」。
+    /// Both the top bar and the expanded panel use it -- one number says "how much was spent",
+    /// the whole set says "where it went".
     fn usage_sum(&self) -> Usage {
         sum_usage(&self.usage_log)
     }
 
-    /// 把账本里的每一轮明细插回对话流，插在那一轮 AI 答复之后。
+    /// Put each turn's breakdown from the ledger back into the transcript, after that turn's AI
+    /// reply.
     ///
-    /// 定位靠「每条用户消息开启一轮」这个天然分界：第 N 轮的明细落在第 N 条用户
-    /// 消息与下一条之间（没有下一条就落末尾）。这样打开一段旧对话时，每一轮的账
-    /// 都贴回它原来待着的位置，而不是在顶上堆成一坨。
+    /// Location relies on the natural boundary "every user message starts a turn": turn N's
+    /// breakdown falls between the Nth user message and the next one (or at the end if there
+    /// isn't one). That way, opening an old conversation puts every turn's bill back where it was,
+    /// instead of heaping them all at the top.
     fn rebuild_usage_rows(&mut self) {
         self.items.retain(|it| !matches!(it, Item::Usage(_)));
         if self.usage_log.is_empty() {
             return;
         }
-        // 先算出每一轮内容的结束下标
+        // First work out the end index of each turn's content
         let mut ends: Vec<usize> = Vec::new();
         for (i, it) in self.items.iter().enumerate() {
             if matches!(it, Item::User(..)) {
@@ -1577,7 +1755,7 @@ impl App {
         if let Some(last) = ends.last_mut() {
             *last = self.items.len().saturating_sub(1);
         }
-        // 倒序插入：后面的轮次先插，前面轮次的下标才不会被带偏
+        // Insert in reverse: later turns first, so earlier turns' indexes don't get skewed
         for rec in self.usage_log.iter().rev() {
             let Some(&end) = ends.get(rec.round.saturating_sub(1) as usize) else {
                 continue;
@@ -1593,23 +1771,27 @@ impl App {
             .auto_shrink([false, false])
             .stick_to_bottom(self.follow || self.force_follow)
             .show(ui, |ui| {
-                // 顶部留白 = 旧顶栏那条（50）＋ 原来的 26。顶栏拆掉之后按钮改成浮在
-                // 内容之上，不留白的话第一行字直接顶到按钮底下。
+                // Top padding = the old top bar's 50 + the original 26. With the bar gone the
+                // buttons float above the content, and without the padding the first line of text
+                // butts right up under them.
                 ui.add_space(76.0);
                 ui.horizontal(|ui| {
                     ui.add_space(pad);
                     ui.vertical(|ui| {
                         ui.set_max_width(inner);
                         ui.set_min_width(inner);
-                        // 版心左右边界：宽 = inner，右端到顶自动换行。
+                        // The measure's left/right bounds: width = inner, wrapping automatically at
+                        // the right edge.
                         //
-                        // egui 的 `Ui::wrap_mode()` 在「非换行水平布局」里返回 `Extend`，
-                        // 而 `Label` 默认会继承它 —— 结果是长文本一行到底、冲出右边界被裁。
-                        // 气泡 / 列表项 / 工具调用行内部全是这种水平布局，所以在栏根上一把锁死，
-                        // 后代 Ui（含 Frame 内部）一律继承 `Wrap`。
+                        // egui's `Ui::wrap_mode()` returns `Extend` inside a "non-wrapping horizontal
+                        // layout" and `Label` inherits that by default -- so long text runs to the
+                        // end of the line and gets clipped past the right edge. Bubbles, list items
+                        // and tool-call rows are all such horizontal layouts internally, so it is
+                        // nailed down once at the column root and every descendant Ui (including
+                        // inside a Frame) inherits `Wrap`.
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                        // 只要还没开始真正的对话，就先展示品牌区
-                        // （此时 items 里可能已有加载/错误提示）
+                        // Until the real conversation starts, show the brand area first (there may
+                        // already be loading / error notices in `items` at this point)
                         let started = self
                             .items
                             .iter()
@@ -1617,9 +1799,10 @@ impl App {
                         if !started && self.live.is_none() {
                             self.empty_state(ui);
                         }
-                        // 图片渲染要查纹理缓存。`self.items` 与 `self.tex` 是**两个不相干
-                        // 的字段**，所以先取一个只借用 `tex` 的引用，循环里借用
-                        // `items` 就不冲突了（整块 `&mut self` 是不行的）。
+                        // Image rendering has to consult the texture cache. `self.items` and
+                        // `self.tex` are **two unrelated fields**, so take a reference that borrows
+                        // only `tex` first, and borrowing `items` in the loop no longer conflicts
+                        // (borrowing all of `&mut self` would not work).
                         let tex = &self.tex;
                         for item in &mut self.items {
                             match item {
@@ -1635,8 +1818,8 @@ impl App {
                         if let Some(l) = &self.live {
                             self.live_block(ui, l, inner);
                         }
-                        // 末尾留出悬浮输入框的高度，最后一条消息才能滚到它上方，
-                        // 而不是永远被压住半截。
+                        // Reserve the floating input box's height at the end, so the last message
+                        // can scroll above it instead of being permanently half-covered.
                         ui.add_space(COMPOSER_RESERVE);
                     });
                 });
@@ -1650,24 +1833,30 @@ impl App {
     }
 
     fn empty_state(&mut self, ui: &mut Ui) {
-        // 首屏只有那张插画（用户 2026-10-06 给的成对素材：亮色一张、暗色一张）。
-        // 原来那句「Hi there」与下面那几条预设示例都按用户要求删掉了 —— 首屏不再
-        // 替用户想他要说什么，只负责好看。
+        // The empty state is just the illustration (a pair supplied by the user on 2026-10-06:
+        // one light, one dark). The old "Hi there" line and the preset examples beneath it were
+        // removed at the user's request -- the empty state no longer presumes to think of what
+        // the user might say; it just has to look good.
         let dark = theme::mode() == theme::Mode::Dark;
-        // 两边各留一点，别让插画贴着对话区的边缘
+        // A little room on each side, so the illustration doesn't press against the edge of the
+        // transcript area
         let max_w = (ui.available_width() - 48.0).max(160.0);
         let art_h = brand::height(dark, max_w);
 
-        // 垂直位置分两种，不是随手取的：
-        // - 正常首屏：居中到「输入框以上那块区域」的正中。输入框是**浮**在底部的，
-        //   `COMPOSER_RESERVE` 正是它占掉的高度，不减掉的话插画会整体偏下。
-        // - 有错误卡片时（模型没配好）：不居中。这时首屏最重要的一条信息是那句错误，
-        //   让插画居中会把卡片挤到下边、甚至顶出可视区。
-        // ⚠️ 这里**不能**用 `ui.available_height()`：`empty_state` 所在的 Ui 是嵌在
-        // `horizontal(...) → vertical(...)` 里的子区域，它在水平布局里被建出来时，
-        // 高度只按「内容到现在为止用掉的那点」算 —— 实测整窗口 828pt 时它只有 30pt，
-        // 于是算出来的余量恰好是 0，插画会一直贴在顶上。用**裁剪区**（ScrollArea 的视口，
-        // 也就是整个内容区）减掉光标当前的 y，才是「下面还剩多少看得见的地方」。
+        // The vertical position comes in two flavours, and neither is arbitrary:
+        // - Normal empty state: centred in "the region above the input box". The input box
+        //   **floats** at the bottom, and `COMPOSER_RESERVE` is exactly the height it takes up;
+        //   without subtracting it the illustration sits low overall.
+        // - With an error card (model not configured): not centred. The single most important
+        //   thing on screen then is that error, and centring the illustration would squash the
+        //   card downward or even push it out of the visible area.
+        // ⚠️ `ui.available_height()` **cannot** be used here: the Ui `empty_state` lives in is a
+        // sub-region nested inside `horizontal(...) -> vertical(...)`, and when it is created
+        // inside a horizontal layout its height is computed only from "whatever the content has
+        // used so far" -- measured at 30pt for a whole 828pt window, so the leftover came out
+        // exactly 0 and the illustration stuck to the top. Subtract the cursor's current y from
+        // the **clip rect** (the ScrollArea's viewport, i.e. the whole content area) and you get
+        // "how much visible room is left below".
         let room =
             (ui.clip_rect().bottom() - ui.next_widget_position().y - COMPOSER_RESERVE).max(0.0);
         let top = if self.log_error.is_some() { 8.0 } else { ((room - art_h) * 0.5).max(0.0) };
@@ -1692,7 +1881,7 @@ impl App {
                             .inner_margin(Margin::symmetric(11, 4))
                             .show(ui, |ui| {
                                 ui.label(
-                                    RichText::new("模型未就绪")
+                                    RichText::new(aox::i18n::t("Model not ready"))
                                         .color(P::on_reverse())
                                         .size(14.0),
                                 );
@@ -1701,12 +1890,12 @@ impl App {
                         ui.label(RichText::new(err).color(P::text_dim()).size(14.5));
                         ui.add_space(8.0);
                         ui.label(
-                            RichText::new(format!("配置文件：{}", self.config_path))
+                            RichText::new(aox::tf!("Config file: {}", self.config_path))
                                 .color(P::text_faint())
                                 .size(13.5),
                         );
                         ui.label(
-                            RichText::new("填写 [provider] 的 base_url / api_key 后重新启动。")
+                            RichText::new(aox::i18n::t("Fill in base_url / api_key under [provider], then restart."))
                                 .color(P::text_faint())
                                 .size(13.5),
                         );
@@ -1717,12 +1906,13 @@ impl App {
 
     fn live_block(&self, ui: &mut Ui, l: &Live, width: f32) {
         let _ = width;
-        // 实时区按**阶段**切开：一段调用流 → 一句阶段回复 → 再一段调用流 → …
-        // （用户 2026-10-05 提的：原来所有调用挤在顶上、所有回复挤在中间，
-        // 看不出哪几步属于哪个阶段。）
+        // The live area is cut by **stage**: a stretch of call stream -> one interim reply ->
+        // another stretch of call stream -> ...
+        // (user request, 2026-10-05: previously all the calls were crammed at the top and all
+        // the replies in the middle, so you couldn't tell which steps belonged to which stage.)
         //
-        // `cuts[i]` = 第 i 句阶段回复说出时已经跑过的步数 ⇒ 第 i 段调用就是
-        // `steps[cuts[i-1] .. cuts[i]]`，最后一段一直画到 `steps.len()`。
+        // `cuts[i]` = the number of steps already run when interim reply i was spoken, so call
+        // stretch i is `steps[cuts[i-1] .. cuts[i]]`, and the last one runs to `steps.len()`.
         for seg in 0..=l.interim.len() {
             let from = if seg == 0 { 0 } else { l.cuts.get(seg - 1).copied().unwrap_or(0) };
             let to = l.cuts.get(seg).copied().unwrap_or(l.steps.len()).min(l.steps.len());
@@ -1735,18 +1925,19 @@ impl App {
                 ui.add_space(14.0);
             }
         }
-        // 正在打的那一句接在最后：它还没归属到任何阶段（说完才知道后面还有没有调用）。
+        // The sentence being typed goes last: it doesn't belong to any stage yet (only once
+        // it's finished do you know whether more calls follow).
         if !l.streaming.trim().is_empty() {
             live_plain_text(ui, &l.streaming, P::text());
             ui.add_space(14.0);
         }
 
-        // 等待动画 + 状态
+        // waiting animation + status
         ui.horizontal(|ui| {
             spinner_dot(ui, self.spin, P::ink());
             ui.add_space(8.0);
             ui.label(
-                RichText::new(if l.status.is_empty() { "思考中" } else { &l.status })
+                RichText::new(if l.status.is_empty() { aox::i18n::t("Thinking") } else { &l.status })
                     .color(P::text_dim())
                     .size(15.0),
             );
@@ -1756,8 +1947,9 @@ impl App {
                     .color(P::text_faint())
                     .size(13.0),
             );
-            // 输出 token 实时滚动。带 `~` 是因为流式过程中服务端还没报数，
-            // 这个值按字符估；任务结束后顶栏会换成精确的总数。
+            // The output token count scrolls live. The `~` is because the server hasn't reported
+            // during streaming and this value is estimated from characters; once the turn ends the
+            // exact total takes over.
             let est = l.out.tokens();
             if est > 0 {
                 ui.add_space(8.0);
@@ -1769,12 +1961,16 @@ impl App {
             }
         });
 
-        // 思考框：**固定高度、且常驻**（用户 2026-10-05：「底下的思考框会时不时上下伸缩，
-        // 导致屏幕上下震动」）。伸缩有两个来源，这里一次治掉：
-        //   ① 流式过程中它从一行涨到四行；
-        //   ② 每次响应结束 `reasoning_live` 变 false、文本被清空，整块忽隐忽现。
-        // 所以框只画一次、高度写死，文字画在框内并按框裁掉。代价是非思考模型也会看到
-        // 这个空框 —— 用「一块稳定的空白」换「整块上下跳」，稳定更值。
+        // The reasoning box: **fixed height and always present** (user, 2026-10-05: "the
+        // reasoning box at the bottom keeps growing and shrinking, which makes the whole screen
+        // jump up and down"). There were two sources of the resizing, both cured at once here:
+        //   ① during streaming it grew from one line to four;
+        //   ② at the end of every response `reasoning_live` went false and the text was cleared,
+        //      so the whole block flickered in and out.
+        // So the box is drawn once with a hard-coded height, and the text is drawn inside it and
+        // clipped to the box. The price is that non-reasoning models see this empty box too --
+        // trading "a stable patch of blank" for "the whole block bouncing up and down"; stable
+        // is worth more.
         const THINK_LINES: usize = 4;
         const THINK_LINE_H: f32 = 20.0;
         ui.add_space(12.0);
@@ -1794,7 +1990,8 @@ impl App {
         if !l.reasoning.is_empty() {
             let inner = rect.shrink2(Vec2::new(16.0, 13.0));
             let tail = tail_lines(&l.reasoning, THINK_LINES);
-            // 先裁再画：文字超过四行时被切掉，而不是把框顶高。
+            // Clip first, then draw: text past four lines gets cut off rather than pushing the
+            // box taller.
             let p = painter.with_clip_rect(inner);
             let g = p.layout(tail, theme::body_font(14.5), P::text_faint(), inner.width());
             p.galley(inner.left_top(), g, P::text_faint());
@@ -1802,15 +1999,17 @@ impl App {
         ui.add_space(16.0);
     }
 
-    /// 把工作区按钮产生的一条请求发给 Agent 线程。
+    /// Send a request produced by the workplace button to the agent thread.
     ///
-    /// 界面自己切不了档：`Workplace` 住在 `Runtime` 里，而 `Runtime` 只有 Agent 那个
-    /// 线程拿得到（见 `bridge.rs` 的 `ToAgent::Workplace`）。所以这里只负责「发出去」，
-    /// 真正的结果与新档位由 bridge 回执（`FromAgent::Workplace`）驱动。
+    /// The UI can't change tiers by itself: `Workplace` lives inside `Runtime`, and only the
+    /// agent thread can get at `Runtime` (see `ToAgent::Workplace` in `bridge.rs`). So all this
+    /// does is "send it out"; the real result and the new tier are driven by the bridge's
+    /// acknowledgement (`FromAgent::Workplace`).
     fn send_ws(&mut self, mode: Mode) {
         if self.demo {
-            // 演示模式没有 Agent 线程来回执，就地模拟一下 —— 好让 `--demo` 也能把
-            // 「切档 → 按钮改名 + 列表打勾跟着走」演出来。只影响界面，不碰磁盘。
+            // Demo mode has no agent thread to acknowledge, so simulate it in place -- that way
+            // `--demo` can also show "switch tier -> button renames + the tick in the list
+            // follows". UI only, no disk involved.
             let (view_mode, root) = match &mode {
                 Mode::Default => (Mode::Default, None),
                 Mode::Fixed(p) => (Mode::Fixed(p.clone()), Some(p.clone())),
@@ -1825,12 +2024,16 @@ impl App {
     fn composer(&mut self, ui: &mut Ui) {
         let (inner, pad) = column(ui.available_width());
         let blocked = self.demo || self.boot.as_ref().is_some_and(|b| !b.provider_ready);
-        // 有选项槽挂着时，**发送的含义变了**：它是「这就是我的回答」，而不是开新一轮
-        //（那一轮正在跑，`busy` 为真）。所以这里要放行 —— 否则用户看着一排选项、
-        // 想自己打字说清楚，而发送键是灰的，只能去点某个都不太对的选项。
+        // While an option slot is up, **the meaning of send changes**: it means "this is my
+        // answer" rather than starting a new turn (that turn is running, so `busy` is true). So it
+        // has to be let through here -- otherwise the user is looking at a row of options, wants
+        // to type their own clearer answer, and finds the send key greyed out, leaving only
+        // options that all miss the point.
         let choosing = self.choice.is_some();
-        // 只有附件、没有文字也允许发送（拖一张图进来按发送是最常见的用法）。
-        // 作答时不吃这一条：那时必须真的打字，光挂个附件不算回答。
+        // Attachments with no text may be sent too (dragging an image in and pressing send is the
+        // most common usage).
+        // This does not apply while answering: then you really have to type; a mere attachment is
+        // not an answer.
         let can_send = !blocked
             && !self.waiting_auth
             && (!self.busy || choosing)
@@ -1843,21 +2046,25 @@ impl App {
                 ui.set_width(inner);
                 ui.set_max_width(inner);
 
-                // 选项槽：模型用 `ask_user` 问出来的选择题。放在待上传栏**之上** ——
-                // 它比「我这次要发什么」更急（用户不答，这一轮就不动）。
+                // The option slot: a multiple-choice question the model asked via `ask_user`. It
+                // goes **above** the pending-upload bar -- it is more urgent than "what am I sending
+                // this time" (until the user answers, this turn doesn't move).
                 self.choice_bar(ui);
 
-                // 待上传栏：输入卡片**上方**那一排小胶囊（用户 2026-10-05 明确要求的位置）。
+                // The pending-upload bar: the row of small chips **above** the input card (the
+                // position the user explicitly asked for on 2026-10-05).
                 self.attach_bar(ui);
 
-                // 悬浮输入框：没有分隔线、四周也不铺底色，靠大圆角 + 一圈细描边 + 一层淡投影
-                // 浮在对话区之上（这就是「背景掏空」的观感来源）。
+                // The floating input box: no separator line and no fill around it, floating above
+                // the transcript on a large corner radius + a thin stroke + a faint shadow (which is
+                // where the "hollowed-out background" look comes from).
                 Frame::NONE
                     .fill(P::surface())
                     .corner_radius(CornerRadius::same(20))
                     .stroke(Stroke::new(
                         if self.dragging_files { 1.5 } else { 1.0 },
-                        // 文件正拖在窗口上方时描边提亮一档：松手会落在哪，得看得出来
+                        // While files are being dragged over the window, brighten the stroke one step:
+                        // where it will land on release has to be visible
                         if self.dragging_files {
                             P::ink()
                         } else if self.busy || self.waiting_auth {
@@ -1877,26 +2084,30 @@ impl App {
                         let w = ui.available_width();
                         ui.set_width(w);
                         ui.set_max_width(w);
-                        // 注意：这里不能用 ui.horizontal_centered()——它会一次性申请「全部可用尺寸」，
-                        // 让自动定高的底栏面板不断膨胀（实测会把整个窗口吃掉）。ui.horizontal 同样
-                        // 会做交叉轴居中，但初始高度只有一行，不会反馈放大。
+                        // Note: ui.horizontal_centered() can't be used here -- it requests "the full
+                        // available size" in one go, which makes the auto-height bottom bar panel keep
+                        // inflating (measured: it swallows the whole window). ui.horizontal centres on
+                        // the cross axis just the same, but its initial height is a single row, so
+                        // there is no feedback loop.
                         ui.horizontal(|ui| {
                             let hint = if self.demo {
-                                "演示模式：仅预览界面排布（以 --demo 启动；正常启动即可对话）"
+                                aox::i18n::t("Demo mode: layout preview only (start with --demo; run normally to chat)")
                             } else if blocked {
-                                "模型未配置，无法对话"
+                                aox::i18n::t("Model not configured; chat unavailable")
                             } else if self.waiting_auth {
-                                "等待授权确认…"
+                                aox::i18n::t("Waiting for authorization…")
                             } else if choosing {
-                                // 指向**上面那一行**行内输入框：作答的地方在题目旁边，
-                                // 不要把人往下面这个框引（那是用户 2026-10-06 明确要的）
-                                "在上面那排选项里点一个，或直接在那一行输入…"
+                                // Point at the inline input box **on the row above**: the place to
+                                // answer is beside the question, and people shouldn't be directed to the
+                                // box below (explicit user request, 2026-10-06)
+                                aox::i18n::t("Click one of the options above, or type in that row…")
                             } else if self.busy {
-                                "正在执行，可点击右侧停止"
+                                aox::i18n::t("Running; click Stop on the right")
                             } else {
-                                "给 AOX 下达指令…"
+                                aox::i18n::t("Tell AOX what to do…")
                             };
-                            // 显式扣掉发送按钮的宽度，避免输入框把按钮挤出卡片
+                            // Explicitly subtract the send button's width so the input box can't push
+                            // the button out of the card
                             let edit_w = (w - 62.0).max(120.0);
                             let text_edit = TextEdit::multiline(&mut self.input)
                                 .desired_rows(1)
@@ -1928,14 +2139,17 @@ impl App {
                             }
                         });
 
-                        // 第二行：输入框**左下角**的工作区按钮。
+                        // Second row: the workplace button at the input box's **bottom-left**.
                         //
-                        // 单独占一行而不是挤进上一行：它说的是「这段对话跑在什么权限下」，
-                        // 与「输入 + 发送」是两件事；挤在一起会把输入框挤窄，而且这枚按钮
-                        // 紧挨着发送圆钮也容易被误点（一个只是「发消息」，一个是「放开所有权限」）。
+                        // On its own row rather than squeezed into the previous one: it says "under
+                        // what permissions this conversation runs", which is a different thing from
+                        // "type + send"; squeezing them together narrows the input box, and this
+                        // button sitting right next to the round send button also invites misclicks
+                        // (one merely "sends a message", the other "drops all restrictions").
                         //
-                        // 演示模式下**允许点**（`self.demo || ...`）：它弹出来的列表 / 确认框 /
-                        // 目录选择器全是纯界面，就地模拟一下就能把版式演完（见 `send_ws`）。
+                        // In demo mode it **can be clicked** (`self.demo || ...`): the list /
+                        // confirmation / directory picker it opens are pure UI, so simulating them in
+                        // place is enough to show the layout (see `send_ws`).
                         ui.add_space(3.0);
                         ui.horizontal(|ui| {
                             workplace_ui::button(ui, &mut self.ws, self.demo || !blocked);
@@ -1945,15 +2159,18 @@ impl App {
         });
     }
 
-    /// 设置：一枚居中的大卡片，左栏选、右栏看。
+    /// Settings: one large centred card, pick on the left, read on the right.
     ///
-    /// 取代了原来右上那三枚按钮（活动流 / 明暗 / 关于）与那枚 380px 的「关于」小卡片
-    /// ——「把三个按钮全删掉，收进一个设置弹窗」是用户 2026-10-05 的要求。
-    /// 所以四个栏目里三个都是**搬家**：「额外」收活动流入口、「外观」收明暗切换、
-    /// 「关于」收版本与协议；只有「系统」是新写的（那些路径以前半藏在关于卡片里，
-    /// 现在成体系地列全）。
+    /// It replaces the three buttons that used to be at the top-right (activity stream / theme /
+    /// about) and that 380px "about" card -- "delete all three buttons and fold them into one
+    /// settings dialog" was the user's request on 2026-10-05.
+    /// So three of the four columns are **relocations**: "Extra" takes the activity-stream
+    /// entrance, "Appearance" takes the light/dark switch, "About" takes the version and the
+    /// license; only "System" is newly written (those paths used to be half-hidden in the about
+    /// card and are now listed properly).
     ///
-    /// 点背景、按 Esc 或点「关闭」都收起（前两条由 `Modal` 自带）。
+    /// Clicking the background, pressing Esc, or clicking "Close" all dismiss it (the first two
+    /// come from `Modal`).
     fn settings_overlay(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -1968,20 +2185,24 @@ impl App {
                     .inner_margin(Margin::symmetric(20, 18)),
             )
             .show(ctx, |ui| {
-                // 高度写死：两栏的切换不该让卡片跟着内容忽大忽小 ——
-                // 从「系统」（一大列路径）切到「额外」（一个按钮）时整块缩水很难看。
+                // Height hard-coded: switching columns shouldn't make the card grow and shrink with
+                // the content -- going from "System" (a long column of paths) to "Extra" (a single
+                // button) shrinking the whole block looks bad.
                 ui.set_width(SETTINGS_W);
                 ui.set_height(SETTINGS_H);
                 ui.horizontal_top(|ui| {
-                    // 这一排的横向间距**一律由下面的 `add_space` 手写**。
+                    // The horizontal spacing in this row is **entirely hand-written by the
+                    // `add_space` calls below**.
                     //
-                    // 不归零的话 `item_spacing`（主题里是 8）会叠加在每次 allocate 之间：
-                    // 左栏与竖线之间多 8、竖线与会话之间又多 8 —— 总宽悄悄变成 716，
-                    // 比 `SETTINGS_W` 多 16。于是卡片比设计宽 16px，而「右栏到底多宽」
-                    // 从可算变成了要猜（这正是第一版被量出来的 758.7 而不是 740）。
+                    // Without zeroing it, `item_spacing` (8 in this theme) stacks between every
+                    // allocate: 8 extra between the left column and the vertical rule, and another 8
+                    // between the rule and the content -- the total width quietly becomes 716, 16
+                    // more than `SETTINGS_W`. So the card is 16px wider than designed, and "how wide
+                    // is the right column really" goes from computable to guesswork (which is exactly
+                    // why the first version measured 758.7 instead of 740).
                     ui.spacing_mut().item_spacing.x = 0.0;
 
-                    // ── 左：栏目 ──
+                    // ── left: the columns ──
                     ui.vertical(|ui| {
                         ui.set_width(SETTINGS_NAV_W);
                         ui.set_height(SETTINGS_H);
@@ -1992,12 +2213,14 @@ impl App {
                         }
                     });
 
-                    // 一条竖线把「选什么」与「看什么」分开。与「关于」里那条横线
-                    // 同一套语汇（1px、border 色），只是转了个方向。
+                    // A vertical rule separates "what you pick" from "what you read". Same
+                    // vocabulary as the horizontal rule in "About" (1px, border colour), just turned
+                    // a quarter turn.
                     //
-                    // 高度**写常量**而不是 `ui.available_height()`：在水平布局里后者会
-                    // 随左边那一栏已经占掉的高度变化，竖线于是时高时矮。常量还顺带
-                    // 把「这条线要贯穿整张卡片」这件事写明。
+                    // The height is **a constant** rather than `ui.available_height()`: inside a
+                    // horizontal layout the latter varies with how much the left column has already
+                    // taken up, so the rule would be tall and short by turns. A constant also states
+                    // plainly that "this line runs the full height of the card".
                     let (rule, _) =
                         ui.allocate_exact_size(Vec2::new(1.0, SETTINGS_H), Sense::hover());
                     ui.painter().vline(
@@ -2007,34 +2230,40 @@ impl App {
                     );
                     ui.add_space(18.0);
 
-                    // ── 右：内容 ──
+                    // ── right: the content ──
                     ui.vertical(|ui| {
                         ui.set_width(SETTINGS_RIGHT_W);
-                        // 高度也写死。理由：`ScrollArea` 取的是「可用高度 ∩ max_height」，
-                        // 而在这个水平布局里，「可用高度」会被同一排的其它子项影响
-                        // （竖线那一下 allocate 就把它吃掉过一次）。写死之后
-                        // 「内容 + 间隙 + 底部按钮」三段的高度都可算，卡片高度就不会
-                        // 随栏目内容变化 —— 那是「切栏目时卡片忽大忽小」的来源。
+                        // The height is hard-coded too. The reason: `ScrollArea` takes "available
+                        // height ∩ max_height", and in this horizontal layout the available height is
+                        // affected by the other children on the same row (the vertical rule's allocate
+                        // ate into it once already). With it hard-coded, the heights of "content + gap
+                        // + bottom button" are all computable, so the card height can't vary with the
+                        // column's content -- and that was the source of "the card grows and shrinks
+                        // when you switch columns".
                         ui.set_height(SETTINGS_H);
-                        // 底部那 SETTINGS_FOOT_H 留给「关闭」：不扣掉的话内容一长
-                        // 就把按钮顶出卡片
+                        // The `SETTINGS_FOOT_H` at the bottom is reserved for "Close": without
+                        // subtracting it, long content pushes the button out of the card
                         ScrollArea::vertical()
                             .id_salt("aox-settings-body")
                             .max_height(SETTINGS_H - SETTINGS_FOOT_H)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                // ⚠️ 这一行是**整个弹窗稳不稳的关键**，别删。
+                                // ⚠️ This line is **what makes the whole dialog stable**; don't delete
+                                // it.
                                 //
-                                // `ScrollArea` 的内宽 = 外宽 − 滚动条占位，而那个占位是
-                                // **逐帧动画**的（`animate_bool_responsive` ×
-                                // `spacing.scroll.allocated_width()`，本项目是 6px）。
-                                // 只要内容宽度还跟着 `available_width()` 走，滚动条每呼吸
-                                // 一次，行宽就变一次、换行的文字就重新折一次行 —— 界面表现
-                                // 就是「整个面板在抖、字发虚」，而且**只在有重绘时发生**
-                                // （鼠标一动就重绘，所以看起来是「鼠标一移就抖」）。
+                                // A `ScrollArea`'s inner width = outer width - the scrollbar's
+                                // reservation, and that reservation is **animated frame by frame**
+                                // (`animate_bool_responsive` x `spacing.scroll.allocated_width()`, 6px
+                                // in this project). As long as the content width still follows
+                                // `available_width()`, every time the scrollbar breathes the row width
+                                // changes and wrapped text re-wraps -- which shows up as "the whole panel
+                                // is jittering and the text looks blurry", and it **only happens when
+                                // there is a repaint** (moving the mouse repaints, so it looks like "it
+                                // jitters the moment I move the mouse").
                                 //
-                                // 钉死之后：内容宽度是常量，折行稳定，滚动条只影响它自己
-                                // 那 6px 的浮动条（浮在内容右侧，不压字）。
+                                // Pinned down: the content width is a constant, wrapping is stable, and
+                                // the scrollbar only affects its own floating 6px bar (which floats to
+                                // the right of the content and doesn't press on the text).
                                 let content_w =
                                     SETTINGS_RIGHT_W - ui.spacing().scroll.allocated_width();
                                 ui.set_width(content_w);
@@ -2047,39 +2276,42 @@ impl App {
                             });
                         ui.add_space(6.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if flat_button(ui, "关闭").clicked() {
+                            if flat_button(ui, aox::i18n::t("Close")).clicked() {
                                 open = false;
                             }
                         });
                     });
                 });
             });
-        // 点背景、按 Esc 也算关闭
+        // Clicking the background or pressing Esc also counts as closing
         if resp.should_close() || !open {
             self.settings_open = false;
         }
     }
 
-    /// 「额外」栏：活动流入口。
+    /// The "Extra" column: the activity-stream entrance.
     ///
-    /// 这一栏刻意只有**一个入口、没有设置项** —— 它排在最前是因为用户这么要求，
-    /// 但里面确实只有「打开活动流」这一件事（原先它占着右上角一枚图标）。
+    /// This column deliberately holds **one entrance and no settings** -- it comes first only
+    /// because the user asked for that, but it really does contain just the one thing, "open the
+    /// activity stream" (which used to occupy an icon in the top-right).
     fn tab_extra(&mut self, ui: &mut Ui) {
-        // 先把锁收掉再判：`is_open()` 这一下要拿锁，而点击分支里的 `open()` 自己还会
-        // 再拿一次 —— 两把锁叠在同一句里就是自锁（顶栏那版踩过）。
+        // Drop the lock first, then test: `is_open()` takes the lock, and `open()` in the click
+        // branch takes it again -- two locks stacked in one statement is a self-deadlock (the
+        // top-bar version ran into this).
         let on = activity::lock(&self.act).is_open();
         if activity_open_button(ui, on).clicked() {
             activity::open(ui.ctx(), &self.act);
         }
         ui.add_space(9.0);
-        ui.label(RichText::new("观测Agent内部循环逻辑").color(P::text_faint()).size(13.0));
+        ui.label(RichText::new(aox::i18n::t("Observe the agent's inner loop")).color(P::text_faint()).size(13.0));
     }
 
-    /// 「外观」栏：明暗三档（含跟随系统）。
+    /// The "Appearance" column: three light/dark options (including follow system).
     ///
-    /// 选哪一档只改 `theme::Pref`；「跟随系统」的实际取值由 `theme::effective` 从系统
-    /// 主题算出来，并且**每帧复查**（见 `theme::follow_system`）——
-    /// 不复查的话，「跟随系统」就只是「启动时照系统的样子定一次」。
+    /// Picking one only changes `theme::Pref`; what "follow system" actually resolves to is
+    /// computed from the system theme by `theme::effective` and **rechecked every frame** (see
+    /// `theme::follow_system`) -- without the recheck, "follow system" would amount to "decide
+    /// once at startup by copying the system".
     fn tab_appearance(&mut self, ui: &mut Ui) {
         let cur = theme::pref();
         for p in theme::Pref::ALL {
@@ -2089,38 +2321,41 @@ impl App {
         }
     }
 
-    /// 「系统」栏：这台机器、这份配置、这些目录。
+    /// The "System" column: this machine, this config, these directories.
     ///
-    /// 顺序照用户点的单子排：系统信息 → 运行时环境 → 模型 → 配置 → 工作空间 →
-    /// 历史 → 插件 → 运行时目录。
+    /// The order follows the list the user asked for: system info -> runtime environment ->
+    /// model -> config -> workplace -> history -> plugins -> runtime directory.
     fn tab_system(&self, ui: &mut Ui) {
         let p = self.boot.as_ref().map(|b| b.paths.clone()).unwrap_or_default();
 
-        kv_row(ui, "系统信息", &p.host);
+        kv_row(ui, aox::i18n::t("System info"), &p.host);
 
-        // 运行时环境：**内置还是系统 PATH** —— 逐语言一行，来源直接写在方括号里。
-        // 不画 ✓/✗：手写字体里那两个字形不一定有（调用流那两枚就是手绘的），
-        // 而「未找到」这个词本身已经把结论说清楚了。
+        // Runtime environment: **bundled or system PATH** -- one row per language, with the
+        // source written straight into brackets.
+        // No ✓/✗ drawn: those two glyphs aren't guaranteed to exist in the hand-picked font (the
+        // two in the call stream are hand-drawn), and the word "not found" already states the
+        // conclusion clearly.
         for (i, it) in self.runtimes.items.iter().enumerate() {
             kv_row_colored(
                 ui,
-                if i == 0 { "运行时环境" } else { "" },
+                if i == 0 { aox::i18n::t("Runtime environment") } else { "" },
                 &format!("{}  {}  [{}]", it.lang, it.command, it.origin),
                 if it.ok { P::text_faint() } else { P::warn() },
             );
         }
 
         if !self.model.is_empty() {
-            kv_row(ui, "所用模型", &self.model);
+            kv_row(ui, aox::i18n::t("Model in use"), &self.model);
         }
         if !p.config.is_empty() {
-            kv_row(ui, "配置文件", &p.config);
+            kv_row(ui, aox::i18n::t("Config file"), &p.config);
         }
-        // 这份配置由哪几层合出来：`core → patch → config.toml`。
+        // Which layers this config is merged from: `core -> patch -> config.toml`.
         //
-        // 只显示名字链、不铺来源树（完整的那张表走 CLI 的 `aox --dump-config`）；
-        // **只有一层时不显示** —— 说「就一层」等于没说话。这条判据是从原来那张
-        // 「关于」小卡片里搬过来的，一字未改。
+        // Only the name chain is shown, not the full provenance tree (for the complete table use
+        // the CLI's `aox --dump-config`); **with only one layer nothing is shown** -- saying
+        // "there's just one layer" amounts to saying nothing. This rule was lifted from the old
+        // "about" card, not a word changed.
         let layers: Vec<String> = self
             .boot
             .as_ref()
@@ -2132,73 +2367,81 @@ impl App {
             })
             .unwrap_or_default();
         if layers.len() > 1 {
-            kv_row(ui, "配置层", &layers.join(" → "));
+            kv_row(ui, aox::i18n::t("Config layers"), &layers.join(" → "));
         }
         if !p.root.is_empty() {
-            kv_row(ui, "应用根目录", &p.root);
+            kv_row(ui, aox::i18n::t("App root"), &p.root);
         }
-        kv_row(ui, "工作空间", &self.workplace_line());
+        kv_row(ui, aox::i18n::t("Workspace"), &self.workplace_line());
         if !p.history.is_empty() {
-            kv_row(ui, "历史记录", &p.history);
+            kv_row(ui, aox::i18n::t("History"), &p.history);
         }
         if !p.plugins.is_empty() {
-            kv_row(ui, "插件目录", &p.plugins);
+            kv_row(ui, aox::i18n::t("Plugins directory"), &p.plugins);
         }
         if !p.runtime.is_empty() {
-            // 「如果是内置的话」——目录在不在，一眼看得出来用没用内置运行时
+            // "if it's bundled" -- whether the directory is there tells you at a glance whether
+            // the bundled runtime is in use
             let note = if std::path::Path::new(&p.runtime).is_dir() {
                 ""
             } else {
-                "（尚未装配内置运行时）"
+                aox::i18n::t(" (built-in runtime not installed)")
             };
-            kv_row(ui, "运行时目录", &format!("{}{note}", p.runtime));
+            kv_row(ui, aox::i18n::t("Runtime directory"), &format!("{}{note}", p.runtime));
         }
 
-        // 本机没有 Python 时给一个一键安装入口。原来它长在「关于」卡片里，
-        // 而现在「关于」只管版本与协议 —— 装运行时是系统层面的事，放这一栏才对。
+        // When there is no Python on this machine, offer a one-click install. It used to live in
+        // the "about" card, but "About" now only covers version and license -- installing a
+        // runtime is a system-level matter, so this is the right column for it.
         if self.runtimes.python_missing {
             ui.add_space(14.0);
             ui.label(
-                RichText::new("本机没有 Python，文件读写、系统信息等能力不可用。")
+                RichText::new(aox::i18n::t("Python is missing on this machine; file I/O, system info and similar capabilities are unavailable."))
                     .color(P::text_dim())
                     .size(13.5),
             );
             ui.add_space(8.0);
-            if primary_button(ui, "安装 Python 运行时（约 10 MB）").clicked() {
-                // 走与 CLI 完全相同的命令路径（宿主自己处理，不发给模型）
+            if primary_button(ui, aox::i18n::t("Install Python runtime (~10 MB)")).clicked() {
+                // Goes down exactly the same command path as the CLI (handled by the host itself,
+                // not sent to the model)
                 let _ = self.tx.send(ToAgent::Input("/runtime install python".into(), Vec::new()));
             }
         }
     }
 
-    /// 工作空间那一行：「路径 + 档位」。
+    /// The workplace row: "path + tier".
     ///
-    /// 工作空间是**跟着对话走**的（`/new` 一律回默认档），所以这里显示的是**当前这段
-    /// 对话**的那块地 —— 这也是为什么它能显示而不用等磁盘扫描：现状由 bridge 主动推。
+    /// The workplace **follows the conversation** (`/new` always goes back to the default tier),
+    /// so what is shown here is **this conversation's** plot of land -- which is also why it can
+    /// be shown without waiting for a disk scan: the bridge pushes the current state.
     fn workplace_line(&self) -> String {
         use aox::workplace::Mode;
         let Some(v) = self.ws.view() else {
-            // 刚启动的头一两帧还没收到回执。不猜一个目录，如实说还不知道。
-            return "（还没收到回执）".into();
+            // The first frame or two after startup hasn't received an acknowledgement yet. Don't
+            // guess a directory; say honestly that it isn't known yet.
+            return aox::i18n::t("(no acknowledgement yet)").into();
         };
         let name = match &v.mode {
-            Mode::Default => "默认档".to_string(),
-            Mode::Full => "完全访问档（写入不受限）".to_string(),
-            Mode::Fixed(p) => format!("固定档 {}", p.display()),
+            Mode::Default => aox::i18n::t("Default tier").to_string(),
+            Mode::Full => aox::i18n::t("Full access tier (writes unrestricted)").to_string(),
+            Mode::Fixed(p) => aox::tf!("Fixed tier {}", p.display()),
         };
         match &v.root {
-            Some(r) => format!("{}（{name}）", r.display()),
-            // `default` 档要等第一条消息才开地。这里刻意与「不受限」分开说 —— 两件事。
-            None => format!("（{name} · 还没开地）"),
+            Some(r) => aox::tf!("{} ({})", r.display(), name),
+            // The `default` tier only opens its plot once the first message arrives. This is
+            // deliberately stated separately from "unrestricted" -- two different things.
+            None => aox::tf!("({} · plot not opened yet)", name),
         }
     }
 
-    /// 「关于」栏：版本、协议、链接。
+    /// The "About" column: version, license, links.
     ///
-    /// 协议正文**直接嵌入仓库里那份 `LICENSE`**，不手抄一行 —— 手抄的那份一旦与文件
-    /// 不一致，「关于」里写的就不是真正生效的那份协议了，而这种错没人会去核对。
+    /// The license text is **the repo's own `LICENSE`, embedded directly**, not copied out by
+    /// hand -- a hand-copied version that drifts from the file means what "About" shows is no
+    /// longer the license actually in force, and nobody ever double-checks that kind of error.
     fn tab_about(&self, ui: &mut Ui) {
-        // 刊头：衬线体的 AOX GUI + 版本号，底下一条细线（与首屏空状态同一个语汇）
+        // Masthead: AOX GUI in a serif face + the version, with a thin rule underneath (the same
+        // vocabulary as the empty state)
         ui.horizontal(|ui| {
             ui.label(RichText::new("AOX GUI").font(theme::serif_font(24.0)).color(P::text()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2216,16 +2459,16 @@ impl App {
 
         ui.add_space(12.0);
         ui.label(
-            RichText::new("基于 Rust 编写的 AOX 图形化应用，遵循开源协议 ISC。")
+            RichText::new(aox::i18n::t("AOX GUI, written in Rust. Licensed under the open-source ISC license."))
                 .color(P::text_dim())
                 .size(14.0),
         );
 
         ui.add_space(16.0);
-        ui.label(RichText::new("ISC 协议全文").color(P::text_faint()).size(12.5));
+        ui.label(RichText::new(aox::i18n::t("Full ISC license text")).color(P::text_faint()).size(12.5));
         ui.add_space(6.0);
-        // 协议正文装在一个带底色的框里。**可选中**：要引用某一条款时能直接复制，
-        // 而不是照着屏幕重打一遍。
+        // The license text sits in a filled box. **Selectable**: when quoting a clause you can
+        // copy it directly instead of retyping it off the screen.
         Frame::NONE
             .fill(P::code_bg())
             .corner_radius(CornerRadius::same(12))
@@ -2244,8 +2487,8 @@ impl App {
             });
 
         ui.add_space(16.0);
-        link_row(ui, "作者博客", "https://2am.top");
-        link_row(ui, "项目地址", "https://github.com/forever218/AOX");
+        link_row(ui, aox::i18n::t("Author's blog"), "https://2am.top");
+        link_row(ui, aox::i18n::t("Project home"), "https://github.com/forever218/AOX");
     }
 
     fn auth_overlay(&mut self, ctx: &egui::Context) {
@@ -2254,14 +2497,14 @@ impl App {
         egui::Modal::new(egui::Id::new("aox-auth")).show(ctx, |ui| {
             ui.set_width(480.0);
             ui.label(
-                RichText::new("工具调用需要授权")
+                RichText::new(aox::i18n::t("Tool call needs authorization"))
                     .color(P::text())
                     .size(17.0)
                     .strong(),
             );
             ui.add_space(4.0);
             ui.label(
-                RichText::new("模型想调用一个会改变系统自身的元工具：")
+                RichText::new(aox::i18n::t("The model wants to call a meta-tool that changes the system itself:"))
                     .color(P::text_faint())
                     .size(14.0),
             );
@@ -2288,8 +2531,10 @@ impl App {
                     ui.add(Label::new(job));
                 });
             ui.add_space(12.0);
-            // 键盘快捷键与 CLI 完全一致：y 允许一次 / a 本会话始终允许 / n 拒绝。
-            // 加 250ms 去抖：弹窗刚出现时忽略按键，避免上一条消息的 Enter 等残留事件误触。
+            // The keyboard shortcuts are identical to the CLI's: y allows once / a always allows
+            // for this session / n denies.
+            // A 250ms debounce is added: keys are ignored right after the dialog appears, so
+            // residue from the previous message (its Enter, say) can't trigger it by accident.
             let settled = self.auth_shown_at.elapsed() > Duration::from_millis(250);
             if settled {
                 if ui.input(|i| i.key_pressed(egui::Key::Y)) {
@@ -2303,21 +2548,21 @@ impl App {
                 }
             }
             ui.horizontal(|ui| {
-                if primary_button(ui, "允许一次").clicked() {
+                if primary_button(ui, aox::i18n::t("Allow once")).clicked() {
                     decision = Some(AuthDecision::Allow);
                 }
-                if flat_button(ui, "本会话始终允许").clicked() {
+                if flat_button(ui, aox::i18n::t("Always allow this session")).clicked() {
                     decision = Some(AuthDecision::AllowSession);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if flat_button(ui, "拒绝").clicked() {
+                    if flat_button(ui, aox::i18n::t("Deny")).clicked() {
                         decision = Some(AuthDecision::Deny);
                     }
                 });
             });
             ui.add_space(6.0);
             ui.label(
-                RichText::new("快捷键：y 允许一次 · a 本会话始终允许 · n / Esc 拒绝")
+                RichText::new(aox::i18n::t("Shortcuts: y allow once · a always for this session · n / Esc deny"))
                     .color(P::text_faint())
                     .size(12.5),
             );
@@ -2331,11 +2576,11 @@ impl App {
                 self.waiting_auth = false;
                 self.note_act(
                     ActKind::Info,
-                    "授权结果",
+                    aox::i18n::t("Authorization result"),
                     match d {
-                        AuthDecision::Allow => "允许一次",
-                        AuthDecision::AllowSession => "本会话始终允许",
-                        AuthDecision::Deny => "拒绝",
+                        AuthDecision::Allow => aox::i18n::t("Allow once"),
+                        AuthDecision::AllowSession => aox::i18n::t("Always allow this session"),
+                        AuthDecision::Deny => aox::i18n::t("Deny"),
                     },
                 );
             }
@@ -2344,27 +2589,31 @@ impl App {
     }
 }
 
-// ─────────────────────────── 演示数据（--demo） ───────────────────────────
+// ─────────────────────────── demo data (--demo) ───────────────────────────
 
-/// 与 CLI 的 `/demo` 对应：不连真实模型也能预览界面排布与事件流的形态。
+/// The counterpart of the CLI's `/demo`: preview the layout and the shape of the event stream
+/// without connecting a real model.
 fn seed_demo(app: &mut App) {
     app.model = "deepseek-chat".into();
     app.config_path = "config.toml".into();
     app.plugins = vec!["filestat".to_string()];
-    app.status = "就绪".into();
-    // 演示模式也从真实的应用根读历史：预览本来就该是真实的样子，
-    // 编几条假对话反而会让人以为侧边栏是装饰品。
+    app.status = aox::i18n::t("Ready").into();
+    // Demo mode reads history from the real application root too: a preview should look real,
+    // and making up a few fake conversations would just make people think the sidebar is
+    // ornamental.
     let root = aox::paths::resolve_workplace().0;
     let store = aox::store::default_store(&root, 0);
     app.boot = Some(BootInfo {
         config_path: app.config_path.clone(),
-        // 演示数据也照真实形态给一条层链，好让「关于」窗口那一行在 --demo 里也看得见。
+        // The demo data gets a realistic layer chain too, so that row in the "About" window is
+        // visible under --demo.
         config_layers: vec!["bundle:core".into(), "config.toml".into()],
         model: app.model.clone(),
         provider_ready: true,
         note: None,
-        // 演示模式也给一份真实的路径清单：设置页的「系统」栏本来就是「看一眼就够」
-        // 的诊断数据，用假路径预览毫无意义（而真路径在演示模式里同样读得到）。
+        // Demo mode gets a real path listing as well: the settings page's "System" column is
+        // exactly the kind of "one glance is enough" diagnostic data, so previewing it with fake
+        // paths is pointless (and the real paths are readable in demo mode anyway).
         paths: BootPaths::new(
             &root,
             std::path::Path::new(&app.config_path),
@@ -2376,12 +2625,14 @@ fn seed_demo(app: &mut App) {
     app.store = Some(store);
     app.refresh_history();
 
-    // 工作区按钮的初值：演示模式下 bridge 不会发 `FromAgent::Workplace`，
-    // 就地塞一份，好让 `--demo` 也能把按钮上的档位名与列表里打勾的那一项演出来。
+    // The workplace button's initial value: in demo mode the bridge won't send
+    // `FromAgent::Workplace`, so one is stuffed in locally, letting `--demo` show the tier name
+    // on the button and the ticked row in the list.
     app.ws.set_view(WorkplaceView { mode: Mode::Default, root: None });
 
-    // 顶栏那枚「Σ 用量」胶囊**只在有账本时才画**，而 `--demo` 没有真实调用 ——
-    // 补两条账，好让预览里也能看到它与被悬停展开的明细面板（也才验得了面板的位置）。
+    // The "Σ usage" chip **is only drawn when there is a ledger**, and `--demo` has no real
+    // calls -- so two records are added, letting the preview show it and the breakdown panel it
+    // expands on hover (which is also the only way to verify the panel's position).
     app.usage_log = vec![
         UsageRecord {
             round: 1,
@@ -2417,20 +2668,20 @@ fn seed_demo(app: &mut App) {
         },
     ];
 
-    app.items.push(Item::User("做一个插件，统计当前目录下各类文件的数量".into(), Vec::new()));
+    app.items.push(Item::User(aox::i18n::t("Make a plugin that counts files by type in the current directory").into(), Vec::new()));
     app.items.push(Item::Process(Process {
         steps: vec![
             StepView {
                 name: "list_plugins".into(),
                 plugin: Some("meta".into()),
                 args: "{}".into(),
-                result: Some((false, "已加载插件: probe_screen, fs".into())),
+                result: Some((false, aox::i18n::t("Plugins loaded: probe_screen, fs").into())),
             },
             StepView {
                 name: "create_plugin".into(),
                 plugin: Some("meta".into()),
                 args: r#"{"name":"filestat","language":"python"}"#.into(),
-                result: Some((false, "插件 filestat 已创建、注册并持久化（1 个工具）".into())),
+                result: Some((false, aox::i18n::t("Plugin filestat created, registered and persisted (1 tool)").into())),
             },
             StepView {
                 name: "filestat_count".into(),
@@ -2439,96 +2690,85 @@ fn seed_demo(app: &mut App) {
                 result: Some((false, ".rs 14 · .py 9 · .toml 4 · .md 2 · .lock 1".into())),
             },
         ],
-        interim: vec!["先看看有没有现成的能力可以复用。".into()],
-        reasoning: "用户要统计文件数量：可以读目录 + 按后缀聚合。宿主里没有这个能力，\
-                    需要先 create_plugin 造一个 filestat 插件，再调用它。"
+        interim: vec![aox::i18n::t("Check for existing capabilities to reuse first.").into()],
+        reasoning: "Counting files by type: the host has no such capability; create a filestat plugin with create_plugin first, then call it."
             .into(),
         elapsed: Some(7.4),
         expanded: false,
         aborted: false,
     }));
     app.items.push(Item::Assistant(
-        "已经为你造好了 `filestat` 插件，它提供工具 **filestat_count**。\n\n\
-         ## 用法\n\n\
-         ```json\n{ \"path\": \".\", \"ext\": null }\n```\n\n\
-         `ext` 留空表示统计全部后缀。当前目录的结果：\n\n\
-         | 后缀 | 数量 |\n|------|------|\n| .rs | 14 |\n| .py | 9 |\n| .toml | 4 |\n| .md | 2 |\n\n\
-         > 插件已持久化到 `plugins/filestat/`，下次启动会自动加载，无需重建。"
+        "Your `filestat` plugin is ready; it provides the tool **filestat_count**.\n\n## Usage\n\n```json\n{ \"path\": \".\", \"ext\": null }\n```\n\nLeave `ext` empty to count all extensions. Result for the current directory:\n\n| Ext | Count |\n|------|------|\n| .rs | 14 |\n| .py | 9 |\n| .toml | 4 |\n| .md | 2 |\n\n> The plugin is persisted under `plugins/filestat/`; it loads automatically on the next start -- no need to rebuild."
             .into(),
     ));
-    // ▼▼▼ 诊断用：超宽内容（长代码行 / 长内联代码 / 长词 / 列表 / 表格）
-    //      —— 验证「内容比版心宽」时是否会在右端边界处换行，而不是被裁切。
+    // ▼▼▼ diagnostics: over-wide content (long code lines / long inline code / long words /
+    //      lists / tables) -- to verify that content wider than the measure wraps at the right
+    //      edge instead of being clipped.
     app.items.push(Item::Assistant(
-        "## 超宽内容\n\n\
-         ```json\n{\"very_long_key_that_never_wraps\":\"C:/Users/someone/AppData/Local/Temp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\",\"n\":1}\n```\n\n\
-         路径 `E:/rustapp/plugins/filestat/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.py` 很长。\n\n\
-         ### 连通性实测\n\n\
-         - `httpfetch_raw` → 请求 bilibili.com 返回 HTTP 200，成功抓取到页面文本（共 183539 字符，已截断），网络与插件进程通信正常。\n\n\
-         - `bilibili_video_info` → 拉取 BV1GJ411x7h7 成功，返回完整元数据（标题「【官方 MV】Never Gonna Give You Up - Rick Astley」、UP 主「索尼音乐中国」、播放 1.06 亿）。\n\n\
-         | 插件 | 语言 | 提供工具 |\n| --- | --- | --- |\n\
-         | bilibili | python | bilibili_video_info（视频元数据）、bilibili_danmaku（弹幕）、bilibili_comments（评论）、bilibili_subtitle（字幕）、bilibili_related（相关推荐） |\n\
-         | httpfetch | python | httpfetch_raw（通用 GET 请求，用于接口调试/抓取网页） |\n\n\
-         结论：无需新建或修复任何插件，现有能力已覆盖 B 站视频信息抓取 + 通用网页请求两类需求，可直接接活。若后续需要文件读写、命令执行、数据导出（如 CSV/Excel）等能力，再按需扩展。\n\n\
-         aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "## Over-wide content\n\n```json\n{\"very_long_key_that_never_wraps\":\"C:/Users/someone/AppData/Local/Temp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\",\"n\":1}\n```\n\nThe path `E:/rustapp/plugins/filestat/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.py` is very long.\n\n### Connectivity test\n\n- `httpfetch_raw` → requested bilibili.com, got HTTP 200 and fetched the page text (183539 chars, truncated); network and plugin-process communication are fine.\n\n- `bilibili_video_info` → fetched BV1GJ411x7h7 successfully with full metadata (title \"Never Gonna Give You Up (Official MV)\", publisher \"Sony Music China\", 106M plays).\n\n| Plugin | Language | Tools |\n| --- | --- | --- |\n| bilibili | python | bilibili_video_info (video metadata), bilibili_danmaku (bullet comments), bilibili_comments (comments), bilibili_subtitle (subtitles), bilibili_related (related videos) |\n| httpfetch | python | httpfetch_raw (generic GET for API debugging / web page fetching) |\n\nConclusion: no new or fixed plugins needed -- existing capabilities already cover Bilibili video info fetching + generic web requests, ready to take the job. File I/O, command execution, data export (CSV/Excel) and similar can be added later as needed.\n\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .into(),
     ));
-    // ▲▲▲ 诊断用
+    // ▲▲▲ diagnostics
     app.items.push(Item::Note(
         NoteKind::Info,
-        "插件 filestat 已恢复（1 个工具）".into(),
+        aox::i18n::t("Plugin filestat restored (1 tool)").into(),
     ));
 
-    // 活动流：按时间顺序铺一遍典型信息流（横向时间轴：色块宽度 = 真实耗时）。
-    // 演示模式把活动流窗口一并打开 —— 它已经是界面的一大块，预览就该看到它。
+    // The activity stream: lay out a typical sequence of events in time order (horizontal
+    // timeline: bar width = real elapsed time). Demo mode opens the activity-stream window as
+    // well -- it is a big part of the UI already, so a preview should show it.
     {
         let mut a = activity::lock(&app.act);
         a.force_open();
-        a.round_begin("做一个插件，统计当前目录下各类文件的数量", 0.0);
+        a.round_begin(aox::i18n::t("Make a plugin that counts files by type in the current directory"), 0.0);
         a.model_begin(0.5);
-        a.model_push("用户要统计文件数量：可以读目录 + 按后缀聚合。宿主里没有这个能力，");
-        a.model_push("需要先 create_plugin 造一个 filestat 插件，再调用它。");
+        a.model_push(aox::i18n::t("Counting files by type: the host has no such capability;"));
+        a.model_push(aox::i18n::t("create a filestat plugin with create_plugin first, then call it."));
         a.tool_begin("list_plugins", Some("meta"), "{}", 1.7);
-        a.tool_end(false, "已加载插件: probe_screen, fs", 2.0);
+        a.tool_end(false, aox::i18n::t("Plugins loaded: probe_screen, fs"), 2.0);
         a.model_begin(2.1);
-        a.model_push("先看看有没有现成的能力可以复用。");
+        a.model_push(aox::i18n::t("Check for existing capabilities to reuse first."));
         a.tool_begin(
             "create_plugin",
             Some("meta"),
             r#"{"name":"filestat","language":"python"}"#,
             2.8,
         );
-        a.tool_note("超时上限 120s");
-        a.note(ActKind::Auth, "请求授权 · create_plugin", "{\"name\":\"filestat\"}", 3.6);
-        a.note(ActKind::Info, "授权结果", "允许一次", 5.8);
-        a.tool_end(false, "插件 filestat 已创建、注册并持久化（1 个工具）", 6.4);
+        a.tool_note(aox::i18n::t("Timeout limit 120s"));
+        a.note(ActKind::Auth, aox::i18n::t("Request authorization · create_plugin"), "{\"name\":\"filestat\"}", 3.6);
+        a.note(ActKind::Info, aox::i18n::t("Authorization result"), aox::i18n::t("Allow once"), 5.8);
+        a.tool_end(false, aox::i18n::t("Plugin filestat created, registered and persisted (1 tool)"), 6.4);
         a.model_begin(6.5);
         a.tool_begin("filestat_count", Some("filestat"), r#"{"path":".","ext":null}"#, 7.4);
         a.tool_end(false, ".rs 14 · .py 9 · .toml 4 · .md 2 · .lock 1", 8.6);
         a.model_begin(8.7);
-        a.model_push("结果已经拿到，整理成一张表给用户。");
+        a.model_push(aox::i18n::t("Result in hand; assembling it into a table for the user."));
         a.end_round(11.9);
-        a.tick(11.9, "就绪", false);
+        a.tick(11.9, aox::i18n::t("Ready"), false);
 
-        // 第二轮：跨轮次、跨插件的连线效果也一并演示
-        a.round_begin("把刚才那个插件的用法写进 README", 13.2);
+        // Second turn: the cross-turn, cross-plugin connector effect is demonstrated too
+        a.round_begin(aox::i18n::t("Write the plugin's usage into the README"), 13.2);
         a.model_begin(13.8);
-        a.model_push("README 里加一节「filestat 用法」即可。");
+        a.model_push(aox::i18n::t("Just add a \"filestat usage\" section to the README."));
         a.tool_begin("fs_write", Some("fs"), r#"{"path":"README.md"}"#, 14.6);
-        a.tool_end(false, "已写入 1.2 KB", 15.4);
+        a.tool_end(false, aox::i18n::t("Wrote 1.2 KB"), 15.4);
         a.model_begin(15.5);
-        a.model_push("写完了。");
+        a.model_push(aox::i18n::t("Done."));
         a.end_round(18.1);
-        a.tick(18.1, "就绪", false);
+        a.tick(18.1, aox::i18n::t("Ready"), false);
     }
 }
 
-/// 主窗口的默认尺寸：按显示器大小算，留出边框与任务栏，再夹到人能看的区间。
+/// The main window's default size: computed from the monitor size, minus the borders and the
+/// taskbar, then clamped to a range a person can actually look at.
 ///
-/// 活动流窗口要「和主窗口一样大」，所以公式只写这一份 —— 两边各算一次必然漂移。
+/// The activity-stream window has to be "the same size as the main window", so this formula is
+/// written once only -- computing it on both sides would inevitably drift apart.
 pub(crate) fn default_window_size(mon: Vec2, chrome: Vec2) -> Vec2 {
-    // 任务栏高度没有 API 可查，按显示器高度取一个保守比例（默认约 48 逻辑点）
+    // There is no API for the taskbar height, so take a conservative fraction of the monitor
+    // height (about 48 logical points by default)
     let taskbar = (mon.y * 0.06).clamp(36.0, 72.0);
-    // 贴边留一点呼吸空间
+    // A little breathing room from the edges
     let margin = Vec2::new(80.0, 28.0);
     Vec2::new(
         (mon.x - margin.x - chrome.x).min(1380.0).max(1000.0),
@@ -2540,35 +2780,45 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.fit_window(ctx);
         self.pump();
-        // 拖放：整窗口任意位置都接（见 `take_dropped`）。放在 `pump` 之后、绘制之前
-        // —— 这一帧刚收下的附件要能在这一帧就出现在待上传栏里。
+        // Drag and drop: anywhere in the window accepts (see `take_dropped`). Placed after
+        // `pump` and before painting -- an attachment received this frame has to appear in the
+        // pending-upload bar this same frame.
         self.take_dropped(ctx);
 
-        // 图片解码：收尾（挂纹理）与排队（起后台线程）。每帧一次，幂等。
+        // Image decoding: finishing (attaching textures) and queueing (starting background
+        // threads). Once per frame, idempotent.
         self.poll_images(ctx);
-        // 首屏插画也在这里推一把：它同样要起后台线程解码、同样要等到解完才能画。
-        // 两张图**一开始就都解**（不是等用着哪张才解），所以放在这里与主题无关。
+        // The empty-state illustration gets a push here too: it likewise needs a background
+        // thread to decode and likewise can't be drawn until that finishes.
+        // Both images are decoded **from the start** (rather than decoding whichever one is in
+        // use), which is why this isn't tied to the theme.
         self.brand.poll(ctx);
 
-        // 「跟随系统」的每帧复查：系统换了主题就跟着换（egui 每帧把当前系统主题放在
-        // `ctx` 里）。不放在切换那一刻算一次的原因见 `theme::follow_system` 的注释 ——
-        // 那样「跟随系统」会退化成「启动时照系统的样子定一次」。
+        // The every-frame recheck for "follow system": when the system theme changes, follow it
+        // (egui puts the current system theme in `ctx` each frame). For why this isn't computed
+        // once at the moment of switching, see the comment on `theme::follow_system` -- that way
+        // "follow system" would degrade into "decide once at startup by copying the system".
         theme::follow_system(ctx);
 
-        // 原生标题栏只留窗口标题本身：图标不设、标题里也不再缀模型名，
-        // 免得左上角挤着一行「AOX · xxx」。底色同步见下面 sync_native_theme。
+        // The native title bar keeps only the window title itself: no icon is set, and the model
+        // name is no longer appended, so a line like "AOX · xxx" isn't crowding the top-left. For
+        // the colour sync see sync_native_theme below.
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
-        // `switching` 也要重绘：切换的回执从 agent 线程异步回来，空闲窗口
-        // 默认不会自己重画，少了这一条就会「点了没反应」，直到下次鼠标一动。
+        // `switching` needs a repaint too: the switch acknowledgement comes back from the agent
+        // thread asynchronously, and an idle window doesn't repaint by itself, so without this it
+        // looks like "I clicked and nothing happened" until the mouse moves next.
         if self.busy || self.waiting_auth || self.live.is_some() || self.switching {
             self.spin += dt;
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
-        // 滑出动画推进：把 `hist_t` 朝开关状态挪一格，挪到为止。
+        // Advance the slide-out animation: step `hist_t` toward the toggle state until it gets
+        // there.
         //
-        // 逐帧推进（而不是「记开始时刻 + 查缓动表」）是为了让中途反向也接得上：
-        // 连点两下开关时，进度从**当前位置**往回走，不会先跳回 0 再重开。
+        // Stepping frame by frame (rather than "remember the start time + consult an easing
+        // table") is what lets a mid-flight reversal connect properly: double-clicking the toggle
+        // walks the progress back from **where it currently is**, instead of jumping to 0 and
+        // starting over.
         let target = if self.show_history { 1.0 } else { 0.0 };
         if self.hist_t != target {
             let step = dt.min(0.05) / HIST_ANIM_SECS;
@@ -2577,8 +2827,9 @@ impl eframe::App for App {
             } else {
                 (self.hist_t - step).max(target)
             };
-            // 动画期间必须自己喊重绘：窗口空闲时 egui 不会自己刷帧，
-            // 少了这一条，滑出会变成一顿一顿的跳格。
+            // During the animation a repaint has to be requested explicitly: an idle window
+            // doesn't repaint on its own in egui, and without this the slide-out becomes a series
+            // of stuttering jumps.
             ctx.request_repaint();
         }
 
@@ -2590,24 +2841,29 @@ impl eframe::App for App {
             theme::sync_caption(frame);
         }
 
-        // 历史浮层：`hist_t` 归零后它自己就不画了，这里**不要**再判 `show_history`
-        // —— 收起的过程也得接着画，判开关会让面板在半路上凭空消失。
+        // The history overlay: once `hist_t` reaches zero it stops drawing itself, so **don't**
+        // additionally test `show_history` here -- the collapsing has to keep being drawn, and
+        // testing the toggle would make the panel vanish mid-way.
         self.history_overlay(ctx);
-        // 活动流在独立窗口里：主窗口每帧把「现在在干什么」同步过去，并重新声明
-        // 那个视口（egui 的视口是声明式的，不声明就会被回收）。
+        // The activity stream lives in its own window: the main window syncs "what is happening
+        // right now" over every frame and re-declares that viewport (egui viewports are
+        // declarative; one that isn't declared gets reclaimed).
         activity::lock(&self.act).tick(self.now(), &self.status, self.busy);
         activity::sync(ctx, &self.act);
         let frame = Frame::NONE.fill(P::bg());
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             let column_rect = ui.max_rect();
-            // 对话区铺满整个中央面板，不再给输入框让出底栏
+            // The transcript fills the whole central panel; no bottom bar is given up for the
+            // input box any more
             self.transcript(ui);
 
-            // 输入框改为一枚悬浮卡片（Foreground 层），直接压在对话内容之上。
-            // 之所以不放在 TopBottomPanel::bottom 里：那会永久占掉一条底栏，
-            // 面板底色与背景同色，看上去就是底部空出一片区域。
-            // constrain_to 在这里有两个作用：把裁切区域限制在本栏内（不会盖到下一层内容），
-            // 以及让 anchor 的居中参考系正好是本栏。
+            // The input box became a floating card (a Foreground layer) pressed right on top of
+            // the transcript. Why not put it in a `TopBottomPanel::bottom`: that would permanently
+            // eat a bottom bar, and since the panel's fill matches the background it just looks
+            // like an empty region at the bottom.
+            // `constrain_to` does two jobs here: it confines the clip region to this column (so it
+            // can't cover the content of the layer below), and it makes the anchor's centring
+            // reference frame exactly this column.
             let clip = Rect::from_min_max(
                 column_rect.min,
                 Pos2::new(column_rect.right(), column_rect.bottom()),
@@ -2623,8 +2879,9 @@ impl eframe::App for App {
                 });
         });
 
-        // 工作区的三个浮层：向上弹出的三选一列表、完全访问的确认框、目录选择器。
-        // 都排在 CentralPanel 之后 —— 它们要盖在对话内容与输入卡片之上。
+        // The workplace's three overlays: the three-way pop-up list, the full-access
+        // confirmation, and the directory picker. All are scheduled after the CentralPanel --
+        // they have to sit above the transcript and the input card.
         if let Some(mode) = workplace_ui::menu(ctx, &mut self.ws) {
             self.send_ws(mode);
         }
@@ -2655,7 +2912,8 @@ impl Drop for App {
         self.flags.request_abort();
         let _ = self.tx.send(ToAgent::Shutdown);
         if let Some(h) = self.driver.take() {
-            // 有界等待：给插件子进程一点时间优雅退出，但绝不卡死界面退出
+            // Bounded wait: give plugin subprocesses a moment to exit gracefully, but never stall
+            // the UI's own exit
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             std::thread::spawn(move || {
                 let _ = h.join();
@@ -2666,87 +2924,101 @@ impl Drop for App {
     }
 }
 
-// ─────────────────────────── 小组件 ───────────────────────────
+// ─────────────────────────── widgets ───────────────────────────
 
-/// 对话栏的版心：返回 (内容宽度, 左右留白)。
-/// 行宽过宽会很难读，所以设了上限并在窗口里居中。
+/// The transcript column's measure: returns (content width, left/right padding).
+/// Over-wide lines are hard to read, so there is an upper bound and it is centred in the
+/// window.
 pub(crate) fn column(available: f32) -> (f32, f32) {
     let inner = (available - 96.0).min(880.0).max(280.0);
     let pad = ((available - inner) * 0.5).max(18.0);
     (inner, pad)
 }
 
-/// 悬浮输入框在纵向占用的空间（卡片高度 + 下边距 + 投影余量）。
-/// 对话流末尾留出这段空白，保证最后一条消息不会被卡片压住。
+/// The vertical space the floating input box takes up (card height + bottom margin + room for the
+/// shadow).
+/// That much blank is reserved at the end of the transcript, so the last message can't be pressed
+/// under the card.
 const COMPOSER_RESERVE: f32 = 118.0;
 
-/// 历史浮层一次最多列出多少个历史对话。
+/// How many conversations the history overlay lists at most.
 ///
-/// 不做分页：几十条已经够「翻回去找刚才那段」了，而列全部意味着每次刷新
-/// 都要扫完整个目录。真要翻更早的，`/history` 与 `history/` 目录都在。
+/// No pagination: a few dozen is already plenty for "scroll back and find the one from just now",
+/// whereas listing everything would mean scanning the whole directory on every refresh. To really
+/// go further back, both `/history` and the `history/` directory are there.
 const HISTORY_LIST_LIMIT: usize = 80;
 
-// ────────────── 浮动按钮条与历史浮层的几何 ──────────────
+// ────────────── geometry of the floating button row and the history overlay ──────────────
 //
-// 这几个数原本散在两处：按钮的落点在 `top_bar` 的 `exact_height(50)` +
-// `Margin::symmetric(20, 0)` 里，历史栏的宽度在 `SidePanel::default_width(266)` 里。
-// 顶栏与侧栏都被拆掉之后，它们没有「容器」可依了，于是显式钉在这里 ——
-// 位置照搬拆栏前的结果，逐像素不变。
+// These numbers used to be scattered across two places: the buttons' landing spots lived in
+// `top_bar`'s `exact_height(50)` + `Margin::symmetric(20, 0)`, and the history column's width
+// lived in `SidePanel::default_width(266)`. With both the top bar and the side column removed they
+// have no "container" to lean on, so they are pinned explicitly here -- the positions are lifted
+// from the pre-removal result, pixel for pixel unchanged.
 
-/// 按钮热区边长（与三枚图标函数里的 `d` 是同一个数）。
+/// Side length of a button's hot zone (the same number as `d` in the three icon functions).
 const BAR_BTN: f32 = 36.0;
-/// 按钮条距窗口**左**边。
+/// Distance from the button row to the window's **left** edge.
 const BAR_LEFT: f32 = 20.0;
-/// 按钮条距窗口上边。`7 + 18 = 25`，正好是旧顶栏 50px 高的一半 ——
-/// 按钮中心线与拆栏之前完全重合。
+/// Distance from the button row to the window's top edge. `7 + 18 = 25`, exactly half of the old
+/// 50px top bar -- the buttons' centre line coincides exactly with the pre-removal one.
 const BAR_TOP: f32 = 7.0;
-/// 历史浮层的宽度。
+/// Width of the history overlay.
 const HISTORY_W: f32 = 300.0;
-/// 历史浮层里「列表以上」那部分的高度（内边距 + 标题行 + 分隔线）。
+/// Height of the "above the list" part of the history overlay (padding + title row + separator).
 ///
-/// 只用来算列表最多能占多高，取整即可 —— 面板的实际高度由内容自己决定，不靠它。
+/// Used only to work out how tall the list may be at most; rounding is fine -- the panel's real
+/// height is decided by its content, not by this.
 const HIST_HEAD: f32 = 74.0;
-/// 滑出 / 收起的动画时长（秒）。
+/// The slide-out / collapse animation duration (seconds).
 ///
-/// 0.24 是「看得出来在动、又不用等」的一档：更短就退回瞬移，更长会觉得
-/// 点完之后界面在迟疑。
+/// 0.24 is the "you can see it moving, but you don't have to wait" setting: shorter falls back to
+/// an instant jump, longer feels like the UI is hesitating after the click.
 const HIST_ANIM_SECS: f32 = 0.24;
 
-/// 顶栏滑出组里的两枚按钮 —— 只有它俩要做「从历史按钮背后钻出来」的裁剪。
+/// The two buttons in the slide-out group -- these are the only ones that need the "emerge from
+/// behind the history button" clipping.
 ///
-/// 用一个枚举而不是写两段几乎一样的 `Area`：两枚按钮的位移、裁剪、留白
-/// 必须逐像素一致，抄成两份的话下次改一处就会两边不齐（那种错很难在看代码时发现，
-/// 只有截图对比才看得出来）。
+/// An enum rather than two nearly identical `Area` blocks: the two buttons' offsets, clipping and
+/// padding have to match pixel for pixel, and with two copies any future change to one of them
+/// leaves the two misaligned (an error that is very hard to spot by reading the code -- only a
+/// screenshot comparison shows it).
 #[derive(Clone, Copy)]
 enum SlideIcon {
-    /// 新建对话
+    /// New conversation
     Plus,
-    /// 设置
+    /// Settings
     Gear,
 }
 
-/// 缓出曲线（cubic ease-out）：起步快、收尾慢。
+/// Ease-out curve (cubic ease-out): quick off the mark, slow to settle.
 ///
-/// 用它而不是官方的 `ctx.animate_bool_with_time`（那是**线性**插值）：
-/// 匀速位移在起点与终点都是硬拐弯 —— 起手像被弹了一下，停下像撞了墙。
+/// Used instead of the built-in `ctx.animate_bool_with_time` (which interpolates **linearly**):
+/// constant-speed motion makes hard corners at both ends -- it kicks off as if flicked and stops
+/// as if it hit a wall.
 fn ease_out_cubic(t: f32) -> f32 {
     let u = 1.0 - t.clamp(0.0, 1.0);
     1.0 - u * u * u
 }
 
-/// 一个「比窗口大得多」的约束矩形：给需要滑到窗口外的 `Area` 用。
+/// A constraint rect that is "much bigger than the window": for the `Area`s that need to slide
+/// outside it.
 ///
-/// `Area` 默认会把自己的位置拉回约束矩形内，滑出动画的位移会被当场抹平，
-/// 所以那几处要放开。**但不要用 `Rect::EVERYTHING`** —— 里边是 ±∞，
-/// 一旦参与「锚点对齐」之类的运算，位置就变成 NaN 或无穷，Area 直接消失
-///（右上那排按钮栽过一次）。给个有限的宽松框，效果一样，还不会算出怪数。
+/// An `Area` pulls its position back inside the constraint rect by default, which flattens the
+/// slide-out offset on the spot, so those places have to release it. **But don't use
+/// `Rect::EVERYTHING`** -- it is ±infinity inside, and as soon as it takes part in something like
+/// anchor alignment the position becomes NaN or infinite and the Area disappears entirely (the
+/// top-right button row ran into this once). Hand it a finite, roomy box: same effect, and no
+/// absurd numbers come out of it.
 fn loose_rect() -> Rect {
     Rect::from_min_max(Pos2::new(-10_000.0, -10_000.0), Pos2::new(10_000.0, 10_000.0))
 }
 
-/// 历史记录按钮：左侧一条竖线（代表侧边栏）+ 三条短横线。
+/// The history button: a vertical rule on the left (standing for the sidebar) plus three short
+/// horizontal lines.
 ///
-/// 与另外两个顶栏图标同一套画法（36px 热区、单色描边、悬停换色）。
+/// Drawn the same way as the two other top-bar icons (36px hot zone, single-colour stroke, hover
+/// recolour).
 fn history_icon(ui: &mut Ui, on: bool) -> egui::Response {
     let d = 36.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
@@ -2760,20 +3032,22 @@ fn history_icon(ui: &mut Ui, on: bool) -> egui::Response {
     };
 
     let painter = ui.painter();
-    // 常态就铺一块底色（= 旧顶栏的填充色）：顶栏拆掉之后按钮直接浮在对话文字上，
-    // 没有这块底，图标会和正文糊在一起。悬停升一档，与列表行、菜单行同一套语言。
+    // A backdrop is laid down even in the resting state (= the old top bar's fill): with the bar
+    // gone the buttons float straight on the transcript text, and without that backdrop the icons
+    // would smear into the body text. Hover raises it one step, the same language as list rows and
+    // menu rows.
     painter.rect_filled(
         rect,
         CornerRadius::same(10),
         if hov { P::surface_hi() } else { P::panel() },
     );
     let r = rect.shrink(10.0);
-    // 左边一条短竖线 = 侧边栏本身
+    // One short vertical line on the left = the sidebar itself
     painter.line_segment(
         [Pos2::new(r.left() + 0.8, r.top()), Pos2::new(r.left() + 0.8, r.bottom())],
         Stroke::new(1.6, fg),
     );
-    // 右侧三条横线 = 列表条目
+    // Three horizontal lines on the right = the list entries
     for i in 0..3 {
         let y = r.top() + r.height() * (0.16 + 0.34 * i as f32);
         painter.line_segment(
@@ -2781,14 +3055,15 @@ fn history_icon(ui: &mut Ui, on: bool) -> egui::Response {
             Stroke::new(1.6, fg),
         );
     }
-    resp.on_hover_text(if on { "隐藏历史记录" } else { "显示历史记录" })
+    resp.on_hover_text(if on { aox::i18n::t("Hide history") } else { aox::i18n::t("Show history") })
 }
 
-/// 「新建对话」按钮：一个「+」。
+/// The "new conversation" button: a "+".
 ///
-/// 与紧挨着的历史图标同一套画法（36px 热区、单色描边、悬停换色），
-/// 两枚并排读作「翻哪段 / 开一段」。任务执行中压暗且不响应点击 ——
-/// 那会儿换对话会让回执排到任务后面才生效，点的人只会觉得界面卡住了。
+/// Drawn the same way as the history icon next to it (36px hot zone, single-colour stroke, hover
+/// recolour); side by side the two read as "browse a thread / start a thread". While a turn is
+/// running it is dimmed and ignores clicks -- switching conversations then would only take effect
+/// after the turn, and the clicker would just think the UI had frozen.
 fn plus_icon(ui: &mut Ui, locked: bool) -> egui::Response {
     let d = 36.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
@@ -2818,17 +3093,18 @@ fn plus_icon(ui: &mut Ui, locked: bool) -> egui::Response {
         Stroke::new(1.6, fg),
     );
     if locked {
-        return resp.on_hover_text("正在执行任务，稍后再新建对话");
+        return resp.on_hover_text(aox::i18n::t("A task is running; start a new conversation later"));
     }
-    resp.on_hover_text("新建对话")
+    resp.on_hover_text(aox::i18n::t("New conversation"))
 }
 
-/// 单行文本，按**像素**收口：超出 `max_w` 就省略号截断。
+/// A single line of text, closed off by **pixels**: anything past `max_w` is elided.
 ///
-/// 不能按字数截（`clamp_str`）：34 个汉字 ≈ 476px，比侧边栏还宽一倍，多出来的
-/// 部分会一路画到面板外面，被「侧边栏 / 主对话区」那条分界线硬切一刀 ——
-/// 看起来就是标题越了界。交给 `LayoutJob` 按实际渲染宽度决定截在哪，
-/// 面板拖宽拖窄都会自动跟着变。
+/// Truncating by character count (`clamp_str`) doesn't work: 34 Han characters are ~476px, twice
+/// the sidebar's width, and the excess draws right out of the panel and gets sliced off hard by
+/// the sidebar / main-transcript divider -- which looks like the title escaping its bounds. Let
+/// `LayoutJob` decide where to cut from the actual rendered width, and it follows automatically
+/// when the panel is dragged wider or narrower.
 fn elide(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::single_section(
         text.to_owned(),
@@ -2837,17 +3113,19 @@ fn elide(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<e
     job.wrap = egui::text::TextWrapping {
         max_width: max_w,
         max_rows: 1,
-        // 中文没有词边界，不开这个的话「整段放不下」时会直接不截
+        // Chinese has no word boundaries; without this, "the whole run doesn't fit" results in no
+        // truncation at all
         break_anywhere: true,
         overflow_character: Some('…'),
     };
     ui.painter().layout_job(job)
 }
 
-/// 侧边栏里的一行历史对话：标题 + 「最后活动 · 条数」。
+/// One history conversation row in the sidebar: title + "last activity · message count".
 ///
-/// `current` = 眼下正在聊的这一段（右侧一个实心点），`locked` = 切换请求在飞行中
-/// 或任务正在执行，此时不接受点击，整行也压暗一档。
+/// `current` = the one being chatted in right now (a filled dot on the right); `locked` = a switch
+/// request is in flight or a turn is running, in which case clicks are refused and the whole row
+/// is dimmed one step.
 fn history_row(
     ui: &mut Ui,
     s: &aox::history::Summary,
@@ -2855,7 +3133,7 @@ fn history_row(
     locked: bool,
     width: f32,
 ) -> egui::Response {
-    let w = (width - 6.0).max(60.0); // 给滚动条留一点
+    let w = (width - 6.0).max(60.0); // leave room for the scroll bar
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 46.0), Sense::click());
     let hov = pointer_if(ui, &resp) && !locked;
     if hov {
@@ -2869,40 +3147,45 @@ fn history_row(
     } else {
         P::text_dim()
     };
-    // 文字右边界定在圆点左边再留 10px：右侧那枚「当前」圆点与安全边距都不占标题的
-    // 宽度，两行都按同一个宽度收口，标题就再也画不出这一行之外。
+    // The text's right bound is set 10px to the left of the dot: neither the "current" dot on the
+    // right nor the safety margin eats into the title's width, so both lines close off at the same
+    // width and the title can never draw outside this row.
     let dot_x = rect.right() - 10.0;
     let max_w = (dot_x - 10.0 - x).max(24.0);
     let title = elide(ui, &s.title, theme::body_font(14.0), title_color, max_w);
     let sub = elide(
         ui,
-        &format!("{} · {} 条", s.time, s.messages),
+        &aox::tf!("{} · {} msgs", s.time, s.messages),
         theme::body_font(12.0),
         P::text_faint(),
         max_w,
     );
     let painter = ui.painter();
-    // galley 以左上角定位，这里减掉自身高度的一半换算成原来的「垂直居中」
+    // A galley is positioned by its top-left, so half its own height is subtracted here to get the
+    // previous "vertically centred" placement
     painter.galley(Pos2::new(x, rect.top() + 15.0 - title.size().y * 0.5), title, title_color);
     painter.galley(Pos2::new(x, rect.top() + 32.0 - sub.size().y * 0.5), sub, P::text_faint());
     if current {
-        // 当前会话用一个实心点标出来，不占用标题宽度
+        // The current conversation is marked with a filled dot, which doesn't eat into the title's
+        // width
         painter.circle_filled(Pos2::new(dot_x, rect.top() + 15.0), 3.2, P::ink_soft());
     }
     if locked {
         return resp.on_hover_text(format!("{}\n{}", s.title, s.id));
     }
-    resp.on_hover_text(format!("{}\n{}\n点击切换到这段对话", s.title, s.id))
+    resp.on_hover_text(aox::tf!("{}\n{}\nClick to switch to this conversation", s.title, s.id))
 }
 
-/// 把读出来的历史消息摊成对话流里的一轮轮记录。
+/// Flatten the history messages read from disk into the transcript's turn-by-turn records.
 ///
-/// 与实时渲染的唯一差别是「过程」的攒法：实时是边收事件边攒，
-/// 这里是从消息序列里回推 —— assistant 的 tool_calls 开一段过程，
-/// 紧随其后的 tool 结果按名字回填到对应那一步上。
+/// The only difference from live rendering is how the "process" is accumulated: live accumulates
+/// as events arrive, whereas here it is reconstructed from the message sequence -- an assistant's
+/// tool_calls open a process, and the tool results right after it are filled back into the
+/// matching step by name.
 fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
     let mut out: Vec<Item> = Vec::new();
-    // 正在攒的那段过程（出现新的用户消息或最终答复时结算并压入 out）
+    // The process currently being accumulated (settled and pushed into `out` when a new user
+    // message or a final answer appears)
     let mut pending: Option<Process> = None;
 
     let flush = |out: &mut Vec<Item>, pending: &mut Option<Process>| {
@@ -2916,18 +3199,20 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
         match m.role.as_str() {
             "user" => {
                 flush(&mut out, &mut pending);
-                // `flat_text` 而不是 `content.clone()`：用户消息可能带附件，那时 content
-                // 是 parts 数组 —— 直接 clone 一个字都显示不出来。宿主自己加的附件清单块
-                // 由 `flat_text` 滤掉（见 `attach::ATTACH_MARK`）。
+                // `flat_text` rather than `content.clone()`: a user message may carry attachments,
+                // in which case content is a parts array -- cloning it directly shows not a single
+                // character. The attachment manifest block the host adds itself is filtered out by
+                // `flat_text` (see `attach::ATTACH_MARK`).
                 let text = m.flat_text();
-                // 胶囊的名字、以及要**显示**的图片路径，都从清单块里还原：
-                // `image_url` 块里没有文件名字段（见 `attach::files_from_content`）。
+                // Both the chip's name and the image paths to **display** are recovered from the
+                // manifest block: the `image_url` block has no file-name field (see
+                // `attach::files_from_content`).
                 let files = m
                     .content
                     .as_ref()
                     .map(aox::attach::files_from_content)
                     .unwrap_or_default();
-                if text.trim_start().starts_with("（宿主提示）") {
+                if text.trim_start().starts_with(aox::history::HOST_PREFIX) {
                     out.push(Item::Note(NoteKind::Warn, text.trim().to_string()));
                 } else {
                     out.push(Item::User(
@@ -2953,7 +3238,7 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
                         steps: Vec::new(),
                         interim: Vec::new(),
                         reasoning: String::new(),
-                        // 历史里没有耗时（那是运行期才有的事实），所以不显示
+                        // History has no elapsed time (that is a runtime-only fact), so it isn't shown
                         elapsed: None,
                         expanded: false,
                         aborted: false,
@@ -2978,7 +3263,8 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
                 let name = m.name.clone().unwrap_or_default();
                 let body = m.flat_text();
                 if let Some(p) = pending.as_mut() {
-                    // 同一步可能有多次同名调用，回填到「最后一个还没有结果的同名步骤」
+                    // The same step may have several calls of the same name; fill back into "the last
+                    // same-named step that has no result yet"
                     if let Some(st) = p
                         .steps
                         .iter_mut()
@@ -2996,13 +3282,16 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
     out
 }
 
-/// 设置：一个齿轮（36px 热区、单色描边、悬停换色 —— 与历史 / 「+」同一套画法）。
+/// Settings: a gear (36px hot zone, single-colour stroke, hover recolour -- the same drawing as
+/// history / "+").
 ///
-/// 齿轮画成 **8 齿的多边形 + 中间一个孔**，而不是「圆圈 + 八条放射线」：
-/// 后者与 [`theme_toggle`] 画太阳的手法一模一样，缩在 36px 里两者会读成同一个图形
-/// （都是「圆 + 八条线」）。齿用**折线**描出来才有轮廓感，一眼分得开。
+/// The gear is drawn as **an 8-tooth polygon plus a hole in the middle**, not as "a circle plus
+/// eight spokes": the latter is exactly how [`theme_toggle`] draws a sun, and shrunk into 36px the
+/// two would read as the same shape (both being "a circle + eight lines"). Drawing the teeth as
+/// **a polyline** gives them an outline and keeps the two instantly distinguishable.
 ///
-/// 齿廓自己算：外圈齿顶与齿谷交替取点，绕一圈闭合。8 齿 × 4 点 = 32 个点。
+/// The tooth profile is computed by hand: alternate points on the tips and the valleys, closing
+/// the loop. 8 teeth x 4 points = 32 points.
 fn gear_icon(ui: &mut Ui) -> egui::Response {
     let d = 36.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
@@ -3020,9 +3309,10 @@ fn gear_icon(ui: &mut Ui) -> egui::Response {
     let c = rect.center();
     let r_out = 9.6_f32;
     let r_in = 6.9_f32;
-    // 一圈分成 TEETH 段，每段里「齿顶 → 齿谷 → 齿谷 → 齿顶」四点。
+    // The circle is divided into TEETH segments, and each one holds four points:
+    // "tip -> valley -> valley -> tip".
     let step = std::f32::consts::TAU / TEETH as f32;
-    let tooth = step * 0.22; // 齿顶占的那段角（其余是齿谷）
+    let tooth = step * 0.22; // the tooth tip's share of the angle (the rest is the valley)
     let mut pts: Vec<Pos2> = Vec::with_capacity(TEETH * 4);
     for k in 0..TEETH {
         let a0 = step * k as f32;
@@ -3036,20 +3326,21 @@ fn gear_icon(ui: &mut Ui) -> egui::Response {
             pts.push(Pos2::new(c.x + co * r, c.y + s * r));
         }
     }
-    pts.push(pts[0]); // 闭合
+    pts.push(pts[0]); // close the loop
     painter.add(egui::Shape::line(pts, Stroke::new(1.5, fg)));
-    // 中心孔 —— 有它才像齿轮，没有就是个八角星
+    // The centre hole -- with it, it looks like a gear; without it, it's an eight-pointed star
     painter.circle_stroke(c, 2.5, Stroke::new(1.5, fg));
 
-    resp.on_hover_text("设置")
+    resp.on_hover_text(aox::i18n::t("Settings"))
 }
 
-/// 那条「信息从这里流到那里」的 S 形流线。
+/// That S-shaped flow line meaning "information flows from here to there".
 ///
-/// 从原来顶栏那枚 `flow_toggle` 里**抽出来**的：那枚按钮已经删掉（活动流改从设置页
-/// 打开），但这条曲线还要在设置页的「打开活动流」按钮上出现 —— 同一个图形只该有一份画法。
+/// **Extracted** from the old top bar's `flow_toggle`: that button has been removed (the activity
+/// stream is opened from the settings page now), but the curve still appears on the settings
+/// page's "open activity stream" button -- one shape should have only one drawing.
 fn draw_flow_curve(painter: &egui::Painter, rect: Rect, fg: Color32) {
-    // 控制点一上一下，得到一条平滑的 S 形
+    // One control point above and one below gives a smooth S
     let a = Pos2::new(rect.left(), rect.bottom());
     let b = Pos2::new(rect.left(), rect.top() + rect.height() * 0.12);
     let c = Pos2::new(rect.right(), rect.bottom() - rect.height() * 0.12);
@@ -3067,10 +3358,10 @@ fn draw_flow_curve(painter: &egui::Painter, rect: Rect, fg: Color32) {
     let pts: Vec<Pos2> = (0..=N).map(|i| at(i as f32 / N as f32)).collect();
     painter.add(egui::Shape::line(pts.clone(), Stroke::new(1.8, fg)));
 
-    // 起点节点
+    // start node
     painter.circle_filled(a, 2.1, fg);
 
-    // 终点箭头：沿曲线末段切向
+    // end arrow: along the tangent of the curve's last segment
     let dir = {
         let v = e - pts[N - 3];
         let l = v.length();
@@ -3088,12 +3379,14 @@ fn draw_flow_curve(painter: &egui::Painter, rect: Rect, fg: Color32) {
     ));
 }
 
-/// 悬停在可点区域上时切到「手型」光标，并返回是否悬停。
+/// Switch to the "hand" cursor while hovering a clickable area, and return whether it is hovered.
 ///
-/// egui 不会给自绘组件自动换光标：`allocate_exact_size(.., Sense::click())` 只注册
-/// 交互区域，光标仍是默认箭头。配合 `selectable_labels`（默认开）时，按钮里的
-/// label 还会把光标改成文本选择的 I 形——于是「按钮上顶着输入光标」。
-/// 统一走这个函数，可点的地方就一定是手型。
+/// egui doesn't change the cursor for hand-drawn widgets automatically:
+/// `allocate_exact_size(.., Sense::click())` only registers an interaction area, and the cursor
+/// stays the default arrow. Together with `selectable_labels` (on by default) the label inside a
+/// button even turns the cursor into the text-selection I-beam -- giving you "an input cursor on
+/// top of a button". Route everything through this function and a clickable place is always a
+/// hand.
 fn pointer_if(ui: &Ui, resp: &egui::Response) -> bool {
     let hov = resp.hovered();
     if hov {
@@ -3102,7 +3395,7 @@ fn pointer_if(ui: &Ui, resp: &egui::Response) -> bool {
     hov
 }
 
-/// 文字按钮的皮肤：尺寸 + 常态/悬停两套配色。
+/// The skin for text buttons: sizing plus a colour pair for resting / hover.
 #[derive(Clone, Copy)]
 struct Btn {
     size: f32,
@@ -3115,13 +3408,15 @@ struct Btn {
     fill_hover: Color32,
 }
 
-/// 自绘文字按钮。
+/// A hand-drawn text button.
 ///
-/// 关键在于**绘制顺序**：先量出文字尺寸 → 按尺寸分配热区 → 铺底色 → 最后画字。
+/// The key is the **order of drawing**: measure the text first -> allocate a hot zone from that
+/// size -> lay down the backdrop -> draw the text last.
 ///
-/// 之前首屏那几枚示例按钮是反过来的：`ui.label()` 先把字画上去，
-/// 悬停时再补一块底色盖住热区——底色落在文字图层之上，鼠标一放上去字就没了。
-/// 这里改成先底后字，两套主题、所有状态都天然不会互相遮挡。
+/// The empty-state example buttons used to do it the other way round: `ui.label()` painted the
+/// text first and the hover backdrop was then laid over the hot zone -- landing above the text
+/// layer, so the moment the mouse arrived the text vanished. Here it is backdrop first, text last,
+/// so in both themes and every state they naturally can't occlude each other.
 fn text_button(ui: &mut Ui, text: &str, b: Btn) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
@@ -3145,13 +3440,14 @@ fn text_button(ui: &mut Ui, text: &str, b: Btn) -> egui::Response {
             egui::StrokeKind::Inside,
         );
     }
-    // 版面用 PLACEHOLDER 排，实际颜色在这里给——于是悬停换色不用重排文字
+    // The layout is done with PLACEHOLDER and the real colours are applied here -- so a hover
+    // recolour doesn't have to re-lay-out the text
     painter.galley(rect.min + b.pad, galley, if hov { b.fg_hover } else { b.fg });
 
     resp
 }
 
-/// 透明底的次要按钮（如弹窗里的「关闭」）。
+/// A secondary button with a transparent backdrop (e.g. "Close" in dialogs).
 pub(crate) fn flat_button(ui: &mut Ui, text: &str) -> egui::Response {
     text_button(
         ui,
@@ -3169,7 +3465,8 @@ pub(crate) fn flat_button(ui: &mut Ui, text: &str) -> egui::Response {
     )
 }
 
-/// 主要动作：反白块（亮色下是墨黑底白字），比描边更有分量。
+/// The primary action: a reversed block (ink-black with white text in the light theme), which
+/// carries more weight than an outline.
 pub(crate) fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
     text_button(
         ui,
@@ -3187,11 +3484,12 @@ pub(crate) fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
     )
 }
 
-/// 危险动作按钮（目前只有「完全访问」的二次确认用）。
+/// The dangerous-action button (currently only used for the "full access" confirmation).
 ///
-/// 用 [`P::danger`] 当底色、文字色仍取 [`P::on_reverse`] —— 这不是巧合：danger 在
-/// 亮色下是深砖红（要浅字）、暗色下是浅砖红（要深字），与「反白块」的明暗方向正好
-/// 一致，所以不必再为它单独算一次前景色。
+/// [`P::danger`] is the backdrop and the text colour is still [`P::on_reverse`] -- not a
+/// coincidence: `danger` is a deep brick red in the light theme (needing light text) and a pale
+/// brick red in the dark theme (needing dark text), which matches the reversed block's light/dark
+/// direction exactly, so no separate foreground colour has to be computed for it.
 pub(crate) fn danger_button(ui: &mut Ui, text: &str) -> egui::Response {
     text_button(
         ui,
@@ -3209,29 +3507,35 @@ pub(crate) fn danger_button(ui: &mut Ui, text: &str) -> egui::Response {
     )
 }
 
-/// 空状态里的示例问题胶囊。
-/// 一枚附件胶囊（待上传栏里的一格）。返回 `true` 表示用户点了右边的 ×。
+/// The example-question chip in the empty state.
+/// One attachment chip (a cell in the pending-upload bar). Returns `true` if the user clicked the
+/// × on the right.
 ///
-/// 整枚胶囊**不可点**，只有 × 是热区：这个胶囊没有「点开」的去处（附件不是链接），
-/// 让整枚都可点就等于「点一下删一个」，太容易手滑。
-/// 选项槽最后那一行：**行内输入**（回车或点右侧箭头作答）。返回用户打的字。
+/// The chip as a whole is **not clickable**; only the × is a hot zone: there is nowhere for this
+/// chip to "open" to (an attachment is not a link), and making the whole thing clickable amounts
+/// to "one click, one deletion", far too easy to fumble.
+/// The last row of the option slot: **inline input** (answer with Enter or by clicking the arrow on
+/// the right). Returns what the user typed.
 ///
-/// 第一版它只是个「自己输入…」的按钮，点了把焦点交给下面那个大输入框。用户的反馈
-/// （2026-10-06）是「不用下面那个大的主输入框」—— 作答的地方就该在题目旁边，
-/// 眼睛不必在上下两个框之间来回跑；而「点了按钮之后还得自己去找另一个框」这件事
-/// 本身就很容易被当成「点了没反应」。
+/// The first version was just a "type your own..." button that handed focus to the big input box
+/// below. The user's feedback (2026-10-06) was "don't use that big main input box below" -- the
+/// place to answer should be beside the question, with no need for the eyes to run back and forth
+/// between two boxes; and "after clicking the button you still have to go find another box" is
+/// itself easily taken for "I clicked it and nothing happened".
 ///
-/// 回车与发送钮两条路都通：单行输入习惯回车，但鼠标用户不该被逼着碰键盘。
+/// Both Enter and the send button work: single-line input naturally wants Enter, but mouse users
+/// shouldn't be forced to touch the keyboard.
 fn ask_input_row(ui: &mut Ui, w: f32, text: &mut String) -> Option<String> {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::same(10), P::surface());
 
-    // 右边那枚发送钮（与主输入框那枚同一套画法，只是小一号）
+    // The send button on the right (same drawing as the one on the main input box, one size down)
     let btn = Rect::from_center_size(
         Pos2::new(rect.right() - 19.0, rect.center().y),
         Vec2::splat(26.0),
     );
-    // 左边空出编号列（12 内缩 + 26 列宽），文字与上面的 A / B / C 左对齐
+    // Leave the number column free on the left (12 padding + 26 column width) so the text is
+    // left-aligned with the A / B / C above it
     let edit_rect = Rect::from_min_max(
         Pos2::new(rect.left() + 38.0, rect.top() + 7.0),
         Pos2::new(btn.left() - 6.0, rect.bottom() - 7.0),
@@ -3244,11 +3548,13 @@ fn ask_input_row(ui: &mut Ui, w: f32, text: &mut String) -> Option<String> {
             .desired_width(edit_rect.width())
             .font(FontId::proportional(13.5))
             .hint_text(
-                RichText::new("也可以在这里直接输入…").color(P::text_faint()).size(13.0),
+                RichText::new(aox::i18n::t("You can also type here…")).color(P::text_faint()).size(13.0),
             ),
     );
-    // 单行 TextEdit 的「回车」标准判据：这一帧**失去焦点**且按下了回车。
-    // 只看 `key_pressed` 不行 —— 那样打字时按回车会误触（它不会失焦）。
+    // The standard test for "Enter" on a single-line TextEdit: it **lost focus** this frame and
+    // Enter was pressed.
+    // `key_pressed` alone won't do -- that would misfire on Enter while typing (it doesn't lose
+    // focus).
     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
     let typed = text.trim().to_string();
@@ -3263,7 +3569,8 @@ fn ask_input_row(ui: &mut Ui, w: f32, text: &mut String) -> Option<String> {
             if hot { P::ink().gamma_multiply(0.75) } else { P::ink() },
         );
     } else {
-        // 空着的时候画个空心圈：让人看得出「这里有个按钮，只是先得写点什么」
+        // Draw a hollow circle while it's empty, so it's clear "there's a button here, you just have
+        // to write something first"
         p.circle_stroke(btn.center(), btn.width() * 0.5, Stroke::new(1.0, P::border()));
     }
     paint_arrow_up(p, btn, if can { P::bg() } else { P::text_faint() });
@@ -3271,19 +3578,21 @@ fn ask_input_row(ui: &mut Ui, w: f32, text: &mut String) -> Option<String> {
     (can && (enter || bresp.clicked())).then_some(typed)
 }
 
-/// 选项槽里的一行选项：`A` + 正文。返回是否被点。
+/// One option row in the option slot: `A` + the body text. Returns whether it was clicked.
 fn ask_row(ui: &mut Ui, w: f32, idx: usize, text: &str) -> bool {
     ask_chip(ui, w, idx, text)
 }
 
-/// 选项槽里的一行：`A` + 正文。
+/// One row in the option slot: `A` + the body text.
 ///
-/// 自绘 + `allocate_exact_size(.., Sense::click())`，**刻意不用 `Frame::show` 之后再
-/// `interact()`**：后者在窄宽度下命中区会跟着内容一起被压扁（第一版就是这样 ——
-/// 画出来是条 28px 宽的竖条，点上去毫无反应）。自绘的话命中区就是这一整行，
-/// 宽度确定、与画出来的完全重合。
+/// Hand-drawn + `allocate_exact_size(.., Sense::click())`, and **deliberately not `Frame::show`
+/// followed by `interact()`**: at narrow widths the latter's hit zone gets squashed along with the
+/// content (that is exactly what the first version did -- it drew as a 28px-wide sliver and
+/// clicking it did nothing at all). Hand-drawn, the hit zone is the whole row: a definite width,
+/// exactly coinciding with what is drawn.
 ///
-/// 编号列占固定宽度，于是 A / B / C 的文字左边**对得齐** —— 选项槽是一列，不是一堆。
+/// The number column takes a fixed width, so the left edges of A / B / C's text **line up** -- the
+/// option slot is a column, not a heap.
 fn ask_chip(ui: &mut Ui, w: f32, idx: usize, text: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 32.0), Sense::click());
     if resp.hovered() {
@@ -3295,7 +3604,8 @@ fn ask_chip(ui: &mut Ui, w: f32, idx: usize, text: &str) -> bool {
         CornerRadius::same(10),
         if resp.hovered() { P::surface_hi() } else { P::surface() },
     );
-    // 悬停时再描一圈：光靠底色那一档，在浅色主题下几乎看不出鼠标停在哪一行
+    // Add a stroke on hover: with the backdrop step alone, in the light theme you can barely tell
+    // which row the mouse is on
     if resp.hovered() {
         p.rect_stroke(
             rect,
@@ -3317,8 +3627,9 @@ fn ask_chip(ui: &mut Ui, w: f32, idx: usize, text: &str) -> bool {
         P::text_faint(),
     );
     let color = P::text();
-    // 按可用宽度估一个上限再省略：中文按 ~13px、西文按 ~7px 折中取 11px，
-    // 估不准也只是多留或少留一点白 —— 而**不省略**的话长选项会直接冲出这一行。
+    // Estimate an upper bound from the available width and elide: splitting the difference between
+    // ~13px for Han and ~7px for Latin gives 11px. Estimating loosely only leaves a bit too much or
+    // too little blank -- **not eliding** would send a long option straight out of the row.
     let keep = (((w - NUM_W - 24.0) / 11.0).max(12.0)) as usize;
     let g = p.layout_no_wrap(middle_elide(text, keep), FontId::proportional(13.5), color);
     p.galley(
@@ -3346,13 +3657,14 @@ fn attach_chip(ui: &mut Ui, name: &str) -> bool {
     removed
 }
 
-/// 胶囊右边的 ×。返回 `true` 表示被点了。
+/// The × on the right of a chip. Returns `true` if it was clicked.
 ///
-/// 用两条线段手绘而不是打 `×` 字符 —— 与调用流里的 ✓/✗ 同一个理由：
-/// 不赌字体里有没有这个字形（缺字形时画出来是个豆腐块，比不画更糟）。
+/// Hand-drawn from two line segments rather than typesetting the `×` character -- the same reason
+/// as the ✓/✗ in the call stream: no betting on whether the font has the glyph (a missing glyph
+/// draws as a tofu box, which is worse than not drawing it).
 fn close_x(ui: &mut Ui) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::click());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("移除");
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(aox::i18n::t("Remove"));
     let col = if resp.hovered() { P::text() } else { P::text_faint() };
     let c = rect.center();
     let s = 3.4;
@@ -3362,18 +3674,20 @@ fn close_x(ui: &mut Ui) -> bool {
     resp.clicked()
 }
 
-/// 过长时**中间省略**：留住头尾，砍中间。
+/// When too long, **elide in the middle**: keep both ends, cut the middle out.
 ///
-/// 为什么砍中间不砍尾巴：这条信息里最有用的一位是**后缀**（`.png` 还是 `.pdf`，
-/// 决定用户要不要先压一下），而尾巴正好是它。`keep` 是保留的字符数（含省略号）。
+/// Why cut the middle rather than the tail: the most useful bit in this information is the
+/// **extension** (`.png` or `.pdf`, which decides whether the user has to compress it first), and
+/// the tail is exactly that. `keep` is the number of characters retained (ellipsis included).
 fn middle_elide(s: &str, keep: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
-    // 太短就不用省；`keep` 小到放不下「头 + 省略号 + 尾」时也别硬省（会显示成一团）
+    // Too short, no need to elide; and when `keep` is too small to fit "head + ellipsis + tail",
+    // don't force it either (it renders as a smear)
     if chars.len() <= keep || keep < 9 {
         return s.to_string();
     }
     let head = keep / 2;
-    let tail = keep - head - 1; // 减掉的 1 是省略号自己占的那位
+    let tail = keep - head - 1; // the subtracted 1 is the ellipsis's own slot
     let mut out: String = chars[..head].iter().collect();
     out.push('…');
     out.extend(chars[chars.len() - tail..].iter());
@@ -3404,7 +3718,8 @@ fn icon_button(
     } else {
         painter.circle_stroke(rect.center(), diameter * 0.5, Stroke::new(1.0, P::border()));
     }
-    // 实心底的按钮里，字形必须用页面底色才看得见（单色方案下 fill 就是「墨」）
+    // Inside a solid-fill button the glyph has to use the page colour to be visible (in a
+    // monochrome scheme `fill` is the "ink")
     let fg = if !enabled { P::text_faint() } else { P::bg() };
     draw(painter, rect, fg);
     resp
@@ -3475,7 +3790,7 @@ fn spinner_dot(ui: &mut Ui, spin: f32, color: Color32) {
     }
 }
 
-/// 逐轮累加出一段对话的合计。
+/// Accumulate a conversation's totals turn by turn.
 fn sum_usage(log: &[UsageRecord]) -> Usage {
     let mut u = Usage::default();
     for r in log {
@@ -3484,45 +3799,49 @@ fn sum_usage(log: &[UsageRecord]) -> Usage {
     u
 }
 
-/// 一轮明细在对话流里那一行的文字。
+/// The text of a turn breakdown's row in the transcript.
 ///
-/// 「直接摊开所有项」是刻意的：这一行就埋在正文旁边，看它的人多半是为了查账，
-/// 让他再点开二级面板反而是折磨。缺的那几项不出现 —— 不拿 0 充数。
+/// "Lay every field out directly" is deliberate: this row is buried right next to the body text,
+/// and whoever reads it is most likely checking the books -- making them open a second-level panel
+/// is torment. Missing fields simply don't appear -- no padding out with 0s.
 fn usage_line(r: &UsageRecord) -> String {
-    let mut parts = vec![format!("#{} · {} 次调用", r.round, r.calls)];
+    let mut parts = vec![aox::tf!("#{} · {} calls", r.round, r.calls)];
     let mut put = |k: &str, v: Option<u64>| {
         if let Some(v) = v {
             parts.push(format!("{k} {}", thousands(v)));
         }
     };
-    put("输入", r.usage.prompt);
-    put("输出", r.usage.completion);
-    put("合计", r.usage.total);
-    put("推理", r.usage.reasoning);
-    put("缓存命中", r.usage.cached);
-    put("缓存未命中", r.usage.cache_miss);
+    put(aox::i18n::t("Input"), r.usage.prompt);
+    put(aox::i18n::t("Output"), r.usage.completion);
+    put(aox::i18n::t("Total"), r.usage.total);
+    put(aox::i18n::t("Reasoning"), r.usage.reasoning);
+    put(aox::i18n::t("Cache hit"), r.usage.cached);
+    put(aox::i18n::t("Cache miss"), r.usage.cache_miss);
     parts.join(" · ")
 }
 
-/// 对话流里那行 token 明细。刻意做得比正文更轻：它是附注，不是内容，
-/// 所以连标记点都不给 —— 一行数字自己就说明它是什么了。
+/// The token breakdown line in the transcript. Deliberately lighter than the body text: it is a
+/// footnote, not content, so it isn't even given a bullet -- a row of numbers says what it is on
+/// its own.
 fn usage_row(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).color(P::text_faint()).size(12.5));
     ui.add_space(10.0);
 }
 
-/// 顶栏那枚「Σ 总 token」点开后的明细：**这段对话的合计**。
+/// The breakdown unfolded from the "Σ total tokens" chip: **this conversation's totals**.
 ///
-/// 逐轮的账不放在这儿 —— 那一行行各自贴着它的 AI 答复写在对话流里（见 `usage_line`）。
-/// 这里回答的是另一个问题：「这一整段对话一共花了多少、花在哪」。
+/// The turn-by-turn bills are not here -- each of those rows sits with its own AI reply in the
+/// transcript (see `usage_line`). What this answers is a different question: "how much did this
+/// whole conversation cost, and where did it go".
 fn usage_detail(ui: &mut Ui, log: &[UsageRecord]) {
-    // 行距压紧。这里是「一列数字」，默认的组块间距会把它撑得像一张松垮的卡片，
-    // 反而更难一眼对出哪几行属于同一项。
+    // Tighten the line spacing. This is "a column of numbers", and the default item spacing
+    // stretches it out into something like a loose card, making it harder to see at a glance which
+    // rows belong to the same entry.
     ui.spacing_mut().item_spacing.y = 1.0;
     let rows: Vec<&UsageRecord> = log.iter().filter(|r| !r.is_empty()).collect();
     if rows.is_empty() {
         ui.label(
-            RichText::new("这段对话还没有用量记录")
+            RichText::new(aox::i18n::t("No usage records for this conversation yet"))
                 .color(P::text_faint())
                 .size(13.0),
         );
@@ -3534,11 +3853,13 @@ fn usage_detail(ui: &mut Ui, log: &[UsageRecord]) {
     }
     let calls: u32 = rows.iter().map(|r| r.calls).sum();
 
-    /// 一行「标签 …… 数字」。`v` 为 None 时整行跳过。
+    /// One "label ... number" row. A `v` of None skips the row entirely.
     ///
-    /// 自己分配这一行的矩形，而不是 `horizontal` + `with_layout` —— 后者在
-    /// 竖向容器里会把行高撑到内容区的富余高度，一列数字 于是松得像张空卡片。
-    /// 数字用等宽字体，右对齐后能上下对齐，看数字比看标签重要。
+    /// Allocate this row's rect directly rather than using `horizontal` + `with_layout` -- the
+    /// latter stretches the row height to the content area's leftover in a vertical container, so a
+    /// column of numbers comes out as loose as an empty card.
+    /// The numbers use a monospace face so that right-aligned they line up vertically; reading the
+    /// numbers matters more than reading the labels.
     fn row(ui: &mut Ui, k: &str, v: Option<u64>) {
         let Some(v) = v else { return };
         let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 21.0), Sense::hover());
@@ -3560,42 +3881,48 @@ fn usage_detail(ui: &mut Ui, log: &[UsageRecord]) {
     }
 
     ui.label(
-        RichText::new(format!("本次对话 · {} 轮 · {} 次调用", rows.len(), calls))
+        RichText::new(aox::tf!("This conversation · {} rounds · {} calls", rows.len(), calls))
             .color(P::text())
             .size(13.5),
     );
     ui.add_space(6.0);
 
-    row(ui, "输入", sum.prompt);
-    row(ui, "输出", sum.completion);
-    row(ui, "合计", sum.total);
-    // 细项缩进一格挂在「合计」下面：推理是输出的一部分，缓存是输入的一部分
-    row(ui, "　其中推理", sum.reasoning);
-    row(ui, "　缓存命中", sum.cached);
-    row(ui, "　缓存未命中", sum.cache_miss);
+    row(ui, aox::i18n::t("Input"), sum.prompt);
+    row(ui, aox::i18n::t("Output"), sum.completion);
+    row(ui, aox::i18n::t("Total"), sum.total);
+    // The sub-items are indented one level under the "totals": reasoning is part of output and
+    // cache is part of input
+    row(ui, aox::i18n::t("  of which reasoning"), sum.reasoning);
+    row(ui, aox::i18n::t("  cache hit"), sum.cached);
+    row(ui, aox::i18n::t("  cache miss"), sum.cache_miss);
 
-    // 末次输入 ≠ 输入合计：前者是「当前上下文多大」，后者是「这些轮一共读进去多少」。
-    // 两个数都摆出来，才不至于把「上下文快满了」误判成「某一轮太贵」。
+    // Last input != total input: the former is "how big is the current context", the latter is
+    // "how much was read in across all these turns". Showing both is what keeps "the context is
+    // nearly full" from being misread as "one turn was too expensive".
     if let Some(v) = rows.last().and_then(|r| r.last_prompt) {
         let (rule, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
         ui.painter()
             .hline(rule.x_range(), rule.center().y, Stroke::new(1.0, P::border()));
         ui.add_space(9.0);
-        row(ui, "当前上下文", Some(v));
+        row(ui, aox::i18n::t("Current context"), Some(v));
     }
 }
 
 fn user_bubble(ui: &mut Ui, text: &str, files: &[String], max_w: f32) {
-    // 内边距会额外占宽度，所以要先把正文的可用宽度扣出来，否则气泡会顶出栏宽被裁
+    // The padding takes up width on top, so the body text's available width has to be subtracted
+    // first; otherwise the bubble sticks out of the column and gets clipped
     let inner_w = (max_w - 44.0).max(140.0);
     let body = text.trim();
 
-    // 正文先按 `inner_w` 折一次行，**量出实际用掉的宽度**：短句收窄、长句走满。
+    // Lay the body text out once at `inner_w` first and **measure the width actually used**: short
+    // sentences narrow, long ones run full.
     //
-    // ⚠️ 这一步不能省。`Frame::show` 算自己那块矩形用的是内容的 `min_rect`，而它一开始
-    // 就被撑到「可用宽度」上 —— 只写 `ui.set_max_width(..)` 是把那个宽度**往下夹**，
-    // 不是让它跟着内容缩。结果就是：不论发多长，气泡都一样宽（用户 2026-10-06 报的正是它）。
+    // ⚠️ This step can't be skipped. `Frame::show` computes its own rect from the content's
+    // `min_rect`, and that is stretched to "available width" from the start -- writing only
+    // `ui.set_max_width(..)` **clamps that width down** rather than letting it shrink with the
+    // content. The result: however long the message, the bubble is the same width (which is exactly
+    // what the user reported on 2026-10-06).
     let galley = (!body.is_empty()).then(|| {
         ui.painter().layout(
             body.to_owned(),
@@ -3605,7 +3932,8 @@ fn user_bubble(ui: &mut Ui, text: &str, files: &[String], max_w: f32) {
         )
     });
     let text_w = galley.as_ref().map_or(0.0, |g| g.size().x);
-    // 带附件时气泡至少要容得下一枚胶囊（取最宽的那枚当下限；真放不下就让它折行）
+    // With attachments the bubble has to fit at least one chip (the widest one is used as the lower
+    // bound; if it really doesn't fit, let it wrap)
     let chips_w = files.iter().map(|n| chip_width(ui, n)).fold(0.0_f32, f32::max);
     let want = text_w.max(chips_w).min(inner_w);
 
@@ -3616,13 +3944,15 @@ fn user_bubble(ui: &mut Ui, text: &str, files: &[String], max_w: f32) {
             .stroke(Stroke::new(1.0, P::border()))
             .inner_margin(Margin::symmetric(20, 15))
             .show(ui, |ui| {
-                // 宽度**钉死**（min 与 max 都设成同一个值），这样内容的 `min_rect`
-                // 就是 `want`，气泡于是贴着内容收 —— 短句一个窄条、长句走满版心。
+                // The width is **pinned** (min and max both set to the same value), so the content's
+                // `min_rect` is `want` and the bubble closes around the content -- a narrow strip for a
+                // short sentence, the full measure for a long one.
                 ui.set_min_width(want);
                 ui.set_max_width(want);
                 ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
-                    // 附件胶囊排在正文**上面**：与待上传栏里的位置一致（发出前后同一个观感），
-                    // 而且空正文时（只发了文件）气泡里也有东西可看。
+                    // The attachment chips go **above** the body text: consistent with their position
+                    // in the pending-upload bar (the same look before and after sending), and with an
+                    // empty body (only files sent) the bubble still has something to show.
                     if !files.is_empty() {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(7.0, 7.0);
@@ -3655,11 +3985,13 @@ fn user_bubble(ui: &mut Ui, text: &str, files: &[String], max_w: f32) {
     ui.add_space(18.0);
 }
 
-/// 一枚已发出的附件胶囊有多宽（**估**）。
+/// How wide a sent attachment chip is (**estimated**).
 ///
-/// 只用来给气泡定一个宽度**下限** —— 量准它得先真的画一遍，不值当；估偏了也只是气泡
-/// 比胶囊宽或窄一点点，而 `horizontal_wrapped` 会自己折行兜住。
-/// ⚠️ 字号 / 内边距 / 描边必须与 [`sent_chip`] 里的那份一致，改那边记得改这里。
+/// Used only to give the bubble a width **lower bound** -- measuring it properly would mean drawing
+/// it once first, which isn't worth it; estimating loosely only leaves the bubble a hair wider or
+/// narrower than the chip, and `horizontal_wrapped` wraps to catch it.
+/// ⚠️ The font size / padding / stroke must match the ones in [`sent_chip`]; changing that side
+/// means changing this one too.
 fn chip_width(ui: &Ui, name: &str) -> f32 {
     const PAD_X: f32 = 11.0;
     const STROKE: f32 = 1.0;
@@ -3671,10 +4003,11 @@ fn chip_width(ui: &Ui, name: &str) -> f32 {
     g.size().x + PAD_X * 2.0 + STROKE * 2.0
 }
 
-/// 已经发出去的消息气泡里的附件胶囊 —— 只读（没有 ×）。
+/// The attachment chip inside an already-sent message bubble -- read-only (no ×).
 ///
-/// 与待上传栏那枚**同一个形状、同一套省略规则**，只少一个 ×：这样「发出去」这个动作
-/// 在视觉上就是「胶囊淡下去、×消失了」，不需要另一种标记去解释。
+/// **The same shape and the same elision rules** as the pending-upload one, just missing an ×: that
+/// way the act of sending is visually "the chip dims and the × disappears", with no other marker
+/// needed to explain it.
 fn sent_chip(ui: &mut Ui, name: &str) {
     Frame::NONE
         .fill(P::surface())
@@ -3691,10 +4024,12 @@ fn assistant_block(ui: &mut Ui, text: &str, width: f32) {
     let _ = width;
 }
 
-/// 看起来像图片的后缀。**只用来决定「值不值得试着解一下」**，不用来判定格式 ——
-/// 真正说了算的是解码器本身（`aox::image::decode`）。所以后缀不在表里、内容其实是
-/// PNG 的文件不会显示成图，这是这条捷径的代价；而反过来「后缀像图片但内容不是」
-/// 会被解码器拒绝，界面按「显示失败」如实说一句，不会假装成功。
+/// Extensions that look like images. **Only used to decide "is it worth trying to decode"**, not
+/// to determine the format -- the decoder itself (`aox::image::decode`) is what actually decides.
+/// So a file whose extension isn't in the table but whose content is really a PNG won't be shown as
+/// an image, which is the price of this shortcut; and conversely "the extension looks like an image
+/// but the content isn't" gets rejected by the decoder, and the UI says "display failed" honestly
+/// rather than pretending it worked.
 fn looks_like_image(p: &std::path::Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
@@ -3707,16 +4042,18 @@ fn looks_like_image(p: &std::path::Path) -> bool {
         })
 }
 
-/// 一条消息带的图片。按版心宽度缩放、保持长宽比。
+/// An image carried by a message. Scaled to the measure's width, aspect ratio preserved.
 ///
-/// 三态各自有各自的画法（见 [`Tex`]）：图 / 「正在解码…」/ 一句失败原因。
-/// **不放大**（`scale` 上限 1.0）：把一张 200×80 的示意图拉满版心只会糊成马赛克，
-/// 而用户看到「它就是这么大」比看到一张虚掉的大图有用。
+/// Each of the three states is drawn its own way (see [`Tex`]): the image / "decoding..." / a
+/// one-line failure reason.
+/// **Never upscaled** (`scale` capped at 1.0): blowing a 200x80 diagram up to the full measure only
+/// smears it into mosaic, and the user seeing "this is how big it is" is more useful than seeing a
+/// blurred large version.
 fn images_block(ui: &mut Ui, paths: &[PathBuf], inner: f32, tex: &HashMap<PathBuf, Tex>) {
     for p in paths {
         if !looks_like_image(p) {
-            // 不是图片（.txt / .zip 之类）：本来就不该有画面，安静跳过。
-            // 它的名字在上面的气泡 / 提示行里已经有了。
+            // Not an image (.txt / .zip and the like): there was never meant to be a picture, so
+            // skip quietly. Its name is already in the bubble / notice line above.
             continue;
         }
         ui.add_space(6.0);
@@ -3729,14 +4066,15 @@ fn images_block(ui: &mut Ui, paths: &[PathBuf], inner: f32, tex: &HashMap<PathBu
             }
             Some(Tex::Failed(e)) => {
                 ui.label(
-                    RichText::new(format!("显示不了这张图：{e}"))
+                    RichText::new(aox::tf!("Cannot display this image: {}", e))
                         .color(P::text_faint())
                         .size(12.5),
                 );
             }
-            // 排队中 / 正在解码。两者对用户是一回事，不必分开说。
+            // Queued / decoding. To the user these are the same thing; no need to say them
+            // separately.
             _ => {
-                ui.label(RichText::new("正在解码图片…").color(P::text_faint()).size(12.5));
+                ui.label(RichText::new(aox::i18n::t("Decoding image…")).color(P::text_faint()).size(12.5));
             }
         }
         ui.add_space(2.0);
@@ -3755,7 +4093,8 @@ fn note_row(ui: &mut Ui, kind: NoteKind, text: &str) {
 }
 
 fn error_card(ui: &mut Ui, text: &str, width: f32) {
-    // 单色方案里，错误用「反白块」而不是红字——对比度最高，也最不依赖色相
+    // In a monochrome scheme, errors use a "reversed block" rather than red text -- the highest
+    // contrast, and the least dependent on hue
     let inner_w = (width - 40.0).max(140.0);
     Frame::NONE
         .fill(P::surface())
@@ -3770,7 +4109,7 @@ fn error_card(ui: &mut Ui, text: &str, width: f32) {
                 .corner_radius(CornerRadius::same(7))
                 .inner_margin(Margin::symmetric(11, 4))
                 .show(ui, |ui| {
-                    ui.label(RichText::new("出错").color(P::on_reverse()).size(14.0));
+                    ui.label(RichText::new(aox::i18n::t("Failed")).color(P::on_reverse()).size(14.0));
                 });
             ui.add_space(10.0);
             let mut job = egui::text::LayoutJob::default();
@@ -3792,17 +4131,18 @@ fn error_card(ui: &mut Ui, text: &str, width: f32) {
 
 fn process_block(ui: &mut Ui, p: &mut Process, width: f32) {
     let n = p.steps.len();
-    // 历史记录里没有耗时信息（那是运行期才有的），所以这一刻只报步数。
+    // History has no elapsed-time information (that only exists at runtime), so only the step
+    // count is reported here.
     let tail = match p.elapsed {
         Some(s) => format!(" · {s:.1}s"),
         None => String::new(),
     };
     let label = if p.aborted {
-        format!("任务已中断 · {n} 步{tail}")
+        aox::tf!("Task interrupted · {} steps{}", n, tail)
     } else if n == 0 {
-        format!("处理过程{tail}")
+        aox::tf!("Processing{}", tail)
     } else {
-        format!("{n} 步工具调用{tail}")
+        aox::tf!("{} tool calls{}", n, tail)
     };
 
     if n == 0 && p.interim.is_empty() && p.reasoning.is_empty() {
@@ -3840,8 +4180,9 @@ fn process_block(ui: &mut Ui, p: &mut Process, width: f32) {
             .stroke(Stroke::new(1.0, P::border()))
             .inner_margin(Margin::symmetric(20, 18))
             .show(ui, |ui| {
-                // 注意：这里必须用「框架内部」的可用宽度。
-                // 沿用外面的 width 会让内容比框架内区还宽，整个卡片被挤出栏宽后裁掉。
+                // Note: the available width **inside the frame** has to be used here.
+                // Reusing the outer width would make the content wider than the frame's inner area,
+                // and the whole card would be pushed past the column width and clipped.
                 let w = ui.available_width();
                 ui.set_width(w);
                 ui.set_max_width(w);
@@ -3860,7 +4201,7 @@ fn process_block(ui: &mut Ui, p: &mut Process, width: f32) {
                 }
                 if !p.reasoning.is_empty() {
                     ui.add_space(12.0);
-                    ui.label(RichText::new("思考过程").color(P::text_faint()).size(13.0));
+                    ui.label(RichText::new(aox::i18n::t("Reasoning")).color(P::text_faint()).size(13.0));
                     ui.add_space(5.0);
                     let mut job = egui::text::LayoutJob::default();
                     job.wrap.max_width = w;
@@ -3881,12 +4222,14 @@ fn process_block(ui: &mut Ui, p: &mut Process, width: f32) {
     }
 }
 
-/// 实时区里的一段「模型正在说的话」。
+/// A stretch of "what the model is saying right now" in the live area.
 ///
-/// 故意用**普通正文**渲染、不加 Markdown、不加气泡边框：它是同一段文字在落盘之前的临时
-/// 形态，落盘后会换成带 Markdown 的气泡。中途另起一套样式，两段看着就不像同一句话，
-/// 切换时会「跳」一下。`break_anywhere` 开着是为了防止答案里的长路径把版心顶破 ——
-/// 这里只求不溢出，好看与否交给最终那条气泡。
+/// Deliberately rendered as **plain body text**, with no Markdown and no bubble border: it is a
+/// temporary form of the same text before it hits disk, and once saved it becomes a bubble with
+/// Markdown. Introducing a different style midway would make the two look like different sentences
+/// and "jump" on the switch. `break_anywhere` is on to stop long paths in the answer from bursting
+/// the measure -- all that matters here is not overflowing; whether it looks good is left to the
+/// final bubble.
 fn live_plain_text(ui: &mut Ui, text: &str, color: Color32) {
     let w = ui.available_width();
     let mut job = egui::text::LayoutJob::default();
@@ -3902,10 +4245,11 @@ fn live_plain_text(ui: &mut Ui, text: &str, color: Color32) {
 
 fn step_row(ui: &mut Ui, st: &StepView) {
     ui.horizontal_top(|ui| {
-        // 状态标记（用户 2026-10-05 定的形态）：进行中 = 三点跑马灯（**刻意与思考中那个
-        // 8 点绕圈的 spinner 不同形**）、成功 = ✓、失败 = ✗。
-        // 也不再编号 —— 编号会把「一个阶段的几步调用」读成一份清单，这里要的是
-        // 「一个接着下一个」。
+        // Status markers (the form settled on with the user, 2026-10-05): in progress = a three-dot
+        // marquee (**deliberately a different shape from the 8-dot orbiting spinner used for
+        // reasoning**), success = ✓, failure = ✗.
+        // They are no longer numbered either -- numbering reads "a few calls in one stage" as a
+        // checklist, whereas what is wanted here is "one after another".
         match &st.result {
             None => call_marquee(ui, P::text_dim()),
             Some((is_err, _)) if *is_err => call_glyph(ui, false, P::ink()),
@@ -3927,17 +4271,19 @@ fn step_row(ui: &mut Ui, st: &StepView) {
                     );
                 });
         }
-        // 参数**不在这里显示**（用户 2026-10-05 提的）：一串 JSON 会把这一行撑成好几行，
-        // 展开后更是一眼看不到底。行上只留「工具名 + 归属插件」，结果在下一行给一行摘要。
-        // 真要看参数，`history/*.jsonl` 里原样存着。
+        // Arguments are **not shown here** (user request, 2026-10-05): a JSON blob would stretch
+        // this row into several lines, and expanded you can't see the bottom of it. The row keeps
+        // only "tool name + owning plugin", and the next row gives a one-line summary of the result.
+        // To really see the arguments, they are stored verbatim in `history/*.jsonl`.
     });
     ui.add_space(5.0);
 }
 
-/// 实时区里的一段调用流（某句阶段回复之前的那些调用）。
+/// A stretch of call stream in the live area (the calls preceding one interim reply).
 ///
-/// 实时区**一段一张卡**（见 `live_block` 的切段循环），过程卡片那边则是一张卡装全部 ——
-/// 行渲染共用同一套，只是分组不同。
+/// The live area gets **one card per stretch** (see the segmentation loop in `live_block`), whereas
+/// the process card puts everything in a single card -- the row rendering is shared, only the
+/// grouping differs.
 fn calls_card(ui: &mut Ui, steps: &[StepView]) {
     Frame::NONE
         .fill(P::surface())
@@ -3945,7 +4291,8 @@ fn calls_card(ui: &mut Ui, steps: &[StepView]) {
         .stroke(Stroke::new(1.0, P::border()))
         .inner_margin(Margin::symmetric(20, 16))
         .show(ui, |ui| {
-            // 用框架内部的可用宽度，避免内容把卡片顶出栏宽
+            // Use the available width inside the frame, so the content can't push the card out of the
+            // column width
             let w = ui.available_width();
             ui.set_width(w);
             ui.set_max_width(w);
@@ -3955,14 +4302,15 @@ fn calls_card(ui: &mut Ui, steps: &[StepView]) {
         });
 }
 
-/// 调用流里的「进行中」：三个点，亮点依次后移。
+/// The "in progress" marker in the call stream: three dots with the lit one moving along.
 ///
-/// 与 [`spinner_dot`] 那个 8 点绕圈**刻意不同形**（用户要求「有区别于思考中的加载动画」）：
-/// 一眼就能分出「是在调工具」还是「是在想」。
+/// **Deliberately a different shape** from [`spinner_dot`]'s 8-dot orbit (the user asked for
+/// "something distinct from the reasoning spinner"): one glance tells you whether it is calling a
+/// tool or thinking.
 fn call_marquee(ui: &mut Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 20.0), Sense::hover());
-    // 相位取 `ui.input(|i| i.time)`（egui 自增的秒数）：任何位置都能直接调它，
-    // 不必把 `App` 的 `spin` 一路传进来。
+    // The phase comes from `ui.input(|i| i.time)` (egui's self-incrementing seconds count):
+    // callable anywhere directly, with no need to thread `App`'s `spin` all the way down.
     let t = ui.input(|i| i.time) as f32;
     let active = ((t * 3.0) as usize) % 3;
     let painter = ui.painter();
@@ -3977,7 +4325,8 @@ fn call_marquee(ui: &mut Ui, color: Color32) {
     }
 }
 
-/// ✓ / ✗。用两条线段手绘 —— 不赌字体里有没有这两个字形（与 `paint_folder` 同一个理由）。
+/// ✓ / ✗. Hand-drawn from two line segments -- no betting on whether the font has these two
+/// glyphs (the same reason as `paint_folder`).
 fn call_glyph(ui: &mut Ui, ok: bool, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 20.0), Sense::hover());
     let c = rect.center();
@@ -4021,32 +4370,36 @@ fn compact_json(v: &serde_json::Value) -> String {
     clamp_str(&s, 300)
 }
 
-// ────────────── 设置弹窗 ──────────────
+// ────────────── settings dialog ──────────────
 
-/// 设置弹窗的**内容区**尺寸（不含内边距 20/18）。
+/// The settings dialog's **content area** size (padding 20/18 excluded).
 ///
-/// 比原来那枚 380px 的「关于」小卡片大一圈：它要装一张两栏的表，右栏还是路径清单
-/// （`E:\rustapp\workplace\2026-10-05-…` 这种值短不了）。
+/// A size up from the old 380px "about" card: it has to hold a two-column table, and the right
+/// column is a list of paths (`E:\rustapp\workplace\2026-10-05-...`, values that can't be short).
 const SETTINGS_W: f32 = 700.0;
-/// 高度写死，理由是「切栏目时卡片不该忽大忽小」——见 `settings_overlay` 的注释。
+/// Height hard-coded, the reason being "the card shouldn't grow and shrink when switching columns"
+/// -- see the comment on `settings_overlay`.
 const SETTINGS_H: f32 = 470.0;
-/// 左栏（栏目列表）宽度。
+/// Width of the left column (the list of columns).
 const SETTINGS_NAV_W: f32 = 132.0;
-/// 右栏宽度 = 总宽 − 左栏 − 竖线 1px − 间距 18px。
+/// Right column width = total - left column - 1px rule - 18px spacing.
 const SETTINGS_RIGHT_W: f32 = SETTINGS_W - SETTINGS_NAV_W - 19.0;
-/// 底部「关闭」那一行占掉的高度（含它与内容之间的间隙）。
+/// The height the bottom "Close" row takes up (including the gap between it and the content).
 const SETTINGS_FOOT_H: f32 = 44.0;
-/// 「名字 + 值」那一行里左列（名字）占的宽度。固定住值才会左右对齐成一条线。
+/// Width taken by the left column (the name) in a "name + value" row. Fixing it is what makes the
+/// values line up in a column.
 const KV_KEY_W: f32 = 84.0;
 
-/// 开源协议正文。**直接嵌入仓库里那份 `LICENSE`** —— 不手抄：手抄的那份迟早与文件
-/// 不一致，而「关于」里写的必须是真正生效的那一份。
+/// The open-source license text. **The repo's own `LICENSE`, embedded directly** -- not copied by
+/// hand: a hand copy will sooner or later drift from the file, and what "About" shows has to be the
+/// one actually in force.
 const LICENSE_TEXT: &str = include_str!("../../LICENSE");
 
-/// 左栏里的一行栏目。
+/// One column row in the left column.
 ///
-/// 选中态用两件事说：「底升一档 + 文字转主色」加左侧一小段竖线。只靠底色的话，
-/// 在这个色阶很窄的单色方案里（`surface_hi` 与 `surface` 只差一档）几乎看不出来。
+/// The selected state is stated in two ways: "backdrop up one step + text in the primary colour"
+/// plus a short vertical rule on the left. With the backdrop alone it would be nearly invisible in
+/// this monochrome scheme's narrow range (`surface_hi` and `surface` are one step apart).
 fn tab_row(ui: &mut Ui, tab: SettingsTab, selected: bool) -> egui::Response {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
@@ -4075,10 +4428,11 @@ fn tab_row(ui: &mut Ui, tab: SettingsTab, selected: bool) -> egui::Response {
     resp
 }
 
-/// 单选行（「外观」那一栏用）：右侧一个圆点，选中的是实心。
+/// A radio row (used by the "Appearance" column): a dot on the right, filled when selected.
 ///
-/// 圆点而不是勾：勾的形状在这个界面里已经被「工作区档位」用掉了（那是「当前生效的
-/// 档位」），再用一次会读成同一件事。实心 / 空心是「选中 / 未选中」最省解释的画法。
+/// A dot rather than a tick: the tick's shape is already taken in this UI by the "workplace tier"
+/// (meaning "the tier currently in force"), and using it again would read as the same thing.
+/// Filled / hollow is the drawing that needs the least explaining for "selected / not selected".
 fn choice_row(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
@@ -4103,13 +4457,15 @@ fn choice_row(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
     resp
 }
 
-/// 「打开活动流」按钮：左边那条流线 + 右边文字。
+/// The "open activity stream" button: the flow line on the left + text on the right.
 ///
-/// 为什么不是一枚纯文字按钮：那条流线是活动流**唯一的视觉身份**（原来顶栏那枚图标就是
-/// 它），丢掉之后这一栏就只剩四个中文字，得先读一遍才知道点开是什么。
+/// Why not a plain text button: that flow line is the activity stream's **only visual identity**
+/// (the old top-bar icon was exactly this), and dropping it would leave this column with just a few
+/// words, so you'd have to read them before knowing what opens.
 ///
-/// 已经开着时整枚按钮淡一档：一个写着「打开」的按钮再点一下**不该把窗口关掉**，
-/// 所以那时它不可点（`activity::open` 里也是这么做的，见它的注释）。
+/// When it is already open the whole button dims one step: a button labelled "open"
+/// **shouldn't close the window** when clicked again, so it isn't clickable then (which is what
+/// `activity::open` does too -- see its comment).
 fn activity_open_button(ui: &mut Ui, on: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(196.0, 42.0), Sense::click());
     let hot = resp.hovered() && !on;
@@ -4130,21 +4486,21 @@ fn activity_open_button(ui: &mut Ui, on: bool) -> egui::Response {
         Stroke::new(1.0, P::border()),
         egui::StrokeKind::Inside,
     );
-    // 图标：18px 见方的流线，靠左内缩 22
+    // Icon: an 18px square flow line, inset 22 from the left
     let icon =
         Rect::from_center_size(Pos2::new(rect.left() + 22.0, rect.center().y), Vec2::splat(18.0));
     draw_flow_curve(painter, icon, fg);
-    let g = painter.layout_no_wrap("打开活动流".to_string(), egui::FontId::proportional(14.5), fg);
+    let g = painter.layout_no_wrap(aox::i18n::t("Open activity stream").to_string(), egui::FontId::proportional(14.5), fg);
     painter.galley(Pos2::new(rect.left() + 42.0, rect.center().y - g.size().y * 0.5), g, fg);
     resp
 }
 
-/// 「名字 + 值」一行（「系统」那一栏全是这种行）。
+/// A "name + value" row (the "System" column is all rows like this).
 fn kv_row(ui: &mut Ui, key: &str, val: &str) {
     kv_row_colored(ui, key, val, P::text_faint());
 }
 
-/// 同上，但值可以换个颜色（「运行时环境」用它把「未找到」标出来）。
+/// As above, but the value may be coloured ("runtime environment" uses this to flag "not found").
 fn kv_row_colored(ui: &mut Ui, key: &str, val: &str, color: Color32) {
     ui.horizontal_top(|ui| {
         let (r, _) = ui.allocate_exact_size(Vec2::new(KV_KEY_W, 19.0), Sense::hover());
@@ -4153,8 +4509,9 @@ fn kv_row_colored(ui: &mut Ui, key: &str, val: &str, color: Color32) {
             let g = p.layout_no_wrap(key.to_string(), egui::FontId::proportional(13.5), P::text_dim());
             p.galley(Pos2::new(r.left(), r.top() + 1.0), g, P::text_dim());
         }
-        // 值一律等宽：它们是路径、命令、版本号，不是散文。可选中 —— 路径经常是要
-        // 复制到别处去用的（终端、资源管理器），只读的显示等于让人照着敲一遍。
+        // Values are always monospace: they are paths, commands, version numbers, not prose.
+        // Selectable -- paths often need copying elsewhere (a terminal, a file manager), and a
+        // read-only display amounts to making people retype them.
         ui.add(
             Label::new(RichText::new(val).font(theme::mono_font(12.5)).color(color))
                 .selectable(true)
@@ -4164,7 +4521,7 @@ fn kv_row_colored(ui: &mut Ui, key: &str, val: &str, color: Color32) {
     ui.add_space(4.0);
 }
 
-/// 「名字 + 可点链接」一行（「关于」那一栏用）。
+/// A "name + clickable link" row (used by the "About" column).
 fn link_row(ui: &mut Ui, key: &str, url: &str) {
     ui.horizontal_top(|ui| {
         let (r, _) = ui.allocate_exact_size(Vec2::new(KV_KEY_W, 19.0), Sense::hover());
@@ -4191,33 +4548,39 @@ fn link_row(ui: &mut Ui, key: &str, url: &str) {
 mod tests {
     use super::*;
 
-    /// 把「设置弹窗为什么必须**钉死**内容宽度」这件事钉成一条可执行的说明。
+    /// Nail down, as an executable statement, why the settings dialog **has to pin** its content
+    /// width.
     ///
-    /// 这一条测的是 **egui 的一个行为**，不是我们的代码：`ScrollArea` 会按
-    /// `animate_bool_responsive` **逐帧动画**地给滚动条分配宽度，于是它内部的内容宽度
-    /// 会连续变化。凡是拿 `available_width()` 当尺寸的控件都会跟着变宽变窄、换行的文字
-    /// 会每帧重新折行 —— 这正是 2026-10-05 那次「鼠标一动，设置面板就轻微震动、
-    /// 字发虚」的根因（没有重绘动画就不推进，所以它只在鼠标移动时才现形）。
+    /// This tests **a behaviour of egui**, not our code: a `ScrollArea` allocates the scrollbar's
+    /// width **animated frame by frame** via `animate_bool_responsive`, so the content width inside
+    /// it keeps changing. Any widget that sizes itself from `available_width()` widens and narrows
+    /// along with it, and wrapped text re-wraps every frame -- which is exactly the root cause of
+    /// the 2026-10-05 "move the mouse and the settings panel shivers slightly with blurry text"
+    /// (the animation doesn't advance without a repaint, so it only shows up while the mouse is
+    /// moving).
     ///
-    /// 为什么值得单独钉住：那个行为在源码里只体现为两行减法
-    /// （`current_bar_use = 动画量 × allocated_width()`），翻代码完全看不出它会牵动布局；
-    /// 而一旦有人把 `settings_overlay` 里的 `ui.set_width(content_w)` 当成多余的删掉，
-    /// 抖动会原样回来 —— 手动测又未必碰得到。所以这条测试的**失败信息**里写清了
-    /// 该去哪一段注释核对。
+    /// Why it is worth pinning separately: in the source that behaviour amounts to two lines of
+    /// subtraction (`current_bar_use = animated amount x allocated_width()`), and reading the code
+    /// gives no hint that it moves the layout around; and the moment someone deletes
+    /// `ui.set_width(content_w)` from `settings_overlay` as redundant, the jitter comes back
+    /// unchanged -- while manual testing may well never run into it. So this test's **failure
+    /// message** says exactly which comment to go and check.
     #[test]
     fn egui_animates_the_scroll_bar_allocation() {
         let ctx = egui::Context::default();
-        // 与本项目 `theme::install_style` 一致：浮动样式 + 占位宽度（thin() 给 6px）
+        // Consistent with this project's `theme::install_style`: floating style + reserved width
+        // (thin() gives 6px)
         ctx.style_mut(|s| s.spacing.scroll = egui::style::ScrollStyle::thin());
         assert!(
             ctx.style().spacing.scroll.allocated_width() > 0.0,
-            "前提：样式里滚动条要占位，否则这条测试什么也证明不了"
+            "precondition: the style must reserve scroll-bar width, otherwise this test proves nothing"
         );
 
         let mut widths: Vec<f32> = Vec::new();
         for frame in 0..8 {
             let input = egui::RawInput {
-                // 动画靠 `time` 推进：不给时间变化，`animate_bool` 就永远停在起点
+                // The animation advances on `time`: with no change in time, `animate_bool` sits at
+                // its starting point forever
                 time: Some(frame as f64 * 0.05),
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
                 ..Default::default()
@@ -4230,7 +4593,7 @@ mod tests {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             widths.push(ui.available_width());
-                            // 内容明显高于视口，逼出滚动条
+                            // Content clearly taller than the viewport, forcing a scrollbar
                             for _ in 0..40 {
                                 ui.label("x");
                             }
@@ -4243,9 +4606,7 @@ mod tests {
         let changed = widths.iter().any(|w| (w - first).abs() > 0.5);
         assert!(
             changed,
-            "egui 不再逐帧改滚动条占位了？那 `App::settings_overlay` 里 \
-             `ui.set_width(content_w)` 那一段的**理由注释**要跟着更新 —— \
-             它存在的唯一目的就是躲开这个动画（不是多余的）。实测宽度序列：{widths:?}"
+                        "egui no longer changes scroll-bar allocation per frame? Then the **rationale comment** for the `ui.set_width(content_w)` block in `App::settings_overlay` must be updated -- its only purpose is to dodge this animation (it is not redundant). Measured width sequence: {widths:?}"
         );
     }
 }

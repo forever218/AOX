@@ -1,49 +1,53 @@
-//! 一句话描述「这台机器是什么」—— 给设置页的「系统」选项卡用。
+//! One-line description of "what machine this is" — for the Settings page's "System" tab.
 //!
-//! # 为什么不报「Windows 11 / 10」
+//! # Why we don't report "Windows 11 / 10"
 //!
-//! 用户看到的操作系统版本号，标准做法是 `GetVersionExW`。但那个 API 从 Windows 8.1
-//! 起就对**没有在清单里声明支持新版本**的进程撒谎：一律报 6.2（Windows 8），
-//! 无论真实系统是 10 还是 11。拿到真值的两条路 —— 读注册表的 `CurrentVersion`、
-//! 或调 ntdll 未公开导出的 `RtlGetVersion` —— 都超出了「显示一行字」该付的代价。
+//! The standard way to read the OS version the user sees is `GetVersionExW`. But since Windows 8.1
+//! that API has lied to any process that did **not declare support for the new version in its
+//! manifest**: it always reports 6.2 (Windows 8), whether the real system is 10 or 11. The two
+//! ways to get the real value — reading `CurrentVersion` from the registry, or calling ntdll's
+//! undocumented `RtlGetVersion` export — both cost more than "printing one line".
 //!
-//! 所以这里报的是**准确且免费**的三样：系统家族、体系结构、这台机器有多少核、
-//! 多少内存。它们足以回答「我当时是在什么机器上跑的这个」，而不会给出一个错的版本号
-//! （那比不报更糟：用户会拿着一个假数字去提 issue）。
+//! So what we report here is the **accurate and free** trio: OS family, architecture, and how many
+//! cores / how much memory this machine has. That is enough to answer "which machine was I running
+//! this on", without handing back a wrong version number (which is worse than reporting none: the
+//! user would file an issue citing a bogus number).
 //!
-//! 体系结构特意取 `std::env::consts::ARCH`（**编译目标**）而不是运行时判定：
-//! 它回答的是「这个二进制是给哪种机器编的」，而这正是排「装错了包」时唯一有用的那个数。
-//! 运行时架构由 Windows 的 `GetNativeSystemInfo` 提供，但两者不一致只发生在
-//! WOW64 场景，而本项目没有 32 位构建 —— 为一个不存在的场景多引一个 API 不值。
+//! Architecture deliberately uses `std::env::consts::ARCH` (the **compile target**) rather than a
+//! runtime check: it answers "which machine was this binary built for", exactly the number that
+//! matters when triaging "wrong package installed". The runtime architecture comes from Windows'
+//! `GetNativeSystemInfo`, but the two only diverge in WOW64 scenarios, and this project ships no
+//! 32-bit build — pulling in another API for a non-existent scenario isn't worth it.
 
-/// 主机概况，例如 `windows x86_64 · 16 核 · 31.7 GB 内存`。
+/// Host summary, e.g. `windows x86_64 · 16 cores · 31.7 GB memory`.
 ///
-/// 取不到的项**直接省掉**，不编造数字：内存查询失败时那一整段不出现，
-/// 而不是显示 `0.0 GB`。
+/// Items we can't read are **dropped entirely** rather than faked: if the memory query fails the
+/// whole segment is absent, instead of showing `0.0 GB`.
 pub fn host_summary() -> String {
     let mut s = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
     if let Some(cores) = cores() {
-        s.push_str(&format!(" · {cores} 核"));
+        s.push_str(&crate::tf!(" · {} cores", cores));
     }
     if let Some(gb) = total_memory_gb() {
-        s.push_str(&format!(" · {gb:.1} GB 内存"));
+        s.push_str(&crate::tf!(" · {} GB memory", format!("{gb:.1}")));
     }
     s
 }
 
-/// 逻辑处理器数。拿不到返回 `None`（少数受限环境会拒绝）。
+/// Logical processor count. Returns `None` when unavailable (a few restricted environments refuse).
 pub fn cores() -> Option<usize> {
     std::thread::available_parallelism().ok().map(|n| n.get())
 }
 
-/// 物理内存总量（GiB）。取不到返回 `None`。
+/// Total physical memory (GiB). Returns `None` when unavailable.
 #[cfg(windows)]
 pub fn total_memory_gb() -> Option<f64> {
     use windows_sys::Win32::System::SystemInformation::GetPhysicallyInstalledSystemMemory;
-    // 这个 API 的返回值单位是 **KiB**（不是字节），名字里没写，是官方文档里的一句小字。
+    // This API's return value is in **KiB** (not bytes) — not stated in its name, just a small-print note in the docs.
     let mut kb: u64 = 0;
-    // SAFETY: 只写一个本函数栈上的 `u64`；调用失败时函数返回 0 且不保证写过出参，
-    // 所以先把它初始化成 0 再判「返回非 0 且值非 0」。
+    // SAFETY: we only write a `u64` that lives on this function's stack; on failure the function
+    // returns 0 and doesn't guarantee it wrote the out-param, so initialize it to 0 first and then
+    // check "return != 0 AND value != 0".
     let ok = unsafe { GetPhysicallyInstalledSystemMemory(&mut kb) };
     if ok == 0 || kb == 0 {
         return None;
@@ -51,8 +55,9 @@ pub fn total_memory_gb() -> Option<f64> {
     Some(kb as f64 / 1024.0 / 1024.0)
 }
 
-/// 非 Windows 平台的占位：Linux/macOS 上读 `/proc/meminfo` / `sysctl` 各有各的做法，
-/// 而这个项目目前只出货 Windows 版。返回 `None` 的后果只是设置页少一段。
+/// Placeholder for non-Windows platforms: reading `/proc/meminfo` / `sysctl` on Linux/macOS
+/// each has its own approach, and this project currently ships Windows only. Returning `None` just
+/// drops one segment from the Settings page.
 #[cfg(not(windows))]
 pub fn total_memory_gb() -> Option<f64> {
     None
@@ -69,8 +74,8 @@ mod tests {
         assert!(s.contains(std::env::consts::ARCH), "{s}");
     }
 
-    /// 这段文本是直接显示给用户的，**不能出现「None」「0.0」这种占位**。
-    /// 取不到的项该整段消失，而不是变成一个看起来像数据的 0。
+    /// This text is shown directly to the user, so it must **not contain placeholders like "None"
+    /// or "0.0"**. Items we can't read should vanish entirely, not turn into a 0 that looks like data.
     #[test]
     fn missing_pieces_are_omitted_not_zeroed() {
         let s = host_summary();
@@ -82,7 +87,7 @@ mod tests {
     #[test]
     fn cores_is_plausible_when_available() {
         if let Some(n) = cores() {
-            assert!(n >= 1 && n <= 4096, "核数不合常理: {n}");
+            assert!(n >= 1 && n <= 4096, "implausible core count: {n}");
         }
     }
 
@@ -90,8 +95,8 @@ mod tests {
     #[test]
     fn memory_is_plausible_when_available() {
         if let Some(gb) = total_memory_gb() {
-            // 任何跑得动这个程序的机器都在 1 GB 以上、1 TB 以下
-            assert!(gb > 1.0 && gb < 1024.0, "内存数不合常理: {gb}");
+            // Any machine that can run this program has more than 1 GB and less than 1 TB
+            assert!(gb > 1.0 && gb < 1024.0, "implausible memory size: {gb}");
         }
     }
 }

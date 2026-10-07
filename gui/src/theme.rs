@@ -1,12 +1,12 @@
-//! 纸张感黑白主题：配色、留白、圆角，以及中文字体加载。
+//! Paper-like black-and-white theme: palette, whitespace, corner radii, and CJK font loading.
 //!
-//! 设计取向是「纸与墨」——没有色相，只有明度层次与留白：
-//! 亮色模式是一张略微发暖的纸，暗色模式是暖调的黑。
-//! 状态语义（成功/警告/失败）不靠颜色区分，而是靠明度对比与反白块。
+//! The design leans into "paper and ink" — no hue, only lightness steps and whitespace:
+//! light mode is a slightly warm sheet of paper; dark mode is a warm-tinted black.
+//! Status semantics (success / warning / failure) are told apart not by color but by lightness contrast and inverted blocks.
 //!
-//! egui 自带字体不含 CJK 字形，中文会渲染成空白方块。这里从系统字体目录里挑一个
-//! 现代无衬线中文字体（优先「等线 Deng」，其次「微软雅黑」）作为回退字体注入。
-//! 同时注册一个真正的「粗体」字族，让 Markdown 的 **加粗** 有实际字重变化。
+//! egui built-in fonts lack CJK glyphs, so Chinese renders as blank boxes. Here we pick a
+//! modern sans-serif CJK font from the system font directories (preferring "Deng"/DengXian, then "Microsoft YaHei") and inject it as a fallback.
+//! We also register a genuine "bold" family so Markdown `**bold**` actually gets a heavier weight.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -16,10 +16,11 @@ use egui::{
     Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Visuals,
 };
 
-// ─────────────────────────── 字号 / 留白刻度 ───────────────────────────
+// ─────────────────────────── Font sizes / whitespace scale ───────────────────────────
 //
-// 这些值现在来自 `[theme.metrics]`（默认即原先写死的常量），所以只能是**运行期访问器**
-// 而不是 `const`。`metrics()` 走 `OnceLock`：装配时写一次，之后只读，开销等同常量。
+// These values now come from `[theme.metrics]` (the defaults equal the previously hard-coded
+// constants), so they can only be **runtime accessors** rather than `const`. `metrics()` goes
+// through `OnceLock`: written once at assembly time, then read-only, at constant cost.
 
 static METRICS: OnceLock<MetricsConfig> = OnceLock::new();
 
@@ -27,52 +28,52 @@ fn metrics() -> &'static MetricsConfig {
     METRICS.get_or_init(MetricsConfig::default)
 }
 
-/// 正文字号。全套界面以它为基准。
+/// Body font size. The whole UI is sized relative to it.
 pub fn body_size() -> f32 {
     metrics().body_size
 }
 
-/// 标题（Heading）字号。
+/// Heading font size.
 pub fn heading_size() -> f32 {
     metrics().heading_size
 }
 
-/// 按钮文字字号。
+/// Button label font size.
 pub fn button_size() -> f32 {
     metrics().button_size
 }
 
-/// 小字字号。
+/// Small-text font size.
 pub fn small_size() -> f32 {
     metrics().small_size
 }
 
-/// 等宽字号（代码块用）。
+/// Monospace font size (used for code blocks).
 pub fn mono_size() -> f32 {
     metrics().mono_size
 }
 
-/// 卡片圆角。
+/// Card corner radius.
 pub fn card_radius() -> u8 {
     metrics().card_radius
 }
 
-/// 自定义粗体字族名。
+/// Custom bold font-family name.
 const BOLD_FAMILY: &str = "aox-strong";
-/// 自定义衬线字族名（内嵌引用等次级标题用，找不到就退回普通字体）。
+/// Custom serif font-family name (for sub-headings like blockquotes; falls back to the plain family if not found).
 const SERIF_FAMILY: &str = "aox-serif";
-/// 自定义品牌字族名（首屏那句大招呼用，找不到就退到衬线）。
+/// Custom brand font-family name (for the big greeting on the first screen; falls back to serif if not found).
 const BRAND_FAMILY: &str = "aox-brand";
 static BOLD_OK: AtomicBool = AtomicBool::new(false);
 static SERIF_OK: AtomicBool = AtomicBool::new(false);
 static BRAND_OK: AtomicBool = AtomicBool::new(false);
 
-/// 系统里是否找到了真正的粗体字体。
+/// Whether a genuine bold font was found on the system.
 pub fn bold_available() -> bool {
     BOLD_OK.load(Ordering::Relaxed)
 }
 
-/// 粗体 FontId（找不到粗体时退回普通字体 + 提亮颜色）。
+/// Bold FontId (falls back to the plain family + brighter color when no bold is available).
 pub fn bold_font(size: f32) -> FontId {
     if bold_available() {
         FontId::new(size, FontFamily::Name(BOLD_FAMILY.into()))
@@ -81,7 +82,7 @@ pub fn bold_font(size: f32) -> FontId {
     }
 }
 
-/// 衬线 FontId（次级标题用；找不到衬线字体时退回粗体）。
+/// Serif FontId (for sub-headings; falls back to bold when no serif font is available).
 pub fn serif_font(size: f32) -> FontId {
     if SERIF_OK.load(Ordering::Relaxed) {
         FontId::new(size, FontFamily::Name(SERIF_FAMILY.into()))
@@ -90,14 +91,14 @@ pub fn serif_font(size: f32) -> FontId {
     }
 }
 
-/// 品牌字 FontId（原本给首屏那句大招呼用）。
+/// Brand-font FontId (originally for the big greeting on the first screen).
 ///
-/// 比衬线松、带点手写的笔意，免得一行问候看起来像文件抬头；
-/// 找不到艺术体时逐级退回衬线 → 粗体，所以调它总是安全的。
+/// Looser than the serif with a hint of handwritten stroke, so a line of greeting does not read like a document letterhead;
+/// when no display font is found it steps down serif to bold, so calling it is always safe.
 ///
-/// ⚠️ 目前**没有调用方**：首屏那句「Hi there」在 2026-10-06 被换成了插画（用户要求）。
-/// 留着的理由是这个字族本身是**配置项**（`brand` / `AOX_GUI_FONT_BRAND`，字体栈照旧在
-/// `install_fonts` 里装）—— 用户哪天想在某处再用一次艺术体，直接调它就行，不必再实现一遍。
+/// WARNING: currently **has no caller**: the first-screen greeting "Hi there" was replaced by an illustration on 2026-10-06 (per user request).
+/// It is kept because this family is itself a **config item** (`brand` / `AOX_GUI_FONT_BRAND`; the font stack is still installed in
+/// `install_fonts`) — if the user ever wants a display font somewhere again, just call it instead of re-implementing it.
 #[allow(dead_code)]
 pub fn brand_font(size: f32) -> FontId {
     if BRAND_OK.load(Ordering::Relaxed) {
@@ -115,41 +116,41 @@ pub fn mono_font(size: f32) -> FontId {
     FontId::monospace(size)
 }
 
-// ─────────────────────────── 明暗模式 ───────────────────────────
+// ─────────────────────────── Light / dark mode ───────────────────────────
 
-/// **实际生效**的配色（两档）。
+/// The **actually active** palette (two variants).
 ///
-/// 与 [`Pref`] 分开是有意的：`Mode` 回答「现在用的是哪套色」，永远只有亮 / 暗两种；
-/// 而用户能选的还有第三种 —— 「跟着系统走」。把那一档塞进 `Mode`，满仓的
-/// `mode() == Mode::Dark` 就都要多想一层「那 System 算哪种」，而且答案还随系统变。
+/// Kept separate from [`Pref`] on purpose: `Mode` answers "which color set is in use right now" and is always either light or dark, whereas the user can also pick a third option — "follow
+/// the system". If that option lived in `Mode`, every `mode() == Mode::Dark` check would have to also wonder "and what does System count as?", and the answer
+/// would shift with the system.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
-    /// 纸
+    /// Paper
     Light,
-    /// 墨
+    /// Ink
     Dark,
 }
 
-/// 用户在设置页里选的**偏好**（三档）。落盘的就是它。
+/// The **preference** the user picks on the settings page (three options). This is what gets persisted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pref {
     Light,
     Dark,
-    /// 跟随系统：系统换主题就跟着换（见 [`follow_system`]）。
+    /// Follow the system: switch along when the system theme changes (see [`follow_system`]).
     System,
 }
 
 impl Pref {
-    /// 设置页里那一行的名字。
+    /// The label for this option on the settings page.
     pub fn label(self) -> &'static str {
         match self {
-            Pref::Light => "亮色 · 纸",
-            Pref::Dark => "暗色 · 墨",
-            Pref::System => "跟随系统",
+            Pref::Light => aox::i18n::t("Light · paper"),
+            Pref::Dark => aox::i18n::t("Dark · ink"),
+            Pref::System => aox::i18n::t("Follow system"),
         }
     }
 
-    /// 落盘用的字面量。
+    /// The string literal used when persisting.
     fn key(self) -> &'static str {
         match self {
             Pref::Light => "light",
@@ -158,12 +159,12 @@ impl Pref {
         }
     }
 
-    /// 设置页里的排列顺序：跟随系统在最前（它是「不用管」的那一档）。
+    /// The order shown on the settings page: "follow system" first (it is the "do not care" option).
     pub const ALL: [Pref; 3] = [Pref::System, Pref::Dark, Pref::Light];
 }
 
-static MODE: AtomicU8 = AtomicU8::new(1); // 默认暗（墨）
-static PREF: AtomicU8 = AtomicU8::new(1); // 默认偏好也是暗
+static MODE: AtomicU8 = AtomicU8::new(1); // default dark (ink)
+static PREF: AtomicU8 = AtomicU8::new(1); // default preference is also dark
 
 pub fn mode() -> Mode {
     if MODE.load(Ordering::Relaxed) == 0 {
@@ -177,7 +178,7 @@ pub fn set_mode(m: Mode) {
     MODE.store(if m == Mode::Light { 0 } else { 1 }, Ordering::Relaxed);
 }
 
-/// 当前偏好（设置页据此画选中态）。
+/// The current preference (the settings page uses this to draw the selected state).
 pub fn pref() -> Pref {
     match PREF.load(Ordering::Relaxed) {
         0 => Pref::Light,
@@ -197,16 +198,17 @@ fn set_pref(p: Pref) {
     );
 }
 
-/// 由「用户偏好 + 系统当前主题」算出**实际**该用哪套色。
+/// Compute the **actually** active palette from "user preference + current system theme".
 ///
-/// 抽成纯函数是为了能直接断言 —— 「跟随系统」这一档的全部逻辑就是这张真值表，
-/// 而它恰好是最容易被写成「跟随 == 总是暗」的那种东西（拿不到系统主题时悄悄退回暗，
-/// 于是「跟随系统」看起来永远不生效）。
+/// Extracted as a pure function so it can be asserted directly — everything about the "follow
+/// system" option is this truth table, and it is exactly the kind of thing that gets written as
+/// "follow == always dark" (silently falling back to dark when the system theme is unavailable,
+/// so "follow system" appears to never take effect).
 pub fn effective(p: Pref, system: Option<egui::Theme>) -> Mode {
     match p {
         Pref::Light => Mode::Light,
         Pref::Dark => Mode::Dark,
-        // 后端没报系统主题时退回暗 —— 与加这一档之前的默认一致。
+        // Fall back to dark when the backend reports no system theme — matches the default before this option was added.
         Pref::System => match system {
             Some(egui::Theme::Light) => Mode::Light,
             _ => Mode::Dark,
@@ -214,7 +216,7 @@ pub fn effective(p: Pref, system: Option<egui::Theme>) -> Mode {
     }
 }
 
-/// 用户在设置页里选了哪一档：立刻生效 + 落盘。
+/// Which option the user picked on the settings page: apply immediately + persist.
 pub fn apply_pref(ctx: &egui::Context, p: Pref) {
     set_pref(p);
     set_mode(effective(p, ctx.system_theme()));
@@ -223,11 +225,11 @@ pub fn apply_pref(ctx: &egui::Context, p: Pref) {
     save_pref();
 }
 
-/// 「跟随系统」的每帧检查：系统换了主题就跟着换。返回是否真的换了。
+/// Per-frame check for "follow system": switch along when the system theme changes. Returns whether it actually changed.
 ///
-/// 为什么不是只在切换那一刻算一次：系统主题是**运行期会变**的（用户在系统设置里
-/// 切了深色），而 egui 每帧都把当前值放在 `ctx` 里。不查的话，「跟随系统」就只是
-/// 「启动时照系统的样子定一次」。
+/// Why not compute it only at the switch moment: the system theme **changes at runtime** (the user flips to dark
+/// in the OS settings), and egui puts the current value in `ctx` every frame. Without this check "follow system"
+/// would only mean "decide once at startup from the system".
 pub fn follow_system(ctx: &egui::Context) -> bool {
     if pref() != Pref::System {
         return false;
@@ -242,8 +244,8 @@ pub fn follow_system(ctx: &egui::Context) -> bool {
     true
 }
 
-// 主题偏好落盘位置：应用根目录下的一个小文件。
-// 找不到可写位置就静默放弃（只是记不住偏好，不影响使用）。
+// Where the theme preference is persisted: a small file in the app root directory.
+// Silently give up if no writable location is found (only the preference is lost, usage is unaffected).
 fn pref_path() -> Option<std::path::PathBuf> {
     let (root, _) = aox::paths::resolve_workplace();
     let p = root.join(".aox-gui-theme");
@@ -254,13 +256,13 @@ fn pref_path() -> Option<std::path::PathBuf> {
     }
 }
 
-/// 读取上次的主题偏好。`None` = 从没记录过（或记录不可辨认），交由上层决定用哪个。
+/// Read the last saved theme preference. `None` = never recorded (or unrecognized), leaving the choice to the caller.
 fn read_pref() -> Option<Pref> {
     let p = pref_path()?;
     parse_pref(&std::fs::read_to_string(p).ok()?)
 }
 
-/// `"light"` / `"dark"` / `"system"`（大小写与首尾空白都容忍）。认不出来返回 `None`。
+/// `"light"` / `"dark"` / `"system"` (case and surrounding whitespace tolerated). Returns `None` if unrecognized.
 fn parse_pref(s: &str) -> Option<Pref> {
     match s.trim().to_ascii_lowercase().as_str() {
         "light" => Some(Pref::Light),
@@ -270,19 +272,19 @@ fn parse_pref(s: &str) -> Option<Pref> {
     }
 }
 
-/// 落盘写的是**偏好**而不是生效模式。
+/// What gets persisted is the **preference**, not the active mode.
 ///
-/// 这一点必须说清：写生效模式的话，「跟随系统」会在第一次跟随之后被自己抹掉 ——
-/// 系统是亮的就写入 `"light"`，下次启动就再也不跟随了。
+/// This must be stated clearly: persisting the active mode would erase "follow system" after the first time it follows —
+/// a light system writes `"light"`, and on next launch it never follows again.
 fn save_pref() {
     if let Some(p) = pref_path() {
         let _ = std::fs::write(p, pref().key());
     }
 }
 
-// ─────────────────────────── 调色板 ───────────────────────────
+// ─────────────────────────── Palette ───────────────────────────
 
-/// 一套完整配色。字段刻意只用明度区分，不带色相。
+/// A complete color set. The fields deliberately differ only by lightness, carrying no hue.
 #[derive(Clone, Copy)]
 struct Palette {
     bg: Color32,
@@ -294,34 +296,35 @@ struct Palette {
     text: Color32,
     text_dim: Color32,
     text_faint: Color32,
-    /// 「墨」——单色方案里的强调色：亮色模式下几乎全黑，暗色模式下几乎全白
+    /// "Ink" — the accent color in the monochrome scheme: near-black in light mode, near-white in dark.
     ink: Color32,
-    /// 墨的弱化版
+    /// A softened version of ink.
     ink_soft: Color32,
     user_bg: Color32,
     code_bg: Color32,
-    /// 行内代码的「芯片」底色。
+    /// The "chip" background for inline code.
     ///
-    /// 必须明显偏离 `bg` / `surface`，否则行内代码就是一片糊过去的浅色，
-    /// 读者完全看不出这是代码。围栏代码块另有 `code_bg`（一整块底色），
-    /// 两者刻意用不同深浅，好让「块」与「行内」一眼分得开。
+    /// It must clearly depart from `bg` / `surface`; otherwise inline code is just a smeared
+    /// light patch and the reader can't tell it's code. Fenced code blocks use `code_bg`
+    /// (a full block of background) instead; the two are deliberately set at different depths
+    /// so "block" and "inline" read apart at a glance.
     code_chip: Color32,
     quote_bar: Color32,
-    /// 反白块的底色（错误提示用：亮色=墨黑底，暗色=近白底）
+    /// Background of the inverted block (used for error hints: ink-black in light mode, near-white in dark).
     reverse_bg: Color32,
-    /// 反白块上的文字
+    /// Text on the inverted block.
     on_reverse: Color32,
-    /// 悬浮卡片的投影色。亮色下一层淡墨就够；暗色下阴影几乎看不见，只能加重补偿。
+    /// Drop-shadow color for floating cards. A faint ink is enough in light mode; in dark mode shadows are nearly invisible, so we compensate by darkening.
     shadow: Color32,
-    /// **整套配色里唯一的色相**：危险动作（目前只有「完全访问」这一处用）。
+    /// **The only hue in the entire palette**: dangerous actions (currently used only at the single "full access" point).
     ///
-    /// 上面那一排刻意只用明度表达语义，但「越界之后没有任何边界」这件事值得破一次例 ——
-    /// 它是唯一一个**点下去就越过所有保护**的开关，明度层次表达不出「这不是一个普通选项」。
-    /// 所以只给这一处留一点砖红，其余仍然全灰。
+    /// The row above deliberately expresses semantics through lightness alone, but "past the boundary there is no boundary" is worth one exception —
+    /// it is the only toggle that, **once clicked, crosses every protection**, and lightness steps cannot convey "this is not an ordinary option".
+    /// So only this one spot keeps a brick-red; everything else stays fully gray.
     danger: Color32,
 }
 
-/// 纸：略微发暖的白，不是纯白。
+/// Paper: a slightly warm white, not pure white.
 const LIGHT: Palette = Palette {
     bg: Color32::from_rgb(0xF2, 0xEF, 0xE8),
     panel: Color32::from_rgb(0xEB, 0xE7, 0xDE),
@@ -341,11 +344,11 @@ const LIGHT: Palette = Palette {
     reverse_bg: Color32::from_rgb(0x1A, 0x19, 0x16),
     on_reverse: Color32::from_rgb(0xF7, 0xF5, 0xF0),
     shadow: Color32::from_rgba_unmultiplied_const(0x1A, 0x19, 0x16, 26),
-    // 砖红：不是信号用的鲜红，是纸面上站得住的那种沉红（与整块暖纸底同调）。
+    // Brick-red: not a signal-bright red, but a settled red that holds up on the page (in tune with the warm paper base).
     danger: Color32::from_rgb(0x9E, 0x2B, 0x21),
 };
 
-/// 墨：暖调的黑，不是纯黑。
+/// Ink: a warm-tinted black, not pure black.
 const DARK: Palette = Palette {
     bg: Color32::from_rgb(0x14, 0x14, 0x12),
     panel: Color32::from_rgb(0x19, 0x19, 0x17),
@@ -365,12 +368,12 @@ const DARK: Palette = Palette {
     reverse_bg: Color32::from_rgb(0xEC, 0xE9, 0xE1),
     on_reverse: Color32::from_rgb(0x14, 0x14, 0x12),
     shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 96),
-    // 墨底上不能用亮色模式那份砖红（#9E2B21 在近黑底上暗得读不出来），
-    // 换成同色相、亮度提上去的高一档红 —— 一样是纸墨体系里的「红」，不是信号灯。
+    // On the ink base we cannot reuse the light-mode brick-red (#9E2B21 is too dark to read on a near-black base),
+    // so we swap in a brighter red of the same hue — still a "red" within the paper-and-ink system, not a signal light.
     danger: Color32::from_rgb(0xE0, 0x6C, 0x5C),
 };
 
-/// 叠加了配置覆盖之后的两套配色。`apply` 时写一次，之后只读 —— 所以取色仍是零开销。
+/// The two palettes after config overrides are merged in. Written once at `apply`, then read-only — so color lookups stay zero-cost.
 static ACTIVE: OnceLock<(Palette, Palette)> = OnceLock::new();
 
 fn pal() -> &'static Palette {
@@ -381,9 +384,9 @@ fn pal() -> &'static Palette {
     }
 }
 
-/// 把配置里的逐字段覆盖叠到内置配色上；没写的字段原样保留。
+/// Merge per-field config overrides onto the built-in palette; fields not specified are kept.
 ///
-/// 只覆盖某个字段（例如只改 `text`）是完全安全的：其余 18 项仍是内置值。
+/// Overriding only a single field (e.g. just `text`) is completely safe: the other 18 entries remain the built-in values.
 fn merge_palette(base: &Palette, ov: &PaletteConfig) -> Palette {
     let c = |d: Color32, o: Option<RgbColor>| match o {
         Some(x) => Color32::from_rgba_unmultiplied(x.r, x.g, x.b, x.a),
@@ -412,7 +415,7 @@ fn merge_palette(base: &Palette, ov: &PaletteConfig) -> Palette {
     }
 }
 
-/// 当前主题下的取色器。运行时求值，所以切换主题后立即生效。
+/// Color accessors for the current theme. Evaluated at runtime, so they take effect immediately on theme switch.
 pub struct P;
 
 impl P {
@@ -443,11 +446,11 @@ impl P {
     pub fn text_faint() -> Color32 {
         pal().text_faint
     }
-    /// 单色强调色（原 ACCENT）
+    /// Monochrome accent color (formerly ACCENT).
     pub fn ink() -> Color32 {
         pal().ink
     }
-    /// 强调色的弱化版（原 ACCENT_DIM）
+    /// Softened accent color (formerly ACCENT_DIM).
     pub fn ink_soft() -> Color32 {
         pal().ink_soft
     }
@@ -457,7 +460,7 @@ impl P {
     pub fn code_bg() -> Color32 {
         pal().code_bg
     }
-    /// 行内代码的芯片底色（比 `code_bg` 更跳一档）。
+    /// Chip background for inline code (one step more emphatic than `code_bg`).
     pub fn code_chip() -> Color32 {
         pal().code_chip
     }
@@ -465,32 +468,32 @@ impl P {
         pal().quote_bar
     }
 
-    // ── 语义色：单色方案里用明度层次表达，而不是色相 ──
+    // ── Semantic colors: expressed via lightness steps in the monochrome scheme, not hue ──
 
-    /// 警告：中间灰（单色方案下靠明度提示）
+    /// Warning: mid-gray (signaled by lightness in the monochrome scheme).
     pub fn warn() -> Color32 {
         pal().text_dim
     }
-    /// 反白块底色
+    /// Inverted-block background.
     pub fn reverse_bg() -> Color32 {
         pal().reverse_bg
     }
-    /// 反白块上的文字
+    /// Text on the inverted block.
     pub fn on_reverse() -> Color32 {
         pal().on_reverse
     }
-    /// 悬浮卡片的投影色
+    /// Drop-shadow color for floating cards.
     pub fn shadow() -> Color32 {
         pal().shadow
     }
-    /// 危险动作专用色 —— 整套配色里唯一的色相。只给「完全访问」这类
-    /// **点下去就越过所有保护**的开关用，别拿它当普通强调色。
+    /// Color reserved for dangerous actions — the only hue in the whole palette. Use only for toggles like "full access"
+    /// that **cross every protection once clicked**; do not treat it as an ordinary accent.
     pub fn danger() -> Color32 {
         pal().danger
     }
 }
 
-// ─────────────────────────── 字体加载 ───────────────────────────
+// ─────────────────────────── Font loading ───────────────────────────
 
 fn font_dirs() -> Vec<String> {
     let mut v = Vec::new();
@@ -507,7 +510,7 @@ fn font_dirs() -> Vec<String> {
     v
 }
 
-/// 依次尝试候选文件名，返回第一个成功读到的。
+/// Try each candidate filename in order and return the first one successfully read.
 fn read_first(cands: &[&str]) -> Option<(String, Vec<u8>)> {
     for dir in font_dirs() {
         for name in cands {
@@ -522,21 +525,21 @@ fn read_first(cands: &[&str]) -> Option<(String, Vec<u8>)> {
     None
 }
 
-/// 中文字体候选（按「现代感」排序）。
+/// CJK font candidates (ordered by "modern feel").
 const CJK_CANDIDATES: &[&str] = &[
-    "Deng.ttf",              // 等线（Win10+，干净现代）
-    "msyh.ttc",              // 微软雅黑
+    "Deng.ttf",              // Deng (Win10+, clean and modern)
+    "msyh.ttc",              // Microsoft YaHei
     "msyhl.ttc",
-    "simhei.ttf",            // 黑体
-    "simsun.ttc",            // 宋体
-    "msjh.ttc",              // 微软正黑（繁体）
+    "simhei.ttf",            // SimHei
+    "simsun.ttc",            // SimSun
+    "msjh.ttc",              // Microsoft JhengHei (Traditional)
     "PingFang.ttc",          // macOS
     "Hiragino Sans GB.ttc",
     "NotoSansCJK-Regular.ttc",
     "NotoSansSC-Regular.otf",
 ];
 
-/// 粗体候选。
+/// Bold candidates.
 const BOLD_CANDIDATES: &[&str] = &[
     "Dengb.ttf",
     "msyhbd.ttc",
@@ -547,7 +550,7 @@ const BOLD_CANDIDATES: &[&str] = &[
     "NotoSansSC-Bold.otf",
 ];
 
-/// 衬线候选（次级标题用）。
+/// Serif candidates (for sub-headings).
 const SERIF_CANDIDATES: &[&str] = &[
     "georgia.ttf",
     "times.ttf",
@@ -557,18 +560,18 @@ const SERIF_CANDIDATES: &[&str] = &[
     "Times New Roman.ttf",
 ];
 
-/// 品牌字候选（首屏大招呼用）。
+/// Brand-font candidates (for the first-screen greeting).
 ///
-/// 按「笔势从强到弱」排，全部是 Windows 自带字体（Gabriola / Inkfree 从 Win10 起
-/// 随系统提供）；一个都没有就退到衬线，界面不会因此缺字。
+/// Ordered "strongest to weakest stroke"; all are Windows-bundled fonts (Gabriola / Inkfree ship with the OS from Win10 onward).
+/// If none are found we fall back to serif and the UI never loses glyphs because of it.
 const BRAND_CANDIDATES: &[&str] = &[
-    "Gabriola.ttf",  // 花体，笔画带书法连带，笔势最足
-    "Inkfree.ttf",   // 钢笔手写，细而松弛
-    "Candara.ttf",   // 人文无衬线，笔尾微翘
+    "Gabriola.ttf",  // Calligraphic, brush-connected strokes, strongest gesture
+    "Inkfree.ttf",   // Pen handwriting, thin and relaxed
+    "Candara.ttf",   // Humanist sans-serif, slightly upturned stroke ends
     "georgia.ttf",
 ];
 
-/// 等宽字体候选（代码块）。
+/// Monospace font candidates (for code blocks).
 const MONO_CANDIDATES: &[&str] = &[
     "CascadiaMono.ttf",
     "CascadiaCode.ttf",
@@ -577,8 +580,8 @@ const MONO_CANDIDATES: &[&str] = &[
     "SourceCodePro-Regular.otf",
 ];
 
-/// 从环境变量读取自定义字体路径（AOX_GUI_FONT / AOX_GUI_FONT_BOLD /
-/// AOX_GUI_FONT_SERIF / AOX_GUI_FONT_BRAND / AOX_GUI_FONT_MONO）。
+/// Read a custom font path from an environment variable (AOX_GUI_FONT / AOX_GUI_FONT_BOLD /
+/// AOX_GUI_FONT_SERIF / AOX_GUI_FONT_BRAND / AOX_GUI_FONT_MONO).
 fn read_env(key: &str) -> Option<(String, Vec<u8>)> {
     let path = std::env::var(key).ok()?;
     let bytes = std::fs::read(&path).ok()?;
@@ -589,14 +592,14 @@ fn read_env(key: &str) -> Option<(String, Vec<u8>)> {
     }
 }
 
-/// `[theme.fonts]` 里的字体路径。`apply` 时写一次。
+/// Font paths from `[theme.fonts]`. Written once at `apply`.
 static FONTS: OnceLock<FontsConfig> = OnceLock::new();
 
 fn fcfg() -> &'static FontsConfig {
     FONTS.get_or_init(FontsConfig::default)
 }
 
-/// 读一个字体文件（空文件视为无效，与 `read_env` 一致）。
+/// Read a font file (an empty file is treated as invalid, consistent with `read_env`).
 fn read_font_file(path: &str) -> Option<(String, Vec<u8>)> {
     let bytes = std::fs::read(path).ok()?;
     if bytes.is_empty() {
@@ -606,17 +609,18 @@ fn read_font_file(path: &str) -> Option<(String, Vec<u8>)> {
     }
 }
 
-/// 一级一级往下找：`[theme.fonts]` 配置 → 环境变量 → 内置候选表。
+/// Walk the levels top to bottom: `[theme.fonts]` config → environment variable → built-in
+/// candidate list.
 ///
-/// 上面两级都把「路径不存在 / 文件为空」化简成 `None`，所以配置写错也不会让界面缺字，
-/// 只会安静地退回下一级。
+/// The two upper levels collapse "path missing / file empty" into `None`, so a wrong config
+/// won't make the UI lose glyphs — it just silently steps down to the next level.
 fn font_source(cfg: Option<&String>, env_key: &str, cands: &[&str]) -> Option<(String, Vec<u8>)> {
     cfg.and_then(|p| read_font_file(p))
         .or_else(|| read_env(env_key))
         .or_else(|| read_first(cands))
 }
 
-/// 装配字体：内建拉丁字体 + 系统中文回退（排在 emoji 字体之前，避免 CJK 落到 emoji 字形上）。
+/// Assemble fonts: built-in Latin fonts + system CJK fallback (placed before emoji fonts so CJK does not fall onto an emoji glyph).
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 
@@ -640,7 +644,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         BOLD_OK.store(true, Ordering::Relaxed);
     }
 
-    // 衬线：次级标题用。找不到就退回粗体（serif_font 内部处理）。
+    // Serif: for sub-headings. Falls back to bold if not found (handled inside serif_font).
     let serif = font_source(fcfg().serif.as_ref(), "AOX_GUI_FONT_SERIF", SERIF_CANDIDATES);
     if let Some((_, bytes)) = serif {
         fonts.font_data.insert("serif".to_owned(), Arc::new(FontData::from_owned(bytes)));
@@ -653,7 +657,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         SERIF_OK.store(true, Ordering::Relaxed);
     }
 
-    // 品牌字：给艺术体留的那一档（首屏那句招呼已经换成插画了，字族本身是配置项，留着）。
+    // Brand font: the slot kept for display fonts (the first-screen greeting is now an illustration, but the family is a config item, so it stays).
     let brand = font_source(fcfg().brand.as_ref(), "AOX_GUI_FONT_BRAND", BRAND_CANDIDATES);
     if let Some((_, bytes)) = brand {
         fonts.font_data.insert("brand".to_owned(), Arc::new(FontData::from_owned(bytes)));
@@ -674,7 +678,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         None
     };
 
-    // 显式重排字族优先级：拉丁 → 中文 → emoji
+    // Explicitly reorder family priority: Latin to CJK to emoji
     let mut prop: Vec<String> = vec!["Ubuntu-Light".to_owned()];
     if !cjk_name.is_empty() {
         prop.push(cjk_name.clone());
@@ -699,7 +703,7 @@ pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-// ─────────────────────────── 样式 ───────────────────────────
+// ─────────────────────────── Style ───────────────────────────
 
 fn widget(v: &mut Visuals, f: impl Fn(&mut egui::style::WidgetVisuals)) {
     f(&mut v.widgets.noninteractive);
@@ -709,8 +713,8 @@ fn widget(v: &mut Visuals, f: impl Fn(&mut egui::style::WidgetVisuals)) {
     f(&mut v.widgets.open);
 }
 
-/// 让整个应用呈现出「无边线噪声、低对比、只用明度说话」的观感。
-/// 切换主题后重新调用本函数即可（字体不必重装）。
+/// Make the whole app read as "no border noise, low contrast, speaking only through lightness".
+/// Just call this function again after switching themes (fonts need not be reinstalled).
 pub fn install_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
 
@@ -765,15 +769,16 @@ pub fn install_style(ctx: &egui::Context) {
 
     style.visuals = v;
 
-    // 关掉「标签里的文字可选」。
+    // Turn off "text in labels is selectable".
     //
-    // 这个开关默认是开的，代价是**每个 ui.label 都会去抢鼠标**：悬停时光标变成
-    // 文本选择的 I 形，按下去还能拖出一段选区。界面里凡是用 label 拼出来的按钮
-    // （「清空」「关闭」「允许一次」以及各条示例），鼠标一放上去就顶着输入光标，
-    // 看着像点错了地方。界面里没有需要复制的段落文本，直接全局关掉最干净。
+    // This flag is on by default, at the cost of **every ui.label grabbing the mouse**: on hover
+    // the cursor becomes the text-selection I-beam and a press can drag out a selection. Any
+    // button built from labels (the "clear" / "close" / "allow once" buttons and the example
+    // rows) then sits under a text cursor on hover, looking like you clicked the wrong spot. The
+    // UI has no paragraph text worth copying, so just disabling it globally is cleanest.
     style.interaction.selectable_labels = false;
 
-    // 留白整体放大一档，是「卡片变大、不再拥挤」的主要来源
+    // Whitespace is scaled up a notch overall — the main reason cards grow and stop feeling cramped.
     let m = metrics();
     style.spacing.item_spacing = egui::vec2(m.item_spacing[0], m.item_spacing[1]);
     style.spacing.button_padding = egui::vec2(m.button_padding[0], m.button_padding[1]);
@@ -794,21 +799,21 @@ pub fn install_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-/// 一次性装配：把配置里的外观覆盖叠到内置主题上。
+/// One-time assembly: merge the appearance overrides from config onto the built-in theme.
 ///
-/// **明暗的优先级**：上次手动切换的记录 > `[theme] mode` > 默认（墨）。
-/// 用户刚点过的那一下最算数；`[theme] mode` 只在「从没切过」时说了算。
+/// **Light/dark precedence**: last manual switch record > `[theme] mode` > default (ink).
+/// The most recent click wins; `[theme] mode` only counts when "never switched before".
 pub fn apply(ctx: &egui::Context, cfg: &ThemeConfig) {
-    // 偏好顺序：上次在设置页里选的（`.aox-gui-theme`）→ `config.toml` 的 `[theme] mode`
-    // → 出厂默认（暗）。注意 `config.toml` 那一层只是**起步值**，用户一旦在设置页里
-    // 选过就以那个为准 —— 否则「改配置才能换主题」，设置页等于摆设。
+    // Preference order: last choice on the settings page (`.aox-gui-theme`) to `[theme] mode` from `config.toml` to factory default (dark).
+    // Note that the `config.toml` layer is only a **starting value**; once the user picks something on the settings page that wins —
+    // otherwise "change config to switch theme" makes the settings page pointless.
     let pref = read_pref()
         .or_else(|| cfg.mode.as_deref().and_then(parse_pref))
         .unwrap_or(Pref::Dark);
     set_pref(pref);
     set_mode(effective(pref, ctx.system_theme()));
 
-    // 三份覆盖都只写一次，之后全程只读 —— 所以 `P::xx()` 取色仍是零开销。
+    // All three overrides are written only once, then read-only for the rest of the run — so `P::xx()` lookups stay zero-cost.
     let _ = ACTIVE.set((
         merge_palette(&LIGHT, &cfg.light),
         merge_palette(&DARK, &cfg.dark),
@@ -821,10 +826,11 @@ pub fn apply(ctx: &egui::Context, cfg: &ThemeConfig) {
     sync_native_theme(ctx);
 }
 
-/// 让操作系统的窗口装饰（标题栏、边框）跟随应用主题。
+/// Make the OS window decorations (title bar, border) follow the app theme.
 ///
-/// 原生标题栏不是 egui 画的，而是窗口管理器（Windows 上是 DWM）画的，默认跟随
-/// 系统主题。不同步的话，亮色的纸白界面会顶着一条深色标题栏，很割裂。
+/// The native title bar is not drawn by egui but by the window manager (DWM on Windows) and
+/// follows the system theme by default. Without syncing, a light paper-white UI would sit under
+/// a dark title bar — jarring.
 pub fn sync_native_theme(ctx: &egui::Context) {
     let t = match mode() {
         Mode::Light => egui::SystemTheme::Light,
@@ -833,14 +839,14 @@ pub fn sync_native_theme(ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(t));
 }
 
-/// 设一条 DWM 窗口属性（`DWMWA_*`）。
+/// Set a DWM window attribute (`DWMWA_*`).
 ///
-/// Windows 11 (build 22000+) 才认识这类属性，旧系统上调用返回失败 ——
-/// **静默忽略即可**，效果只是退回系统默认，不是错误。
+/// Windows 11 (build 22000+) recognizes these attributes; on older systems the call fails —
+/// **just ignore it silently**, the only effect is falling back to the system default, not an error.
 ///
-/// 单独抽出来是为了**全 crate 只有这一处 extern 声明**。同一个符号在两个文件里
-/// 各声明一遍，签名稍有出入编译器就报 `clashing_extern_declarations`
-/// （真踩过：`hwnd` 一边写 `isize`、一边写 `*mut c_void`）。
+/// Pulled out on its own so that **this is the only extern declaration across the whole crate**. If the same symbol is declared in two files, any slight signature mismatch makes the compiler
+/// emit `clashing_extern_declarations` (we actually hit this: `hwnd` was `isize` on one side and
+/// `*mut c_void` on the other).
 #[cfg(windows)]
 pub(crate) fn dwm_set_attribute(
     hwnd: isize,
@@ -870,11 +876,13 @@ pub(crate) fn dwm_set_attribute(
     -1
 }
 
-/// `SM_CXICON`：任务栏 / Alt+Tab 用的那档图标的边长（100% 缩放是 32，150% 是 48）。
+/// `SM_CXICON`: the edge length of the icon used for the taskbar / Alt+Tab (32 at 100% scaling,
+/// 48 at 150%).
 ///
-/// 拿它是因为它与 `SM_CXSMICON`（标题栏那档）**恰好成 2:1**，而 `window_icon` 只交得出
-/// **一个**尺寸：于是大的那档 1:1 不缩放、小的那档是干净的 2:1 缩小（点阵画法 2:1 缩，
-/// 等于直接还原成小一格的原稿）。
+/// We use it because it is **exactly 2:1** with `SM_CXSMICON` (the title-bar size), while
+/// `window_icon` can only hand back **one** size: so the large size maps 1:1 unscaled and the
+/// small size is a clean 2:1 downscale (a 2:1 bitmap downscale is exactly the next-smaller
+/// original redrawn).
 #[cfg(windows)]
 pub fn system_icon_size() -> i32 {
     const SM_CXICON: i32 = 11;
@@ -882,7 +890,7 @@ pub fn system_icon_size() -> i32 {
     extern "system" {
         fn GetSystemMetrics(index: i32) -> i32;
     }
-    // SAFETY: 取一个系统度量，无副作用、无出参。
+    // SAFETY: take a system metric; no side effects, no output parameters.
     unsafe { GetSystemMetrics(SM_CXICON) }
 }
 
@@ -897,20 +905,20 @@ pub(crate) const DWMWA_BORDER_COLOR: u32 = 34;
 pub(crate) const DWMWA_CAPTION_COLOR: u32 = 35;
 /// `DWMWA_TEXT_COLOR`
 pub(crate) const DWMWA_TEXT_COLOR: u32 = 36;
-/// `DWMWA_WINDOW_CORNER_PREFERENCE`（配合 `DWMWCP_*`）
+/// `DWMWA_WINDOW_CORNER_PREFERENCE` (used together with `DWMWCP_*`)
 pub(crate) const DWMWA_CORNER_PREFERENCE: u32 = 33;
-/// `DWMWCP_ROUND`：系统的标准圆角。`DONOTROUND` = 1，`ROUND` = 2，`ROUNDSMALL` = 3。
+/// `DWMWCP_ROUND`: the system standard rounded corners. `DONOTROUND` = 1, `ROUND` = 2, `ROUNDSMALL` = 3.
 pub(crate) const DWMWCP_ROUND: i32 = 2;
 
-/// 把原生标题栏染成与界面**完全一致**的颜色，让它彻底融入窗口。
+/// Dye the native title bar to a color **identical** to the UI, so it melts into the window.
 ///
-/// `sync_native_theme` 只能让标题栏在「系统亮色 / 系统暗色」里二选一，拿到的是
-/// DWM 自己那套灰（亮色约 `#F3F3F3`、暗色约 `#202020`），和纸与墨的暖调对不上。
-/// 想真正严丝合缝，只能直接设 DWM 属性：
+/// `sync_native_theme` can only make the title bar pick one of "system light / system dark", yielding DWM own gray
+/// (~`#F3F3F3` light, ~`#202020` dark) that does not match the warm paper-and-ink tones.
+/// To truly fit, we must set the DWM attributes directly:
 ///
-/// - `DWMWA_CAPTION_COLOR`(35)：标题栏底色
-/// - `DWMWA_TEXT_COLOR`(36)：标题栏文字色
-/// - `DWMWA_BORDER_COLOR`(34)：窗口外框线
+/// - `DWMWA_CAPTION_COLOR`(35): title-bar background
+/// - `DWMWA_TEXT_COLOR`(36): title-bar text color
+/// - `DWMWA_BORDER_COLOR`(34): window outer border
 
 pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
     use raw_window_handle::RawWindowHandle;
@@ -921,28 +929,28 @@ pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
     };
     let hwnd = w.hwnd.get();
 
-    // 注意 DWM 要的是 COLORREF（0x00BBGGRR），和 Color32 的 RGBA 排列不同，得换序
+    // Note DWM wants a COLORREF (0x00BBGGRR), which differs in channel order from Color32's RGBA, so we must reorder.
     let colorref = |c: Color32| -> u32 {
         ((c.b() as u32) << 16) | ((c.g() as u32) << 8) | c.r() as u32
     };
 
-    // 标题栏与边框都吃主界面的**底色**：顶栏拆掉之后，对话区的底色就是整个窗口
-    // 的底色，标题栏再用 panel 就成了一条明晃晃的色差（2026-10-04 用户要求「无色差」）。
-    // 边框一并抹平 —— 不然窗口四周还会留一圈「另一档灰」。
-    // （用 panel 是顶栏还在时的选择：顶栏与标题栏同色读作一体。顶栏没了，跟 bg 走。）
+    // Both the title bar and the border take the UI base color: once the top bar was removed, the conversation area base color is the whole window base color,
+    // so using panel for the title bar would leave a glaring color mismatch (user asked for "no color difference" on 2026-10-04).
+    // The border is flattened too — otherwise a ring of "another shade of gray" would remain around the window.
+    // (Using panel was the choice when the top bar still existed: top bar and title bar sharing a color read as one piece. With the top bar gone, follow bg.)
     let cap = colorref(P::bg());
     let text = colorref(P::text_dim());
     let border = colorref(P::bg());
-    // 失败也无所谓（老系统不支持），所以返回值直接丢掉
+    // Failure is harmless (old systems don't support it), so we just drop the return value.
     dwm_set_attribute(hwnd, DWMWA_CAPTION_COLOR, std::ptr::addr_of!(cap).cast(), 4);
     dwm_set_attribute(hwnd, DWMWA_TEXT_COLOR, std::ptr::addr_of!(text).cast(), 4);
     dwm_set_attribute(hwnd, DWMWA_BORDER_COLOR, std::ptr::addr_of!(border).cast(), 4);
-    // 标题栏左上角那枚图标**不动**：它现在就是 exe 资源里那份 `assets/aox.ico`
-    //（见 `main.rs` 里 `with_icon(IconData::default())` 那段注释）。
-    // 曾经这里调 `hide_caption_icon(hwnd)` 把它换成一张 1×1 透明图（2026-10-04 用户
-    // 要求「标题栏只剩系统按钮」）；2026-10-06 用户改主意要显示程序图标，于是删掉了
-    // —— 顺带说明：那个做法后来也失效了，因为 eframe 会给自己装一个默认图标（黑底白字
-    // 的「e」）并**在之后**覆盖掉我们设的 HICON，标题栏于是显示的是 eframe 的标志。
+    // The icon at the top-left of the title bar is **left alone**: it is now the `assets/aox.ico` from the exe resources
+    // (see the comment around `with_icon(IconData::default())` in `main.rs`).
+    // We used to call `hide_caption_icon(hwnd)` here to swap in a 1x1 transparent image (user asked for "title bar shows only the system buttons" on 2026-10-04); on
+    // 2026-10-06 the user changed their mind and wanted the app icon shown, so we removed it —
+    // worth noting: that approach later stopped working anyway, because eframe installs its own default icon (a white "e" on black) and
+    // **afterwards** overrides the HICON we set, so the title bar ended up showing eframe mark.
 }
 
 #[cfg(not(windows))]
@@ -952,19 +960,20 @@ pub fn sync_caption(_handle: &dyn raw_window_handle::HasWindowHandle) {}
 mod tests {
     use super::*;
 
-    /// 「跟随系统」这一档的全部逻辑就是这张真值表。
+    /// The whole logic of the "follow system" option is this truth table.
     ///
-    /// 单独立一条测试，是因为它最容易被写成一句 `_ => Mode::Dark` 就算完 ——
-    /// 那样「跟随系统」在系统是亮色时也永远显示暗色，而**看代码完全看不出来**：
-    /// 分支在、赋值也对，只是判断依据错了。
+    /// It gets its own test because it's the easiest thing to write as a single `_ => Mode::Dark`
+    /// and call it done — then "follow system" would always show dark even when the system is
+    /// light, and **reading the code gives no hint**: the branch is there, the assignment is
+    /// correct, only the basis for the decision is wrong.
     #[test]
     fn effective_follows_the_system_only_when_asked_to() {
         use egui::Theme;
-        assert_eq!(effective(Pref::Light, Some(Theme::Dark)), Mode::Light, "选了亮就一直是亮");
-        assert_eq!(effective(Pref::Dark, Some(Theme::Light)), Mode::Dark, "选了暗就一直是暗");
+        assert_eq!(effective(Pref::Light, Some(Theme::Dark)), Mode::Light, "once light is picked it stays light");
+        assert_eq!(effective(Pref::Dark, Some(Theme::Light)), Mode::Dark, "once dark is picked it stays dark");
         assert_eq!(effective(Pref::System, Some(Theme::Light)), Mode::Light);
         assert_eq!(effective(Pref::System, Some(Theme::Dark)), Mode::Dark);
-        // 后端没报系统主题：退回暗（与加这一档之前的默认一致），而不是随机或 panic
+        // Backend reports no system theme: fall back to dark (matches the pre-option default), not random or panic.
         assert_eq!(effective(Pref::System, None), Mode::Dark);
     }
 
@@ -977,17 +986,17 @@ mod tests {
         assert_eq!(parse_pref(""), None);
     }
 
-    /// 落盘写的是**偏好**，不是生效模式。
+    /// What is persisted is the **preference**, not the active mode.
     ///
-    /// 这条钉住一个很隐蔽的退化：写成生效模式的话，「跟随系统」会在第一次跟随之后
-    /// 被自己抹掉 —— 系统此刻是亮的就写入 `"light"`，下次启动再也不跟随了。
-    /// 所以这里断言的是 `Pref::key()` 这一串，而不是 `mode()`。
+    /// This pins down a very sneaky regression: writing the active mode would erase "follow system" after the first time it follows —
+    /// the system being light right now writes `"light"`, and on next launch it never follows again.
+    /// So here we assert on `Pref::key()`, not on `mode()`.
     #[test]
     fn the_persisted_string_is_the_preference_not_the_effective_mode() {
         assert_eq!(Pref::System.key(), "system");
         assert_eq!(parse_pref(Pref::System.key()), Some(Pref::System));
         for p in Pref::ALL {
-            assert_eq!(parse_pref(p.key()), Some(p), "{p:?} 落盘后必须能读回来");
+            assert_eq!(parse_pref(p.key()), Some(p), "{p:?} must read back after persisting");
         }
     }
 }

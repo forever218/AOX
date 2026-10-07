@@ -1,362 +1,459 @@
-# 插件子进程的围栏与沙箱路线
+# The fence around plugin subprocesses, and the sandbox roadmap
 
-> 这份文档回答两个问题：**现在到底挡住了什么**，以及**要挡住更多得付什么代价**。
-> 已实现的是「① Job Object 围栏」与「③ 工作区边界（文件能力收回宿主）」（均 2026-10-04）。
-> ②a / ②b / ④ 都还没做，各自的代价写在下面。
+> This document answers two questions: **what is actually blocked right now**, and **what
+> blocking more would cost**.
+> What is implemented is "① the Job Object fence" and "③ the workplace boundary (file capability
+> taken back by the host)" (both 2026-10-04).
+> ②a / ②b / ④ are not built; each one's price is written below.
 
-## 0. 一句话
+## 0. In one sentence
 
-**现在的状态是「围栏」，不是「沙箱」。**
+**What exists right now is a "fence", not a "sandbox".**
 
-围栏 = 进程数 / 内存 / UI 三样，由 Windows 内核强制；**文件与网络它一个字都管不了**。
-一个插件仍然可以删掉你有权限删的任何文件。这句话在 `/sandbox` 的输出里也原样印了一遍 ——
-它不是免责声明，是使用前必须知道的事实。
+A fence covers three things — process count / memory / UI — and is enforced by the Windows
+kernel; **files and the network are entirely outside its reach**. A plugin can still delete any
+file you have permission to delete. That sentence is printed verbatim in `/sandbox`'s output
+too — it is not a disclaimer, it is a fact you have to know before using it.
 
-## 1. 威胁模型：先分清要防的是谁
+## 1. Threat model: first be clear about who you are defending against
 
-AOX 的插件**不是第三方成品，是 AI 现场写的**。所以真正的风险排序是：
+AOX's plugins **are not third-party products; the AI writes them on the spot**. So the real
+ordering of risk is:
 
-| # | 风险 | 典型形态 | 谁能治 |
+| # | Risk | Typical shape | Who can fix it |
 |---|------|----------|--------|
-| ① | **AI 写错** | `fs_rm(recursive=True, path=".")`、路径拼错、递归删错目录 | 收窄能力就够（③ / ④） |
-| ② | **AI 被内容骗** | 读到的文件里藏着指令，让它去删/传别的东西（prompt injection） | 收窄能力就够（③ / ④） |
-| ③ | **恶意第三方插件** | 从别处拷来的插件目录 | **只有真沙箱**（②a） |
+| ① | **the AI writes it wrong** | `fs_rm(recursive=True, path=".")`, a mis-joined path, recursing into the wrong directory | narrowing the capability is enough (③ / ④) |
+| ② | **the AI is tricked by content** | a file it read hides instructions telling it to delete or upload something else (prompt injection) | narrowing the capability is enough (③ / ④) |
+| ③ | **a malicious third-party plugin** | a plugin directory copied in from elsewhere | **only a real sandbox** (②a) |
 
-①② 靠「不让危险动作出现在模型能写的地方」就能解决，代价极小；
-③ 需要内核级隔离，代价大一个数量级。**先做哪一步，取决于你担心的其实是哪一类。**
+①② are solved by "don't let dangerous operations appear where the model can write them", at
+almost no cost; ③ needs kernel-level isolation, an order of magnitude more expensive.
+**Which step to take first depends on which of these you are actually worried about.**
 
-## 2. 方案对照
+## 2. Option comparison
 
-体积按 `aox.exe` 3.12 MB 计。①②③④ 的编号同时是「拦在哪一层」的编号。
+Sizes are measured against `aox.exe` at 3.12 MB. The numbers ①②③④ double as "which layer
+blocks it".
 
-| | 方案 | 代码量 | 体积 | 内核级真挡住 | 明确挡不住 |
+| | Option | Code size | Binary size | Really blocked by the kernel | Explicitly not blocked |
 |---|---|---|---|---|---|
-| **①** | **Job Object 围栏** ✅已做 | ~340 行 | **+16.5 KB** | 进程数失控（fork bomb，**默认最多再开 8 个子进程**）、内存上限、宿主一退全灭、禁剪贴板/桌面 | **文件与网络** |
-| **②a** | AppContainer 真容器 | ~400–600 行 | +150–300 KB | 文件越界（读+写+删）、网络、注册表、跨进程通信 | 合法但越界的插件会失效 |
-| **②b** | 低完整性级别（写降级） | ~150 行 | +5–10 KB | 一切「写」：普通文件、注册表、系统设置 | **读**、网络、进程数 |
-| **③** | 文件能力收回宿主 | ~600 行 | **+68 KB** | 上面表格里的 ①② 两类风险 | 不守规矩的插件（自己 `open()`） |
-| **④** | WASM / WASI | 巨大 | **+3–5 MB** | 一切，且跨平台 | 推翻 Python/Node/Rust 子进程插件这套资产 |
+| **①** | **Job Object fence** ✅ done | ~340 lines | **+16.5 KB** | runaway process count (fork bomb, **8 more child processes by default**), memory ceiling, everything dies when the host dies, clipboard/desktop blocked | **files and network** |
+| **②a** | AppContainer, a real container | ~400–600 lines | +150–300 KB | out-of-bounds files (read+write+delete), network, registry, cross-process communication | legitimate but out-of-bounds plugins stop working |
+| **②b** | low integrity level (write downgrade) | ~150 lines | +5–10 KB | every kind of "write": ordinary files, registry, system settings | **reads**, network, process count |
+| **③** | file capability taken back by the host | ~600 lines | **+68 KB** | risks ① and ② in the table above | a plugin that doesn't play by the rules (calls `open()` itself) |
+| **④** | WASM / WASI | huge | **+3–5 MB** | everything, and cross-platform | it would overturn the whole Python/Node/Rust subprocess plugin asset |
 
-横向对照：Linux 上达到 ②a 的效果只要 `pre_exec` + `unshare(CLONE_NEWNS|CLONE_NEWNET)`
-+ bind-mount + `setrlimit` + `PR_SET_NO_NEW_PRIVS`，~120 行零依赖。
-**Windows 没有这样一步到位的 API，所以只能拼。**
+Lateral comparison: on Linux, reaching ②a's effect takes only `pre_exec` +
+`unshare(CLONE_NEWNS|CLONE_NEWNET)` + bind-mount + `setrlimit` + `PR_SET_NO_NEW_PRIVS`, about
+120 lines with no dependencies.
+**Windows has no single API that gets you there, so it has to be assembled from pieces.**
 
-## 3. 已实现：① Job Object 围栏
+## 3. Implemented: ① the Job Object fence
 
-代码在 `src/sandbox.rs`（配置在 `config.toml [sandbox]`），接进 `plugin::spawn_command` 一个点。
-所有插件进程 —— 首启、`create_plugin`、崩溃自愈重启 —— 都走同一条路，没有第二条。
+The code lives in `src/sandbox.rs` (configured under `config.toml [sandbox]`) and hooks into
+exactly one place, `plugin::spawn_command`. Every plugin process — first launch,
+`create_plugin`, crash self-healing restart — takes the same path; there is no second one.
 
-### 挡住的四件事
+### The four things it blocks
 
-| 限制位 | 关掉的失败模式 |
+| Limit bit | Failure mode it closes |
 |--------|----------------|
-| `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`（默认 = 8 个**子**进程） | 进程数失控。插件连同它拉起的子孙（子进程**自动继承这个 Job**，跑不出围栏）最多只有那几个 —— fork bomb 靠并发翻倍，封顶就起不来。`0` 可以把这条彻底锁死 |
-| `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` | 孤儿进程。宿主崩溃、被 taskkill 也算 —— 不会留下一堆 python 在后台 |
-| `JOB_OBJECT_LIMIT_PROCESS_MEMORY`（默认**关**） | 内存失控。默认关的理由见下 |
-| `JOB_OBJECT_UILIMIT_*` | 插件伸手碰宿主的窗口 / 剪贴板 / 桌面 / 全局原子 |
+| `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` (default = 8 **child** processes) | runaway process count. A plugin plus the descendants it spawns (**children inherit this Job automatically** and can't leave the fence) are capped at that number — a fork bomb grows by doubling, so a cap stops it getting off the ground. `0` locks this path down completely |
+| `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` | orphan processes. A host crash, or a `taskkill`, counts too — you don't end up with a pile of pythons in the background |
+| `JOB_OBJECT_LIMIT_PROCESS_MEMORY` (**off** by default) | runaway memory. For why it's off by default, see below |
+| `JOB_OBJECT_UILIMIT_*` | a plugin reaching for the host's window / clipboard / desktop / global atoms |
 
-> ⚠️ 第一行**当天改过一次**。它最初是 `= 1` 且按「含插件自己」的总数写进 Job ——
-> 等于「Job 里只准有 1 个进程」，插件自己就占满，于是**任何靠 `subprocess` 干活的插件
-> 在默认配置下全废**（调 `curl`、调 `git`、调解释器，一律 `WinError 1816 配额不足`）。
-> 这是设计过头，不是配置问题。现在：**默认放行 8 个子进程**，防护从「一个都不许」
-> 换成「并发封顶」（子进程继承 Job，所以封顶就够了），要回到最严写 `max_processes = 0`。
-> 平台那个「含自己」的口径收在 `SandboxConfig::job_process_limit` 一处，配置这一层
-> 只说用户关心的事。
+> ⚠️ The first row **was changed once on the day it shipped**. It began as `= 1`, written into
+> the Job as a total that **included the plugin itself** — meaning "only 1 process allowed in
+> this Job", which the plugin filled on its own, so **any plugin that does its work through
+> `subprocess` was dead under the default configuration** (calling `curl`, `git`, or an
+> interpreter all gave `WinError 1816: not enough quota`). That was over-design, not a
+> configuration problem. Now: **8 child processes are allowed by default**, and the protection
+> changed from "none at all" to "a concurrency cap" (children inherit the Job, so a cap is
+> enough); write `max_processes = 0` to go back to strictest. The platform's "including itself"
+> accounting is contained in one place, `SandboxConfig::job_process_limit`, so the
+> configuration layer only talks about what the user cares about.
 
-### 三个非显然的设计决定
+### Three non-obvious design decisions
 
-**① 每个插件一个 Job，不是一个全局 Job。** `ACTIVE_PROCESS` 是**整个 Job** 的额度。
-共用一个 Job 的话这个数字就成了全局预算 —— 一个插件把额度吃光，别的插件连启动都启动不了，
-而且报错会指向别处。一个插件一个 Job，额度才真的是「这个插件能再开几个子进程」
-（也就是 `job_process_limit()` 里那个 `+1` 只能是它自己）。
+**① One Job per plugin, not one global Job.** `ACTIVE_PROCESS` is an allowance for **the whole
+Job**. With a shared Job the number would become a global budget — one plugin could eat the whole
+allowance and the others couldn't even start, and the error would point somewhere else. One Job
+per plugin makes the allowance really mean "how many more child processes this plugin may open"
+(which is why the `+1` in `job_process_limit()` can only be the plugin itself).
 
-**② 子进程用 `CREATE_SUSPENDED` 出生。** 出生后再塞进 Job 有一个窗口期：
-`spawn()` 返回到 `AssignProcessToJobObject` 之间，子进程已经在跑自己的第一行代码了。
-冻住它就没有这个窗口。代价是要自己找回主线程句柄（`std` 与 `tokio` 都不给），
-走一次 ToolHelp 快照 + `OpenThread` + `ResumeThread`。**恢复这步绝不能省** ——
-漏了它进程会永远冻着，表现是「插件 initialize 握手超时」，和围栏八竿子打不着，极难查。
+**② Children are born `CREATE_SUSPENDED`.** Putting them into the Job after birth leaves a
+window: between `spawn()` returning and `AssignProcessToJobObject`, the child is already running
+its first line of code. Freezing it removes that window. The price is finding the main thread
+handle yourself (neither `std` nor `tokio` hands it over): one ToolHelp snapshot + `OpenThread` +
+`ResumeThread`. **The resume step must never be skipped** — miss it and the process freezes
+forever, which shows up as "the plugin's initialize handshake timed out", nothing to do with the
+fence and extremely hard to diagnose.
 
-**③ 围栏是「尽力而为」，失败要出声。** 宿主自己可能已经在一个 Job 里（被 IDE、终端、
-计划任务启动）。Windows 8+ 允许嵌套 Job，但外层策略可能不允许，此时
-`AssignProcessToJobObject` 失败 —— 这时**照常放行插件**，把原因记进 `Fence`，
-由 `/sandbox` 与启动警告如实说「这个插件没套上」。
-（`/plugins` 里每个插件后面那枚 `围栏 ✓ / ✗` 就是这个。）
-静默降级不行，但「套不上就不让插件跑」也不行 —— 围栏是加固，不是前置条件。
+**③ The fence is "best effort", and failure has to speak up.** The host may already be inside a
+Job itself (started by an IDE, a terminal, a scheduled task). Windows 8+ allows nested Jobs, but
+the outer policy may forbid it, and then `AssignProcessToJobObject` fails — in that case **let
+the plugin through as usual**, record the reason in `Fence`, and have `/sandbox` and the startup
+warning say honestly "this plugin was not fenced".
+(That is exactly the `fence ✓ / ✗` marker after each plugin in `/plugins`.)
+Silent degradation is unacceptable, but so is "no fence, no plugin" — the fence is
+reinforcement, not a precondition.
 
-### 自检证据（`aox selftest`，回归 7）
+### Self-check evidence (`aox selftest`, regression 7)
 
-**三段对拍**，三段都必须过 —— 只测一边说明不了任何事（「被拦住了」很可能只是因为逻辑没跑到）：
+**Three-way A/B**, and all three have to pass — testing only one side proves nothing ("it was
+blocked" may just mean the logic never ran):
 
 ```
-[selftest]   默认额度: SPAWN: rc=0 out=child-ok
-[selftest]   额度锁 0: SPAWN-BLOCKED: OSError: [WinError 1816] 配额不足，无法处理此命令。
-[selftest]   围栏关闭: SPAWN: rc=0 out=child-ok
+[selftest]   default allowance: SPAWN: rc=0 out=child-ok
+[selftest]   allowance locked to 0: SPAWN-BLOCKED: OSError: [WinError 1816] Not enough quota is available to process this command.
+[selftest]   fence off: SPAWN: rc=0 out=child-ok
 ```
 
-三行都是同一个「尝试拉起子进程」的插件，唯一变的是配置：
+All three lines are the same plugin "trying to spawn a child process"; only the configuration
+differs:
 
-- **默认额度（8 个子进程）**：子进程真的跑起来了（`child-ok`）—— 插件得能干活，这是默认值的底线；
-- **`max_processes = 0`**：没跑起来 ⇒ 这条路仍然能锁死，fork bomb 防护还在；
-- **围栏整个关掉**：又跑起来了 ⇒ 中间那行的「被拦下」确实归因于 Job，
-  而不是这台机器上的 python 自己有别的毛病。
+- **default allowance (8 child processes)**: the child really ran (`child-ok`) — a plugin has to
+  be able to work; that is the floor for the default value;
+- **`max_processes = 0`**: it didn't run => this path can still be locked down, and fork-bomb
+  protection is intact;
+- **fence switched off entirely**: it ran again => the "blocked" in the middle row really is
+  attributable to the Job, not to some other fault in this machine's python.
 
-断言断的是**内容**（子进程有没有真的跑起来），不是错误码的措辞。
+The assertion is on the **content** (whether the child actually ran), not on the wording of an
+error code.
 
-> 这条对拍当场抓出过一个真 bug：最初 `enabled = false` 只关掉了「先冻住」那一半，
-> Job 照样在建，于是「关掉围栏」的对照组仍然拿到 1816 —— 也就是说
-> `enabled = false` 当时是**假的**。单边测试永远发现不了这个。
+> This A/B caught a real bug on the spot: originally `enabled = false` only turned off the
+> "freeze first" half, and the Job was still created, so the control group for "fence off" still
+> got 1816 — meaning `enabled = false` was **fake** at the time. A one-sided test can never find
+> that.
 
-另外，`selftest` 里既有的整条链路（建插件 → 注册 → 调用 → 中文往返 → cwd 校验 → 卸载）
-在围栏**开着**的情况下全部通过 —— 顺带证明围栏不会把插件自己饿死。
+Also, the whole existing `selftest` chain (create plugin -> register -> call -> CJK round trip ->
+cwd check -> uninstall) passes with the fence **on** — which incidentally proves the fence
+doesn't starve the plugin itself.
 
-实机 `aox` 跑一遍：8 个真实插件（python 与 rust 都有）全部 `围栏 ✓`。
+Running the real `aox`: all 8 real plugins (both python and rust) show `fence ✓`.
 
-### 已知边界
+### Known limits
 
-- **文件与网络**：管不了。想挡住删文件，必须走 ②a 或 ③。
-- **`max_processes` 改过语义（2026-10-04）**：它现在数的是**插件能再开几个子进程**
-  （不含插件自己），默认 `8`，写进 Job 时 `+1`；`0` = 一个都不许（唯一能把子进程这条路
-  锁死的档）。旧语义是「含插件自己的进程总数」，默认 1 ⇒ 靠 `subprocess` 干活的插件
-  在默认配置下全废（`WinError 1816 配额不足`）—— 那正是这次改掉的东西。
-- **子进程继承 Job**：插件拉起的子孙自动属于同一个 Job（没开 `BREAKAWAY_OK`），
-  所以内存 / UI 限制与「宿主一退全灭」对它们一样有效；`ACTIVE_PROCESS` 封的只是**并发数**。
-- **内存帽默认关**：超限是**整个进程被内核结束**，不是一次分配失败。偏紧的帽子会把
-  「合法但吃内存」的插件直接打死，且插件侧看不到任何原因，只表现为「老是莫名其妙被重启」。
-  想开就明确地开。
-- **非 Windows**：整个模块退化成 no-op，并且**不假装成功** —— `Fence::active = false`，
-  原因写明「本平台没有 Job Object」，`/sandbox` 会照实说。
-- **改配置需要重启**：围栏在 spawn 时定型，运行期间改 `[sandbox]` 只影响下一次 spawn / 重启。
+- **Files and network**: out of reach. To block file deletion you have to go through ②a or ③.
+- **`max_processes` changed meaning (2026-10-04)**: it now counts **how many more child
+  processes the plugin may open** (the plugin itself excluded), default `8`, `+1` when written
+  into the Job; `0` = none at all (the only setting that truly locks this path down). The old
+  meaning was "total processes including the plugin", default 1, so plugins that work via
+  `subprocess` were dead under the default configuration (`WinError 1816`) — exactly what this
+  change fixed.
+- **Children inherit the Job**: a plugin's descendants belong to the same Job automatically
+  (`BREAKAWAY_OK` is not set), so the memory / UI limits and "everything dies when the host
+  dies" apply to them too; `ACTIVE_PROCESS` caps only the **concurrency count**.
+- **The memory cap is off by default**: exceeding it **kills the whole process in the kernel**,
+  it is not one failed allocation. A cap that is too tight will kill a plugin outright that is
+  legitimate but memory-hungry, and nothing is visible from the plugin's side — it just looks
+  like "it keeps getting restarted for no reason". Turn it on deliberately if you want it.
+- **Non-Windows**: the whole module degrades to a no-op, and **doesn't pretend to succeed** --
+  `Fence::active = false` with the reason spelled out as "this platform has no Job Object", and
+  `/sandbox` reports it honestly.
+- **Changing the config needs a restart**: the fence is fixed at spawn time, so editing
+  `[sandbox]` during a run only affects the next spawn / restart.
 
-## 4. 已实现的 ③：工作区边界（文件能力收回宿主）
+## 4. Implemented ③: the workplace boundary (file capability taken back by the host)
 
-宿主内置 `read_file` / `write_file` / `list_dir` / `remove` 四个文件工具
-（`src/tool/hostfs.rs`）—— 参数与实现都在宿主手里，所以「**写入与删除**必须先过工作区判定」
-这件事**无法被绕过**（除非模型不用它们、改自己造插件，那属于另一类风险，见 §1）。
+The host ships four built-in file tools, `read_file` / `write_file` / `list_dir` / `remove`
+(`src/tool/hostfs.rs`) — parameters and implementation are both in the host's hands, so "**writes
+and deletes must pass the workplace check first**" **cannot be bypassed** (unless the model
+doesn't use them and builds its own plugin instead, which is a different class of risk, see §1).
 
-**三档**（`src/workplace.rs`，`config.toml` 的 `[workplace] mode`）：
+**Three tiers** (`src/workplace.rs`, `[workplace] mode` in `config.toml`):
 
-| 档位 | 含义 | 受限档位下管什么 |
+| Tier | Meaning | What it governs when restricted |
 |------|------|------|
-| `default` | 每段新对话在 `<应用根>/workplace/<YYYYMMDDHHMMSS>/` 开一块新地（同一秒撞名会自动加 `-2`） | 写·删只准这块地；**读不设限** |
-| `full` | 不受限。**要它得显式写 `mode = "full"`** —— 出厂默认是 `default`（2026-10-05 改的） | 什么都不管 |
-| `fixed`（`root = "..."`） | 固定一块地（GUI 的「选择工作区」等价于它） | 同 `default` |
+| `default` | each new conversation opens a fresh plot at `<app root>/workplace/<YYYYMMDDHHMMSS>/` (a name collision within the same second appends `-2`) | writes and deletes only inside that plot; **reads are unrestricted** |
+| `full` | unrestricted. **You have to write `mode = "full"` explicitly** — the factory default is `default` (changed 2026-10-05) | governs nothing |
+| `fixed` (with `root = "..."`) | one fixed plot (the GUI's "choose workplace" is equivalent to it) | same as `default` |
 
-**读写不对称（2026-10-04 定的语义，本层最重要的一条）**：
+**Reads and writes are asymmetric (the semantics settled on 2026-10-04; the single most
+important rule at this layer)**:
 
-| 工具 | 意图（`workplace::Access`） | 受限档位下 |
+| Tool | Intent (`workplace::Access`) | When restricted |
 |---|---|---|
-| `read_file` / `list_dir` | `Read` | **整个设备都能读，不受工作区限制**（连「地还没开」时也照读） |
-| `write_file` / `remove` | `Write` | 必须在工作区内；相对路径一律拒 |
+| `read_file` / `list_dir` | `Read` | **the whole device is readable, unrestricted by the workplace** (it reads even when "the plot isn't open yet") |
+| `write_file` / `remove` | `Write` | must be inside the workplace; relative paths are always refused |
 
-为什么拆开：**后果不对称** —— 读是取信息，写删是改设备（而且不可逆）。想读一份散落在
-别处的资料（日志、配置、别处的项目）是很常见的正当需求；为它设一道提权流程只会把用户
-逼去常开「完全访问」，边界反而更松。而「AOX 只能在划定的那块地里落笔」才是这层
-真正要保住的东西。它的代价见「已知边界」第一条。
+Why split them: **the consequences are asymmetric** — reading takes information, writing and
+deleting change the device (and irreversibly). Wanting to read material that lives somewhere else
+(logs, configs, another project) is a very common legitimate need; putting an elevation flow in
+front of it only pushes users into leaving "full access" on permanently, which makes the boundary
+looser instead. Whereas "AOX may only put its pen down inside the plot drawn for it" is what this
+layer actually has to protect. Its price is in the first item under "known limits".
 
-运行期切换：命令行 `/workplace`（看现状）与 `/workplace full|default|<目录>`（切档位）。
-判定与执行都在 `workplace` 模块里，CLI 与 GUI 共用一份实现、一份文案。
+Switching at runtime: `/workplace` at the command line (show the current state) and
+`/workplace full|default|<directory>` (switch tier). Both the check and the execution live in the
+`workplace` module, so the CLI and the GUI share one implementation and one body of copy.
 
-**四个非显然的设计决定**：
+**Four non-obvious design decisions**:
 
-- **受限档位下相对路径一律拒绝（只对写/删成立）。** 宿主与插件子进程的工作目录不是同一个
-  （插件的 cwd 是应用根，见 `plugin::spawn_command`），同一串 `config.toml` 在两边会指到
-  两个不同文件 —— 那种「宿主以为在里面、插件实际去了外面」的不一致，比多写几个字符危险得多。
-  拒绝文案里会把根直接告诉模型，好让它改写。**读不拒相对路径**：读错了顶多读到别处的同名
-  文件，那层歧义（cwd 不同）只在「写」上才致命。
-- **插件工具那张粗网按插件声明的意图判（2026-10-05 起）。** 宿主对插件是黑盒，看不出某个
-  路径参数是拿去读还是拿去写；而「少挡一次写」的代价远大于「多挡一次读」，所以**没声明的**
-  一律当潜在的写处理。插件可以在工具声明里补第 4 位 `"read"` 把这道误伤去掉（Python SDK：
-  `("<说明>", <schema>, <handler>, "read")`），声明的工具按读判 —— 与 `read_file` 同档，
-  读区外不再被拒。**声明是可选、且默认关闭的**，所以本次改动对已有插件零影响
-  （`plugins/fs` 那几个纯读工具顺手补上了）。
-  不声明的 `fs` 类插件在受限档下读区外仍会被拒（宿主内置的 `read_file` 不会）——
-  这是刻意的保守方向：宿主文件工具才是被认可的读写通道。
-  ⚠️ 它是**声明、不是强制**：插件声明 `read` 之后照样可以去写。这一层防的是
-  「模型顺手写到区外」，不是防一个存心作恶的插件进程（那属于 §1 的 ③，只有 ②a 管得了）。
-- **`Pending`（受限但根未定）与 `Full` 严格分开**：`default` 档位在首条消息之前，
-  判定是**全拒绝**而不是全放行。把「不受限」和「还没定」混成一个 `None`，就会造出
-  「受限档位下因为还没建目录而静默放行」——那是最坏的一种失效。
-- **越界不是静默拦下。** 文案分两份：给模型的（`Reject::model_text`）三段是硬要求 ——
-  ① 发生了什么 + 根在哪 ② 这是权限边界、**别重试也别换写法绕过** ③ 请转述用户并给提权途径；
-  给用户的是另一行（`Reject::user_text`，走 `Warn` 事件）。合并成一份会让两边都不好用。
-  写「别重试」是因为模型面对失败的本能是换个写法再试一次，而越界是换不掉的。
-- **宿主文件工具是 `ToolKind::Host`，不是 `Meta`。** 前者跟 `[auth] plugin_tools` 那档走
-  （默认 `auto`），后者跟 `meta_tools`（默认 `ask`）。并进 `Meta` 会让每次读写都弹授权框，
-  而模型手里 `fs_*` 那类插件工具是 auto 的 —— 同一件事两套行为，换一个工具就变，最难解释。
-  想单独收紧按名字 override：`[auth.overrides] read_file = "ask"`。
-- **档位的判据是「运行期怎么来的」，不是配置里写了什么。** 状态里另记一个 `picked`
-  （这块地是用户点名挑的，还是 `default` 档现建的），`snapshot()` 读它。拿 `cfg.mode` 推会出错：
-  配置写 `default` 的用户照样能在运行期挑一块固定的地（`/workplace <目录>`、GUI 的选择器），
-  那时 `set_mode` 报「已切到「选择工作区」：X」，紧接着 `snapshot()` 却报「档位：默认」——
-  同一个动作两种说法；GUI 上就是「按钮写着默认、打勾也在默认上，而写入实际去了 X」。
-  这一趟干脆把配置字段从 `Workplace` 里删掉了：留着它只会诱使人再去「按配置推档位」。
+- **Relative paths are always refused under a restricted tier (for writes/deletes only).** The
+  host and the plugin subprocess don't share a working directory (a plugin's cwd is the app root,
+  see `plugin::spawn_command`), so the same string `config.toml` points at two different files on
+  the two sides — and "the host thinks it's inside while the plugin actually went outside" is far
+  more dangerous than a few extra characters. The refusal text tells the model the root directly
+  so it can rewrite the call. **Reads don't refuse relative paths**: reading the wrong file at
+  worst reads a same-named file elsewhere, and that ambiguity (different cwd) is only fatal for
+  writes.
+- **The coarse net over plugin tools judges by the plugin's declared intent (since 2026-10-05).**
+  A plugin is a black box to the host, which can't tell whether a given path argument is for
+  reading or writing; and "blocking one write too few" costs far more than "blocking one read too
+  many", so **anything undeclared** is treated as a potential write. A plugin can add a fourth
+  field, `"read"`, to a tool declaration to remove that collateral damage (Python SDK:
+  `("<description>", <schema>, <handler>, "read")`), and a declared tool is judged as a read --
+  the same tier as `read_file`, no longer refused for out-of-area reads. **The declaration is
+  optional and off by default**, so this change has zero effect on existing plugins (the
+  read-only tools in `plugins/fs` were filled in while we were there).
+  An undeclared `fs`-family plugin is still refused for out-of-area reads under a restricted
+  tier (the host's own `read_file` is not) — that is the deliberately conservative direction:
+  the host's file tools are the sanctioned read/write channel.
+  ⚠️ It is **a declaration, not enforcement**: a plugin that declares `read` can still write.
+  What this layer defends against is "the model casually writing outside the area", not a plugin
+  process with malicious intent (that is §1's ③, which only ②a can handle).
+- **`Pending` (restricted but root undecided) is strictly separate from `Full`**: under the
+  `default` tier, before the first message, the verdict is **refuse everything**, not allow
+  everything. Merging "unrestricted" and "not decided yet" into one `None` would produce "under a
+  restricted tier, silently allow everything because the directory doesn't exist yet" — the worst
+  possible kind of failure.
+- **Going out of bounds is not a silent refusal.** The copy comes in two parts: one for the
+  model (`Reject::model_text`), whose three paragraphs are a hard requirement — ① what happened
+  and where the root is; ② this is a permission boundary, **don't retry and don't rewrite your way
+  around it**; ③ relay it to the user and give the way to get elevated; and a separate line for
+  the user (`Reject::user_text`, sent as a `Warn` event). Merging the two would make both worse.
+  "Don't retry" is in there because a model's instinct on failure is to try a different
+  formulation, and an out-of-bounds condition is not something you can formulate your way past.
+- **The host's file tools are `ToolKind::Host`, not `Meta`.** The former follows the
+  `[auth] plugin_tools` tier (default `auto`), the latter follows `meta_tools` (default `ask`).
+  Folding them into `Meta` would pop an authorization dialog on every read and write, while the
+  `fs_*` family of plugin tools in the model's hands is `auto` — two behaviours for the same
+  thing, changing with which tool you use, and hardest of all to explain. To tighten one
+  individually, override by name: `[auth.overrides] read_file = "ask"`.
+- **The tier's test is "how it came about at runtime", not "what the config says."** The state
+  records an extra `picked` (whether this plot was named by the user or freshly created by the
+  `default` tier), and `snapshot()` reads it. Deriving it from `cfg.mode` goes wrong: a user
+  whose config says `default` can still pick one fixed plot at runtime (`/workplace <dir>`, or
+  the GUI's picker), and then `set_mode` reports "switched to 'choose workplace': X" while
+  `snapshot()` immediately after reports "tier: default" — one action, two stories; on the GUI
+  that is "the button says default and the tick is on default, while writes actually go to X".
+  So the config field was simply deleted from `Workplace`: keeping it only tempts people into
+  "deriving the tier from config" again.
 
-**判定点两处（纵深，不是重复）**：
+**Two checkpoints (defence in depth, not duplication)**:
 
-1. `Agent::authorize_and_execute` —— 所有工具调用的唯一收口，**早于授权**。
-   早于授权是为了：越界调用不必先弹一次授权框再告诉用户「其实碰不到」；而且这里拿得到
-   `Ui`，能给用户发一条 `Warn`（工具的 `call` 里拿不到）。宿主文件工具按 `path` 参数精确判；
-   插件工具按参数名 + 值形态扫「像路径」的字符串（`workplace::scan_paths`，粗网）。
-2. 每个宿主文件工具自己的 `call` 开头（`hostfs::guard` / `hostfs::guard_read`）——
-   防止有人绕过循环直接 `Runtime::execute`（`selftest` 就是这么调的）。两层用的是
-   **同一套**判定（读走 `check_read`、写删走 `check`），所以不存在两套规则。
-   读那条路**分出来单独写**（`guard_read` 而不是复用 `guard`）：这样「读和写不是一档」
-   在调用点上一眼可见，哪天有人给读也套上边界，代码 diff 藏不住。
+1. `Agent::authorize_and_execute` — the single funnel for every tool call, **ahead of
+   authorization**. Ahead of authorization so that an out-of-bounds call doesn't first pop an
+   authorization dialog and then tell the user "actually you can't touch that"; and because this
+   is where a `Ui` is available to send the user a `Warn` (which a tool's `call` can't do). The
+   host's file tools are judged precisely by their `path` argument; plugin tools are swept for
+   strings that "look like a path" by argument name and value shape (`workplace::scan_paths`, the
+   coarse net).
+2. The top of each host file tool's own `call` (`hostfs::guard` / `hostfs::guard_read`) — so
+   nobody can bypass the loop and call `Runtime::execute` directly (which is how `selftest` calls
+   it). Both layers use **the same** check (reads go through `check_read`, writes and deletes
+   through `check`), so there aren't two sets of rules.
+   The read path is **written out separately** (`guard_read` rather than reusing `guard`): that
+   way "reads and writes aren't the same tier" is visible at a glance at the call site, and if
+   someone ever puts a boundary on reads too, the code diff can't hide it.
 
-**已知边界**（务必别把它当沙箱）：
+**Known limits** (please don't mistake this for a sandbox):
 
-- **「读不设限」= 这层挡不住「读遍整台机器」。** 受限档位下模型（或被内容骗过的模型）可以读
-  任何它进程权限够得着的文件 —— 包括别处的密钥、配置、源码。这层挡的是**改设备**，
-  不是**看设备**。要连读一起关，只有 OS 级隔离（§②a 的 AppContainer）。
-- **它管不了插件自己 `open()` 文件** —— 插件进程拿到的还是宿主的权限。
-  对 §1 的 ①② 两类（AI 写错 / 被内容骗）**等价于 AppContainer**，因为危险动作没有出现在
-  模型能写的地方；但对 ③（恶意第三方插件）一点用没有 —— 那只有 ②a。
-- **插件工具那一层是粗网**：只在参数名像路径、或值的形态明显是路径（`/x`、`X:\x`、`~/x`、
-  含 `..` 分量）时才判。**漏判是刻意的代价** —— 值里带 `/` 但键名不像路径的一般放过，
-  因为把它们当路径会把插件取 URL 之类的正常调用一起拒掉。
-  这张网只回答「哪些值是路径」；**「拿它去读还是去写」问工具自己**（`Tool::access`，
-  插件侧是声明的那一位）—— 网本身不预设方向。
-- ✅ **已修（2026-10-04）**：「含 `..` 分量」那条规则**不区分值的性质** —— 一段**源码**里
-  只要出现 `../../`（两个 `..` 被 `/` 夹住），整段源码就会被当作一个路径去判。
-  实测：2,240 字节的插件源码 ⇒ `scan_paths` 命中 **1 条，长度 = 2240 字节（就是整段源码）**。
-  后果分两档，都不好：**受限档**下它不是绝对路径 ⇒ `Reject::Relative` ⇒
-  **`create_plugin` 直接被拒** —— 模型在插件源码里写一次 `a/../b` 就再也造不出插件
-  （这是功能坏了，不是慢）；**full 档**下判定结果虽然被丢弃，`normalize` 却会拿这 2.2 KB
-  「路径」逐级向上试 `canonicalize`（每级一次系统调用）⇒ 每次 `create_plugin` 白烧约 1 ms。
-  修法：值的形态先过一道闸 —— **含换行、或长过 260 字符（Windows `MAX_PATH`）就不判为路径**，
-  真正的路径参数不会长成一块源码。闸门只装在「靠值形态猜」那两条路上，**键名命中
-  `path` / `file` 之类时照判**（那是插件自己声明的，300 字符的长路径也得认）。
-  回归钉在 `multiline_source_is_not_treated_as_a_path`。
-- ✅ **工作区跟着对话走（2026-10-04 起）**：档位与根会写进那段对话的 `.jsonl`
-  （`{"kind":"workplace","mode":"default|fixed|full","root":"..."}`，每次**变了**才追加一条，
-  读的时候取最后一条）。于是：
-  - 打开旧对话会把它自己那块地还回来 —— 原先不存档，恢复对话沿用「当前这块地」，
-    同一段对话每次进去的工作区都不同（用户报的）。
-  - **`/new` 一律回到「默认」档**（`Agent::new_conversation` → `reset_for_new_conversation`），
-    上一段对话临时切过的档不继承。⚠️ 代价：配置里写 `mode = "fixed"` 的用户，只有**本次启动的
-    第一段对话**落在配置点名的那块地，之后每段新对话都在 `workplace/` 下另开一块。
-  - 旧对话文件里没有这条记录（那时还没这功能）：恢复时**什么都不动**，等它下一次落盘时记上，
-    从此这段对话也有了自己的地。
-- **工作区目录不会自动清理**（与 `history/` 一样只增不删）。
+- **"Reads are unrestricted" means this layer does not stop "reading the whole machine."** Under
+  a restricted tier the model (or a model tricked by content) can read any file its process has
+  permission for — including keys, configs and source elsewhere. This layer blocks **changing
+  the device**, not **looking at the device**. To close reads too, you need OS-level isolation
+  (§②a's AppContainer).
+- **It can't stop a plugin from `open()`-ing a file itself** — a plugin process still gets the
+  host's permissions. For §1's ① and ② (the AI writing it wrong / being tricked by content) it is
+  **equivalent to AppContainer**, because the dangerous operation never appears where the model
+  can write it; but for ③ (a malicious third-party plugin) it does nothing — that needs ②a alone.
+- **The plugin-tool layer is a coarse net**: it only judges when an argument name looks like a
+  path, or a value's shape is obviously a path (`/x`, `X:\x`, `~/x`, contains a `..` component).
+  **Missing some is a deliberate price** — a value containing `/` whose key name doesn't look
+  like a path is normally let through, because treating those as paths would also refuse
+  perfectly normal calls where a plugin fetches a URL.
+  That net answers only "which values are paths"; **"is it for reading or writing" is asked of the
+  tool itself** (`Tool::access`; on the plugin side, the declared field) — the net doesn't
+  presuppose a direction.
+- ✅ **Fixed (2026-10-04)**: the "contains a `..` component" rule **didn't distinguish the nature
+  of the value** — if a piece of **source code** contained `../../` (two `..`s fenced by `/`),
+  the entire source was treated as one path to be judged. Measured: 2,240 bytes of plugin source
+  => `scan_paths` hit **1 entry, length = 2240 bytes (i.e. the whole source)**. The consequences
+  came in two grades, both bad: under a **restricted tier** it isn't an absolute path =>
+  `Reject::Relative` => **`create_plugin` refused outright** — one `a/../b` in plugin source and
+  the model can never build a plugin again (that is a broken feature, not a slow one); under
+  **full**, the verdict is discarded but `normalize` still tries `canonicalize` level by level on
+  that 2.2 KB "path" (one syscall per level) => every `create_plugin` burns about 1 ms for
+  nothing. Fix: the value's shape goes through a gate first — **containing a newline, or longer
+  than 260 characters (Windows `MAX_PATH`), means it is not judged as a path**; a real path
+  argument never looks like a slab of source. The gate is installed only on the two "guess by
+  value shape" paths; **when the key name hits `path` / `file` and the like it is still judged**
+  (that is the plugin's own declaration, and a 300-character path has to be honoured).
+  Pinned by the regression `multiline_source_is_not_treated_as_a_path`.
+- ✅ **The workplace follows the conversation (since 2026-10-04)**: the tier and the root are
+  written into that conversation's `.jsonl`
+  (`{"kind":"workplace","mode":"default|fixed|full","root":"..."}`, **appended only when it
+  changes**, and reading takes the last entry). So:
+  - Opening an old conversation hands back its own plot — previously nothing was persisted and a
+    restored conversation reused "the current plot", so the same conversation had a different
+    workplace every time you entered it (reported by the user).
+  - **`/new` always returns to the "default" tier** (`Agent::new_conversation` ->
+    `reset_for_new_conversation`); a tier switched temporarily in the previous conversation is
+    not inherited. ⚠️ The price: a user with `mode = "fixed"` in config gets the plot named by
+    the config only for **the first conversation of this launch**, and every new conversation
+    after that opens another plot under `workplace/`.
+  - Old conversation files have no such record (the feature didn't exist yet): on restore
+    **nothing is touched**, and it is recorded the next time it lands on disk, after which that
+    conversation has its own plot too.
+- **Workplace directories are not cleaned up automatically** (like `history/`, they only grow).
 
-**开销实测（2026-10-04，release 口径，本机）** —— 用来回答「这些边界会不会拖慢模型执行」：
+**Measured overhead (2026-10-04, release build, this machine)** — to answer "do these boundaries
+slow the model down":
 
-| 项 | 单次 | 频率 |
+| Item | Per call | Frequency |
 |---|---|---|
-| `Workplace::check`（full 档 / 路径**已存在**） | **65 µs** | 每个「像路径的参数」× 每工具调用 |
-| `Workplace::check`（full 档 / 路径**不存在**） | **224 µs** | 同上（写文件时正是这一档：要走 3 次 `canonicalize`） |
-| `Workplace::check`（fixed 档 / 区内 · 区外） | 68 · 95 µs | 同上 |
-| `scan_paths`（3 个参数 · 2.2 KB 源码） | 0.25 · 0.53 µs | 每次插件工具调用 |
-| 空钩子链 `before_tool` ×1 | 0.022 µs | 每轮 5 次 |
-| `Policy::level_for` | 0.003 µs | 每工具调用 |
-| `Runtime::tool_schemas`（7 个工具） | **15 µs** | **每轮一次**（27 个工具约 60 µs） |
-| Job Object 围栏 | **0** | 只在 spawn / respawn，运行期不碰 |
+| `Workplace::check` (full tier / path **exists**) | **65 µs** | per "path-like argument" × per tool call |
+| `Workplace::check` (full tier / path **does not exist**) | **224 µs** | same (writing a file is exactly this case: 3 `canonicalize` calls) |
+| `Workplace::check` (fixed tier / inside · outside) | 68 · 95 µs | same |
+| `scan_paths` (3 arguments · 2.2 KB source) | 0.25 · 0.53 µs | per plugin tool call |
+| empty hook chain, `before_tool` ×1 | 0.022 µs | 5 times per turn |
+| `Policy::level_for` | 0.003 µs | per tool call |
+| `Runtime::tool_schemas` (7 tools) | **15 µs** | **once per turn** (about 60 µs for 27 tools) |
+| Job Object fence | **0** | only at spawn / respawn, never touched at runtime |
 
-**结论：这些边界对「模型执行速度」测不出来。** 每轮总额 < 1 ms，而一次 LLM 往返是**秒级**、
-一次插件工具执行是 ms~s 级 —— 占比 < 0.02%。缝那一层（钩子链 / 策略）更是完全免费。
+**Conclusion: these boundaries are unmeasurable against "model execution speed".** The total per
+turn is under 1 ms, while one LLM round trip is on the order of **seconds** and one plugin tool
+execution is ms~s — under 0.02%. The seam layer (hook chain / policy) is free outright.
 
-那两个「白花的数」**当天就都处理掉了**：
+Those two "wasted numbers" **were both dealt with the same day**:
 
-1. ✅ `Workplace::is_unrestricted()` + `Agent::workplace_reject` 开头短路：full 档下
-   **整条判定（含 `scan_paths` 那张粗网）一步都不跑**。`check` 的开销 ≈95% 是文件系统
-   系统调用（debug 72 µs vs release 65 µs，几乎不变 ⇒ 吃的是 `canonicalize` 不是 CPU），
-   而调用方在 full 档下把 `normalize` 的结果整个丢掉（只要 `.err()`）——
-   那 65~224 µs 现在不存在了。短路本身是一次取锁 + 一次 `matches!`（纳秒量级）。
-   它必须与「full 档下任何路径都放行」严格一致，所以钉了一条
-   `is_unrestricted_agrees_with_check`（含「`Pending` 绝不能报不受限」——
-   那是「受限档静默全放行」，最坏的一种失效）。
-2. ✅ 「整段源码被当路径」已修，见上面 §4 的已知边界条目。
+1. ✅ `Workplace::is_unrestricted()` plus a short-circuit at the top of `Agent::workplace_reject`:
+   under the full tier **the whole check (including the `scan_paths` coarse net) doesn't run a
+   single step**. About 95% of `check`'s cost is filesystem syscalls (debug 72 µs vs release
+   65 µs, almost unchanged => it is `canonicalize` being paid for, not CPU), and the caller
+   discards `normalize`'s result entirely under the full tier (it only wants `.err()`) — so those
+   65~224 µs no longer exist. The short-circuit itself is one lock acquisition plus one
+   `matches!` (nanosecond scale). It has to agree exactly with "any path is allowed under the
+   full tier", so a test pins it: `is_unrestricted_agrees_with_check` (including "`Pending` must
+   never report unrestricted" — that would be "a restricted tier silently allowing everything",
+   the worst kind of failure).
+2. ✅ "A whole slab of source treated as a path" is fixed — see the known-limits entry in §4
+   above.
 
-**真正影响"速度"的不是判定，是行为**：受限档下越界会让模型**多烧一轮对话**
-（一次 LLM 往返 + 可能的用户交互），比判定本身贵四五个数量级；
-`[sandbox] max_processes = 1` 会让「靠 `subprocess` 干活的插件」**直接失败** ——
-那不是变慢，是坏（调大即可）。
+**What actually affects "speed" isn't the check, it's the behaviour**: under a restricted tier,
+going out of bounds costs the model **one extra conversation turn** (an LLM round trip plus
+possibly a user interaction), four or five orders of magnitude more expensive than the check
+itself; and `[sandbox] max_processes = 1` makes "plugins that work via `subprocess`"
+**fail outright** — that isn't slower, that's broken (raise it).
 
-**GUI 入口（2026-10-04 已落地）**：输入框**左下角**那枚「工作区 · <档位>」按钮 →
-向上弹出三选一列表（默认 / 选择工作区… / 完全访问）→「完全访问」红色加粗，点它先弹
-**红色二次确认**（`egui::Modal`）→「选择工作区…」打开**内置 egui 目录选择器**
-（盘符 chips + 上级目录 + 子目录列表 + 「选定此目录」）。
+**GUI entry point (landed 2026-10-04)**: the "workplace · <tier>" button at the **bottom-left**
+of the input box -> a three-way list pops upward (default / choose workplace... / full access) ->
+"full access" is red and bold, and clicking it opens a **red confirmation first**
+(`egui::Modal`) -> "choose workplace..." opens the **built-in egui directory picker**
+(drive chips + parent directory + subdirectory list + "select this directory").
 
-三档在界面上与 CLI 是**同一条实现**（都收口到 `Workplace::set_mode`）：界面不自己切档 ——
-`Workplace` 住在 `Runtime` 里，只有 Agent 线程拿得到，所以按钮只发一条
-`ToAgent::Workplace(Mode)`（见 `gui/src/bridge.rs`），结果由 `FromAgent::Workplace`
-回执驱动（打勾靠 `PartialEq` 比档位，不解析文案）。回执在**启动 / 每轮结束 / 每次切档后**
-各发一次 —— 第三处是因为 `default` 档的根要到首条消息才建（不重发的话按钮会一直显示「还没定」）。
-代码在 `gui/src/workplace_ui.rs`；`--demo` 下按钮可点（就地模拟，只动界面不碰磁盘），
-方便预览版式。
+On the interface the three tiers are **the same implementation** as the CLI (both funnel into
+`Workplace::set_mode`): the interface doesn't switch tiers itself — `Workplace` lives inside
+`Runtime`, and only the agent thread can reach it, so the button merely sends one
+`ToAgent::Workplace(Mode)` (see `gui/src/bridge.rs`), and the result is driven by the
+`FromAgent::Workplace` acknowledgement (the tick compares tiers with `PartialEq`; it doesn't
+parse copy). The acknowledgement is sent **at startup / at the end of every turn / after every
+tier switch** — the third because the `default` tier's root isn't created until the first
+message (without the resend the button would show "not decided yet" forever). The code is in
+`gui/src/workplace_ui.rs`; under `--demo` the button is clickable (simulated in place, interface
+only, no disk), which makes the layout easy to preview.
 
-`Reject::model_text`（给模型的越界契约）里的提权途径已补上这一条界面入口。
+`Reject::model_text` (the out-of-bounds contract given to the model) has had this interface entry
+point added to its list of ways to get elevated.
 
-### ②a AppContainer（唯一能挡住恶意插件的）
+### ②a AppContainer (the only thing that stops a malicious plugin)
 
-进程以 AppContainer SID 运行，默认**文件全禁、网络全禁、注册表全禁**；
-要让它干活，把 `<root>/plugins`（只读）、内置运行时目录（只读）、工作区（读写）
-逐个 `SetNamedSecurityInfo` 授给该 SID。网络由 `SECURITY_CAPABILITIES` 决定，不给就完全没有。
+The process runs under an AppContainer SID: by default **all files, all network and all registry
+access are denied**; to let it work, grant that SID each of `<root>/plugins` (read-only), the
+bundled runtime directory (read-only) and the workplace (read-write) with
+`SetNamedSecurityInfo`. The network is decided by `SECURITY_CAPABILITIES`; grant nothing and
+there is none at all.
 
-为什么需要启动器：AppContainer 必须通过 `CreateProcessW` + `STARTUPINFOEX` +
-`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` 启动，`std` / `tokio` 到不了这层。
-**最省的做法是让 `aox.exe` 兼职**：加一个隐藏子命令
-`aox.exe --sandbox-exec <profile.json> -- python.exe -u main.py`，
-它 `CreateProcessW` 出真正的插件进程，`bInheritHandles=TRUE` 让 stdin/stdout 管道
-**直接继承、不用写一行转发代码**，自己作为 Job 持有者活着（它一死 Job 关闭，插件一起死）。
-宿主那边几乎不用改 —— 还是 `Command::new`，只是 argv 换了一条。
+Why a launcher is needed: an AppContainer has to be started via `CreateProcessW` +
+`STARTUPINFOEX` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, and neither `std` nor `tokio`
+reaches that layer. **The cheapest approach is to have `aox.exe` do double duty**: add a hidden
+subcommand, `aox.exe --sandbox-exec <profile.json> -- python.exe -u main.py`, which
+`CreateProcessW`s the real plugin process, sets `bInheritHandles=TRUE` so the stdin/stdout pipes
+are **inherited directly with no forwarding code at all**, and then lives on as the Job holder
+(when it dies the Job closes and the plugins die with it). The host side barely changes — still
+`Command::new`, just a different argv.
 
-**AC 下有三个必须实测的坑**：`from plugin_sdk import serve` 会让 Python 往
-`plugins/sdk/` 写 `__pycache__`（设 `PYTHONDONTWRITEBYTECODE=1` 最干净）；
-内置 python 运行时目录必须对它只读授权，否则解释器起不来；
-`fs` 插件里的 `%USERPROFILE%`、`tempfile.gettempdir()` 在 AC 下会落到容器目录或直接失败。
+**Three pitfalls that must be measured under AC**: `from plugin_sdk import serve` makes Python
+write `__pycache__` into `plugins/sdk/` (setting `PYTHONDONTWRITEBYTECODE=1` is cleanest); the
+bundled python runtime directory must be granted read-only to it, or the interpreter won't
+start; and `%USERPROFILE%` plus `tempfile.gettempdir()` in the `fs` plugin land in the container
+directory or fail outright under AC.
 
-### ②b 低完整性级别（值得先花 30 分钟 spike）
+### ②b Low integrity level (worth a 30-minute spike first)
 
-想法最优雅 —— 「能读、不能删」，一句话。门槛在换令牌要走 `CreateProcessAsUser`，
-文档要求 `SeAssignPrimaryToken`，普通用户没有。**唯一的活路是传入「自身令牌的
-restricted 版本」（`CreateRestrictedToken` 的产物）** —— 那种情况下这个权限不被要求。
-把握度是「很可能通，但必须实测」：30 行 FFI + 一行 `open(r'C:\t.txt','w')` 就能有答案。
-如果通了，它比 ②a 便宜一个数量级。
+The idea is the most elegant — "can read, cannot delete", one sentence. The obstacle is that
+swapping tokens goes through `CreateProcessAsUser`, which the docs say requires
+`SeAssignPrimaryToken`, something an ordinary user doesn't have. **The only way through is to
+pass a "restricted version of its own token" (the product of `CreateRestrictedToken`)** — in that
+case the privilege isn't required. Confidence is "very likely to work, but it must be measured":
+30 lines of FFI plus one `open(r'C:\t.txt','w')` gives you the answer. If it works, it is an
+order of magnitude cheaper than ②a.
 
-> 另有一条没试过的路：`SetInformationJobObject(JobObjectSecurityLimitInformation)`
-> 可以让**一个 Job 里的进程统一跑在受限令牌下**，`windows-sys` 里那几个
-> `JOB_OBJECT_SECURITY_*` 常量就在那儿。如果那条路在非管理员下可用，
-> ②b 就能直接长在已经做好的 ① 上，连 `CreateProcessAsUser` 都不用碰。**未验证。**
+> There is also a road nobody has tried: `SetInformationJobObject(JobObjectSecurityLimitInformation)`
+> can make **all processes in one Job run under a restricted token**, and the
+> `JOB_OBJECT_SECURITY_*` constants are right there in `windows-sys`. If that road works for a
+> non-administrator, ②b could grow directly on top of the ① that is already built, without ever
+> touching `CreateProcessAsUser`. **Unverified.**
 
-### ④ WASM/WASI（不建议）
+### ④ WASM/WASI (not recommended)
 
-唯一**跨平台且不可绕过**的沙箱，但 wasmtime + Cranelift 进 EXE 约 **+3–5 MB**
-（现在整个 `aox.exe` 才 3.14 MB，等于翻倍还多），还要把三种语言的子进程插件换成
-wasm 模块 + host call。对现阶段代价与收益不成比例；留作「真要跑不受信任的第三方插件」时再议。
+The only sandbox that is **cross-platform and unbypassable**, but wasmtime + Cranelift adds about
+**+3–5 MB** to the EXE (`aox.exe` is only 3.14 MB today, so this more than doubles it), and the
+three-language subprocess plugin model would have to become wasm modules plus host calls. The
+cost and benefit are out of proportion at this stage; leave it for "when we really do need to run
+untrusted third-party plugins".
 
-## 5. 怎么关、怎么调
+## 5. How to turn it off, how to tune it
 
 ```toml
 [sandbox]
-enabled = false      # 完全退回围栏之前，与旧版本逐字节一致
-max_processes = 8    # 插件最多再开几个子进程（0 = 一个都不许；额度是每个插件一份）
-max_memory_mb = 512  # 想开内存帽再开：超限是杀进程，不是分配失败
-ui_limits = false    # 允许插件碰宿主窗口/剪贴板（正常不需要）
+enabled = false      # fall all the way back to before the fence: byte for byte identical to the old version
+max_processes = 8    # how many more child processes a plugin may open (0 = none at all; the allowance is per plugin)
+max_memory_mb = 512  # only turn the memory cap on if you mean it: exceeding it kills the process, it isn't a failed allocation
+ui_limits = false    # let the plugin touch the host's window/clipboard (normally unnecessary)
 
-[workplace]          # 段名 2026-10-04 由 [workspace] 改成 [workplace]；旧名仍然认
-mode = "default"     # 出厂默认：每段对话在 workplace/ 下开一块新地（写入与删除只限在里面）
-# mode = "full"      # 不受限 —— 要它得显式写出来（2026-10-05 起默认不再是 full）
-# mode = "default"   # 每段对话一块新地：<应用根>/workplace/<时间戳>/
+[workplace]          # renamed from [workspace] to [workplace] on 2026-10-04; the old name still works
+mode = "default"     # factory default: each conversation opens a fresh plot under workplace/ (writes and deletes only inside)
+# mode = "full"      # unrestricted -- it has to be written explicitly (the default stopped being full on 2026-10-05)
+# mode = "default"   # one fresh plot per conversation: <app root>/workplace/<timestamp>/
 # mode = "fixed"
-# root = "sandbox-work"   # 固定工作区（相对路径相对应用根）
+# root = "sandbox-work"   # a fixed workplace (relative paths are relative to the app root)
 ```
 
-改完要重启（两样都在启动时定型）。命令行 `/sandbox` 看围栏当前生效值、`/workplace` 看
-边界现状（读不设限、写删受限）；`/plugins` 看每个插件的围栏状态。运行期切档位不用改配置：
-`/workplace full` / `/workplace default` / `/workplace <目录>`；GUI 则是输入框左下角那枚
-「工作区」按钮（三档 + 目录选择器 + 「完全访问」红色二次确认）。
+Changes need a restart (both are fixed at startup). Use `/sandbox` to see the fence's current
+effective values and `/workplace` to see the boundary's state (reads unrestricted, writes and
+deletes restricted); `/plugins` shows each plugin's fence state. You don't have to edit the
+config to switch tiers at runtime: `/workplace full` / `/workplace default` / `/workplace
+<directory>`; in the GUI, the "workplace" button at the bottom-left of the input box (three tiers
++ a directory picker + a red confirmation for "full access").
 
-## 6. 回滚
+## 6. Rollback
 
-单点：`plugin::spawn_command` 里的 `cmd.process_flags(sandbox.create_flags())` 与
-`spawn_and_init` / `respawn` 里的 `sandbox.contain(&child)`。
-把 `[sandbox] enabled` 设为 `false` 就等价于删掉这两处（`create_flags` 返回 0，
-`contain` 连 Job 都不建 —— 这一条是 A/B 对照组逼出来的，见第 3 节）。
+Single point of contact: `cmd.process_flags(sandbox.create_flags())` in `plugin::spawn_command`,
+and `sandbox.contain(&child)` in `spawn_and_init` / `respawn`. Setting `[sandbox] enabled` to
+`false` is equivalent to deleting both (`create_flags` returns 0, and `contain` doesn't even
+create a Job — a point the A/B control group forced, see section 3).
 
-③ 的回滚更简单：把 `[workplace] mode` 写回 `"full"`（或者直接删掉整段 `[workplace]`）。
-代码上等价于「`Workplace::check_access` 永远返回 `Ok`」—— `full` 档直通，所以边界判定在
-热路径上只是一次分支，不会有任何路径被拒。想连工具都不注册也可以（`main.rs` 与 `gui/src/bridge.rs`
-里那两处 `for t in host_file_tools()`），但没必要：`full` 档下这几个工具与普通读写工具无异。
-另外 `src/tool/hostfs.rs` 是**纯新增**，`src/workplace.rs` 也是 —— 想彻底摘掉，
-把这两处注册删掉再删这两个文件即可（`Runtime.workplace` 字段一并去掉）。
+Rolling back ③ is simpler still: write `[workplace] mode` back to `"full"` (or delete the whole
+`[workplace]` section). In code that is equivalent to "`Workplace::check_access` always returns
+`Ok`" — the full tier passes straight through, so the boundary check is one branch on the hot
+path and no path is ever refused. You can also skip registering the tools at all (the two
+`for t in host_file_tools()` sites in `main.rs` and `gui/src/bridge.rs`), but there's no need:
+under the full tier those tools are no different from ordinary read/write tools. Also,
+`src/tool/hostfs.rs` is **purely additive**, and so is `src/workplace.rs` — to remove them
+completely, delete those two registrations and then those two files (dropping the
+`Runtime.workplace` field along with them).

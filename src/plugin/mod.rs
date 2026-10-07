@@ -1,13 +1,13 @@
-//! 插件宿主：每个插件是一个独立子进程，通过 stdio 交换「每行一个 JSON」的 RPC 消息。
+//! Plugin host: each plugin is a separate child process, exchanging "one JSON per line" RPC messages over stdio.
 //!
-//! 协议：
-//!   1. 宿主启动插件后发送 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-//!      插件回复 result: {"name":..., "tools":[{"name","description","parameters","access"}]}
-//!      `access` 可缺省：写 "read" 表示这道工具**只读**（工作区边界按读判 —— 读不设限），
-//!      其余一律按「可能落盘」判。见 [`ToolDef::access`]。
-//!   2. 宿主发送 {"jsonrpc":"2.0","id":N,"method":"tools/call","params":{"name","arguments"}}
-//!      插件回复 result: {"content":"...","is_error":false}
-//!   3. 宿主可发送通知 {"jsonrpc":"2.0","method":"shutdown"}，插件应自行退出。
+//! Protocol:
+//!   1. After starting a plugin, the host sends {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+//!      The plugin replies with result: {"name":..., "tools":[{"name","description","parameters","access"}]}
+//!      `access` is optional: writing "read" means this tool is **read-only** (the workspace boundary is judged as a read — reads are unrestricted),
+//!      everything else is judged as "may write to disk". See [`ToolDef::access`].
+//!   2. The host sends {"jsonrpc":"2.0","id":N,"method":"tools/call","params":{"name","arguments"}}
+//!      The plugin replies with result: {"content":"...","is_error":false}
+//!   3. The host may send the notification {"jsonrpc":"2.0","method":"shutdown"}; the plugin should exit on its own.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -22,44 +22,46 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use crate::config::RuntimesConfig;
+use crate::i18n::t;
+use crate::tf;
 use crate::runtime::Runtime;
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 const RUST_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// 抑制子进程在 Windows 上弹出控制台黑窗口。
+/// Suppress the console black window that child processes pop up on Windows.
 ///
-/// 子进程的**创建标志**。
+/// **Creation flags** for child processes.
 ///
-/// 两件事共用这一处：
+/// Two things share this one spot:
 ///
-/// ① **`CREATE_NO_WINDOW`** —— 插件进程的 stdin/stdout 是管道、stderr 落到
-///    `stderr.log`，**从不需要控制台**。但在 GUI 版里宿主编译为 `windows` 子系统
-///    （自身没有控制台），此时启动 `python.exe` / `node.exe` / `rustc.exe` 这类
-///    控制台程序，Windows 会专门为它分配一个新控制台——用户看到的表现就是
-///    「动不动弹出几个黑色窗口」。统一加上这个标志后 CLI 与 GUI 行为一致。
-/// ② **围栏的 `CREATE_SUSPENDED`**（`src/sandbox.rs`）—— 让进程先冻住，好让宿主
-///    在它跑第一行代码之前把它塞进 Job Object。
+/// ① **`CREATE_NO_WINDOW`** — a plugin process's stdin/stdout are pipes and stderr goes to
+///    `stderr.log`, so it **never needs a console**. But in the GUI build the host is compiled as the `windows` subsystem
+///    (with no console of its own); launching console programs like `python.exe` / `node.exe` / `rustc.exe` at that point
+///    makes Windows allocate a fresh console just for it — what the user sees is
+///    "black windows popping up out of nowhere". Adding this flag everywhere makes CLI and GUI behave the same.
+/// ② **The fence's `CREATE_SUSPENDED`** (`src/sandbox.rs`) — freeze the process first so the host
+///    can stuff it into a Job Object before it runs its first line of code.
 ///
-/// 有**两种** `Command`：插件子进程用 `tokio::process::Command`（异步），
-/// 而运行时装配链（certutil / tar / powershell）用 `std::process::Command`（同步）。
-/// 两者都实现了 `creation_flags`，所以这里用一个小 trait 统一，
-/// 避免在每个调用点各自复制一遍平台细节。
+/// There are **two** kinds of `Command`: plugin child processes use `tokio::process::Command` (async),
+/// while the runtime-provisioning chain (certutil / tar / powershell) uses `std::process::Command` (sync).
+/// Both implement `creation_flags`, so a small trait unifies them here,
+/// avoiding a copy of the platform details at every call site.
 pub(crate) trait ProcessFlags {
-    /// 只要求「不弹控制台窗口」。装配链那几个调用点要的就是这个。
+    /// Only requires "no console window pops up". That is exactly what the provisioning call sites need.
     fn hide_console(&mut self) {
         self.process_flags(0);
     }
 
-    /// 设置创建标志：`CREATE_NO_WINDOW` **或上** `extra`。
+    /// Set the creation flags: `CREATE_NO_WINDOW` **OR'd with** `extra`.
     ///
-    /// ⚠️ 底层是**覆盖**不是追加，所以必须一次给全 —— 这也是为什么 `extra`
-    /// 走参数进来、而不是让调用方自己再调一次 `creation_flags`（那样会把
-    /// `CREATE_NO_WINDOW` 抹掉，黑色窗口又回来了）。
+    /// ⚠️ The underlying call **overwrites** rather than appends, so everything must be given at once — that is also why `extra`
+    /// comes in as a parameter instead of letting the caller call `creation_flags` again (which would wipe
+    /// out `CREATE_NO_WINDOW` and bring the black window back).
     fn process_flags(&mut self, extra: u32);
 }
 
-/// 不生成控制台窗口（`winbase.h`）。
+/// Do not create a console window (`winbase.h`).
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -88,33 +90,33 @@ impl ProcessFlags for std::process::Command {
     fn process_flags(&mut self, _extra: u32) {}
 }
 
-/// 插件除工具之外还贡献什么（阶段 6 · 6b）。
+/// What a plugin contributes besides tools (stage 6 · 6b).
 ///
-/// 全部字段可缺省 —— 老插件的 `plugin.toml` 里根本没有 `[contributes]`，
-/// 反序列化出来就是「什么都不贡献」，行为与今天逐字节一致。
+/// All fields are optional — an old plugin's `plugin.toml` has no `[contributes]` at all,
+/// so it deserializes to "contributes nothing", byte-identical in behaviour to today.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Contributes {
-    /// 要接哪几个钩子点。**只认 `hook::POINTS` 里那五个名字**（就是 trait 的方法名）；
-    /// 写错一个即**激活失败** —— 与 `[store] backend` / `[loop] impl` 同一条原则：
-    /// 写了却不生效是最难查的一类问题，宁可当场吵。
+    /// Which hook points to attach to. **Only the five names in `hook::POINTS` are recognized** (they are the trait method names);
+    /// a single misspelling means **activation fails** — the same principle as `[store] backend` / `[loop] impl`:
+    /// a setting written but never taking effect is the hardest class of bug to track down; better to argue loudly on the spot.
     pub hooks: Vec<String>,
-    /// 要贡献的提示词段 id。**正文不写在这里** —— 激活时用 `prompt/segment` 取回，
-    /// 免得提示词内容在两处各存一份、改了清单忘了正文。
+    /// Prompt-segment ids to contribute. **The body is not written here** — it is fetched with `prompt/segment` at activation,
+    /// so the prompt content is not stored in two places and the body forgotten when the manifest is edited.
     pub prompt_segments: Vec<String>,
-    /// 是否贡献主题补丁（激活时用 `theme/patch` 取回）。
+    /// Whether to contribute a theme patch (fetched with `theme/patch` at activation).
     ///
-    /// 本期只做「取回 + 校验 + 展示」，GUI 合并**推迟**：界面主题在建窗口**之前**
-    /// 就定型了（`gui/src/main.rs` 的 `load_theme` 跑在主线程，而插件加载在后台线程），
-    /// 组件补丁天然晚于主题。协议先立好，省得将来再改一遍 RPC。
+    /// This cycle only does "fetch + validate + display"; merging in the GUI is **deferred**: the UI theme is fixed **before**
+    /// the window is created (`gui/src/main.rs`'s `load_theme` runs on the main thread while plugin loading runs on a background thread),
+    /// so a component patch is inherently later than the theme. Set up the protocol now to avoid redoing the RPC later.
     pub theme: bool,
-    /// 能力申请。非空时，**本插件的工具调用一律走 `Ask`**（见 `auth::Policy::level_for`）：
-    /// 声明了要什么能力就得由人点一次头，不许静默搭 `[auth] plugin_tools` 的便车。
+    /// Capability requests. When non-empty, **this plugin's tool calls all go through `Ask`** (see `auth::Policy::level_for`):
+    /// having declared what capabilities it wants, a human must nod once; it may not silently ride on `[auth] plugin_tools`.
     pub caps: Vec<String>,
 }
 
 impl Contributes {
-    /// 什么都没贡献 —— 用来判断「这个插件是不是只剩工具」。
+    /// Contributes nothing — used to decide "is this plugin down to just tools".
     pub fn is_empty(&self) -> bool {
         self.hooks.is_empty()
             && self.prompt_segments.is_empty()
@@ -122,11 +124,11 @@ impl Contributes {
             && self.caps.is_empty()
     }
 
-    /// 生效值 = 清单 ← `initialize` 覆盖（**后写者胜**，与阶段 5 的层栈同一个思路）。
+    /// Effective value = manifest ← overridden by `initialize` (**last writer wins**, the same idea as the stage-5 layer stack).
     ///
-    /// 为什么不只认一处：清单是**离线声明**（宿主不启动插件也看得见，模型照着它写），
-    /// `initialize` 是**进程实况**（插件自己知道得更准，比如它按环境变量决定接哪些点）。
-    /// 两处都有时以进程为准；只写清单的老插件照旧可用。
+    /// Why not recognize only one place: the manifest is an **offline declaration** (visible without starting the plugin, and the model writes against it),
+    /// while `initialize` is the **live process state** (the plugin knows better, e.g. it decides which points to attach to from environment variables).
+    /// When both are present the process wins; an old plugin that only writes the manifest still works.
     pub fn overridden_by(self, live: Option<Self>) -> Self {
         let Some(live) = live else { return self };
         Self {
@@ -141,10 +143,10 @@ impl Contributes {
         }
     }
 
-    /// 校验并规范化：去空白、丢空项、去重；钩子点再按 [`crate::hook::POINTS`] 的固定顺序排。
+    /// Validate and normalize: trim, drop empties, dedupe; hook points are then sorted into [`crate::hook::POINTS`]'s fixed order.
     ///
-    /// 认不出的钩子点直接报错（见字段文档）。排序也是为了让「钩子按什么顺序跑」
-    /// 只取决于声明内容、不取决于书写顺序 —— 同一份清单每次给出同一个执行序。
+    /// An unrecognized hook point is a hard error (see the field docs). The sort also makes the question of what order hooks run in
+    /// depend only on the declared content, not on the order written — the same manifest yields the same execution order every time.
     pub fn normalize(mut self) -> Result<Self> {
         let mut hooks: Vec<String> = Vec::new();
         for p in self.hooks.drain(..) {
@@ -153,10 +155,11 @@ impl Contributes {
                 continue;
             }
             if !crate::hook::POINTS.contains(&p.as_str()) {
-                bail!(
-                    "[contributes] hooks 里有认不出的钩子点: {p}（可用的五个: {}）",
+                bail!(tf!(
+                    "[contributes] hooks has an unknown hook point: {} (the five valid ones: {})",
+                    p,
                     crate::hook::POINTS.join(" / ")
-                );
+                ));
             }
             if !hooks.contains(&p) {
                 hooks.push(p);
@@ -184,12 +187,12 @@ pub struct PluginManifest {
     pub name: String,
     pub language: String,
     pub description: String,
-    /// 脚本插件为入口文件名（main.py）；rust 插件为编译产物文件名
+    /// For a script plugin this is the entry file name (main.py); for a rust plugin it is the compiled artifact's file name
     pub entry: String,
-    /// 除工具之外还贡献什么（阶段 6 · 6b）。缺省 = 只提供工具，与今天一致。
+    /// What it contributes besides tools (stage 6 · 6b). Default = tools only, same as today.
     ///
-    /// `skip_serializing_if`：`save()` 时不给「什么都没贡献」的插件写一个空的
-    /// `[contributes]` 段 —— 老插件重新落盘后仍与旧格式一致。
+    /// `skip_serializing_if`: `save()` does not write an empty
+    /// `[contributes]` section for a plugin that "contributes nothing" — an old plugin re-persisted still matches the old format.
     #[serde(default, skip_serializing_if = "Contributes::is_empty")]
     pub contributes: Contributes,
 }
@@ -210,19 +213,19 @@ pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub parameters: Value,
-    /// 这道工具**声明的意图**：只读还是可能落盘。
+    /// The **declared intent** of this tool: read-only, or possibly writing to disk.
     ///
-    /// 插件在 `initialize` 的工具对象里用 `"access": "read"` 声明（缺省 = 落盘）。
-    /// 宿主只拿它做一件事：判**工作区边界**时按哪一档走 —— 读不设限、写删必须在区内。
+    /// A plugin declares it with `"access": "read"` in the `initialize` tool object (default = write).
+    /// The host uses it for exactly one thing: which tier to apply when judging the **workspace boundary** — reads are unrestricted, writes/deletes must be inside.
     ///
-    /// 为什么这件事必须由插件自己说：插件是**黑盒**，宿主看不见它拿那个路径去干什么，
-    /// 只能按参数名扫「像路径」的字符串（`workplace::scan_paths`）。那张粗网对写是对的
-    /// （保守），对读就是误伤 —— 一个扫描 D 盘的只读工具会被按写入拦下。
-    /// 声明这一位，就是把这个「宿主猜不出来」的信息补上。
+    /// Why the plugin itself must say: a plugin is a **black box**, the host cannot see what it does with that path,
+    /// and can only scan argument names for "path-like" strings (`workplace::scan_paths`). That coarse net is right for writes
+    /// (conservative), but for reads it is collateral damage — a read-only tool that scans the D drive gets blocked as a write.
+    /// Declaring this bit fills in the information "the host cannot guess".
     ///
-    /// ⚠️ 它是**声明，不是强制**：插件仍可以声明 `read` 之后去写。宿主这层边界防的是
-    /// 「模型顺手写到区外」，不是防一个存心作恶的插件进程（那属于另一类威胁模型，
-    /// 见 `docs/SANDBOX.md`）。所以这里不做校验，只如实采信。
+    /// ⚠️ It is a **declaration, not enforcement**: a plugin can still declare `read` and then write. This host-side boundary guards against
+    /// "the model casually writing outside the area", not against a deliberately malicious plugin process (that is a different threat model,
+    /// see `docs/SANDBOX.md`). So no validation is done here, only faithful acceptance.
     pub access: crate::workplace::Access,
 }
 
@@ -233,13 +236,13 @@ struct RpcChannel {
 }
 
 impl RpcChannel {
-    /// 读一行。容忍非 UTF-8 字节（lossy 解码），返回 None 表示子进程 EOF。
+    /// Read one line. Tolerates non-UTF-8 bytes (lossy decode); returning None means child EOF.
     ///
-    /// 子进程若在协议行里混入 GBK/二进制字节，旧实现会直接报
-    /// 「stream did not contain valid UTF-8」而击穿整个 RPC；这里改为尽力解码。
+    /// If a child process mixes GBK/binary bytes into a protocol line, the old implementation would report
+    /// "stream did not contain valid UTF-8" and break the whole RPC; here we decode on a best-effort basis.
     async fn next_line(&mut self) -> Result<Option<String>> {
         let mut buf: Vec<u8> = Vec::new();
-        let n = self.out.read_until(b'\n', &mut buf).await.context("读取插件 stdout 失败")?;
+        let n = self.out.read_until(b'\n', &mut buf).await.context(t("failed to read from the plugin's stdout"))?;
         if n == 0 {
             return Ok(None);
         }
@@ -253,35 +256,35 @@ impl RpcChannel {
     }
 }
 
-/// 一个存活中的插件进程
+/// A live plugin process
 pub struct PluginHandle {
     pub name: String,
     pub language: String,
     pub description: String,
     pub tool_defs: Vec<ToolDef>,
-    /// 生效的组件声明（`plugin.toml [contributes]` ← `initialize` 覆盖后的结果）。
+    /// The effective component declaration (`plugin.toml [contributes]` ← the result after `initialize` overrides).
     pub contributes: Contributes,
-    /// 激活时取回并校验过的主题补丁（与 `config.toml [theme]` 同形状）。
-    /// 本期**只存与展示**，GUI 合并推迟（见 [`Contributes::theme`]）。
+    /// The theme patch fetched and validated at activation (same shape as `config.toml [theme]`).
+    /// This cycle only **stores and displays** it; GUI merging is deferred (see [`Contributes::theme`]).
     pub theme_patch: Option<Box<crate::config::ThemeConfig>>,
-    /// 钩子 RPC 的失败账 —— 与 [`crate::hook::ComponentHook`] **共享同一对 Arc**：
-    /// 钩子那边只读（展示），这里只写（记账）。钩子不允许抛错（抛了会击穿主循环），
-    /// 所以失败只能这样留痕 —— 静默降级，但不静默消失。
+    /// The failure ledger for hook RPC — **shares the same Arc pair** with [`crate::hook::ComponentHook`]:
+    /// the hook side only reads (display), this side only writes (accounting). Hooks may not throw (throwing would break the main loop),
+    /// so failure can only be recorded this way — degrade silently, but never vanish silently.
     pub hook_failures: Arc<std::sync::atomic::AtomicU64>,
     pub hook_last_error: Arc<std::sync::Mutex<Option<String>>>,
     cfg: RuntimesConfig,
-    /// 本插件进程的**围栏**（Job Object，见 `src/sandbox.rs`）。
+    /// This plugin process's **fence** (Job Object, see `src/sandbox.rs`).
     ///
-    /// 放在这里而不是 `Runtime` 上，是为了让它的生命周期**等于进程的生命周期**：
-    /// `Fence::drop` 会关掉 Job 句柄，而 `KILL_ON_JOB_CLOSE` 随即带走这个插件
-    /// 连同它的子孙。于是「插件停止」这件事有两道保险 —— `child.kill()` 与围栏关闭。
+    /// It lives here rather than on `Runtime` so its lifetime **equals the process's lifetime**:
+    /// `Fence::drop` closes the Job handle, and `KILL_ON_JOB_CLOSE` then takes the plugin away
+    /// together with its descendants. So "stop the plugin" has two safeguards — `child.kill()` and closing the fence.
     ///
-    /// 用 `Mutex` 包一层只为一件事：`respawn` 要在 `&self` 上换掉它（原子替换，
-    /// 旧围栏那一刻被 Drop ⇒ 旧进程被 Job 兜底带走，即便 `kill()` 没等干净）。
+    /// The `Mutex` wrapper is for one thing only: `respawn` must swap it out through `&self` (atomic replacement;
+    /// the old fence is Dropped at that moment ⇒ the old process is carried off by the Job, even if `kill()` did not wait cleanly).
     pub fence: std::sync::Mutex<crate::sandbox::Fence>,
-    /// 建围栏用的配置（`respawn` 时要用它重新套一次）。
+    /// Config for building the fence (used by `respawn` to apply it afresh).
     sandbox: crate::sandbox::Sandbox,
-    /// 应用根目录：插件进程的工作目录。插件内相对路径因此与宿主视图一致。
+    /// Application root: the plugin process's working directory. Relative paths inside the plugin therefore match the host's view.
     root: PathBuf,
     dir: PathBuf,
     manifest: PluginManifest,
@@ -290,7 +293,7 @@ pub struct PluginHandle {
 }
 
 impl PluginHandle {
-    /// 发送一次 RPC 并等待匹配 id 的响应（忽略其他行）。
+    /// Send one RPC and wait for the response with a matching id (other lines are ignored).
     pub async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
         let mut ch = self.rpc.lock().await;
         ch.next_id += 1;
@@ -298,33 +301,33 @@ impl PluginHandle {
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let mut line = serde_json::to_string(&req)?;
         line.push('\n');
-        ch.stdin.write_all(line.as_bytes()).await.context("写入插件 stdin 失败")?;
+        ch.stdin.write_all(line.as_bytes()).await.context(t("failed to write to the plugin's stdin"))?;
         ch.stdin.flush().await?;
         loop {
             let line = ch
                 .next_line()
                 .await?
-                .ok_or_else(|| anyhow!("插件 {} 进程已退出", self.name))?;
+                .ok_or_else(|| anyhow!(tf!("plugin {} process has exited", self.name)))?;
             let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                continue; // 插件打印的非协议行，忽略
+                continue; // a non-protocol line printed by the plugin; ignore it
             };
             if v.get("id").and_then(|x| x.as_u64()) != Some(id) {
                 continue;
             }
             if let Some(err) = v.get("error") {
-                bail!("插件 {} 返回错误: {err}", self.name);
+                bail!(tf!("plugin {} returned an error: {}", self.name, err));
             }
             return Ok(v.get("result").cloned().unwrap_or(Value::Null));
         }
     }
 
     pub async fn shutdown(&self) {
-        // 尽力通知，随后强制结束
+        // Notify on a best-effort basis, then force it to end
         let _ = self.rpc("shutdown", Value::Null).await;
         let _ = self.child.lock().await.kill().await;
     }
 
-    /// 杀死当前进程并重新拉起 + 重新握手。用于插件无响应/崩溃后的自愈。
+    /// Kill the current process, respawn it, and re-handshake. Used for self-healing after the plugin hangs/crashes.
     pub async fn respawn(&self) -> Result<()> {
         {
             let mut c = self.child.lock().await;
@@ -332,13 +335,13 @@ impl PluginHandle {
         }
         let mut child = spawn_command(&self.cfg, &self.root, &self.dir, &self.manifest, &self.sandbox)?
             .spawn()
-            .context("重启插件进程失败")?;
-        // 新进程要**重新套一次围栏**，理由与首次启动相同：它也是冻着出来的。
-        // 旧围栏在这行之后才被换掉（它的 Job 里只有那个已经死掉的旧进程，
-        // 关不关都无所谓，但顺序上先套新的更安全）。
+            .context(t("failed to restart the plugin process"))?;
+        // The new process must be **fenced afresh**, for the same reason as the first launch: it too comes out frozen.
+        // The old fence is replaced only after this line (its Job holds only the old, already-dead process,
+        // so whether it closes hardly matters, but fencing the new one first is safer).
         let fence = self.sandbox.contain(&child);
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("无法获取插件 stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("无法获取插件 stdout"))?;
+        let stdin = child.stdin.take().ok_or_else(|| anyhow!(t("cannot take the plugin's stdin")))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!(t("cannot take the plugin's stdout")))?;
         {
             let mut ch = self.rpc.lock().await;
             *ch = RpcChannel { stdin, out: BufReader::new(stdout), next_id: 0 };
@@ -347,21 +350,21 @@ impl PluginHandle {
         if let Ok(mut f) = self.fence.lock() {
             *f = fence;
         }
-        // 握手确认新进程可用
+        // Handshake to confirm the new process is usable
         self.rpc("initialize", json!({})).await?;
         Ok(())
     }
 
-    /// 围栏状态的一行短文本（`/plugins` 用）。
+    /// A one-line short text of fence status (used by `/plugins`).
     pub fn fence_status(&self) -> String {
         match self.fence.lock() {
             Ok(f) => f.status_text(),
-            Err(_) => "围栏 ?".to_string(),
+            Err(_) => t("fenced ?").to_string(),
         }
     }
 }
 
-/// 插件提供的一个工具（对 ToolRegistry 注册）
+/// A tool provided by a plugin (registered with ToolRegistry)
 pub struct PluginTool {
     handle: Arc<PluginHandle>,
     def: ToolDef,
@@ -381,7 +384,7 @@ impl crate::tool::Tool for PluginTool {
     fn parameters(&self) -> Value {
         self.def.parameters.clone()
     }
-    /// 按**插件声明的**意图判（见 [`ToolDef::access`]）—— 没声明就是落盘。
+    /// Judged by the **plugin-declared** intent (see [`ToolDef::access`]) — undeclared means write.
     fn access(&self) -> crate::workplace::Access {
         self.def.access
     }
@@ -394,20 +397,20 @@ impl crate::tool::Tool for PluginTool {
         let first = tokio::time::timeout(timeout, self.handle.rpc("tools/call", params.clone())).await;
         let first_err = match first {
             Ok(Ok(v)) => return parse_tool_result(v),
-            Ok(Err(e)) => format!("插件 {} 通信失败: {e:#}", self.handle.name),
-            Err(_) => format!("插件 {} 响应超时（{} 秒）", self.handle.name, timeout.as_secs()),
+            Ok(Err(e)) => tf!("plugin {} communication failed: {}", self.handle.name, format!("{e:#}")),
+            Err(_) => tf!("plugin {} response timed out ({} s)", self.handle.name, timeout.as_secs()),
         };
 
-        // 插件无响应/崩溃：重启进程后重试一次
+        // Plugin unresponsive/crashed: respawn the process and retry once
         match self.handle.respawn().await {
             Ok(()) => {
                 match tokio::time::timeout(timeout, self.handle.rpc("tools/call", params)).await {
                     Ok(Ok(v)) => parse_tool_result(v),
-                    Ok(Err(e)) => ToolOutput::err(format!("{first_err}；重启插件后重试仍失败: {e:#}")),
-                    Err(_) => ToolOutput::err(format!("{first_err}；重启插件后重试仍超时")),
+                    Ok(Err(e)) => ToolOutput::err(tf!("{}; the retry after restarting the plugin failed too: {}", first_err, format!("{e:#}"))),
+                    Err(_) => ToolOutput::err(tf!("{}; the retry after restarting the plugin timed out too", first_err)),
                 }
             }
-            Err(re) => ToolOutput::err(format!("{first_err}；且插件重启失败: {re:#}")),
+            Err(re) => ToolOutput::err(tf!("{}; and restarting the plugin failed: {}", first_err, format!("{re:#}"))),
         }
     }
 }
@@ -419,12 +422,12 @@ fn parse_tool_result(v: Value) -> crate::tool::ToolOutput {
         .map(|s| s.to_string())
         .unwrap_or_else(|| v.to_string());
     let is_error = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
-    // `"attach": ["<绝对路径>", …]` —— 插件**产出的文件**，宿主会挂给模型看。
+    // `"attach": ["<absolute path>", …]` — files **produced by the plugin**, which the host attaches for the model to see.
     //
-    // 这是「插件也能上传」的落点：插件是独立进程，调不到宿主的 `attach_file` 工具，
-    // 但它能在自己的返回值里**声明**产出的文件。宿主拿到的是一条路径，走的是与用户拖放
-    // 完全相同的判定（`Attachment::probe`）—— 所以「插件截图 → 模型真的看见那张图」成立，
-    // 而不是只把路径当字符串塞进上下文。协议形状见 `prompt::BUILTIN_PROMPT`。
+    // This is the landing spot for "plugins can upload too": a plugin is a separate process and cannot call the host's `attach_file` tool,
+    // but it can **declare** the produced files in its own return value. What the host gets is a path, going through exactly the same
+    // check as a user drag-and-drop (`Attachment::probe`) — so "plugin screenshots → the model really sees that image" holds,
+    // rather than just stuffing the path into the context as a string. Protocol shape in `prompt::BUILTIN_PROMPT`.
     let attach = v
         .get("attach")
         .and_then(|a| a.as_array())
@@ -449,15 +452,15 @@ fn spawn_command(
         .create(true)
         .append(true)
         .open(dir.join("stderr.log"))?;
-    // 入口脚本一律用绝对路径，这样即便把工作目录设成应用根也不会找错文件。
+    // Entry scripts always use absolute paths, so even with the working directory set to the app root the wrong file is never found.
     let entry = dir.join(&manifest.entry);
     let mut cmd = match manifest.language.as_str() {
         "python" => {
             let mut c = Command::new(&cfg.python);
-            // -X utf8 + PYTHONUTF8/PYTHONIOENCODING：强制子进程 stdin/stdout 走 UTF-8。
-            // 这是从宿主侧根治「Windows 默认 GBK 输出破坏 JSON 协议」的关键，
-            // 不再依赖模型在每个插件里手写编码补丁。
-            // -u：关闭缓冲，保证协议行即时可见。
+            // -X utf8 + PYTHONUTF8/PYTHONIOENCODING: force the child's stdin/stdout through UTF-8.
+            // This is the key, from the host side, to curing "Windows' default GBK output breaks the JSON protocol",
+            // no longer relying on the model hand-writing an encoding patch in every plugin.
+            // -u: disable buffering so protocol lines are visible immediately.
             c.args(["-X", "utf8", "-u"]).arg(&entry);
             c.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
             c
@@ -469,10 +472,10 @@ fn spawn_command(
             c
         }
         "rust" => Command::new(&entry),
-        other => bail!("未知插件语言: {other}"),
+        other => bail!(tf!("unknown plugin language: {}", other)),
     };
-    // 围栏要求「先冻住」（`CREATE_SUSPENDED`），由 `spawn_and_init` 在加入 Job 之后再放行。
-    // 沙箱关着时这一项是 0，行为与围栏之前完全一致。
+    // The fence requires "freeze first" (`CREATE_SUSPENDED`); `spawn_and_init` resumes it after it joins the Job.
+    // With the sandbox off this item is 0, and behaviour is exactly as before the fence.
     cmd.process_flags(sandbox.create_flags());
     cmd.current_dir(root)
         .stdin(Stdio::piped())
@@ -482,7 +485,7 @@ fn spawn_command(
     Ok(cmd)
 }
 
-/// 启动插件进程并完成 initialize 握手
+/// Start the plugin process and complete the initialize handshake
 async fn spawn_and_init(
     cfg: &RuntimesConfig,
     root: &Path,
@@ -492,12 +495,12 @@ async fn spawn_and_init(
 ) -> Result<PluginHandle> {
     let mut child = spawn_command(cfg, root, dir, manifest, sandbox)?
         .spawn()
-        .with_context(|| format!("启动插件 {} 失败（请检查 {} 是否在 PATH 中）", manifest.name, cfg.python))?;
-    // 立刻套围栏：进程是冻着出来的，这里是**唯一**能保证「它跑第一行代码之前
-    // 已经在 Job 里」的位置。放进 `PluginHandle` 之后它就与进程同生共死了。
+        .with_context(|| tf!("failed to start plugin {} (check whether {} is in PATH)", manifest.name, cfg.python))?;
+    // Fence it immediately: the process comes out frozen, and this is the **only** place guaranteeing that, before it runs its first line of code,
+    // it is already in the Job. Once inside `PluginHandle` it lives and dies with the process.
     let fence = sandbox.contain(&child);
-    let stdin = child.stdin.take().ok_or_else(|| anyhow!("无法获取插件 stdin"))?;
-    let stdout = child.stdout.take().ok_or_else(|| anyhow!("无法获取插件 stdout"))?;
+    let stdin = child.stdin.take().ok_or_else(|| anyhow!(t("cannot take the plugin's stdin")))?;
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!(t("cannot take the plugin's stdout")))?;
 
     let handle = PluginHandle {
         name: manifest.name.clone(),
@@ -520,24 +523,24 @@ async fn spawn_and_init(
 
     let result = tokio::time::timeout(INIT_TIMEOUT, handle.rpc("initialize", json!({})))
         .await
-        .map_err(|_| anyhow!("插件 {} initialize 握手超时（{} 秒）", manifest.name, INIT_TIMEOUT.as_secs()))??;
+        .map_err(|_| anyhow!(tf!("plugin {} initialize handshake timed out ({} s)", manifest.name, INIT_TIMEOUT.as_secs())))??;
 
-    // ---- 工具（**老形状一个字段都没动**）----
-    // `tools` 缺席按空处理：只贡献钩子/提示词段、不提供工具的组件，本来就没必要
-    // 造一个空数组。它要是数组但不是数组（类型写错），仍然当场报错。
+    // ---- Tools (**not a single field of the old shape was changed**) ----
+    // A missing `tools` is treated as empty: a component that only contributes hooks/prompt segments and
+    // provides no tools has no reason to build an empty array. If it is meant to be an array but is not (wrong type), it still errors on the spot.
     let tools: Vec<Value> = match result.get("tools") {
         None | Some(Value::Null) => Vec::new(),
         Some(v) => v
             .as_array()
             .cloned()
-            .ok_or_else(|| anyhow!("插件 {} initialize 的 tools 不是数组", manifest.name))?,
+            .ok_or_else(|| anyhow!(tf!("plugin {}'s initialize.tools is not an array", manifest.name)))?,
     };
     let mut defs = vec![];
     for t in &tools {
         let name = t
             .get("name")
             .and_then(|n| n.as_str())
-            .ok_or_else(|| anyhow!("插件 {} 的工具缺少 name", manifest.name))?
+            .ok_or_else(|| anyhow!(tf!("a tool of plugin {} lacks name", manifest.name)))?
             .to_string();
         let description = t.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
         let parameters = t.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object"}));
@@ -545,13 +548,13 @@ async fn spawn_and_init(
         defs.push(ToolDef { name, description, parameters, access });
     }
 
-    // ---- 贡献声明：清单 ← `initialize` 覆盖（阶段 6 · 6b）----
-    // 不返回 `contributes` 就是老形状，照旧只用清单（多数插件那份是空的）。
+    // ---- Contribution declaration: manifest ← overridden by `initialize` (stage 6 · 6b) ----
+    // Not returning `contributes` is the old shape and just uses the manifest as before (for most plugins that one is empty).
     let live = match result.get("contributes") {
         None | Some(Value::Null) => None,
         Some(v) => Some(
             serde_json::from_value::<Contributes>(v.clone())
-                .with_context(|| format!("插件 {} 的 initialize.contributes 解析失败", manifest.name))?,
+                .with_context(|| tf!("failed to parse plugin {}'s initialize.contributes", manifest.name))?,
         ),
     };
     let contributes = manifest
@@ -559,27 +562,27 @@ async fn spawn_and_init(
         .clone()
         .overridden_by(live)
         .normalize()
-        .with_context(|| format!("插件 {} 的贡献声明有问题", manifest.name))?;
+        .with_context(|| tf!("plugin {}'s contribution declaration is malformed", manifest.name))?;
 
-    // **阶段 6 · 6b 放宽的那一处**：以前「未声明任何工具」直接判失败，于是
-    // 「只贡献钩子、不提供工具」的组件根本没有活路。现在改成取并集 ——
-    // 工具与贡献**至少得有一样**；两样都没有才是真的配置错误（它什么都不做）。
+    // **The one thing stage 6 · 6b loosened**: previously "declared no tools at all" was a straight failure, so
+    // a component that "only contributes hooks, provides no tools" had no path to life at all. Now it takes the union —
+    // there must be **at least one** of tools and contributions; having neither is a genuine config error (it does nothing).
     if defs.is_empty() && contributes.is_empty() {
-        bail!(
-            "插件 {} 既没声明工具，也没在 [contributes] 里声明任何贡献 —— 它什么都不会做",
+        bail!(tf!(
+            "plugin {} declares neither tools nor any [contributes] — it would do nothing",
             manifest.name
-        );
+        ));
     }
 
     Ok(PluginHandle { tool_defs: defs, contributes, ..handle })
 }
 
-/// 从一条工具声明里取「工作区意图」。
+/// Extract the "workspace intent" from a tool declaration.
 ///
-/// **只认 `"read"`**（大小写与首尾空白容忍），其余 —— 写 `"write"`、拼错成 `"ReadOnly"`、
-/// 类型写成数字、干脆没有这个字段 —— 一律落到「落盘」。这个不对称是刻意的：
-/// 认错方向的两个后果差着量级，**拼错只让工具被多挡一次（用户看得见、模型能改），
-/// 而放错会让一次越界写直接落盘**（不可逆）。所以宁可少认，不可多认。
+/// **Only `"read"` is recognized** (case-insensitive, trimming tolerated); everything else — writing `"write"`, misspelling `"ReadOnly"`,
+/// typing it as a number, or simply having no such field — all fall through to "write". This asymmetry is deliberate:
+/// the two consequences of a wrong direction differ by orders of magnitude — **a misspelling only blocks the tool one extra time (the user sees it, the model can fix it),
+/// whereas getting it wrong lets an out-of-bounds write land directly on disk** (irreversible). So better to recognize too little than too much.
 fn parse_access(t: &Value) -> crate::workplace::Access {
     match t.get("access").and_then(|a| a.as_str()).map(str::trim) {
         Some(s) if s.eq_ignore_ascii_case("read") => crate::workplace::Access::Read,
@@ -587,41 +590,41 @@ fn parse_access(t: &Value) -> crate::workplace::Access {
     }
 }
 
-/// 组件贡献的提示词段默认排在**所有段之后**（内置 core=10 / protocol=20 /
-/// env=30 / rules=40，配置段缺省 50）。组件是「补一层」，不该插到项目规则前面去。
+/// Component-contributed prompt segments default to **after all segments** (built-in core=10 / protocol=20 /
+/// env=30 / rules=40, config segments default 50). A component is "one more layer" and should not jump ahead of the project rules.
 const COMPONENT_SEGMENT_ORDER: i32 = 60;
 
-/// 组件贡献出问题时的提示。
+/// A notice for when a component contribution goes wrong.
 ///
-/// 走 stderr 而不是 UI 事件：激活发生在**组装 Runtime 期间**（CLI 还没进 REPL、
-/// GUI 还没建窗口），此刻根本没有 ui 可以发。运行期出的事故另有
-/// [`crate::hook::ComponentHook`] 那本失败账兜底（`/hook` 里看得见）。
+/// It goes to stderr rather than a UI event: activation happens **while the Runtime is being assembled** (the CLI has not entered the REPL,
+/// the GUI has not built its window), and at that moment there is no ui to send to. Runtime accidents have
+/// [`crate::hook::ComponentHook`]'s failure ledger to fall back on (visible in `/hook`).
 fn component_warn(plugin: &str, why: impl std::fmt::Display) {
-    eprintln!("[组件] {plugin}: {why}");
+    eprintln!("{}", tf!("[component] {}: {}", plugin, why));
 }
 
-/// 把插件提供的**工具与贡献**注册进 Runtime，并把句柄纳入管理。
+/// Register the plugin's **tools and contributions** into the Runtime and bring the handle under management.
 ///
-/// 顺序：**先取贡献内容（要 RPC）→ 再注册工具 → 最后挂贡献**。
+/// Order: **fetch contribution content first (needs RPC) → then register tools → attach contributions last**.
 ///
-/// 两条错误处理的界线是刻意分开的：
-/// - **工具注册失败 = 整个插件装不上**（与今天一致，回滚已注册的）；
-/// - **贡献内容取不回来 = 只警告那一条**（降级）。一个提示词段取不回来，
-///   不该把插件已经能用的工具一起废掉。
+/// The two error-handling lines are deliberately separate:
+/// - **tool registration failure = the whole plugin fails to install** (same as today, rolling back what was registered);
+/// - **failure to fetch contribution content = warn about that one only** (degrade). Failing to fetch one prompt segment
+///   must not scrap tools the plugin can already use.
 async fn activate(rt: &Arc<Runtime>, handle: PluginHandle) -> Result<Vec<String>> {
-    // ---- ① 取回需要 RPC 的贡献（提示词段正文 / 主题补丁）----
+    // ---- ① Fetch the contributions that need RPC (prompt segment bodies / theme patch) ----
     let mut seg_texts: Vec<(String, String)> = Vec::new();
     for id in &handle.contributes.prompt_segments {
         match handle.rpc("prompt/segment", json!({ "id": id })).await {
             Ok(v) => {
                 let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
                 if text.trim().is_empty() {
-                    component_warn(&handle.name, format!("提示词段 {id} 的正文为空，跳过"));
+                    component_warn(&handle.name, tf!("prompt segment {}'s body is empty; skipping", id));
                 } else {
                     seg_texts.push((id.clone(), text));
                 }
             }
-            Err(e) => component_warn(&handle.name, format!("取提示词段 {id} 失败: {e:#}")),
+            Err(e) => component_warn(&handle.name, tf!("failed to fetch prompt segment {}: {}", id, format!("{e:#}"))),
         }
     }
 
@@ -632,16 +635,16 @@ async fn activate(rt: &Arc<Runtime>, handle: PluginHandle) -> Result<Vec<String>
                 Ok(t) => theme_patch = Some(Box::new(t)),
                 Err(e) => component_warn(
                     &handle.name,
-                    format!("主题补丁不是 [theme] 那个形状，已忽略: {e}"),
+                    tf!("the theme patch is not [theme]-shaped; ignored: {}", format!("{e:#}")),
                 ),
             },
-            Err(e) => component_warn(&handle.name, format!("取主题补丁失败: {e:#}")),
+            Err(e) => component_warn(&handle.name, tf!("failed to fetch the theme patch: {}", format!("{e:#}"))),
         }
     }
 
     let handle = Arc::new(PluginHandle { theme_patch, ..handle });
 
-    // ---- ② 工具：注册失败即整体回滚（与今天一致）----
+    // ---- ② Tools: registration failure rolls back the whole thing (same as today) ----
     let mut registered: Vec<String> = vec![];
     for def in &handle.tool_defs {
         let tool = Arc::new(PluginTool { handle: handle.clone(), def: def.clone() });
@@ -650,13 +653,13 @@ async fn activate(rt: &Arc<Runtime>, handle: PluginHandle) -> Result<Vec<String>
                 rt.unregister(n).await;
             }
             handle.shutdown().await;
-            return Err(e.context(format!("激活插件 {} 失败", handle.name)));
+            return Err(e.context(tf!("failed to activate plugin {}", handle.name)));
         }
         registered.push(def.name.clone());
     }
 
-    // ---- ③ 贡献：钩子（纯本地注册，不发 RPC）----
-    // 失败账与句柄**共享同一对 Arc**，所以 `/hook` 报告读到的就是这里记下的。
+    // ---- ③ Contributions: hooks (purely local registration, no RPC) ----
+    // The failure ledger and the handle **share the same Arc pair**, so what `/hook` reports is exactly what is recorded here.
     if !handle.contributes.hooks.is_empty() {
         rt.add_hook(Arc::new(crate::hook::ComponentHook::new(
             handle.name.clone(),
@@ -667,13 +670,13 @@ async fn activate(rt: &Arc<Runtime>, handle: PluginHandle) -> Result<Vec<String>
         )));
     }
 
-    // ---- ④ 贡献：提示词段（正文在 ① 已取回，这里只入注册表）----
+    // ---- ④ Contributions: prompt segments (bodies already fetched in ①; here they only enter the registry) ----
     for (id, body) in seg_texts {
         rt.add_prompt_segment(crate::prompt::PromptSegment {
-            // 段 id 加插件名前缀：段 id 是全局唯一的，两个组件各写一个 `extra_rules`
-            // 不该互相顶掉（那正是「后注册者胜」会干的事）。
+            // Segment id is prefixed with the plugin name: segment ids are globally unique, and two components each writing an `extra_rules`
+            // must not clobber each other (which is exactly what "last registrant wins" would do).
             id: format!("{}:{id}", handle.name),
-            title: format!("{id}（{}）", handle.name),
+            title: tf!("{} ({})", id, handle.name),
             body,
             order: COMPONENT_SEGMENT_ORDER,
             source: crate::prompt::Source::Plugin,
@@ -684,8 +687,8 @@ async fn activate(rt: &Arc<Runtime>, handle: PluginHandle) -> Result<Vec<String>
     Ok(registered)
 }
 
-/// create_plugin 元工具的实现：写源码 → （rust 则编译）→ 启动握手 → 注册工具。
-/// 成功返回注册的工具名列表。
+/// Implementation of the create_plugin meta-tool: write source → (compile if rust) → startup handshake → register tools.
+/// On success returns the list of registered tool names.
 pub async fn create_plugin(
     rt: &Arc<Runtime>,
     name: &str,
@@ -697,30 +700,30 @@ pub async fn create_plugin(
         || name.is_empty()
         || name.len() > 40
     {
-        bail!("插件名只能包含小写字母/数字/下划线，且长度 1-40: {name:?}");
+        bail!(tf!("plugin names may contain only lowercase letters/digits/underscores, length 1-40: {}", format!("{name:?}")));
     }
     let entry = match language {
         "python" => "main.py",
         "node" => "main.js",
         "rust" => "main.rs",
-        other => bail!("language 只能是 python / node / rust，收到: {other}"),
+        other => bail!(tf!("language must be python / node / rust, got: {}", other)),
     };
     let dir = rt.plugins_dir.join(name);
-    // 只有「正在运行的插件」才需要先卸载；残留目录（上次创建失败留下的）自动清理后重建，
-    // 避免出现「创建报已存在、删除报不存在」的死循环。
+    // Only a "currently running plugin" needs unloading first; a leftover directory (from a previous failed creation) is auto-cleaned and rebuilt,
+    // avoiding the dead loop of "creation says it already exists, removal says it does not exist".
     if rt.plugins.lock().await.contains_key(name) {
-        bail!("插件 {name} 正在运行，如需重建请先 remove_plugin");
+        bail!(tf!("plugin {} is running; remove_plugin first if you want to rebuild it", name));
     }
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("清理残留插件目录失败: {}", dir.display()))?;
+            .with_context(|| tf!("failed to clean up the leftover plugin directory: {}", dir.display()))?;
     }
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join(entry), source)?;
 
     let result = create_plugin_inner(rt, name, language, description, entry, &dir).await;
     if result.is_err() {
-        let _ = std::fs::remove_dir_all(&dir); // 失败不留残骸
+        let _ = std::fs::remove_dir_all(&dir); // leave no debris behind on failure
     }
     result
 }
@@ -737,13 +740,13 @@ async fn create_plugin_inner(
 
     if language == "rust" {
         let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
-        // 用解析后的 rustc（可能是应用目录内置的），而不是 config 里的原始值
+        // Use the resolved rustc (possibly the one bundled in the app directory), not the raw value from config
         let runtimes = rt.runtimes();
         let mut cmd = Command::new(&runtimes.rustc);
         cmd.arg("--edition=2021").arg("-O");
-        // 静态链接 CRT，与宿主自身的构建保持一致（见 .cargo/config.toml）。
-        // 只加在 windows 上：其他平台 +crt-static 语义不同（会牵动 libc 的静态/动态链接），
-        // 而这里的目标就是「让插件 exe 不再依赖 VCRUNTIME140.dll」这一件事。
+        // Statically link the CRT, consistent with the host's own build (see .cargo/config.toml).
+        // Only added on windows: on other platforms +crt-static has different semantics (it affects libc's static/dynamic linking),
+        // whereas the goal here is exactly one thing: "stop the plugin exe depending on VCRUNTIME140.dll".
         if cfg!(windows) {
             cmd.args(["-C", "target-feature=+crt-static"]);
         }
@@ -751,10 +754,10 @@ async fn create_plugin_inner(
         cmd.hide_console();
         let build = tokio::time::timeout(RUST_BUILD_TIMEOUT, cmd.output())
             .await
-            .map_err(|_| anyhow!("rustc 编译超时"))?
-            .context("无法启动 rustc（rust 插件需要 Rust 工具链在 PATH 中）")?;
+            .map_err(|_| anyhow!(t("rustc compile timed out")))?
+            .context(t("cannot start rustc (rust plugins need the Rust toolchain in PATH)"))?;
         if !build.status.success() {
-            bail!("rustc 编译失败:\n{}", String::from_utf8_lossy(&build.stderr));
+            bail!(tf!("rustc compile failed:\n{}", String::from_utf8_lossy(&build.stderr)));
         }
         entry = exe;
     }
@@ -764,8 +767,8 @@ async fn create_plugin_inner(
         language: language.to_string(),
         description: description.to_string(),
         entry,
-        // `create_plugin` 造出来的插件默认只提供工具；要声明贡献，模型随后改
-        // `plugin.toml`（或直接让 `initialize` 返回 `contributes`）——两条路都认。
+        // A plugin created by `create_plugin` provides tools only by default; to declare contributions the model later edits
+        // `plugin.toml` (or has `initialize` return `contributes` directly) — both routes are recognized.
         contributes: Contributes::default(),
     };
     manifest.save(dir)?;
@@ -775,8 +778,8 @@ async fn create_plugin_inner(
     activate(rt, handle).await
 }
 
-/// remove_plugin 元工具的实现。
-/// 无论插件是否处于加载状态，都尝试清理其目录，保证「删了就是删了」。
+/// Implementation of the remove_plugin meta-tool.
+/// Whether or not the plugin is loaded, try to clean up its directory, guaranteeing "deleted means deleted".
 pub async fn remove_plugin(rt: &Arc<Runtime>, name: &str) -> Result<Vec<String>> {
     let handle = {
         let mut plugins = rt.plugins.lock().await;
@@ -794,22 +797,22 @@ pub async fn remove_plugin(rt: &Arc<Runtime>, name: &str) -> Result<Vec<String>>
     let dir = rt.plugins_dir.join(name);
     let dir_existed = dir.exists();
     if dir_existed {
-        std::fs::remove_dir_all(&dir).with_context(|| format!("删除插件目录失败: {}", dir.display()))?;
+        std::fs::remove_dir_all(&dir).with_context(|| tf!("failed to delete the plugin directory: {}", dir.display()))?;
     }
     if removed.is_empty() && !dir_existed {
-        bail!("插件不存在: {name}");
+        bail!(tf!("no such plugin: {}", name));
     }
     Ok(removed)
 }
 
-/// 启动时扫描 plugins/ 目录，恢复所有持久化插件。
-/// 返回 (插件名, 结果) 列表，失败不阻断启动。
+/// On startup, scan the plugins/ directory and restore all persisted plugins.
+/// Returns a list of (plugin name, result); failures do not block startup.
 pub async fn load_all(rt: &Arc<Runtime>) -> Vec<(String, Result<Vec<String>>)> {
     let mut out = vec![];
     let Ok(entries) = std::fs::read_dir(&rt.plugins_dir) else {
         return out;
     };
-    // 解析后的解释器配置，整轮扫描共用一份（中途不会被改写）
+    // The resolved interpreter config, shared across the whole scan (never rewritten midway)
     let runtimes = rt.runtimes();
     for entry in entries.flatten() {
         let dir = entry.path();
@@ -821,7 +824,7 @@ pub async fn load_all(rt: &Arc<Runtime>) -> Vec<(String, Result<Vec<String>>)> {
             Err(e) => {
                 out.push((
                     dir.file_name().unwrap_or_default().to_string_lossy().to_string(),
-                    Err(anyhow!("manifest 读取失败: {e:#}")),
+                    Err(anyhow!(tf!("failed to read the manifest: {}", format!("{e:#}")))),
                 ));
                 continue;
             }
@@ -836,140 +839,144 @@ pub async fn load_all(rt: &Arc<Runtime>) -> Vec<(String, Result<Vec<String>>)> {
     out
 }
 
-/// 确保 plugins/sdk/ 存在（Python SDK + 协议说明），供模型编写的插件引用。
-/// 这两个文件由宿主完全拥有，每次启动覆盖写入，保证与宿主版本一致。
+/// Ensure plugins/sdk/ exists (Python SDK + protocol doc) for plugins the model writes to reference.
+/// These two files are wholly owned by the host and overwritten on every startup, guaranteeing they match the host version.
 pub fn ensure_sdk(plugins_dir: &Path) -> Result<()> {
     let sdk = plugins_dir.join("sdk");
     std::fs::create_dir_all(&sdk)?;
-    std::fs::write(sdk.join("plugin_sdk.py"), PYTHON_SDK)?;
-    std::fs::write(sdk.join("PROTOCOL.md"), PROTOCOL_DOC)?;
+    std::fs::write(sdk.join("plugin_sdk.py"), t(PYTHON_SDK))?;
+    std::fs::write(sdk.join("PROTOCOL.md"), t(PROTOCOL_DOC))?;
     Ok(())
 }
 
-pub const PROTOCOL_DOC: &str = r#"# 插件协议（宿主 <-> 插件子进程）
+pub const PROTOCOL_DOC: &str = r#"# Plugin protocol (host <-> plugin subprocess)
 
-每条消息是 stdout/stdin 上的「一行 JSON」。stdout 只允许协议消息，日志一律写 stderr。
+Every message is "one line of JSON" on stdout/stdin. stdout carries protocol messages only; logs always go to stderr.
 
-## 1. 握手
+## 1. Handshake
 
-宿主发送:
+The host sends:
    {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-插件回复一行:
+The plugin replies with one line:
    {"jsonrpc":"2.0","id":1,"result":{
-      "name":"<插件名>",
-      "tools":[{"name":"<工具名>","description":"<说明>","parameters":<JSON Schema>,"access":"<read|write>"}],
-      "contributes":{ ... }          // 可选，见 §4
+      "name":"<plugin name>",
+      "tools":[{"name":"<tool name>","description":"<description>","parameters":<JSON Schema>,"access":"<read|write>"}],
+      "contributes":{ ... }          // optional, see §4
    }}
 
-`tools` 可以省略（只贡献、不提供工具的组件就没必要写它）。
-`contributes` 省略即老形状 —— 只提供工具的插件一个字段都不用改。
+`tools` may be omitted (a component that only contributes, without offering tools, need not write it).
+Omitting `contributes` means the old shape — a tools-only plugin changes not one field.
 
-`access` 也可以省略，省略 = `"write"`：
+`access` may also be omitted; omitted = `"write"`:
 
-  - `"read"`  —— 这道工具**只读**（扫描 / 统计 / 列目录 / 解析文件）。
-                宿主的工作区边界按「读」判，而**读不设限**：它可以访问工作区外的路径，
-                与宿主自带的 read_file / list_dir 同一档，不需要用户提权。
-  - `"write"` —— 可能落盘（默认）。带路径的参数必须落在本次对话的工作区内，否则整次调用
-                被拦下（宿主只能按参数名扫「像路径」的字符串，判不出你拿它去读还是去写，
-                所以没声明的一律按最保守的档走）。
+  - `"read"`  — this tool is **read-only** (scanning / stats / listing / parsing files).
+                The host's workplace boundary judges it by "read", and **reads are unrestricted**: it can
+                reach paths outside the workspace, the same tier as the host's own read_file / list_dir,
+                no user elevation needed.
+  - `"write"` — may touch the disk (the default). Path-bearing arguments must stay inside this
+                conversation's workspace, otherwise the whole call is blocked (the host can only scan
+                argument values for strings that "look like paths" and cannot tell whether you read or
+                write with them, so anything undeclared is handled at the most conservative tier).
 
-只有**真的不写文件、不删东西**的工具才该声明 `"read"`。声明不实不会被宿主拦住
-（插件进程内部宿主看不见），但那等于把这道工具的工作区边界自己撤了。
+Only tools that **really write no files and delete nothing** should declare `"read"`. A false
+declaration is not caught by the host (it cannot see inside the plugin process), but it amounts to
+tearing down that tool's workplace boundary yourself.
 
-## 2. 工具调用
+## 2. Tool call
 
-宿主: {"jsonrpc":"2.0","id":N,"method":"tools/call","params":{"name":"<工具名>","arguments":{...}}}
-插件: {"jsonrpc":"2.0","id":N,"result":{"content":"<字符串结果>","is_error":false}}
+Host: {"jsonrpc":"2.0","id":N,"method":"tools/call","params":{"name":"<tool name>","arguments":{...}}}
+Plugin: {"jsonrpc":"2.0","id":N,"result":{"content":"<string result>","is_error":false}}
 
-## 3. 结束
+## 3. Shutdown
 
-宿主发送 {"jsonrpc":"2.0","method":"shutdown"}（无 id），插件应退出。
+The host sends {"jsonrpc":"2.0","method":"shutdown"} (no id); the plugin should exit.
 
-## 4. 组件贡献（可选，阶段 6 · 6b）
+## 4. Component contributions (optional, stage 6 · 6b)
 
-在 plugin.toml 里声明：
+Declared in plugin.toml:
 
     [contributes]
-    hooks = ["before_tool", "on_error"]   # 只认下面五个名字，写错即激活失败
-    prompt_segments = ["extra_rules"]     # 段 id；正文用 prompt/segment 取回
-    theme = true                          # 是否贡献主题补丁
-    caps = ["fs_write"]                   # 能力申请：本插件的工具调用一律走「询问」
+    hooks = ["before_tool", "on_error"]   # only the five names below are accepted; a typo fails activation
+    prompt_segments = ["extra_rules"]     # segment ids; fetch the body with prompt/segment
+    theme = true                          # whether to contribute a theme patch
+    caps = ["fs_write"]                   # capability request: this plugin's tool calls always go through "ask"
 
-也可以改由上面 initialize 的 `contributes` 返回 —— **两处都有时以 initialize 为准**
-（清单是离线声明，进程实况更准）。
+Alternatively return them from initialize's `contributes` above — **when both exist, initialize wins**
+(the manifest is an offline declaration; the process's live answer is more accurate).
 
-**钩子实现不许报错**：宿主把超时（10 秒）、通信失败、以及认不出的返回值一律当作
-「放行」，并把失败记在账上（`/hook` 里看得到）。所以钩子只管返回想表达的意思，
-不必自己兜底 —— 但**也不要**拿它做耗时的事，它挡着主循环。
+**Hook implementations must not error**: the host treats timeouts (10 s), communication failures and
+unrecognised return values all as "pass", and books the failure (`/hook` shows it). So hooks just
+return what they mean to say — no need to backstop anything — but **don't** do slow work in them:
+they block the main loop.
 
-### 4.1 钩子
+### 4.1 Hooks
 
-宿主: {"jsonrpc":"2.0","id":N,"method":"hooks/<点>","params":{...}}
-插件: {"jsonrpc":"2.0","id":N,"result":{...}}
+Host: {"jsonrpc":"2.0","id":N,"method":"hooks/<point>","params":{...}}
+Plugin: {"jsonrpc":"2.0","id":N,"result":{...}}
 
-点               params                              result
-before_request   {"tools":[...]}                     {"verdict":"pass"|"reject","reason":"…","inject":["补充文本"]}
-after_reply      {"text":…,"tool_calls":<条数>}       {"verdict":…,"text":"改写后的正文"}
-before_tool      {"tool":"名字","args":{...}}         {"verdict":…,"args":{改后的参数}}
+point            params                              result
+before_request   {"tools":[...]}                     {"verdict":"pass"|"reject","reason":"…","inject":["extra text"]}
+after_reply      {"text":…,"tool_calls":<count>}      {"verdict":…,"text":"rewritten text"}
+before_tool      {"tool":"name","args":{...}}         {"verdict":…,"args":{changed args}}
 after_tool       {"tool":…,"content":…,"is_error":…}  {"verdict":…,"content":…,"is_error":…}
-on_error         {"error":"…"}                        {"action":"propagate"|"retry","note":"给模型的提示"}
+on_error         {"error":"…"}                        {"action":"propagate"|"retry","note":"hint for the model"}
 
-`inject` 只接受**用户文本**（字符串数组）—— 钩子这一层只开放「追加」，
-不给「改写历史」的能力（那是 `[loop] max_rounds` 的事）。
-`after_reply` 只能改正文，不能改 `tool_calls`（改了等于伪造模型意图）。
+`inject` accepts **user text only** (an array of strings) — this layer opens up "appending" only,
+not "rewriting history" (that is `[loop] max_rounds`'s business).
+`after_reply` can only change the text, not `tool_calls` (changing those would forge the model's intent).
 
-### 4.2 提示词段
+### 4.2 Prompt segments
 
-宿主: {"jsonrpc":"2.0","id":N,"method":"prompt/segment","params":{"id":"extra_rules"}}
-插件: {"jsonrpc":"2.0","id":N,"result":{"text":"这一段的正文"}}
+Host: {"jsonrpc":"2.0","id":N,"method":"prompt/segment","params":{"id":"extra_rules"}}
+Plugin: {"jsonrpc":"2.0","id":N,"result":{"text":"the segment's body"}}
 
-### 4.3 主题补丁
+### 4.3 Theme patch
 
-宿主: {"jsonrpc":"2.0","id":N,"method":"theme/patch","params":null}
-插件: {"jsonrpc":"2.0","id":N,"result":{ ...与 config.toml 的 [theme] 同一形状... }}
+Host: {"jsonrpc":"2.0","id":N,"method":"theme/patch","params":null}
+Plugin: {"jsonrpc":"2.0","id":N,"result":{ ...same shape as config.toml's [theme]... }}
 
-本期宿主只**取回并校验**主题补丁（GUI 合并尚未接线，见 `plugin/mod.rs` 的注释）。
+For now the host only **fetches and validates** theme patches (GUI merging is not wired yet — see
+the comments in `plugin/mod.rs`).
 
-Python 插件推荐直接使用同目录下的 plugin_sdk.py。
-"#;
+Python plugins should use the plugin_sdk.py in the same directory directly."#;
 
-pub const PYTHON_SDK: &str = r#""""
-AOX - Python 插件 SDK
+pub const PYTHON_SDK: &str = r#"""""
+AOX - Python plugin SDK
 
-最小插件（只提供工具）:
+A minimal plugin (tools only):
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sdk"))
     from plugin_sdk import serve
 
     def my_tool(args):
-        return "结果字符串"
+        return "result string"
 
-    serve("插件名", {
-        "my_tool": ("工具说明", {"type": "object", "properties": {}}, my_tool),
+    serve("plugin name", {
+        "my_tool": ("what the tool does", {"type": "object", "properties": {}}, my_tool),
     })
 
-组件（除工具之外还贡献钩子 / 提示词段 / 主题）:
+Components (hooks / prompt segments / theme on top of tools):
     def before_tool(params):
-        # params = {"tool": "工具名", "args": {...}}
+        # params = {"tool": "tool name", "args": {...}}
         return {"verdict": "pass", "args": params["args"]}
 
     serve(
-        "插件名",
+        "plugin name",
         {},
         contributes={"hooks": ["before_tool"], "prompt_segments": ["note"], "caps": ["fs_write"]},
         hooks={"before_tool": before_tool},
-        prompt_segments={"note": "写文件之前先想清楚要写什么。"},
+        prompt_segments={"note": "Think about what to write before writing any file."},
     )
 
-工具或钩子里抛异常都不会连累宿主：工具异常变成 is_error 结果，
-钩子异常写进 stderr 并按「放行」返回。
+Exceptions thrown inside a tool or a hook never take the host down: a tool exception becomes an
+is_error result; a hook exception goes to stderr and returns as "pass".
 """
 import sys
 import json
 
 
 def _resolve(value):
-    # 允许「值」和「无参函数」两种写法（后者用于每次现算的场景）
+    # accepts either a plain value or a zero-arg callable (the latter is computed each time)
     return value() if callable(value) else value
 
 
@@ -979,17 +986,20 @@ def _send(msg):
 
 
 def _tool_entry(name, spec):
-    """一条工具声明 → 协议里的 JSON。
+    """One tool declaration -> the protocol's JSON.
 
-    spec 是 (说明, JSON Schema, handler)，**第 4 位可选**写 access：
+    spec is (description, JSON Schema, handler), with an **optional 4th slot** for access:
 
-      "read"  → 这道工具**只读**。宿主的工作区边界会按「读」判 —— 读不设限，
-                于是扫描 / 统计 / 列目录可以访问工作区外的路径
-                （与宿主自带的 read_file / list_dir 同一档，不需要用户提权）。
-      不写 / 其它 → 可能落盘：带路径的参数必须落在本次对话的工作区内。
+      "read"  -> this tool is **read-only**. The host's workplace boundary judges by "read" —
+                 reads are unrestricted, so scanning / stats / listing can reach paths outside
+                 the workspace (the same tier as the host's own read_file / list_dir; no user
+                 elevation needed).
+      omitted / other -> may touch the disk: path-bearing arguments must stay inside this
+                 conversation's workspace.
 
-    只有**真的不写文件、不删东西**的工具才该写 "read"。声明不实不会被宿主拦住
-    （它看不见插件进程内部），但那就等于把这道工具的工作区边界自己撤了。
+    Only tools that **really write no files and delete nothing** should write "read". A false
+    declaration is not caught by the host (it cannot see inside the plugin process), but it
+    amounts to tearing down that tool's workplace boundary yourself.
     """
     return {
         "name": name,
@@ -1000,16 +1010,16 @@ def _tool_entry(name, spec):
 
 
 def serve(plugin_name, tools, contributes=None, hooks=None, prompt_segments=None, theme=None):
-    """起服务。参数都可缺省，只写用得上的那些。
+    """Serve. Every parameter is optional; write only the ones you use.
 
-    tools:           {工具名: (说明, JSON Schema, handler[, "read"])}，
-                     handler(dict) -> 结果字符串。
-                     第 4 位写 "read" = 这道工具只读（见 _tool_entry）
-    contributes:     贡献声明 dict（hooks / prompt_segments / theme / caps），
-                     等价于写在 plugin.toml 的 [contributes] 里（两处都有时以此为准）
-    hooks:           {点名字: fn(params) -> dict}，点名字见 PROTOCOL.md 的五个
-    prompt_segments: {段 id: 正文}，正文也可以是 fn() -> 正文
-    theme:           主题补丁 dict，也可以是 fn() -> dict
+    tools:           {tool name: (description, JSON Schema, handler[, "read"])},
+                     handler(dict) -> result string.
+                     A 4th slot "read" = the tool is read-only (see _tool_entry)
+    contributes:     contribution dict (hooks / prompt_segments / theme / caps),
+                     equivalent to [contributes] in plugin.toml (when both exist, this wins)
+    hooks:           {point name: fn(params) -> dict}; point names are the five in PROTOCOL.md
+    prompt_segments: {segment id: body}; the body may also be fn() -> body
+    theme:           theme patch dict; may also be fn() -> dict
     """
     tools = tools or {}
     hooks = hooks or {}
@@ -1038,7 +1048,7 @@ def serve(plugin_name, tools, contributes=None, hooks=None, prompt_segments=None
             args = params.get("arguments") or {}
             try:
                 if tname not in tools:
-                    raise KeyError(f"未知工具: {tname}")
+                    raise KeyError(f"unknown tool: {tname}")
                 handler = tools[tname][2]
                 _send({"jsonrpc": "2.0", "id": mid,
                        "result": {"content": str(handler(args)), "is_error": False}})
@@ -1049,13 +1059,13 @@ def serve(plugin_name, tools, contributes=None, hooks=None, prompt_segments=None
             point = method[len("hooks/"):]
             handler = hooks.get(point)
             if handler is None:
-                # 没声明这个点：直接「放行」，宿主那边连失败账都不会记
+                # this point is not declared: "pass" straight away, the host does not even book a failure
                 _send({"jsonrpc": "2.0", "id": mid, "result": {}})
             else:
                 try:
                     _send({"jsonrpc": "2.0", "id": mid, "result": handler(params) or {}})
                 except Exception as e:
-                    # 钩子抛异常不连累宿主：写 stderr 留痕，按「放行」返回
+                    # a hook exception never takes the host down: trace to stderr, return as "pass"
                     sys.stderr.write(f"[hook {point}] {type(e).__name__}: {e}\n")
                     sys.stderr.flush()
                     _send({"jsonrpc": "2.0", "id": mid, "result": {}})
@@ -1069,28 +1079,27 @@ def serve(plugin_name, tools, contributes=None, hooks=None, prompt_segments=None
         elif method == "theme/patch":
             _send({"jsonrpc": "2.0", "id": mid, "result": _resolve(theme) or {}})
         elif method == "shutdown":
-            break
-"#;
+            break"#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 老清单（没有 `[contributes]`）必须原样能解析 —— 向后兼容是这一阶段的硬指标。
+    /// An old manifest (no `[contributes]`) must still parse as-is — backward compatibility is a hard requirement of this stage.
     #[test]
     fn old_manifest_without_contributes_still_parses() {
         let m: PluginManifest = toml::from_str(
-            "name = \"fs\"\nlanguage = \"python\"\ndescription = \"文件读写\"\nentry = \"main.py\"\n",
+            "name = \"fs\"\nlanguage = \"python\"\ndescription = \"file read/write\"\nentry = \"main.py\"\n",
         )
         .unwrap();
-        assert!(m.contributes.is_empty(), "老清单不该凭空长出贡献");
+        assert!(m.contributes.is_empty(), "an old manifest must not grow contributions out of nowhere");
     }
 
-    /// 新清单能解析出四类声明。
+    /// A new manifest can parse the four kinds of declaration.
     #[test]
     fn manifest_parses_the_contributes_section() {
         let m: PluginManifest = toml::from_str(
-            "name = \"comp\"\nlanguage = \"python\"\ndescription = \"组件\"\nentry = \"main.py\"\n\n\
+            "name = \"comp\"\nlanguage = \"python\"\ndescription = \"component\"\nentry = \"main.py\"\n\n\
              [contributes]\n\
              hooks = [\"before_tool\", \"on_error\"]\n\
              prompt_segments = [\"note\"]\n\
@@ -1105,7 +1114,7 @@ mod tests {
         assert!(!m.contributes.is_empty());
     }
 
-    /// 空的贡献段不该被**写出来** —— 老插件重新落盘后格式仍与旧版一致。
+    /// An empty contribution section must not be **written out** — an old plugin re-persisted still matches the old format.
     #[test]
     fn save_omits_an_empty_contributes_section() {
         let dir = std::env::temp_dir().join("aox-manifest-save-test");
@@ -1119,11 +1128,11 @@ mod tests {
         };
         m.save(&dir).unwrap();
         let text = std::fs::read_to_string(dir.join("plugin.toml")).unwrap();
-        assert!(!text.contains("contributes"), "空的贡献段不该被写出来: {text}");
+        assert!(!text.contains("contributes"), "an empty contributes section must not be written: {text}");
         let _ = std::fs::remove_file(dir.join("plugin.toml"));
     }
 
-    /// 认不出的钩子点名 = **激活失败**，且错误里要同时给出「是哪个」和「可用哪些」。
+    /// An unrecognized hook point name = **activation failure**, and the error must give both "which one" and "which are available".
     #[test]
     fn normalize_rejects_an_unknown_hook_point() {
         let c = Contributes {
@@ -1131,11 +1140,11 @@ mod tests {
             ..Default::default()
         };
         let e = c.normalize().unwrap_err().to_string();
-        assert!(e.contains("before_evrything"), "错误里要点名是哪个: {e}");
-        assert!(e.contains("before_request"), "错误里要列出可用的五个: {e}");
+        assert!(e.contains("before_evrything"), "the error must name the offender: {e}");
+        assert!(e.contains("before_request"), "the error must list the five valid ones: {e}");
     }
 
-    /// 规范化：去空白、丢空项、去重；钩子点顺序固定按 `POINTS`，与书写顺序无关。
+    /// Normalization: trim, drop empties, dedupe; hook point order is fixed by `POINTS`, independent of the order written.
     #[test]
     fn normalize_dedups_and_fixes_the_order() {
         let c = Contributes {
@@ -1144,11 +1153,11 @@ mod tests {
             ..Default::default()
         };
         let c = c.normalize().unwrap();
-        assert_eq!(c.hooks, vec!["before_tool", "on_error"], "按 POINTS 的固定顺序");
+        assert_eq!(c.hooks, vec!["before_tool", "on_error"], "in POINTS' fixed order");
         assert_eq!(c.prompt_segments, vec!["note"]);
     }
 
-    /// `initialize` 覆盖清单（**后写者胜**），但「清单有、initialize 没提」的字段留给清单。
+    /// `initialize` overrides the manifest (**last writer wins**), but a field "present in the manifest and unmentioned by initialize" stays with the manifest.
     #[test]
     fn initialize_contributes_wins_over_the_manifest() {
         let manifest = Contributes {
@@ -1157,38 +1166,38 @@ mod tests {
             ..Default::default()
         };
 
-        // initialize 什么都没说 → 完全用清单
+        // initialize said nothing → use the manifest entirely
         assert_eq!(manifest.clone().overridden_by(None).hooks, vec!["before_tool"]);
 
-        // initialize 说了 → 它说的字段以它为准，其余保留清单
+        // initialize spoke → the fields it names are its call, the rest stay with the manifest
         let live = Contributes { hooks: vec!["on_error".into()], theme: true, ..Default::default() };
         let eff = manifest.overridden_by(Some(live));
-        assert_eq!(eff.hooks, vec!["on_error"], "进程实况覆盖清单");
-        assert!(eff.theme, "清单没提 theme，取 initialize 的");
-        assert_eq!(eff.caps, vec!["fs_read"], "initialize 没提 caps，保留清单的");
+        assert_eq!(eff.hooks, vec!["on_error"], "the process's live answer overrides the manifest");
+        assert!(eff.theme, "the manifest does not mention theme; take initialize's");
+        assert_eq!(eff.caps, vec!["fs_read"], "initialize does not mention caps; keep the manifest's");
     }
 
-    /// 声明的**读取意图**怎么解析。
+    /// How the declared **read intent** is parsed.
     ///
-    /// 这条钉的是一个**不对称**：认错方向的两个后果差着量级 —— 该认成读的没认成，
-    /// 工具被多挡一次（用户看得见、模型能改）；该认成写的认成了读，一次越界写就直接
-    /// 落盘了（不可逆）。所以只认 `"read"`，其余一律落到最保守的「落盘」。
+    /// This pins an **asymmetry**: the two consequences of a wrong direction differ by orders of magnitude — failing to recognize a read
+    /// blocks the tool one extra time (the user sees it, the model can fix it); recognizing a write as a read lets an out-of-bounds write
+    /// land directly on disk (irreversible). So only `"read"` is recognized; everything else falls to the most conservative "write".
     #[test]
     fn access_declaration_is_read_only_when_it_exactly_says_so() {
         use crate::workplace::Access;
         let read = |v: serde_json::Value| parse_access(&json!({"access": v}));
 
         assert_eq!(read(json!("read")), Access::Read);
-        // 大小写与首尾空白容忍：这是「同一个词写歪了」，不该罚
+        // Case and surrounding-whitespace tolerant: this is "the same word written crookedly", and should not be punished
         assert_eq!(read(json!(" read ")), Access::Read);
         assert_eq!(read(json!("READ")), Access::Read);
 
-        // 其余全部落到落盘 —— 每一条都可能是插件作者的手滑，多挡一次不会出事
+        // Everything else falls to write — each could be a plugin author's slip, and one extra block does no harm
         assert_eq!(read(json!("write")), Access::Write);
-        assert_eq!(read(json!("readonly")), Access::Write, "只认 read 这一个词");
+        assert_eq!(read(json!("readonly")), Access::Write, "only the word read is recognised");
         assert_eq!(read(json!("read_only")), Access::Write);
-        assert_eq!(read(json!(1)), Access::Write, "类型不对也保守");
+        assert_eq!(read(json!(1)), Access::Write, "a wrong type is treated conservatively too");
         assert_eq!(read(json!(null)), Access::Write);
-        assert_eq!(parse_access(&json!({})), Access::Write, "缺字段 = 老插件，行为不变");
+        assert_eq!(parse_access(&json!({})), Access::Write, "missing field = old plugin, unchanged behavior");
     }
 }

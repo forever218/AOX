@@ -1,18 +1,20 @@
-# core —— 出厂组合的唯一入口。
+# core -- the single entry point of the factory composition.
 #
-# 它自己**不带任何值**，只声明「这一套由哪些 bundle 组成」。每个 bundle 管一块，
-# 顺序即优先级：**后入场的覆盖先入场的**；聚合者（也就是本文件）在它的子 bundle
-# 之后入场，所以 core 自己若写了值，能盖住下面这些。
+# It carries **no values of its own**; it only declares "which bundles make up this set".
+# Each bundle owns one area, and the order is the priority: **later entrants override earlier
+# ones**; the aggregator (this file) enters after its sub-bundles, so anything core writes for
+# itself covers them.
 #
-# 想改这一套？别改这里 —— 在 aox.toml 的 [profiles.<名>] 里换 bundle 列表，
-# 或者叠一层 patch 文件（见 aox.example.toml）。
+# Want to change the set? Don't change this -- swap the bundle list under [profiles.<name>] in
+# aox.toml, or layer a patch file on top (see aox.example.toml).
 #
-# 这五个名字就是「出厂选择」的全部：换 llm-openai 就是换协议家族，
-# 换 store-jsonl 就是换存储形态，换 loop-standard 就是换循环形态。
+# These five names are the whole of the "factory choice": swap llm-openai and you swap the
+# protocol family, swap store-jsonl and you swap the storage form, swap loop-standard and you
+# swap the loop form.
 bundles = [
-    "llm-openai",     # 模型端点：OpenAI 兼容协议
-    "tools",          # 工具、插件运行时、以及它们默认的授权档
-    "store-jsonl",    # 存储：一次对话一个文件
-    "loop-standard",  # 循环：标准主循环、不带任何 hook
-    "prompt-core",    # 提示词：内置分段（core / protocol / env / rules）
+    "llm-openai",     # model endpoint: the OpenAI-compatible protocol
+    "tools",          # tools, the plugin runtime, and their default authorization tiers
+    "store-jsonl",    # storage: one file per conversation
+    "loop-standard",  # loop: the standard main loop, with no hooks at all
+    "prompt-core",    # prompt: the built-in segments (core / protocol / env / rules)
 ]

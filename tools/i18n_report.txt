@@ -1,0 +1,1395 @@
+
+===== gui\src\activity.rs (57) =====
+  gui\src\activity.rs:90: 输入
+  gui\src\activity.rs:91: 模型
+  gui\src\activity.rs:92: 工具
+  gui\src\activity.rs:93: 授权
+  gui\src\activity.rs:94: 信息
+  gui\src\activity.rs:95: 警告
+  gui\src\activity.rs:96: 错误
+  gui\src\activity.rs:156: 输入
+  gui\src\activity.rs:157: 模型
+  gui\src\activity.rs:159: 系统
+  gui\src\activity.rs:388: 用户指令
+  gui\src\activity.rs:409: 模型产出
+  gui\src\activity.rs:427: …（前文省略）{}
+  gui\src\activity.rs:474: \n\n── 结果 ──\n
+  gui\src\activity.rs:698: AOX 活动流
+  gui\src\activity.rs:1137: 活动流
+  gui\src\activity.rs:1142: 就绪
+  gui\src\activity.rs:1146: 空闲 · 不记录任何内容
+  gui\src\activity.rs:1148: 空闲 · 共 {} 轮 · {} 条记录
+  gui\src\activity.rs:1298: 起点
+  gui\src\activity.rs:1299: 把第一轮的开始钉在最左边
+  gui\src\activity.rs:1304: 居中
+  gui\src\activity.rs:1305: 让「当前时刻」停在正中，两边都看得见
+  gui\src\activity.rs:1310: 最新
+  gui\src\activity.rs:1311: 贴着最新的进度走
+  gui\src\activity.rs:1320: 轮次
+  gui\src\activity.rs:1331: 定位
+  gui\src\activity.rs:1339: 共 {} 轮
+  gui\src\activity.rs:1353: 行高 ＋：把每一行撑高。超出可视区后用 Shift+滚轮 上下翻
+  gui\src\activity.rs:1358: 行高 －：把每一行压矮，一屏看更多行
+  gui\src\activity.rs:1362: 行高
+  gui\src\activity.rs:1365: 放大（横轴）
+  gui\src\activity.rs:1368: 缩小（横轴）
+  gui\src\activity.rs:1371: 缩放
+  gui\src\activity.rs:1374: 适应
+  gui\src\activity.rs:1375: 整段铺满窗口，并把行高交回自动
+  gui\src\activity.rs:1380: 连接线
+  gui\src\activity.rs:1381: 按真实执行顺序把各条色块首尾相连，线色取自出发的那一条
+  gui\src\activity.rs:1503: 滚轮：左右平移 · Ctrl+滚轮：缩放横轴 · Shift+滚轮：上下翻行\n\\n             拖动：平移 · 点击色块：看这一步的详情
+  gui\src\activity.rs:1584: 秒
+  gui\src\activity.rs:1591: 轮次
+  gui\src\activity.rs:1662: 还有 {below} 行 · Shift+滚轮 上下翻
+  gui\src\activity.rs:1925: 空闲时不记录任何内容 · 下达指令后，这里会按时间铺开模型与每一步工具调用
+  gui\src\activity.rs:2035: 还没有选中任何过程
+  gui\src\activity.rs:2038: 程序空闲时不记录任何内容；下达指令后，这里会按时间铺开每一步。
+  gui\src\activity.rs:2060: 第 {} 轮
+  gui\src\activity.rs:2083: {} 开始 · 进行中 {dur:.2}s
+  gui\src\activity.rs:2111: （没有更多信息）
+  gui\src\activity.rs:2166: 看看目录
+  gui\src\activity.rs:2169: 3 项
+  gui\src\activity.rs:2171: 信息
+  gui\src\activity.rs:2174: 输入 / 模型 / 工具 / 系统 各一条
+  gui\src\activity.rs:2175: 同样的记录不该被导出两次
+  gui\src\activity.rs:2178: 再写个文件
+  gui\src\activity.rs:2188: 装回来的记录本来就在文件里，水位要跟着对齐
+  gui\src\activity.rs:2189: 装回来的不该被当成新记录再写一遍
+  gui\src\activity.rs:2194: 继续
+
+===== gui\src\app.rs (136) =====
+  gui\src\app.rs:202: 额外
+  gui\src\app.rs:203: 外观
+  gui\src\app.rs:204: 系统
+  gui\src\app.rs:205: 关于
+  gui\src\app.rs:383: 就绪
+  gui\src\app.rs:518: 就绪
+  gui\src\app.rs:518: 未配置模型
+  gui\src\app.rs:557: 思考中
+  gui\src\app.rs:569: 思考中
+  gui\src\app.rs:643: 请求授权 · {tool}
+  gui\src\app.rs:652: 等你选择
+  gui\src\app.rs:661: 等你选择
+  gui\src\app.rs:665: 致命错误
+  gui\src\app.rs:840: 历史记录
+  gui\src\app.rs:842: 刷新
+  gui\src\app.rs:859: 还没有历史记录。\n发出第一条指令后，这段对话会自动保存到这里。
+  gui\src\app.rs:985: 执行 {name}
+  gui\src\app.rs:987: 超时上限 {timeout_secs}s
+  gui\src\app.rs:1003: 信息
+  gui\src\app.rs:1009: 警告
+  gui\src\app.rs:1025: 错误
+  gui\src\app.rs:1046: 就绪
+  gui\src\app.rs:1069: 任务中断
+  gui\src\app.rs:1069: 已执行 {elapsed:.1}s
+  gui\src\app.rs:1103: 拖入的「{}」没有本机路径，无法作为附件。
+  gui\src\app.rs:1195: 当前模型 {}：DeepSeek 侧只有 deepseek-flash 支持图片输入（照发也行，端点会报错）。
+  gui\src\app.rs:1242: （{} 个附件）
+  gui\src\app.rs:1244: {text}（{} 个附件）
+  gui\src\app.rs:1263: 正在中断…
+  gui\src\app.rs:1280: 思考中
+  gui\src\app.rs:1695: 模型未就绪
+  gui\src\app.rs:1704: 配置文件：{}
+  gui\src\app.rs:1709: 填写 [provider] 的 base_url / api_key 后重新启动。
+  gui\src\app.rs:1749: 思考中
+  gui\src\app.rs:1885: 演示模式：仅预览界面排布（以 --demo 启动；正常启动即可对话）
+  gui\src\app.rs:1887: 模型未配置，无法对话
+  gui\src\app.rs:1889: 等待授权确认…
+  gui\src\app.rs:1893: 在上面那排选项里点一个，或直接在那一行输入…
+  gui\src\app.rs:1895: 正在执行，可点击右侧停止
+  gui\src\app.rs:1897: 给 AOX 下达指令…
+  gui\src\app.rs:2050: 关闭
+  gui\src\app.rs:2075: 观测Agent内部循环逻辑
+  gui\src\app.rs:2099: 系统信息
+  gui\src\app.rs:2107: 运行时环境
+  gui\src\app.rs:2114: 所用模型
+  gui\src\app.rs:2117: 配置文件
+  gui\src\app.rs:2135: 配置层
+  gui\src\app.rs:2138: 应用根目录
+  gui\src\app.rs:2140: 工作空间
+  gui\src\app.rs:2142: 历史记录
+  gui\src\app.rs:2145: 插件目录
+  gui\src\app.rs:2152: （尚未装配内置运行时）
+  gui\src\app.rs:2154: 运行时目录
+  gui\src\app.rs:2162: 本机没有 Python，文件读写、系统信息等能力不可用。
+  gui\src\app.rs:2167: 安装 Python 运行时（约 10 MB）
+  gui\src\app.rs:2182: （还没收到回执）
+  gui\src\app.rs:2185: 默认档
+  gui\src\app.rs:2186: 完全访问档（写入不受限）
+  gui\src\app.rs:2187: 固定档 {}
+  gui\src\app.rs:2192: （{name} · 还没开地）
+  gui\src\app.rs:2219: 基于 Rust 编写的 AOX 图形化应用，遵循开源协议 ISC。
+  gui\src\app.rs:2225: ISC 协议全文
+  gui\src\app.rs:2247: 作者博客
+  gui\src\app.rs:2248: 项目地址
+  gui\src\app.rs:2257: 工具调用需要授权
+  gui\src\app.rs:2264: 模型想调用一个会改变系统自身的元工具：
+  gui\src\app.rs:2306: 允许一次
+  gui\src\app.rs:2309: 本会话始终允许
+  gui\src\app.rs:2313: 拒绝
+  gui\src\app.rs:2320: 快捷键：y 允许一次 · a 本会话始终允许 · n / Esc 拒绝
+  gui\src\app.rs:2334: 授权结果
+  gui\src\app.rs:2336: 允许一次
+  gui\src\app.rs:2337: 本会话始终允许
+  gui\src\app.rs:2338: 拒绝
+  gui\src\app.rs:2354: 就绪
+  gui\src\app.rs:2420: 做一个插件，统计当前目录下各类文件的数量
+  gui\src\app.rs:2427: 已加载插件: probe_screen, fs
+  gui\src\app.rs:2433: 插件 filestat 已创建、注册并持久化（1 个工具）
+  gui\src\app.rs:2442: 先看看有没有现成的能力可以复用。
+  gui\src\app.rs:2443: 用户要统计文件数量：可以读目录 + 按后缀聚合。宿主里没有这个能力，\\n                    需要先 create_plugin 造一个 filestat 插件，再调用它。
+  gui\src\app.rs:2450: 已经为你造好了 `filestat` 插件，它提供工具 **filestat_count**。\n\n\\n         ## 用法\n\n\\n         ```json\n{ \"path\": \".\", \"ext\": null }\n```\n\n\\n         `ext` 留空表示统计全部后缀。当前目录的结果：\n\n\\n         | 后缀 | 数量 |…
+  gui\src\app.rs:2456: ## 超宽内容\n\n\\n         ```json\n{\"very_long_key_that_never_wraps\":\"C:/Users/someone/AppData/Local/Temp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\",\"n\":1}\n```\n\n\\n         路径 `E:/rustapp/plugins/file…
+  gui\src\app.rs:2462: 插件 filestat 已恢复（1 个工具）
+  gui\src\app.rs:2470: 做一个插件，统计当前目录下各类文件的数量
+  gui\src\app.rs:2472: 用户要统计文件数量：可以读目录 + 按后缀聚合。宿主里没有这个能力，
+  gui\src\app.rs:2473: 需要先 create_plugin 造一个 filestat 插件，再调用它。
+  gui\src\app.rs:2475: 已加载插件: probe_screen, fs
+  gui\src\app.rs:2477: 先看看有没有现成的能力可以复用。
+  gui\src\app.rs:2484: 超时上限 120s
+  gui\src\app.rs:2485: 请求授权 · create_plugin
+  gui\src\app.rs:2486: 授权结果
+  gui\src\app.rs:2486: 允许一次
+  gui\src\app.rs:2487: 插件 filestat 已创建、注册并持久化（1 个工具）
+  gui\src\app.rs:2492: 结果已经拿到，整理成一张表给用户。
+  gui\src\app.rs:2494: 就绪
+  gui\src\app.rs:2497: 把刚才那个插件的用法写进 README
+  gui\src\app.rs:2499: README 里加一节「filestat 用法」即可。
+  gui\src\app.rs:2501: 已写入 1.2 KB
+  gui\src\app.rs:2503: 写完了。
+  gui\src\app.rs:2505: 就绪
+  gui\src\app.rs:2768: 隐藏历史记录
+  gui\src\app.rs:2768: 显示历史记录
+  gui\src\app.rs:2805: 正在执行任务，稍后再新建对话
+  gui\src\app.rs:2807: 新建对话
+  gui\src\app.rs:2863: {} · {} 条
+  gui\src\app.rs:2879: {}\n{}\n点击切换到这段对话
+  gui\src\app.rs:2914: （宿主提示）
+  gui\src\app.rs:3028: 设置
+  gui\src\app.rs:3231: 也可以在这里直接输入…
+  gui\src\app.rs:3339: 移除
+  gui\src\app.rs:3476: #{} · {} 次调用
+  gui\src\app.rs:3482: 输入
+  gui\src\app.rs:3483: 输出
+  gui\src\app.rs:3484: 合计
+  gui\src\app.rs:3485: 推理
+  gui\src\app.rs:3486: 缓存命中
+  gui\src\app.rs:3487: 缓存未命中
+  gui\src\app.rs:3509: 这段对话还没有用量记录
+  gui\src\app.rs:3547: 本次对话 · {} 轮 · {} 次调用
+  gui\src\app.rs:3553: 输入
+  gui\src\app.rs:3554: 输出
+  gui\src\app.rs:3555: 合计
+  gui\src\app.rs:3557: 　其中推理
+  gui\src\app.rs:3558: 　缓存命中
+  gui\src\app.rs:3559: 　缓存未命中
+  gui\src\app.rs:3569: 当前上下文
+  gui\src\app.rs:3716: 显示不了这张图：{e}
+  gui\src\app.rs:3723: 正在解码图片…
+  gui\src\app.rs:3757: 出错
+  gui\src\app.rs:3785: 任务已中断 · {n} 步{tail}
+  gui\src\app.rs:3787: 处理过程{tail}
+  gui\src\app.rs:3789: {n} 步工具调用{tail}
+  gui\src\app.rs:3847: 思考过程
+  gui\src\app.rs:4121: 打开活动流
+  gui\src\app.rs:4198: 前提：样式里滚动条要占位，否则这条测试什么也证明不了
+  gui\src\app.rs:4230: egui 不再逐帧改滚动条占位了？那 `App::settings_overlay` 里 \\n             `ui.set_width(content_w)` 那一段的**理由注释**要跟着更新 —— \\n             它存在的唯一目的就是躲开这个动画（不是多余的）。实测宽度序列：{widths:?}
+
+===== gui\src\brand.rs (7) =====
+  gui\src\brand.rs:178: 解码线程提前结束了
+  gui\src\brand.rs:214: 插画显示不出来：{e}
+  gui\src\brand.rs:236: 内嵌的 ico 应该有多档尺寸，实际只有 {}
+  gui\src\brand.rs:238: 尺寸不合理：{size}
+  gui\src\brand.rs:241: {size}×{size} 那帧不是 PNG 载荷
+  gui\src\brand.rs:245: 256 那帧没被认出来
+  gui\src\brand.rs:247: 没有 32×32 那帧
+
+===== gui\src\bridge.rs (12) =====
+  gui\src\bridge.rs:154: 切换工作区失败（{label}）: {e:#}
+  gui\src\bridge.rs:321: 内部错误：这条路径不支持附件，{} 个附件未随消息发出。
+  gui\src\bridge.rs:511: 模型未就绪，暂时无法切换对话
+  gui\src\bridge.rs:516: 模型未就绪，这条指令没有发出。
+  gui\src\bridge.rs:525: 模型未就绪，工作区暂时无法切换。
+  gui\src\bridge.rs:602: 无法创建异步运行时: {e}
+  gui\src\bridge.rs:612: 无法启动 agent 线程
+  gui\src\bridge.rs:629: 插件 SDK 写入失败（{:#}）：插件功能可能不可用
+  gui\src\bridge.rs:697: 插件 {name} 加载失败: {e:#}
+  gui\src\bridge.rs:705: 以下插件没套上进程围栏，它们不受进程数 / 内存 / UI 限制：{}
+  gui\src\bridge.rs:713: LLM 未就绪: {e:#}
+  gui\src\bridge.rs:715: 请在 config.toml 的 [provider] 填写 base_url 与 api_key（或 api_key_env）后重新启动。
+
+===== gui\src\main.rs (1) =====
+  gui\src\main.rs:46: [theme] {e:#}；改用配置里的 [theme]
+
+===== gui\src\svg.rs (14) =====
+  gui\src\svg.rs:153: 这段 SVG 里没有能画的东西（只认 rect / line / text）
+  gui\src\svg.rs:157: 这段 SVG 的尺寸是 0（检查 viewBox）
+  gui\src\svg.rs:418: 图没画出来：{e}
+  gui\src\svg.rs:492: 应当解析成功
+  gui\src\svg.rs:501: >开始</text>\n               </svg>
+  gui\src\svg.rs:511: 第一个应当是 rect：{other:?}
+  gui\src\svg.rs:515: 开始
+  gui\src\svg.rs:519: 第三个应当是 text：{other:?}
+  gui\src\svg.rs:535: 只该留下那个 rect 与 line
+  gui\src\svg.rs:566: 后面的属性不能跟着错位
+  gui\src\svg.rs:572: viewBox 优先
+  gui\src\svg.rs:574: 带 px 后缀也要认
+  gui\src\svg.rs:581: 兜底尺寸要包住形状：{}×{}
+  gui\src\svg.rs:587: ?>\n               <!-- 说明：这是个流程图 -->\n               <svg viewBox=
+
+===== gui\src\syntax.rs (2) =====
+  gui\src\syntax.rs:651: 调用(参数)
+  gui\src\syntax.rs:656: a = \"x\" // 不是注释
+
+===== gui\src\theme.rs (6) =====
+  gui\src\theme.rs:146: 亮色 · 纸
+  gui\src\theme.rs:147: 暗色 · 墨
+  gui\src\theme.rs:148: 跟随系统
+  gui\src\theme.rs:963: 选了亮就一直是亮
+  gui\src\theme.rs:964: 选了暗就一直是暗
+  gui\src\theme.rs:990: {p:?} 落盘后必须能读回来
+
+===== gui\src\workplace_ui.rs (22) =====
+  gui\src\workplace_ui.rs:95: 工作区 · 默认 · {}
+  gui\src\workplace_ui.rs:96: 工作区 · 默认
+  gui\src\workplace_ui.rs:98: 工作区 · {}
+  gui\src\workplace_ui.rs:99: 工作区 · 完全访问
+  gui\src\workplace_ui.rs:101: 工作区
+  gui\src\workplace_ui.rs:262: 默认
+  gui\src\workplace_ui.rs:263: 每段新对话在 workplace/ 下开一块新地
+  gui\src\workplace_ui.rs:278: 选择工作区…
+  gui\src\workplace_ui.rs:291: 完全访问
+  gui\src\workplace_ui.rs:411: 切换到「完全访问」？
+  gui\src\workplace_ui.rs:414: AOX 将可以读写设备上任何文件，工作区边界不再拦截
+  gui\src\workplace_ui.rs:420: 潘多拉魔盒正在打开......虽然这不总是坏事
+  gui\src\workplace_ui.rs:426: 确认切换
+  gui\src\workplace_ui.rs:430: 取消
+  gui\src\workplace_ui.rs:473: 选择工作区目录
+  gui\src\workplace_ui.rs:475: 取消
+  gui\src\workplace_ui.rs:524: ..  上级目录
+  gui\src\workplace_ui.rs:534: （已经是顶层）
+  gui\src\workplace_ui.rs:541: 无法读取此目录：{e}
+  gui\src\workplace_ui.rs:543: （此目录下没有子目录）
+  gui\src\workplace_ui.rs:565: 选定后，写入与删除都被限制在这个目录里（读取不受限）。
+  gui\src\workplace_ui.rs:570: 选定此目录
+
+===== src\agent.rs (21) =====
+  src\agent.rs:128: 对话历史无法写入 {}（{e:#}）：本次对话不会被保存
+  src\agent.rs:154: {input}\n\n（宿主提示）以下附件没能附上：\n{}
+  src\agent.rs:160: {text}\n\n（宿主提示）附件没能附上：{e}
+  src\agent.rs:319: 本对话的工作区：{}\n  写入与删除都被限制在这个目录里（读取不受限，设备上任何文件都能读）。\\n                 要放宽：`/workplace`，或输入框左下角的「工作区」。
+  src\agent.rs:324: 创建工作区失败：{e:#}
+  src\agent.rs:482: 工具 {name} 被宿主策略禁止（config.toml 的 [auth]）。\\n                     不要再尝试调用它，改用其它工具或换一条实现路径。
+  src\agent.rs:485: 用户拒绝了这次工具调用。请改用其他方式完成任务，或向用户说明原因。
+  src\agent.rs:566: 【如果这道工具只读，上面那句「不要重试」不适用】\n\\n     如果这道插件工具本来就只是**读**（扫描 / 统计 / 列目录 / 解析文件这类），\\n     那么拦住你的不是权限，而是插件没声明自己是只读的。\n\\n     请让插件在工具声明里补上第 4 位 `\"read\"`，重建插件后即可照常访问工作区外的路径。\\n     Python SDK 的写法是把三元组写成四元组…
+  src\agent.rs:614: 运行时应当能建起来
+  src\agent.rs:617: 注册假工具应当成功
+  src\agent.rs:647: `tool_access` 要把工具声明的意图透出来
+  src\agent.rs:650: 只读工具访问工作区外的路径必须放行 —— 这就是「插件的读也放开」那条需求
+  src\agent.rs:656: 没声明就是落盘，这是默认档
+  src\agent.rs:659: 没声明只读的插件工具，带区外路径必须被拦下
+  src\agent.rs:660: 权限边界
+  src\agent.rs:665: 宿主写工具的区外路径必须被拦
+  src\agent.rs:666: 权限边界
+  src\agent.rs:684: 通用部分要原样在前：{plugin}
+  src\agent.rs:685: 插件那条出路必须附上
+  src\agent.rs:686: 要写清补的是哪个字面量：{plugin}
+  src\agent.rs:689: 宿主工具不该收到那段插件专用的出路
+
+===== src\agent_loop.rs (56) =====
+  src\agent_loop.rs:75: 未知的循环实现: {name}（当前可用: {}）\n\\n         请检查 config.toml 的 [loop] impl，或删掉它使用默认值。
+  src\agent_loop.rs:84: 关闭（max_rounds = 0，上下文不设上限）
+  src\agent_loop.rs:87: 保留最近 {} 轮（一轮从一条 user 消息开始）
+  src\agent_loop.rs:92: 循环实现: {}（可选: {}）\n\\n         上下文裁剪: {trim}\n\n\\n         改 config.toml 的 [loop] 段后重启生效；/hook 看钩子、/prompt 看提示词段。
+  src\agent_loop.rs:126: 裁剪切点必须落在一条 user 消息上
+  src\agent_loop.rs:166: 上下文超过 {max_rounds} 轮，已丢掉最老的 {dropped} 条消息（内存与对话文件已同步回滚）。
+  src\agent_loop.rs:176: 本轮请求被宿主钩子拦下：{why}
+  src\agent_loop.rs:183: 思考中
+  src\agent_loop.rs:214: 模型请求失败，宿主自动重试（第 {llm_retries}/{max_llm_retries} 次）：{e:#}
+  src\agent_loop.rs:218: （宿主提示）上一次模型请求失败：{e:#}。请继续完成刚才的任务。
+  src\agent_loop.rs:239: 宿主钩子否决了这次回复（第 {empty_retries} 次）：{why}
+  src\agent_loop.rs:243: （宿主提示）你上一条回复被宿主规则否决：{why}。请调整后重试。
+  src\agent_loop.rs:249: 模型回复连续 {} 次被宿主钩子否决：{why}
+  src\agent_loop.rs:260: 模型输出被 max_tokens={} 截断且正文为空（推理 token 占满了输出额度）。
+  src\agent_loop.rs:267: 模型返回空回复（第 {empty_retries} 次），正在重试…
+  src\agent_loop.rs:271: （宿主提示）你上一条回复是空的。若任务尚未完成，请继续调用工具；\\n                             若已完成，请用自然语言给出最终总结。
+  src\agent_loop.rs:278: 模型连续 {} 次返回空回复，本轮任务已停止。\n\\n                     诊断：{}。可执行 `AOX_DEBUG_LLM=1 aox` 复现，原始响应会写入 logs/llm.jsonl。\n\\n                     常见原因：① 模型是思考模式但 max_tokens 太小（推理 token 也算额度）；\\n                   …
+  src\agent_loop.rs:287: 模型输出被 max_tokens={} 截断（{}），本轮内容可能不完整。\\n                     建议调大 config.toml 的 max_tokens（思考模型的推理 token 也计入额度）。
+  src\agent_loop.rs:316: 工具参数不是合法 JSON: {e}
+  src\agent_loop.rs:366: 工具产出的附件没能传给模型：{p}
+  src\agent_loop.rs:400: （宿主提示）以下是刚才那次工具调用产出的文件，图片内容已经直接发给你了 —— \\n         请直接看图判断，不要只根据文件名猜：\n{names}
+  src\agent_loop.rs:424: {}…\n[结果过长已截断，原长度 {total} 字符]
+  src\agent_loop.rs:444: 问题 {n}
+  src\agent_loop.rs:445: 想一下
+  src\agent_loop.rs:446: 第 {n} 份内容
+  src\agent_loop.rs:447: 答复 {n}
+  src\agent_loop.rs:462: 默认 max_rounds=0 必须完全不裁
+  src\agent_loop.rs:468: 刚好等于上限不裁
+  src\agent_loop.rs:474: 3 轮超过 2 轮上限，应当裁
+  src\agent_loop.rs:475: 第 2 轮的 user 在第 5 位
+  src\agent_loop.rs:476: 问题 2
+  src\agent_loop.rs:477: 丢掉的是完整的一轮（4 条），不含 system
+  src\agent_loop.rs:489: 轮数 {turns} 保留 {keep} 时切点越界
+  src\agent_loop.rs:490: 轮数 {turns} 保留 {keep} 时切点歪了
+  src\agent_loop.rs:494: 丢弃段的最后一条应当是上一轮的收尾，否则就是把一轮劈成两半
+  src\agent_loop.rs:505: system 永远在下标 0，不参与裁剪
+  src\agent_loop.rs:515: 裁剪只会变短，不会变长
+  src\agent_loop.rs:525: 测试用运行时不应失败
+  src\agent_loop.rs:541: 1 条 system + 3 轮 × 4 条
+  src\agent_loop.rs:543: 3 轮超过 2 轮上限，应当裁
+  src\agent_loop.rs:547: system + 最后 2 轮
+  src\agent_loop.rs:548: 系统提示永远保留
+  src\agent_loop.rs:552: 问题 2
+  src\agent_loop.rs:553: 留下的必须是**最新**两轮，不是最老两轮
+  src\agent_loop.rs:557: 答复 3
+  src\agent_loop.rs:558: 最后一轮要完整保留到它的最终答复
+  src\agent_loop.rs:572: cut = {cut} 不该动任何东西
+  src\agent_loop.rs:579: 未知实现必须报错
+  src\agent_loop.rs:580: 报错要带上写错的那个名字: {e}
+  src\agent_loop.rs:581: 报错要告诉用户当前可用的是什么: {e}
+  src\agent_loop.rs:588: {name:?} 应可用: {e:#}
+  src\agent_loop.rs:607: 挂得上的文件必须产出一条消息
+  src\agent_loop.rs:608: 图片只能出现在 user 消息里
+  src\agent_loop.rs:609: 必须是 parts 数组
+  src\agent_loop.rs:612: （宿主提示）
+  src\agent_loop.rs:643: 合格那个必须照挂
+
+===== src\attach.rs (43) =====
+  src\attach.rs:123: {} 读不到：{e}
+  src\attach.rs:126: {} 是目录。附件只收单个文件 —— 要打包请先压成一个文件。
+  src\attach.rs:131: {} 不是普通文件，无法作为附件。
+  src\attach.rs:137: {} 是图片但 {} 字节，超过单张上限 {} MiB（端点硬限制）。\\n                 请先压缩或缩小尺寸再挂。
+  src\attach.rs:145: {} 有 {} MiB，超过单个附件上限 {} MiB —— 它编码成 base64 之后放不进\\n                 单次请求体（{} MiB）。请先压缩或分块。
+  src\attach.rs:162: 读取 {} 失败：{e}
+  src\attach.rs:178: {} 打不开：{e}
+  src\attach.rs:180: 读取 {} 的文件头失败：{e}
+  src\attach.rs:192: 一次最多发 {MAX_IMAGES} 张图片，这次有 {images} 张。请分批发。
+  src\attach.rs:201: 这批附件太大：编码后约 {} MiB，超过单次请求体上限 {} MiB（端点硬限制）。\\n             请分批发，或先压缩。
+  src\attach.rs:215: [附件]\n
+  src\attach.rs:244: （以上文件已随本条消息一并发送；若端点提示某个格式不受支持，\\n         请用 read_file 直接读取上面的路径。）
+  src\attach.rs:466: 你好
+  src\attach.rs:467: 你好
+  src\attach.rs:482: 看看这张图
+  src\attach.rs:484: 正文 + 清单 + 图片块
+  src\attach.rs:486: 看看这张图
+  src\attach.rs:486: 用户正文必须原样，不被清单污染
+  src\attach.rs:512: 帮我看下
+  src\attach.rs:514: 帮我看下
+  src\attach.rs:515: 路径清单不该出现在可读文本里：{flat}
+  src\attach.rs:530: 非图片不该在 probe 阶段被拒
+  src\attach.rs:532: 读一下
+  src\attach.rs:534: 0=正文 1=清单 2=文件块
+  src\attach.rs:554: 错误里要说清是哪个闸门与数值：{err}
+  src\attach.rs:555: 压缩
+  src\attach.rs:555: 还要给出下一步：{err}
+  src\attach.rs:570: 36 MiB 编码后正好 48 MiB，应当放行
+  src\attach.rs:571: 再叠一点正文就超了，必须拦
+  src\attach.rs:595: 目录
+  src\attach.rs:615: 合格的那个必须留下
+  src\attach.rs:617: 另外两个各要有一句话：{bad:?}
+  src\attach.rs:637: 看这张
+  src\attach.rs:638: 前提：编码后确实带着载荷
+  src\attach.rs:640: 带附件的消息一定要被改写
+  src\attach.rs:642: 载荷必须摘掉：{s}
+  src\attach.rs:643: 图片块整块丢掉，不留假的 url：{s}
+  src\attach.rs:644: 清单要留着，否则历史里看不出带了什么：{s}
+  src\attach.rs:645: 看这张
+  src\attach.rs:645: 正文当然要留着：{s}
+  src\attach.rs:651: 看这张
+  src\attach.rs:655: 你好
+  src\attach.rs:656: 只有字
+
+===== src\auth.rs (4) =====
+  src\auth.rs:186: 同名工具与同名插件同时有 override 时，以工具为准
+  src\auth.rs:290: 工具名 override 最优先
+  src\auth.rs:291: 插件名 override 次之
+  src\auth.rs:303: 兜底 override 命中元工具，能力位不该把它改成 ask
+
+===== src\config\layer.rs (81) =====
+  src\config\layer.rs:132: 合成后的配置树无法序列化
+  src\config\layer.rs:133: （无层）
+  src\config\layer.rs:136: 合成后的配置解析失败（最后一层是 {last}）—— \\n                 多半是必填项没给（如 [provider] 的 base_url / model）或类型写错了；\\n                 报错里的行号指的是合成结果、不是你某个文件里的行，\\n                 用 `aox --dump-config` 看合成树就能对上是哪个键
+  src\config\layer.rs:149: 配置层（低 → 高，后面的覆盖前面的）：\n
+  src\config\layer.rs:151:   {}. {}（{} 个值）\n
+  src\config\layer.rs:154: 共 {} 层，合成后 {} 个值。
+  src\config\layer.rs:159: \n（应用根下没有 aox.toml —— 只用 config.toml 一份，与阶段 5 之前等价。）
+  src\config\layer.rs:168: 配置层（低 → 高，后面的覆盖前面的；config.toml 永远是最后一层）：\n
+  src\config\layer.rs:171:    ← 最后一层
+  src\config\layer.rs:179: 默认（代码）
+  src\config\layer.rs:184: \n合成后的配置（{} 个值；`#` 后面是最后写这个值的层）：\n
+  src\config\layer.rs:188: \n  （空 —— 所有键都留给代码默认。）\n
+  src\config\layer.rs:202: \n合成树里**没有**的键 = 不参与合成：或没有出厂值（必填项，由你在 config.toml 里给，\n\\n             比如 [provider] 的 base_url / model），或由代码在读取时兜底（比如 [theme] 的各尺度默认）。\n
+  src\config\layer.rs:245: 找不到清单文件 {}
+  src\config\layer.rs:259: 清单文件 {} 里没有 [profiles.{name}]。请补上这一节，\\n                     或删掉这个文件（没有它时只用 config.toml 一份，行为与以前一致）。
+  src\config\layer.rs:264: 清单文件 {} 里没有 profile「{name}」；现有的有：{}
+  src\config\layer.rs:277: patch 文件不存在：{}（在 {} 的 profile「{name}」里列出）
+  src\config\layer.rs:282: patch 文件
+  src\config\layer.rs:295: 找不到配置文件 {}。请复制 config.example.toml 为 config.toml 并填写 API 配置。
+  src\config\layer.rs:300: 配置文件 {} 解析失败
+  src\config\layer.rs:342: bundle 成环：{} → {name}
+  src\config\layer.rs:346: bundle {name}（{origin}）解析失败
+  src\config\layer.rs:348: bundle {name}（{origin}）的根必须是一张表
+  src\config\layer.rs:354: bundle {name}（{origin}）的 bundles 必须是一个字符串数组
+  src\config\layer.rs:361: bundle {name}（{origin}）的 bundles 里有一项不是字符串
+  src\config\layer.rs:386: 读不了 bundle 文件 {}
+  src\config\layer.rs:388: 文件覆盖内置
+  src\config\layer.rs:390: 自定义
+  src\config\layer.rs:396: 内置
+  src\config\layer.rs:397: 认不出的 bundle「{name}」：既没有内置，也没有 {}
+  src\config\layer.rs:518: 清单文件
+  src\config\layer.rs:521: 清单文件 {} 的根必须是一张表
+  src\config\layer.rs:529: [profiles.{name}] 必须是一张表
+  src\config\layer.rs:550: {what} 里有一项不是字符串
+  src\config\layer.rs:553: {what} 必须是一个字符串数组
+  src\config\layer.rs:559: 读不了{what} {}
+  src\config\layer.rs:560: {what} {} 解析失败
+  src\config\layer.rs:589: 拒绝在临时目录之外清理
+  src\config\layer.rs:592: 只清理自己造的目录
+  src\config\layer.rs:633: 没有 aox.toml 就该只有 config.toml 一层
+  src\config\layer.rs:643: 合成结果必须与直接解析 config.toml 逐字段相同
+  src\config\layer.rs:662: core 的出厂值必须与代码默认逐字段相同（bundle 与 serde 默认不能悄悄漂移）
+  src\config\layer.rs:685: patch 的 stream = false 应压过 bundle 的 true
+  src\config\layer.rs:686: patch 应压过 bundle 的 60
+  src\config\layer.rs:689: agent 表是深合的：patch 只改了超时，不该把 max_result_chars 一起抹掉
+  src\config\layer.rs:691: config.toml 仍是最强的一层
+  src\config\layer.rs:733: 应走 strict
+  src\config\layer.rs:737: strict 排在后、盖住 tools
+  src\config\layer.rs:742: default 不含 strict
+  src\config\layer.rs:757: bundle:tools（文件覆盖内置）
+  src\config\layer.rs:758: 该标出这是文件覆盖：{labels:?}
+  src\config\layer.rs:762: 文件里的值生效
+  src\config\layer.rs:765: 文件是整层取代内置：它没写的 plugin_tools 回落到代码默认（tools.toml 那一行已经不在层里）
+  src\config\layer.rs:784: 后一层整个换掉数组，不是拼接
+  src\config\layer.rs:797: 裸 fs_* 不是合法 TOML 键 —— 这正是 config.example.toml 里要写引号的原因
+  src\config\layer.rs:822: 每个值后面要有来源：{d}
+  src\config\layer.rs:826: ← 最后一层
+  src\config\layer.rs:826: 要标出哪一层是最后一层：{d}
+  src\config\layer.rs:837: bundle:loop-standard（0 个值）
+  src\config\layer.rs:837: 空的 bundle 要显示 0：{s}
+  src\config\layer.rs:838: bundle:core（0 个值）
+  src\config\layer.rs:838: 聚合者自己不带值：{s}
+  src\config\layer.rs:839: 共 7 层
+  src\config\layer.rs:839: 五个叶子 + core + config.toml：{s}
+  src\config\layer.rs:840: 没有 aox.toml
+  src\config\layer.rs:840: 有 aox.toml 时不该出现那句：{s}
+  src\config\layer.rs:843: 显式指定不存在的清单必须报错
+  src\config\layer.rs:856: 认不出的 bundle
+  src\config\layer.rs:865: patch 文件不存在
+  src\config\layer.rs:872: 成环
+  src\config\layer.rs:877: 没有 profile
+  src\config\layer.rs:880: 不存在的清单.toml
+  src\config\layer.rs:882: 找不到清单文件
+  src\config\layer.rs:886: 找不到配置文件
+  src\config\layer.rs:903: 示例配置要能读
+  src\config\layer.rs:906: 示例清单应能合成
+  src\config\layer.rs:907: 示例合成结果应能解析
+  src\config\layer.rs:919: 示例配置没写 [prompt]，该由 bundle 提供；实际是 {prompt_order}
+  src\config\layer.rs:924: 示例配置写的 120 秒必须赢过出厂 bundle
+  src\config\layer.rs:934: 层栈里该有 strict：{:?}
+  src\config\layer.rs:940: strict profile 比 default 正好多一层
+
+===== src\config.rs (39) =====
+  src\config.rs:86: 环境变量 {env_name} 未设置，无法获取 API key
+  src\config.rs:92: 未配置 API key：请在 config.toml 的 [provider] 中设置 api_key 或 api_key_env
+  src\config.rs:470: 颜色：\"#RRGGBB\" / \"#RRGGBBAA\" / \"#RGB\" 或 [r, g, b(, a)]
+  src\config.rs:475: 无法解析颜色 {s:?}：应为 #RRGGBB / #RRGGBBAA / #RGB
+  src\config.rs:496: 颜色数组需要 3 或 4 个分量（每个 0~255）
+  src\config.rs:653: 找不到主题文件 {}
+  src\config.rs:655: 主题文件 {} 不能当作主题使用
+  src\config.rs:668: 找不到配置文件 {}。请复制 config.example.toml 为 config.toml 并填写 API 配置。
+  src\config.rs:672: 配置文件 {} 解析失败
+  src\config.rs:721: 前导 # 可省，大小写不敏感
+  src\config.rs:736: \"红色\"
+  src\config.rs:737: {bad} 不该被接受
+  src\config.rs:746: 默认不指定明暗，交给偏好记录 / 内置默认
+  src\config.rs:807: 主题段应能解析
+  src\config.rs:812: 没写的尺度仍取默认
+  src\config.rs:814: 只改了 text，其余 17 项不受影响
+  src\config.rs:815: 改暗色不该碰到亮色
+  src\config.rs:841: ));\n        assert_eq!(c.theme.metrics.body_size, 20.0);\n        assert_eq!(c.theme.metrics.indent, 22.0);\n        assert_eq!(c.theme.dark.text, Some(RgbColor { r: 0x12, g: 0x34, b: 0x56, a: 255 })…
+  src\config.rs:881: ));\n        assert_eq!(wrapped.metrics.body_size, 19.0);\n        assert_eq!(wrapped.light.text, Some(RgbColor { r: 0, g: 0xFF, b: 0, a: 255 }));\n        assert!(wrapped.dark.text.is_none());\n    }…
+  src\config.rs:893: );\n        }\n\n        // 纸 / 墨 是内置配色的完整复制，18 个字段应全部覆盖到\n        let paper = ThemeConfig::load(Path::new(
+  src\config.rs:901: )).unwrap();\n        assert!(ink.dark.bg.is_some() && ink.dark.text.is_some());\n        assert!(ink.dark.on_reverse.is_some() && ink.dark.shadow.is_some());\n\n        // 高对比两套明暗都定义了（否则另一半会退回内置配色、看着…
+  src\config.rs:906: )).unwrap();\n        assert!(hc.light.bg.is_some() && hc.dark.bg.is_some());\n        assert_eq!(hc.metrics.body_size, 17.0);\n    }\n\n    /// 老配置（完全没写 `[theme]`）必须照常解析 —— 阶段 2 不能打破既有 config.toml。\n…
+  src\config.rs:921: );\n\n        assert!(c.theme.mode.is_none());\n        assert!(c.theme.dark.text.is_none());\n        assert_eq!(c.theme.metrics.body_size, 16.0);\n    }\n\n    /// `[hook.tool_args_default.<工具名>]` 的…
+  src\config.rs:950: ].as_bool(), Some(true));\n    }\n\n    /// `[hook] max_llm_retries`（阶段 6 · 6b 的配置驱动兜底）：不写 = 0 = 不重试。\n    #[test]\n    fn hook_section_parses_max_llm_retries() {\n        let p = 
+  src\config.rs:958: 不写 [hook] 应能解析
+  src\config.rs:959: 默认 0 = 不重试，与阶段 4 逐字节一致
+  src\config.rs:962: 应能解析
+  src\config.rs:980: [workplace] 应当能解析
+  src\config.rs:982: 旧段名 [workspace] 必须仍能解析
+  src\config.rs:983: 旧段名读出来的必须与新段名一模一样
+  src\config.rs:984: 值要真的读进来，而不是落回默认
+  src\config.rs:990: 同一段写两个名字应当报错
+  src\config.rs:1026: );\n        assert!(c.hook.tool_args_default.is_empty());\n    }\n\n    /// `[loop]` 的默认值：standard + 不裁剪。\n    /// 这条是「不写 `[loop]` ⇒ 行为与阶段 5 逐字节相同」的数据层保证。\n    #[test]\n    fn loop_defaults_to_standar…
+  src\config.rs:1045: );\n    }\n\n    /// `[loop]` 段两个键都要认 —— 顺带钉住「`impl` 这个 TOML 键名不能被 Rust 关键字那件事带偏」。\n    #[test]\n    fn loop_section_parses_impl_and_max_rounds() {\n        let c: Config = toml::from_str(\n          …
+  src\config.rs:1064: );\n        assert_eq!(c.loop_config.max_rounds, 6);\n    }\n\n    /// 只写 `max_rounds` 时 `impl` 取默认 —— 与其它各表一样「整表可缺项」。\n    #[test]\n    fn loop_section_partial_still_parses() {\n        let c: Config…
+  src\config.rs:1083: );\n        assert_eq!(c.loop_config.max_rounds, 3);\n    }\n\n    /// `[sandbox]` 的默认值：**开着**，且是「对合法插件零影响」的那一组。\n    ///\n    /// 这条与其它各段的「默认 = 不生效」是**刻意不同**的：围栏的默认值本身就是行为，\n    /// 所以更要把它钉死 —— 哪天有人顺…
+  src\config.rs:1105: );\n        assert!(c.sandbox.ui_limits);\n\n        let d = SandboxConfig::default();\n        assert!(d.enabled && d.max_processes == 8 && d.max_memory_mb == 0 && d.ui_limits);\n        // `+1` 是**平…
+  src\config.rs:1121: \n        );\n    }\n\n    /// 只写一个键时其余取默认（与其它各表一样「整表可缺项」）。\n    #[test]\n    fn sandbox_section_partial_still_parses() {\n        let c: Config = toml::from_str(\n            r#
+  src\config.rs:1144: );\n        assert!(c.sandbox.ui_limits);\n    }\n\n    /// 关掉围栏这条路必须真的存在（它是唯一的退路）。\n    #[test]\n    fn sandbox_can_be_turned_off() {\n        let c: Config = toml::from_str(\n            r#
+
+===== src\history.rs (22) =====
+  src\history.rs:29: （宿主提示）
+  src\history.rs:184: 用法: /history show <序号|文件名>
+  src\history.rs:188: 用法: /history open <序号|文件名>
+  src\history.rs:192: 用法: /history rm <序号|文件名>
+  src\history.rs:195: 未知的 /history 子命令: {other}\n\\n             用法: /history [list] | /history show <序号|文件名> | \\n             /history open <序号|文件名> | /history rm <序号|文件名> | /history dir
+  src\history.rs:208: （还没有历史记录）\n  目录: {}
+  src\history.rs:210: 历史记录（{} 个对话，最近聊过的在前）  {}
+  src\history.rs:212:   ← 当前
+  src\history.rs:214: \n  {:>2}. {}  {:>4} 条  {}{}
+  src\history.rs:223: \n  用法: /history show <序号> 看全文 | /history open <序号> 接着聊 | \\n         /history rm <序号> | /history dir
+  src\history.rs:232: （空对话）
+  src\history.rs:244: 宿主:
+  src\history.rs:246: 你:
+  src\history.rs:259: 附件:
+  src\history.rs:266: 助手:
+  src\history.rs:330: 没报就是没有，不许变成 0
+  src\history.rs:354: （宿主提示）你上一条回复是空的。
+  src\history.rs:355: 帮我看看
+  src\history.rs:358: 宿主:
+  src\history.rs:358: 宿主提示要单独标出来
+  src\history.rs:359: 你:
+  src\history.rs:359: 真人消息用「你:」
+
+===== src\hook.rs (55) =====
+  src\hook.rs:264: 循环钩子 · 0 个 —— 行为与内置循环完全一致。\n  \\n                    两个来源：config.toml 的 [hook]（配置驱动，启动时定型）；\\n                    插件 plugin.toml 的 [contributes] hooks（组件贡献，激活时挂上）。
+  src\hook.rs:267: 循环钩子 · {} 个 · 按注册顺序执行\n
+  src\hook.rs:272: \n  来源：config.toml 的 [hook] / 插件 [contributes] hooks。\\n             配置改完需重启；组件随插件激活/卸载。
+  src\hook.rs:306: [hook.tool_args_default.{tool}] 无法转成 JSON
+  src\hook.rs:334: （不是对象，将被忽略）
+  src\hook.rs:339: 补默认参数（只补模型没给的键）：{}
+  src\hook.rs:423: 组件 {} 不在运行（已卸载或加载失败）
+  src\hook.rs:434: {method}: 超时（{} 秒）
+  src\hook.rs:452: 组件要求拦下这一步，但没给理由
+  src\hook.rs:466: 组件贡献 · 接 {}
+  src\hook.rs:468:  · 申请能力 {}
+  src\hook.rs:477: （无详情）
+  src\hook.rs:478: \n     ⚠ 已失败 {n} 次（按可降级处理；最近一次：{last}）
+  src\hook.rs:571: （组件建议重试，未给出提示）
+  src\hook.rs:618: 测试用运行时不应失败
+  src\hook.rs:663: 空链不许动 tools
+  src\hook.rs:664: 空链不许塞消息
+  src\hook.rs:672: 空链不许改回复
+  src\hook.rs:676: 空链不许改参数
+  src\hook.rs:693: b 说不
+  src\hook.rs:699: b 说不
+  src\hook.rs:700: 被拦下之后不该再问 c
+  src\hook.rs:728: 后一个钩子必须看到前一个的改动
+  src\hook.rs:752: 宿主补充说明
+  src\hook.rs:760: 宿主补充说明
+  src\hook.rs:772: 有配置就要造出钩子
+  src\hook.rs:775: 我自己的路径
+  src\hook.rs:777: 我自己的路径
+  src\hook.rs:777: 显式值不许被默认值顶掉
+  src\hook.rs:778: 缺的那个补上
+  src\hook.rs:783: 没配的工具不该被动
+  src\hook.rs:791: 字符串
+  src\hook.rs:802: 默认配置不该造出钩子
+  src\hook.rs:822: 默认配置：空链
+  src\hook.rs:823: 0 个
+  src\hook.rs:827: 配了就该挂上
+  src\hook.rs:829: 报告要带上钩子名: {rep}
+  src\hook.rs:830: 报告要说清补了哪个键: {rep}
+  src\hook.rs:840: 一开始必须是空链（零漂移的前提）
+  src\hook.rs:843: 不
+  src\hook.rs:848: 不
+  src\hook.rs:849: push 进来的钩子必须真的被调用
+  src\hook.rs:859: 大小写不认
+  src\hook.rs:860: 类型不对不认
+  src\hook.rs:863: 组件要求拦下这一步，但没给理由
+  src\hook.rs:864: 理由为空时也要有一句能见人的话
+  src\hook.rs:867: 越界了
+  src\hook.rs:868: 越界了
+  src\hook.rs:889: 组件不在时参数不许被改动
+  src\hook.rs:890: 失败要记账
+  src\hook.rs:893: 账上要写清是哪个组件: {:?}
+  src\hook.rs:897: 已失败 1 次
+  src\hook.rs:897: 报告里要看得到失败: {}
+  src\hook.rs:922: 没声明的点不许改回复
+  src\hook.rs:924: 没声明的点不该产生失败账
+
+===== src\image.rs (18) =====
+  src\image.rs:45: 图片文件不在了：{}
+  src\image.rs:56: 内嵌的图片是空的
+  src\image.rs:136: GDI+ 初始化失败（status {st}）
+  src\image.rs:154: 解不开这张图（GDI+ status {st}）：{}
+  src\image.rs:191: 这段内嵌图片太大了（超过 4 GB）
+  src\image.rs:197: 创建内存流失败
+  src\image.rs:204: 解不开这段内嵌的图片（GDI+ status {st}）
+  src\image.rs:227: 这张图的尺寸是 0
+  src\image.rs:230: 图太大了（{w}×{h}，上限约 24 MPix），没法显示
+  src\image.rs:247: 读不出这张图的像素（GDI+ status {st}）
+  src\image.rs:268: 本平台暂不支持显示图片（{}）
+  src\image.rs:272: 本平台暂不支持显示图片
+  src\image.rs:293: 前两个像素要转成 RGBA，padding 要丢掉
+  src\image.rs:327: 不存在的文件不该解开
+  src\image.rs:329: 不在了
+  src\image.rs:352: {name}.png 应该解得开：{e}
+  src\image.rs:353: {name}.png 的尺寸要与 PNG 头一致
+  src\image.rs:357: {name}.png 是透明底的，解出来却一个透明像素都没有
+
+===== src\llm\mod.rs (6) =====
+  src\llm\mod.rs:38: finish_reason={:?}, 推理 token={n}
+  src\llm\mod.rs:209: 模型不可用：{}
+  src\llm\mod.rs:284: 中文
+  src\llm\mod.rs:289: lo 世
+  src\llm\mod.rs:289: 界
+  src\llm\mod.rs:292: hello 世界
+
+===== src\llm\openai.rs (7) =====
+  src\llm\openai.rs:73: LLM 请求失败 HTTP {status}: {}
+  src\llm\openai.rs:76: LLM 返回不是合法 JSON: {e}; body={}
+  src\llm\openai.rs:80: LLM 返回缺少 choices[0].message: {}
+  src\llm\openai.rs:83: assistant 消息解析失败: {e}; raw={}
+  src\llm\openai.rs:102: LLM 请求失败 HTTP {status}: {}
+  src\llm\openai.rs:300: \n  提示: 该模型为思考模式（thinking），必须把上一条 assistant 消息的 \\n                 reasoning_content 原样回传。若仍报此错，请把日志中的原始响应发我。
+  src\llm\openai.rs:353: {h}\n…[中间省略 {} 字符]…\n{t}
+
+===== src\main.rs (57) =====
+  src\main.rs:37: \n按回车键退出…
+  src\main.rs:138: 提示: {} 不可写，改用 {}
+  src\main.rs:177: {}（后端 {}）
+  src\main.rs:182: {}  {}（{} 条）\n{}
+  src\main.rs:193: 已切换到「{}」（{} 条消息）。接下来的发言会继续追加到同一个文件。\n  {}
+  src\main.rs:201: 已删除: {}  {}
+  src\main.rs:257: [配置错误] {e:#}
+  src\main.rs:274: 未找到配置文件，已为你创建模板: {}
+  src\main.rs:275: 请用编辑器打开它，填写 base_url 和 api_key（或 api_key_env），然后重新启动本程序。
+  src\main.rs:278: 无法创建配置文件 {}: {werr}
+  src\main.rs:279: 请确认该目录可写，或用 --config <路径> 指定一个可写位置。
+  src\main.rs:283: [配置错误] {e:#}
+  src\main.rs:300: [配置错误] {e:#}
+  src\main.rs:327: 插件 {name} 加载失败: {e:#}
+  src\main.rs:336: 以下插件没套上进程围栏，它们不受进程数 / 内存 / UI 限制：{}
+  src\main.rs:344: LLM 未就绪: {e:#}
+  src\main.rs:346: 可在 config.toml 填写 base_url / api_key（或设置 api_key_env 指向的环境变量）；\\n                 本地命令 /tools /plugins /demo 仍可用。
+  src\main.rs:360: 模型
+  src\main.rs:364: 配置 {}   插件目录 {}
+  src\main.rs:368: 输入 /help 查看所有命令
+  src\main.rs:370: 项目主页 {}
+  src\main.rs:403: 工具: {}
+  src\main.rs:408: （无已加载插件）
+  src\main.rs:422: 插件: {}
+  src\main.rs:434: 钩子 {}
+  src\main.rs:437: 提示词段 {}
+  src\main.rs:440: 申请能力 {}
+  src\main.rs:445: 主题补丁 ✓（GUI 合并待接线）
+  src\main.rs:447: 主题补丁（没取到）
+  src\main.rs:453: 组件贡献：\n{}
+  src\main.rs:461: 思考中
+  src\main.rs:475: 演示结束：上面的工具调用过程已折叠，输入 **/expand** 可展开查看。
+  src\main.rs:502: 已开一段新对话。上一段已经保存在 history/ 里（/history 可查）。
+  src\main.rs:520: 显示本帮助
+  src\main.rs:521: 列出当前所有可用工具
+  src\main.rs:522: 列出已加载的插件，以及各自贡献了什么（钩子 / 提示词段 / 能力）
+  src\main.rs:523: 查看插件运行时状态；/runtime install python 装配内置运行时
+  src\main.rs:526: 历史对话；list 列表，show <序号> 看全文，open <序号> 接着聊，rm <序号> 删除
+  src\main.rs:528: 开一段新对话（当前这段已自动保存进历史）
+  src\main.rs:531: 把本机文件挂进待上传栏，随下一条消息一起发给模型；/attach clear 取下全部
+  src\main.rs:533: 预览终端排版与过程折叠效果
+  src\main.rs:534: 展开上一次被折叠的工具调用过程
+  src\main.rs:535: 回看上一次任务的 token 用量明细
+  src\main.rs:536: 查看系统提示词的分段拼装结果（config.toml 的 [prompt] 可重排/禁用/追加）
+  src\main.rs:537: 查看生效的循环钩子（来自 config.toml 的 [hook] 与插件的 [contributes]）
+  src\main.rs:540: 查看主循环实现与上下文裁剪（config.toml 的 [loop]：impl 换实现、max_rounds 限轮数）
+  src\main.rs:544: 查看插件子进程的围栏（config.toml 的 [sandbox]：进程数 / 内存 / UI 限制；也写明它管不了什么）
+  src\main.rs:548: 查看/切换模型的文件边界；/workplace full|default|<目录> 切档位（config.toml 的 [workplace]）
+  src\main.rs:552: 查看这份配置由哪几层合成（应用根下的 aox.toml 可自定义；--dump-config 看每个值的来源）
+  src\main.rs:554: 退出程序（/exit 等价）
+  src\main.rs:564: 其余输入直接发给模型；任务进行中按 Ctrl+C 可中断
+  src\main.rs:596: 已中断当前任务（对话已回滚到任务前状态；待上传栏里的附件仍在）
+  src\main.rs:626: 待上传栏是空的。用法：/attach <文件路径> [更多路径…]（带空格的路径请整体加引号）
+  src\main.rs:633: 待上传（{} 个）：\n  {list}\n下一条消息会带上它们。
+  src\main.rs:640: 待上传栏已清空。
+  src\main.rs:651: 没给出路径。用法：/attach <文件路径>
+  src\main.rs:672: 已挂上 {added} 个文件（共 {} 个），随下一条消息发出。
+
+===== src\message.rs (9) =====
+  src\message.rs:156: [图片]
+  src\message.rs:158: 附件
+  src\message.rs:159: [文件: {name}]
+  src\message.rs:196: 看这张
+  src\message.rs:198: parts 数组不该被当成「模型的正文」
+  src\message.rs:200: 看这张
+  src\message.rs:201: [图片]
+  src\message.rs:208: 你好
+  src\message.rs:209: 你好
+
+===== src\plugin\mod.rs (83) =====
+  src\plugin\mod.rs:157: [contributes] hooks 里有认不出的钩子点: {p}（可用的五个: {}）
+  src\plugin\mod.rs:242: 读取插件 stdout 失败
+  src\plugin\mod.rs:301: 写入插件 stdin 失败
+  src\plugin\mod.rs:307: 插件 {} 进程已退出
+  src\plugin\mod.rs:315: 插件 {} 返回错误: {err}
+  src\plugin\mod.rs:335: 重启插件进程失败
+  src\plugin\mod.rs:340: 无法获取插件 stdin
+  src\plugin\mod.rs:341: 无法获取插件 stdout
+  src\plugin\mod.rs:359: 围栏 ?
+  src\plugin\mod.rs:397: 插件 {} 通信失败: {e:#}
+  src\plugin\mod.rs:398: 插件 {} 响应超时（{} 秒）
+  src\plugin\mod.rs:406: {first_err}；重启插件后重试仍失败: {e:#}
+  src\plugin\mod.rs:407: {first_err}；重启插件后重试仍超时
+  src\plugin\mod.rs:410: {first_err}；且插件重启失败: {re:#}
+  src\plugin\mod.rs:472: 未知插件语言: {other}
+  src\plugin\mod.rs:495: 启动插件 {} 失败（请检查 {} 是否在 PATH 中）
+  src\plugin\mod.rs:499: 无法获取插件 stdin
+  src\plugin\mod.rs:500: 无法获取插件 stdout
+  src\plugin\mod.rs:523: 插件 {} initialize 握手超时（{} 秒）
+  src\plugin\mod.rs:533: 插件 {} initialize 的 tools 不是数组
+  src\plugin\mod.rs:540: 插件 {} 的工具缺少 name
+  src\plugin\mod.rs:554: 插件 {} 的 initialize.contributes 解析失败
+  src\plugin\mod.rs:562: 插件 {} 的贡献声明有问题
+  src\plugin\mod.rs:569: 插件 {} 既没声明工具，也没在 [contributes] 里声明任何贡献 —— 它什么都不会做
+  src\plugin\mod.rs:600: [组件] {plugin}: {why}
+  src\plugin\mod.rs:619: 提示词段 {id} 的正文为空，跳过
+  src\plugin\mod.rs:624: 取提示词段 {id} 失败: {e:#}
+  src\plugin\mod.rs:635: 主题补丁不是 [theme] 那个形状，已忽略: {e}
+  src\plugin\mod.rs:638: 取主题补丁失败: {e:#}
+  src\plugin\mod.rs:653: 激活插件 {} 失败
+  src\plugin\mod.rs:700: 插件名只能包含小写字母/数字/下划线，且长度 1-40: {name:?}
+  src\plugin\mod.rs:706: language 只能是 python / node / rust，收到: {other}
+  src\plugin\mod.rs:712: 插件 {name} 正在运行，如需重建请先 remove_plugin
+  src\plugin\mod.rs:716: 清理残留插件目录失败: {}
+  src\plugin\mod.rs:754: rustc 编译超时
+  src\plugin\mod.rs:755: 无法启动 rustc（rust 插件需要 Rust 工具链在 PATH 中）
+  src\plugin\mod.rs:757: rustc 编译失败:\n{}
+  src\plugin\mod.rs:797: 删除插件目录失败: {}
+  src\plugin\mod.rs:800: 插件不存在: {name}
+  src\plugin\mod.rs:824: manifest 读取失败: {e:#}
+  src\plugin\mod.rs:849: # 插件协议（宿主 <-> 插件子进程）\n\n每条消息是 stdout/stdin 上的「一行 JSON」。stdout 只允许协议消息，日志一律写 stderr。\n\n## 1. 握手\n\n宿主发送:\n   {
+  src\plugin\mod.rs:856: :{}}\n插件回复一行:\n   {
+  src\plugin\mod.rs:861: :{ ... }          // 可选，见 §4\n   }}\n\n`tools` 可以省略（只贡献、不提供工具的组件就没必要写它）。\n`contributes` 省略即老形状 —— 只提供工具的插件一个字段都不用改。\n\n`access` 也可以省略，省略 = `
+  src\plugin\mod.rs:869: `  —— 这道工具**只读**（扫描 / 统计 / 列目录 / 解析文件）。\n                宿主的工作区边界按「读」判，而**读不设限**：它可以访问工作区外的路径，\n                与宿主自带的 read_file / list_dir 同一档，不需要用户提权。\n  - `
+  src\plugin\mod.rs:872: ` —— 可能落盘（默认）。带路径的参数必须落在本次对话的工作区内，否则整次调用\n                被拦下（宿主只能按参数名扫「像路径」的字符串，判不出你拿它去读还是去写，\n                所以没声明的一律按最保守的档走）。\n\n只有**真的不写文件、不删东西**的工具才该声明 `
+  src\plugin\mod.rs:876: `。声明不实不会被宿主拦住\n（插件进程内部宿主看不见），但那等于把这道工具的工作区边界自己撤了。\n\n## 2. 工具调用\n\n宿主: {
+  src\plugin\mod.rs:881: :{...}}}\n插件: {
+  src\plugin\mod.rs:882: :false}}\n\n## 3. 结束\n\n宿主发送 {
+  src\plugin\mod.rs:886: }（无 id），插件应退出。\n\n## 4. 组件贡献（可选，阶段 6 · 6b）\n\n在 plugin.toml 里声明：\n\n    [contributes]\n    hooks = [
+  src\plugin\mod.rs:893: ]   # 只认下面五个名字，写错即激活失败\n    prompt_segments = [
+  src\plugin\mod.rs:894: ]     # 段 id；正文用 prompt/segment 取回\n    theme = true                          # 是否贡献主题补丁\n    caps = [
+  src\plugin\mod.rs:896: ]                   # 能力申请：本插件的工具调用一律走「询问」\n\n也可以改由上面 initialize 的 `contributes` 返回 —— **两处都有时以 initialize 为准**\n（清单是离线声明，进程实况更准）。\n\n**钩子实现不许报错**：宿主把超时（10 秒）、通信失败、以及认不出的返回值一律当作\n「放行」，并把失败记在账上（`/hook`…
+  src\plugin\mod.rs:907: :{...}}\n插件: {
+  src\plugin\mod.rs:908: :{...}}\n\n点               params                              result\nbefore_request   {
+  src\plugin\mod.rs:912: :<条数>}       {
+  src\plugin\mod.rs:913: :{改后的参数}}\nafter_tool       {
+  src\plugin\mod.rs:915: }\n\n`inject` 只接受**用户文本**（字符串数组）—— 钩子这一层只开放「追加」，\n不给「改写历史」的能力（那是 `[loop] max_rounds` 的事）。\n`after_reply` 只能改正文，不能改 `tool_calls`（改了等于伪造模型意图）。\n\n### 4.2 提示词段\n\n宿主: {
+  src\plugin\mod.rs:923: }}\n插件: {
+  src\plugin\mod.rs:924: }}\n\n### 4.3 主题补丁\n\n宿主: {
+  src\plugin\mod.rs:928: :null}\n插件: {
+  src\plugin\mod.rs:929: :{ ...与 config.toml 的 [theme] 同一形状... }}\n\n本期宿主只**取回并校验**主题补丁（GUI 合并尚未接线，见 `plugin/mod.rs` 的注释）。\n\nPython 插件推荐直接使用同目录下的 plugin_sdk.py。\n
+  src\plugin\mod.rs:945: 结果字符串
+  src\plugin\mod.rs:947: 插件名
+  src\plugin\mod.rs:948: 工具说明
+  src\plugin\mod.rs:953: 工具名
+  src\plugin\mod.rs:957: 插件名
+  src\plugin\mod.rs:961: 写文件之前先想清楚要写什么。
+  src\plugin\mod.rs:966: \nimport sys\nimport json\n\n\ndef _resolve(value):\n    # 允许「值」和「无参函数」两种写法（后者用于每次现算的场景）\n    return value() if callable(value) else value\n\n\ndef _send(msg):\n    sys.stdout.write(json.dumps(msg, en…
+  src\plugin\mod.rs:1049: ):]\n            handler = hooks.get(point)\n            if handler is None:\n                # 没声明这个点：直接「放行」，宿主那边连失败账都不会记\n                _send({
+  src\plugin\mod.rs:1056: : handler(params) or {}})\n                except Exception as e:\n                    # 钩子抛异常不连累宿主：写 stderr 留痕，按「放行」返回\n                    sys.stderr.write(f
+  src\plugin\mod.rs:1083: name = \"fs\"\nlanguage = \"python\"\ndescription = \"文件读写\"\nentry = \"main.py\"\n
+  src\plugin\mod.rs:1086: 老清单不该凭空长出贡献
+  src\plugin\mod.rs:1093: name = \"comp\"\nlanguage = \"python\"\ndescription = \"组件\"\nentry = \"main.py\"\n\n\\n             [contributes]\n\\n             hooks = [\"before_tool\", \"on_error\"]\n\\n             prompt_segm…
+  src\plugin\mod.rs:1117: 空的贡献段不该被写出来: {text}
+  src\plugin\mod.rs:1129: 错误里要点名是哪个: {e}
+  src\plugin\mod.rs:1130: 错误里要列出可用的五个: {e}
+  src\plugin\mod.rs:1142: 按 POINTS 的固定顺序
+  src\plugin\mod.rs:1161: 进程实况覆盖清单
+  src\plugin\mod.rs:1162: 清单没提 theme，取 initialize 的
+  src\plugin\mod.rs:1163: initialize 没提 caps，保留清单的
+  src\plugin\mod.rs:1183: 只认 read 这一个词
+  src\plugin\mod.rs:1185: 类型不对也保守
+  src\plugin\mod.rs:1187: 缺字段 = 老插件，行为不变
+
+===== src\prompt.rs (43) =====
+  src\prompt.rs:40: 你是 AOX，一个「自我增长」的 AI 代理，运行在用户本地的 Rust 宿主程序中。\n\n# 核心事实\n- 宿主自带**元工具**（create_plugin / list_plugins / remove_plugin，用来繁殖插件）与\n  **文件工具**（read_file / write_file / list_dir / remove / attach_file，直接可用，\n …
+  src\prompt.rs:57: :{}}\n   插件回复一行: {
+  src\prompt.rs:58: :<JSON Schema>}]}}\n2. 工具调用: {
+  src\prompt.rs:59: :{...}}}\n   插件回复: {
+  src\prompt.rs:60: :false}}\n3. 结束: 宿主发送 {
+  src\prompt.rs:61: }（无 id），插件应退出。\n\n# Python 插件模板（强烈推荐直接使用宿主提供的 SDK）\n宿主已在 plugins/sdk/plugin_sdk.py 提供 SDK，插件源码这样写：\n\nimport sys, os\nsys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+  src\prompt.rs:67: ))\nfrom plugin_sdk import serve\n\ndef my_tool(args):\n    # args 是 dict，返回任意可 str() 的结果\n    return 
+  src\prompt.rs:75: }}}, my_tool),\n    # 只读工具补第 4 位 
+  src\prompt.rs:76: ，见下\n    
+  src\prompt.rs:77: ),\n})\n\n# 规则\n- 工具名全局唯一，必须用「插件名_功能」命名（例如 fs_read_file），避免与其他插件冲突。\n- **只读的工具请在声明里补第 4 位 `
+  src\prompt.rs:82: `**（见上面 `my_scan` 那行）。本对话有\n  **工作区边界**：它只挡写入与删除，读不设限（read_file / list_dir 可以读设备上任何文件）。\n  但插件对宿主是**黑盒** —— 宿主只能按参数名扫「像路径」的字符串，判不出你是去读还是去写，\n  所以没声明的一律按「可能写入」拦。于是扫描、统计、列目录、解析文件这类只读工具\n  一碰工作区外的路径就会被拦下…
+  src\prompt.rs:87: ` 之后宿主按「读」判，这类工具就能照常访问工作区外的路径，**不需要向用户提权**。\n  反过来，**会写文件 / 删东西 / 改系统状态的工具不要加这一位** —— 它们必须落在工作区内，\n  那是用户划的边界，不是可以绕开的东西。\n- parameters 必须是合法的 JSON Schema object。\n- 结果 content 必须是字符串；长结果尽量精炼。\n- 每个插件保…
+  src\prompt.rs:112: ]}`。\n- 宿主能挡下的硬限制（撞上去只会得到一句难懂的 400）：单张图片 ≤ 32 MiB、\n  单个附件 ≤ 36 MiB、单次请求体 ≤ 48 MiB。超了会当场告诉你，压缩 / 分批即可。\n- 支不支持某个格式**由端点说了算**，宿主不按后缀拦。端点回「不支持该格式」或\n  「该模型不支持图片」时，把它的原话转述给用户，不要自己编一个理由。\n\n# 你展示给用户的东西也要能…
+  src\prompt.rs:122: `\n  声明的图，宿主都会**画在对话流里**给用户看。所以产出图之后直接说「图在下面」就行，\n  不必再用文字把图里的内容复述一遍。\n- **要画图就写 SVG**。流程图 / 结构图 / 时序图直接在正文里写一个 ```svg 围栏，宿主会把它\n  **画出来**（不是显示成代码）。当前支持的范围很小，写之前先对一眼：\n  - 根元素：`<svg viewBox=
+  src\prompt.rs:127: >`（不写 viewBox 就按形状范围兜底，但建议写上）\n  - 三种形状：`<rect x y width height rx>`、`<line x1 y1 x2 y2>`、`<text x y font-size text-anchor>`\n  - 属性：`fill` / `stroke` / `stroke-width`（`#rrggbb`、`rgb(r,g,b)`、`none` 与十…
+  src\prompt.rs:147: \n\n# 插件协议
+  src\prompt.rs:154: # 插件协议
+  src\prompt.rs:186: 内置
+  src\prompt.rs:187: 配置
+  src\prompt.rs:188: 运行时
+  src\prompt.rs:189: 项目文件
+  src\prompt.rs:190: 插件
+  src\prompt.rs:218: 身份与核心事实
+  src\prompt.rs:225: 插件协议与内置规则
+  src\prompt.rs:252: \n\n# 运行环境（由宿主确定，直接使用，勿猜测）\n\\n         - 应用根目录（＝插件进程的工作目录）: {root}\n\\n         - 插件目录: {plugins}\n\\n         - 插件源码路径形如: {plugins}\\<插件名>\\main.py\n\\n         - 平台: {os}\n\\n         - 所有相对路径都相对「应…
+  src\prompt.rs:266: 运行环境
+  src\prompt.rs:285: 项目规则（RULES.md）
+  src\prompt.rs:288: # 项目规则\n{body}
+  src\prompt.rs:387: 系统提示拼装结果 · {} 段 · {} 字符\n
+  src\prompt.rs:404: \n  （另有 {} 段被 disable 或内容为空，未参与拼装）
+  src\prompt.rs:406: \n  改 config.toml 的 [prompt] 可重排 / 禁用 / 追加段。
+  src\prompt.rs:435: 测试用运行时不应因存储后端失败
+  src\prompt.rs:442: 两段都不应为空
+  src\prompt.rs:460: 段 {} 以换行开头
+  src\prompt.rs:461: 段 {} 以换行结尾
+  src\prompt.rs:487: 团队风格
+  src\prompt.rs:488: 先给结论再给理由。
+  src\prompt.rs:497: 先给结论再给理由。
+  src\prompt.rs:507: 你是一个只做代码评审的助手。
+  src\prompt.rs:515: 你是一个只做代码评审的助手。
+  src\prompt.rs:517: 你初始没有任何实际工具
+  src\prompt.rs:525: # 插件协议
+  src\prompt.rs:526: # 核心事实
+
+===== src\runtime.rs (3) =====
+  src\runtime.rs:188: 工具名冲突: {name}（工具名全局唯一，请用「插件名_功能」命名）
+  src\runtime.rs:250: 工具不存在: {name}
+  src\runtime.rs:257: 工具 {name} 执行超时（{} 秒）
+
+===== src\runtimes.rs (39) =====
+  src\runtimes.rs:51: Node 运行时单文件就超过 80 MB，不适合自动装配。请自行安装 Node.js 后确保 `node` 在 PATH 中，\\n     或在 config.toml 的 [runtimes] node 写入完整路径。
+  src\runtimes.rs:105: config.toml 指定
+  src\runtimes.rs:106: 应用目录内置
+  src\runtimes.rs:108: 未找到
+  src\runtimes.rs:255: 插件运行时：\n
+  src\runtimes.rs:267:   内置运行时目录: {}\n
+  src\runtimes.rs:268:   离线包约定名:   {PACK_NAME}（放在 exe 同目录或应用根即可）\n
+  src\runtimes.rs:270:   已发现离线包:   {}\n
+  src\runtimes.rs:283: 未检测到 Python，python 插件不可用（文件读写、系统信息等能力都靠它）。\\n         输入 /runtime install python 可安装内置运行时（约 10 MB，装到 {}）。
+  src\runtimes.rs:292: \n- 可用插件运行时：
+  src\runtimes.rs:300: 缺失
+  src\runtimes.rs:307: \n- **本机没有 Python**：不要创建 language=\"python\" 的插件，那一定会失败。\\n             可以改用 language=\"rust\"（编译产物运行期不需要任何运行时）；\\n             或先让用户执行 /runtime install python 安装内置运行时，再重试。
+  src\runtimes.rs:312: \n- 本机没有 rustc：**创建** rust 插件会失败，但已经编译好的 rust 插件可以正常加载运行。
+  src\runtimes.rs:352: 调用 certutil 计算校验和失败（系统缺少 certutil？）
+  src\runtimes.rs:359: 无法从 certutil 输出中解析 SHA-256：\n{}
+  src\runtimes.rs:382: 解压失败：tar 与 PowerShell 都无法调用
+  src\runtimes.rs:385: 解压 {} 失败：\n{}
+  src\runtimes.rs:424: 请求失败：{url}
+  src\runtimes.rs:426: 服务端拒绝了请求：{url}
+  src\runtimes.rs:430: 无法创建 {}
+  src\runtimes.rs:443: 下载中 {pct}%（{:.1}/{:.1} MB）
+  src\runtimes.rs:453: 下载不完整：收到 {got} 字节，Content-Length 为 {t}
+  src\runtimes.rs:466: 校验 SHA-256…
+  src\runtimes.rs:474: 运行时包校验失败：\n  期望 {expect}\n  实际 {got}\n\\n                     （若这是你自己托管的包，请在 [runtimes] 里更新 python_sha256）
+  src\runtimes.rs:477: 校验通过
+  src\runtimes.rs:479: 未配置 python_sha256，跳过校验
+  src\runtimes.rs:482: 未配置 python_sha256，跳过校验
+  src\runtimes.rs:484: 解压…
+  src\runtimes.rs:488: 解压后没有找到 {}，包结构可能不正确
+  src\runtimes.rs:504: 内置 Python 运行时已存在：{}
+  src\runtimes.rs:516: 发现离线运行时包：{}
+  src\runtimes.rs:541: 下载运行时：{url}
+  src\runtimes.rs:557: 无法把解压结果移动到 {}
+  src\runtimes.rs:560: 运行时已就位：{}
+  src\runtimes.rs:588: 不支持的运行时: {other}（可选：python）
+  src\runtimes.rs:591: 未知的 /runtime 子命令: {other}\n\\n             用法: /runtime [status] | /runtime install [python] | /runtime dir
+  src\runtimes.rs:613: （没能取到版本号）
+  src\runtimes.rs:615: Python 运行时已装配：{}\n  {ver}\n  \\n                 已立即生效：之后新建的 python 插件直接用它；\\n                 此前因缺少 python 而加载失败的插件，重启程序后会自动恢复。
+  src\runtimes.rs:619: {} 不支持自动装配
+
+===== src\sandbox.rs (19) =====
+  src\sandbox.rs:95: 围栏已关闭（config.toml 的 [sandbox] enabled = false）
+  src\sandbox.rs:104: 本平台没有 Job Object（围栏目前只有 Windows 实现）
+  src\sandbox.rs:136: 围栏 ✓
+  src\sandbox.rs:137: 围栏 ✗（{r}）
+  src\sandbox.rs:138: 围栏 ✗
+  src\sandbox.rs:159: 子进程已经退出，来不及套围栏
+  src\sandbox.rs:162: 拿不到子进程 pid，来不及套围栏
+  src\sandbox.rs:170: 建立围栏失败：{e}
+  src\sandbox.rs:190: 无法恢复子进程主线程（已终止该进程）
+  src\sandbox.rs:196: 这个环境不允许把进程加入 Job（{e}），该插件未受限
+  src\sandbox.rs:209: CreateJobObjectW 失败（{}）
+  src\sandbox.rs:235: 写入资源限制失败（{e}）
+  src\sandbox.rs:316: 错误码 {}
+  src\sandbox.rs:348: 非 Windows（本平台无围栏实现）
+  src\sandbox.rs:349: 插件进程围栏 · {platform}\n
+  src\sandbox.rs:351: \n  状态：已关闭（config.toml 的 [sandbox] enabled = false）\n
+  src\sandbox.rs:355: \n  ✓ 每个插件一个独立 Job；它能再开 {} 个子进程（0 = 一个都不许）\n  \\n         ✓ 宿主退出即全灭（KILL_ON_JOB_CLOSE；崩溃、被 kill 也算）\n  \\n         {} 内存上限：{}\n  \\n         {} USER 对象隔离（窗口 / 剪贴板 / 桌面 / 全局原子）\n
+  src\sandbox.rs:358: 未设（默认关：超限是直接杀进程，见配置注释）
+  src\sandbox.rs:362: \n  ✗ 文件读写与删除 —— Job Object 管不了，围栏挡不住插件删任何它有权限删的文件\n  \\n         ✗ 网络访问 —— 同上\n  \\n         ✗ 读取越界 —— 同上\n\n  \\n         围栏是加固，不是沙箱。要挡住文件/网络，需要 AppContainer 或换执行体（WASM），\\n         见 docs 里的沙箱方案对照。…
+
+===== src\selftest.rs (91) =====
+  src\selftest.rs:16: ))\nfrom plugin_sdk import serve\n\ndef echo(args):\n    # 附带 cwd 与非 ASCII 内容：用于验证「工作目录=应用根」与「UTF-8 往返」两条修复\n    return 
+  src\selftest.rs:74: [selftest] 初始化运行时…
+  src\selftest.rs:81: [selftest] 通过 create_plugin 链路创建自检插件…
+  src\selftest.rs:82: 自检回显插件
+  src\selftest.rs:83: [selftest] 已注册工具: {}
+  src\selftest.rs:85: selftest_echo 未注册
+  src\selftest.rs:88: [selftest] 调用 selftest_echo…
+  src\selftest.rs:90: [selftest] 返回: {}
+  src\selftest.rs:92: 回显结果不符合预期
+  src\selftest.rs:95: 中文标记OK
+  src\selftest.rs:96: 非 ASCII 内容未能正确往返，编码链路仍有问题: {}
+  src\selftest.rs:101: 插件工作目录仍是插件自身目录，未指向应用根: {}
+  src\selftest.rs:104: [selftest] 通过 remove_plugin 链路卸载插件…
+  src\selftest.rs:106: [selftest] 已注销工具: {}
+  src\selftest.rs:110: 卸载后工具仍残留
+  src\selftest.rs:114: [selftest] 回归：残留目录重建…
+  src\selftest.rs:118: 残留目录重建测试
+  src\selftest.rs:120: 残留目录重建后工具未注册
+  src\selftest.rs:123: 残留文件未被清理
+  src\selftest.rs:128: [selftest] 回归：幽灵插件清理…
+  src\selftest.rs:134: 幽灵插件目录未被清理
+  src\selftest.rs:140: [selftest] 回归：思考模式 reasoning_content 往返…
+  src\selftest.rs:143: 我先看看有哪些插件。
+  src\selftest.rs:144: 需要先确认当前可用的能力。
+  src\selftest.rs:152: 需要先确认当前可用的能力。
+  src\selftest.rs:153: assistant 消息的 reasoning_content 未被保留（思考模式下回传会被 API 拒绝）
+  src\selftest.rs:156: 需要先确认当前可用的能力。
+  src\selftest.rs:157: 回传请求中缺少 reasoning_content: {back}
+  src\selftest.rs:160: 回传请求中缺少 tool_calls
+  src\selftest.rs:165: 普通消息不应序列化 reasoning_content: {plain}
+  src\selftest.rs:170: [selftest] 回归：SSE 流式解析（思考过程 + 工具调用分片）…
+  src\selftest.rs:193: 先看
+  src\selftest.rs:194: 有哪些插件
+  src\selftest.rs:207: 好的
+  src\selftest.rs:225: 先看有哪些插件
+  src\selftest.rs:226: 思考过程未实时推送给 sink: {streamed:?}
+  src\selftest.rs:230: 好的
+  src\selftest.rs:231: 正文增量未实时推送给 sink: {streamed_text:?}
+  src\selftest.rs:234: 未识别 data: [DONE]
+  src\selftest.rs:237: 先看有哪些插件
+  src\selftest.rs:238: 流式累加未保留 reasoning_content（思考模式回传会被 API 拒绝）
+  src\selftest.rs:240: 好的
+  src\selftest.rs:241: 流式正文累加错误: {:?}
+  src\selftest.rs:245: 流式工具调用数量错误: {}
+  src\selftest.rs:248: 第 1 个工具调用拼装错误: {:?}
+  src\selftest.rs:254: 分片参数拼接错误: {:?}
+  src\selftest.rs:257: finish_reason 未捕获: {:?}
+  src\selftest.rs:268: usage 未完整捕获: {u:?}
+  src\selftest.rs:278: [selftest] 回归：进程围栏（Job Object）…
+  src\selftest.rs:280: 围栏验证
+  src\selftest.rs:282: 围栏验证插件未注册工具
+  src\selftest.rs:288: [selftest]   默认额度: {}
+  src\selftest.rs:290: 围栏验证插件自身执行失败（围栏不该影响插件自己）: {}
+  src\selftest.rs:294: 默认配置（max_processes = {}）下插件拉不起子进程 —— \\n                 默认额度把插件干活挡住了: {}
+  src\selftest.rs:307: 围栏验证（锁死）
+  src\selftest.rs:309: [selftest]   额度锁 0: {}
+  src\selftest.rs:311: 额度锁 0 时插件自身执行失败（围栏不该影响插件自己）: {}
+  src\selftest.rs:314: max_processes = 0 没锁住：插件仍然拉起了子进程 —— {}
+  src\selftest.rs:324: 围栏验证（对照）
+  src\selftest.rs:326: [selftest]   围栏关闭: {}
+  src\selftest.rs:329: 对照组失败：关掉围栏后插件仍拉不起子进程 ⇒ 挡住它的不是围栏，\\n                 上面那条「额度锁 0 生效」的结论无效 —— {}
+  src\selftest.rs:342: [selftest] 回归：工作区边界（文件能力收回宿主）…
+  src\selftest.rs:365: fixed 档位没有确定工作区根
+  src\selftest.rs:370: 工作区内的内容
+  src\selftest.rs:373: 工作区内写入被拒了（边界太紧）: {}
+  src\selftest.rs:376: 工作区内的内容
+  src\selftest.rs:377: 工作区内的读写往返失败: {}
+  src\selftest.rs:383: [selftest]   受限档越界: {}
+  src\selftest.rs:385: 越界写入没被拦下
+  src\selftest.rs:388: 越界写入被拒了，但文件真的被创建了 —— 这个边界是假的
+  src\selftest.rs:390: 权限边界
+  src\selftest.rs:390: 不要重试
+  src\selftest.rs:390: 转述给用户
+  src\selftest.rs:392: 越界文案缺了「{needle}」这一段（模型会因此反复重试）: {}
+  src\selftest.rs:401: 受限档位下**写**的相对路径没被拒
+  src\selftest.rs:405: 区外的内容
+  src\selftest.rs:407: 区外的内容
+  src\selftest.rs:408: 受限档位下读区外文件失败（读应当不设限）: {}
+  src\selftest.rs:412: 受限档位下删区外文件没被拦下
+  src\selftest.rs:415: 区外删除被拒了，但文件真的被删了 —— 这个边界是假的
+  src\selftest.rs:417: [selftest]   读区外放行 / 删区外拦截: 对拍通过
+  src\selftest.rs:428: full 档位不该有工作区根
+  src\selftest.rs:435: 对照组失败：full 档位下同一个路径也写不了 ⇒ 上面「越界被拦」不能归因于工作区 —— {}
+  src\selftest.rs:440: 对照组报告写入成功，但文件不在
+  src\selftest.rs:452: [selftest] 回归：插件声明的 read 意图…
+  src\selftest.rs:455: 只读声明自检
+  src\selftest.rs:459: {t} 未注册（已注册: {tools:?}）
+  src\selftest.rs:466: 声明了 \"read\" 的工具在注册表上不是只读（拿到了 {a:?}）—— \\n                 先查 Python SDK 的 `_tool_entry` 有没有把第 4 位发出来
+  src\selftest.rs:473: 没声明 access 的工具被当成了只读（拿到了 {b:?}）—— 这会静默放松写边界
+  src\selftest.rs:475: [selftest]   声明 read → Read；未声明 → Write: 对拍通过
+  src\selftest.rs:478: [selftest] 全部通过 ✔
+
+===== src\store\jsonl.rs (96) =====
+  src\store\jsonl.rs:407: 无法删除 {}
+  src\store\jsonl.rs:432: 无法创建历史目录 {}
+  src\store\jsonl.rs:457: 无法打开 {}
+  src\store\jsonl.rs:674: （空对话）
+  src\store\jsonl.rs:681: 无法打开 {}
+  src\store\jsonl.rs:801: 请给出对话序号或文件名（可用 /history 查看列表）
+  src\store\jsonl.rs:808: 序号不合法: {key}
+  src\store\jsonl.rs:810: 序号从 1 开始
+  src\store\jsonl.rs:815: 没有第 {n} 个对话（可用 /history 查看列表）
+  src\store\jsonl.rs:820: 找不到对话 {key}（可用 /history 查看列表）
+  src\store\jsonl.rs:879: 看这张
+  src\store\jsonl.rs:890: 对话文件应当已经写出来
+  src\store\jsonl.rs:892: 载荷不该进对话文件：{}
+  src\store\jsonl.rs:893: 附件清单要留着（历史里得看得出带了什么）
+  src\store\jsonl.rs:894: 看这张
+  src\store\jsonl.rs:894: 正文当然要留着
+  src\store\jsonl.rs:900: 看这张
+  src\store\jsonl.rs:902: 重开旧对话时要能把胶囊画回来
+  src\store\jsonl.rs:915: 第一行\n第二行 \"引号\" 与中文
+  src\store\jsonl.rs:916: 先看看
+  src\store\jsonl.rs:917: 列出 3 项
+  src\store\jsonl.rs:919: 文件不存在
+  src\store\jsonl.rs:920: 完成了。
+  src\store\jsonl.rs:924: system 不入档，6 条消息应全部读到
+  src\store\jsonl.rs:926: 第一行\n第二行 \"引号\" 与中文
+  src\store\jsonl.rs:930: 先看看
+  src\store\jsonl.rs:935: assistant 消息没有工具结果标记
+  src\store\jsonl.rs:937: 完成了。
+  src\store\jsonl.rs:944: 第一行
+  src\store\jsonl.rs:945: 显示时间形如 10-02 15:39: {}
+  src\store\jsonl.rs:954: 你是 AOX…
+  src\store\jsonl.rs:973: 保留我
+  src\store\jsonl.rs:976: 别留我
+  src\store\jsonl.rs:988: 只剩「保留我」一条
+  src\store\jsonl.rs:989: 保留我
+  src\store\jsonl.rs:992: meta + 1 条消息
+  src\store\jsonl.rs:1002: （宿主提示）你上一条回复是空的。
+  src\store\jsonl.rs:1003: 好
+  src\store\jsonl.rs:1004: 修一下登录 bug
+  src\store\jsonl.rs:1007: 修一下登录 bug
+  src\store\jsonl.rs:1039: 好行
+  src\store\jsonl.rs:1042: {这不是 JSON\n{\"kind\":\"unknown\"}\n
+  src\store\jsonl.rs:1046: 好行
+  src\store\jsonl.rs:1059: 第一句
+  src\store\jsonl.rs:1060: 用户指令
+  src\store\jsonl.rs:1062: 好
+  src\store\jsonl.rs:1070: 活动流记录不该被当成消息计数
+  src\store\jsonl.rs:1071: 第一句
+  src\store\jsonl.rs:1076: 用户指令
+  src\store\jsonl.rs:1078: 负载里的 kind 是类别（工具/模型…），不是行类型
+  src\store\jsonl.rs:1083: 第一句
+  src\store\jsonl.rs:1085: 只剩「第一句」
+  src\store\jsonl.rs:1086: 活动流不受消息回滚影响
+  src\store\jsonl.rs:1095: 唯一一个
+  src\store\jsonl.rs:1100: 支持只写时间戳前缀
+  src\store\jsonl.rs:1103: 8 位日期前缀要当 id 前缀
+  src\store\jsonl.rs:1104: 带扩展名也认
+  src\store\jsonl.rs:1106: 序号从 1 开始
+  src\store\jsonl.rs:1107: 空键不该被当成序号
+  src\store\jsonl.rs:1108: 像日期的前缀找不到就该找不到
+  src\store\jsonl.rs:1121: 第一句
+  src\store\jsonl.rs:1125: 第二句
+  src\store\jsonl.rs:1128: 不能多出第二个文件
+  src\store\jsonl.rs:1131: 第二句
+  src\store\jsonl.rs:1146: {\"role\":\"user\",\"content\":\"只有消息\"}\n
+  src\store\jsonl.rs:1149: 写回原文件
+  src\store\jsonl.rs:1150: 接着写
+  src\store\jsonl.rs:1158: 新消息追加在原文件末尾
+  src\store\jsonl.rs:1159: 没有另起文件
+  src\store\jsonl.rs:1185: 先开的对话
+  src\store\jsonl.rs:1187: 后开的对话
+  src\store\jsonl.rs:1188: 后写的文件在前
+  src\store\jsonl.rs:1192: 又聊了一句
+  src\store\jsonl.rs:1196: 刚聊过的那段排最前
+  src\store\jsonl.rs:1198: 显示时间取自 mtime，不该为空: {}
+  src\store\jsonl.rs:1232: 各项 token 必须逐项往返
+  src\store\jsonl.rs:1250: 还没写过就是 None（旧对话文件都走这一支）
+  src\store\jsonl.rs:1255: 第一句
+  src\store\jsonl.rs:1266: 应当读到最后一条
+  src\store\jsonl.rs:1267: 取的是最后一条，不是第一条
+  src\store\jsonl.rs:1268: full 档没有根
+  src\store\jsonl.rs:1269: 切档不该把「本对话自建地」弄丢
+  src\store\jsonl.rs:1273: 只剩这句
+  src\store\jsonl.rs:1275: 回滚不该丢掉工作区记录
+  src\store\jsonl.rs:1277: 中断回滚只该丢消息
+  src\store\jsonl.rs:1278: 消息确实被回滚成 1 条
+  src\store\jsonl.rs:1302: 没报就是没有，不许变成 0
+  src\store\jsonl.rs:1316: 第一句
+  src\store\jsonl.rs:1317: 半截
+  src\store\jsonl.rs:1337: 回滚后只剩一条消息
+  src\store\jsonl.rs:1338: 用量记录必须原样保留
+  src\store\jsonl.rs:1339: 活动流也必须原样保留
+  src\store\jsonl.rs:1349: 看看现在有什么能力
+  src\store\jsonl.rs:1363: usage 行不算消息
+  src\store\jsonl.rs:1364: 看看现在有什么能力
+  src\store\jsonl.rs:1387: 文件确实被删了
+
+===== src\store.rs (6) =====
+  src\store.rs:126: 未知的存储后端: {name}（当前可用: {}）\n\\n         请检查 config.toml 的 [store] backend，或删掉它使用默认值。
+  src\store.rs:146: 未知后端必须报错
+  src\store.rs:148: 报错要带上写错的那个名字: {e}
+  src\store.rs:149: 报错要告诉用户当前可用的是什么: {e}
+  src\store.rs:158: {name:?} 应可用: {e:#}
+  src\store.rs:160: 位置: {}
+
+===== src\sysinfo.rs (4) =====
+  src\sysinfo.rs:26:  · {cores} 核
+  src\sysinfo.rs:29:  · {gb:.1} GB 内存
+  src\sysinfo.rs:85: 核数不合常理: {n}
+  src\sysinfo.rs:94: 内存数不合常理: {gb}
+
+===== src\tool\ask.rs (32) =====
+  src\tool\ask.rs:57: 请用户在几个选项里挑一个，并**等他作答**（会暂停当前这轮）。\\n         需要用户做决定时用它 —— 在正文里写「你选 1 还是 2？」是没用的：那是纯文本，\\n         用户得自己打字，他打的字与你的编号对不对得上也没人保证。\\n         选项会自动编号，界面还会附一条「自己输入」。返回值是用户选中的那一项，\\n         或者他自己打的一段话（那也是一…
+  src\tool\ask.rs:66: {ASK_TOOL} 必须由宿主主循环处理（它需要把界面递进来），不能直接执行
+  src\tool\ask.rs:77: 要问用户的一句话。写清在选什么（例如「这份报告按哪种口径统计？」）
+  src\tool\ask.rs:84: 候选答案，2~6 个。**只写正文，不要自己编号** —— 宿主会加 A/B/C…。\\n                                每个选项要能独立看懂，不要写「同上」或「选第一个」
+  src\tool\ask.rs:101: {ASK_TOOL} 缺少 question（要给用户一句能看懂的问题）
+  src\tool\ask.rs:107: {ASK_TOOL} 的 options 必须是字符串数组
+  src\tool\ask.rs:113: {ASK_TOOL} 的 options 里有非字符串项：{o}
+  src\tool\ask.rs:117: {ASK_TOOL} 的 options 里有空选项 —— 去掉它再调用
+  src\tool\ask.rs:123: {ASK_TOOL} 至少要两个选项（给了 {} 个）。只有一个可能就不用问了，直接做
+  src\tool\ask.rs:178: 用户选了 {}. {text}
+  src\tool\ask.rs:179: 界面回了一个不存在的选项下标（内部错误），请重新问一次
+  src\tool\ask.rs:184: 用户没有点选项，直接回答了：{t}
+  src\tool\ask.rs:187: 用户没有作答（他关掉了选项、或者界面断了）。\\n             不要再问同一个问题：要么按你的默认判断继续做，并把「我按 X 做了」说清楚；\\n             要么把决定留给用户的下一条消息。
+  src\tool\ask.rs:198:   按哪种口径统计？ 
+  src\tool\ask.rs:198:  左边 
+  src\tool\ask.rs:198: 右边
+  src\tool\ask.rs:200: 按哪种口径统计？
+  src\tool\ask.rs:200: 首尾空白要去掉
+  src\tool\ask.rs:201: 左边
+  src\tool\ask.rs:201: 右边
+  src\tool\ask.rs:209: 空选项
+  src\tool\ask.rs:211: 非字符串
+  src\tool\ask.rs:216: 只有一个
+  src\tool\ask.rs:217: 至少要两个
+  src\tool\ask.rs:229: 选项{i}
+  src\tool\ask.rs:232: 选项0
+  src\tool\ask.rs:232: 截断要留前面几个，不是随机丢
+  src\tool\ask.rs:257: {input:?} 应当认成第 {want} 项
+  src\tool\ask.rs:260: A4 纸
+  src\tool\ask.rs:260: 第 1 个
+  src\tool\ask.rs:260: 是
+  src\tool\ask.rs:261: {input:?} 不该被认成选项
+
+===== src\tool\hostfs.rs (66) =====
+  src\tool\hostfs.rs:70: 缺少参数 {PATH_ARG}（必须是字符串路径）
+  src\tool\hostfs.rs:91: 读取一个文本文件并返回其内容（宿主提供）。读取不受工作区限制 —— 设备上的任何文件都能读。
+  src\tool\hostfs.rs:97: 要读取的文件路径（绝对路径；读取不受工作区限制）
+  src\tool\hostfs.rs:98: 最多读取多少字节，默认 200000
+  src\tool\hostfs.rs:113: {} 是一个目录，不是文件。要看里面有什么请用 list_dir。
+  src\tool\hostfs.rs:125: 读取 {} 失败: {e}
+  src\tool\hostfs.rs:129: {} 看起来是二进制文件（含 NUL 字节），本工具只读文本。
+  src\tool\hostfs.rs:136: {}（{} 字节）\n
+  src\tool\hostfs.rs:139: ⚠️ 文件超过 {limit} 字节，**下面只是前 {limit} 字节**，不是全文。\n
+  src\tool\hostfs.rs:165: 把一个字符串写进文本文件（覆盖写，宿主提供，受工作区限制）。路径必须是工作区内的绝对路径；父目录默认自动创建。
+  src\tool\hostfs.rs:171: 要写入的文件路径（绝对路径，且在工作区内）
+  src\tool\hostfs.rs:172: 文件内容（整份覆盖）
+  src\tool\hostfs.rs:173: 父目录不存在时是否自动创建，默认 true
+  src\tool\hostfs.rs:190: 缺少参数 content（必须是字符串）
+  src\tool\hostfs.rs:193: {} 是一个目录，不能当文件写。
+  src\tool\hostfs.rs:200: 创建父目录 {} 失败: {e}
+  src\tool\hostfs.rs:207: 父目录 {} 不存在（create_dirs = false，所以没有自动创建）
+  src\tool\hostfs.rs:215: 已{} {}（{} 字节）
+  src\tool\hostfs.rs:216: 覆盖
+  src\tool\hostfs.rs:216: 创建
+  src\tool\hostfs.rs:220: 写入 {} 失败: {e}
+  src\tool\hostfs.rs:243: 列出目录内容（宿主提供）。列出不受工作区限制。不传 path 时列出当前工作区根。目录名带 `/` 后缀。
+  src\tool\hostfs.rs:249: 要列出的目录（绝对路径）；省略 = 工作区根
+  src\tool\hostfs.rs:267: {} 不存在
+  src\tool\hostfs.rs:270: {} 不是目录。要读文件请用 read_file。
+  src\tool\hostfs.rs:274: 列出 {} 失败: {e}
+  src\tool\hostfs.rs:285: {}（{} 项）\n
+  src\tool\hostfs.rs:290:   {name}  ({size} 字节)\n
+  src\tool\hostfs.rs:294:   …另有 {} 项未列出（上限 {LIST_LIMIT}）\n
+  src\tool\hostfs.rs:329: 把一个本机文件挂给模型看（宿主提供）。图片（JPEG/PNG/GIF/WebP）会**真的发给模型**，\\n         模型能看见内容；其它格式也会照发，由端点决定收不收。\\n         截图 / 图表 / 扫描件这类要「看」的东西用它，不要用 read_file（那个只读文本）。
+  src\tool\hostfs.rs:335: 要挂上的文件路径（绝对路径；不受工作区限制）
+  src\tool\hostfs.rs:351: 图片（{}）
+  src\tool\hostfs.rs:352: 文件（非图片，端点可能不支持这个格式）
+  src\tool\hostfs.rs:357: 已挂上{}：{}（{} 字节）。它的内容会在你的下一次请求里出现。
+  src\tool\hostfs.rs:388: 删除一个文件或空目录（宿主提供，受工作区限制）。删非空目录必须显式 recursive = true。
+  src\tool\hostfs.rs:394: 要删除的路径（绝对路径，且在工作区内）
+  src\tool\hostfs.rs:395: 是否递归删除非空目录，默认 false
+  src\tool\hostfs.rs:414: {} 是当前工作区根，不能删除它自己。要清理内容请删里面的条目。
+  src\tool\hostfs.rs:419: {} 不存在
+  src\tool\hostfs.rs:429: {} 是非空目录。要真的递归删掉它，请显式传 recursive = true。
+  src\tool\hostfs.rs:437: 已删除目录 {}（{}）
+  src\tool\hostfs.rs:439: 递归
+  src\tool\hostfs.rs:439: 空目录
+  src\tool\hostfs.rs:441: 删除目录 {} 失败: {e}
+  src\tool\hostfs.rs:445: 已删除文件 {}
+  src\tool\hostfs.rs:446: 删除文件 {} 失败: {e}
+  src\tool\hostfs.rs:467: 运行时应当能建起来
+  src\tool\hostfs.rs:469: 注册宿主文件工具应当成功
+  src\tool\hostfs.rs:487: 你好\n
+  src\tool\hostfs.rs:489: 父目录应当被自动创建
+  src\tool\hostfs.rs:493: 你好
+  src\tool\hostfs.rs:493: 内容应当读回来：{}
+  src\tool\hostfs.rs:507: 越界的写入绝不能真的发生
+  src\tool\hostfs.rs:508: 权限边界
+  src\tool\hostfs.rs:509: 不要重试
+  src\tool\hostfs.rs:510: 转述给用户
+  src\tool\hostfs.rs:525: 外面的内容
+  src\tool\hostfs.rs:529: 读区外文件必须放行（新语义）：{}
+  src\tool\hostfs.rs:530: 外面的内容
+  src\tool\hostfs.rs:534: 列区外目录必须放行：{}
+  src\tool\hostfs.rs:539: 删区外文件必须被拦：{}
+  src\tool\hostfs.rs:540: 越界的删除绝不能真的发生
+  src\tool\hostfs.rs:541: 权限边界
+  src\tool\hostfs.rs:555: 非空目录不该被一次手滑删掉
+  src\tool\hostfs.rs:570: 工作区根不能被删
+  src\tool\hostfs.rs:582: 目录应带 / 后缀：{}
+
+===== src\tool\meta.rs (20) =====
+  src\tool\meta.rs:29: 编写并注入一个新工具插件（自我增长）。插件是独立子进程，通过 stdio 行 JSON 协议通信（协议见系统提示与 plugins/sdk/PROTOCOL.md）。创建成功后其声明的工具立即可调用，并持久化到 plugins/ 目录。若同名插件上次创建失败留下残留目录，会自动清理后重建，直接复用原插件名即可。
+  src\tool\meta.rs:35: 插件名，小写字母/数字/下划线，1-40 字符
+  src\tool\meta.rs:37: 插件语言。推荐 python（启动快、json 内置）；rust 仅可用 std 单文件编译
+  src\tool\meta.rs:38: 一句话说明这个插件提供什么能力
+  src\tool\meta.rs:39: 完整插件源码
+  src\tool\meta.rs:47: 缺少参数 name
+  src\tool\meta.rs:50: 缺少参数 language
+  src\tool\meta.rs:54: 缺少参数 source
+  src\tool\meta.rs:58: 插件 {name} 创建成功，已注册 {} 个工具: {}。现在可以直接调用它们。
+  src\tool\meta.rs:62: 插件创建失败: {e:#}
+  src\tool\meta.rs:80: 列出当前已加载的所有插件及其提供的工具。创建新插件前应先调用本工具检查是否已有可复用的能力。
+  src\tool\meta.rs:90: 当前没有任何已加载的插件。如任务需要工具能力，请用 create_plugin 创建。
+  src\tool\meta.rs:93: 已加载 {} 个插件:
+  src\tool\meta.rs:99:     工具 {}: {}
+  src\tool\meta.rs:119: 卸载并删除一个插件：停止其进程、注销其工具、删除 plugins/ 下对应目录（即使插件未被加载，也会清理其残留目录）。用于重建坏掉的插件或清理不再需要的能力。
+  src\tool\meta.rs:125: 要删除的插件名
+  src\tool\meta.rs:133: 缺少参数 name
+  src\tool\meta.rs:137: 插件 {name} 已删除，注销工具: {}
+  src\tool\meta.rs:138: （无）
+  src\tool\meta.rs:140: 删除插件失败: {e:#}
+
+===== src\ui\cli.rs (48) =====
+  src\ui\cli.rs:135: 暂无可展开的记录（尚未完成过任务）
+  src\ui\cli.rs:140: ──────────────── 上次任务过程 · {} 步 · {:.1}s ────────────────
+  src\ui\cli.rs:143: [中间说明 {}]
+  src\ui\cli.rs:157: （未完成）
+  src\ui\cli.rs:161: 最终输出：
+  src\ui\cli.rs:178: 当前对话还没有用量记录（尚未完成过任务，或端点不返回 usage）
+  src\ui\cli.rs:186: token 用量 · 本次对话 {} 轮 · {} 次模型调用
+  src\ui\cli.rs:189: 合计
+  src\ui\cli.rs:197: {} 次调用
+  src\ui\cli.rs:200: 输入 {}
+  src\ui\cli.rs:203: 输出 {}
+  src\ui\cli.rs:206: 推理 {}
+  src\ui\cli.rs:209: 缓存命中 {}
+  src\ui\cli.rs:215: 当前上下文
+  src\ui\cli.rs:227:   token 用量 · 第 {} 轮
+  src\ui\cli.rs:231: 输入
+  src\ui\cli.rs:234: 输出
+  src\ui\cli.rs:237: 合计
+  src\ui\cli.rs:245: 其中推理
+  src\ui\cli.rs:248: 缓存命中
+  src\ui\cli.rs:251: 缓存未命中
+  src\ui\cli.rs:258: 模型调用
+  src\ui\cli.rs:258: {} 次
+  src\ui\cli.rs:260: 末次输入
+  src\ui\cli.rs:265: 本次对话累计
+  src\ui\cli.rs:266: {}（{} 次调用）
+  src\ui\cli.rs:296: 执行 {name}
+  src\ui\cli.rs:310: 思考中
+  src\ui\cli.rs:341: ┌─ 授权请求 ────────────────────────────────
+  src\ui\cli.rs:342: 工具
+  src\ui\cli.rs:349: [y]允许一次   [a]本会话始终允许   [n]拒绝   (回车=y)
+  src\ui\cli.rs:351: └─ 请选择 >
+  src\ui\cli.rs:361: 无效输入，请输入 y / a / n >
+  src\ui\cli.rs:375: 你 >
+  src\ui\cli.rs:397: 参数 {}
+  src\ui\cli.rs:403: …{name} 执行中（超时 {timeout_secs} 秒，Ctrl+C 中断）
+  src\ui\cli.rs:409: 失败
+  src\ui\cli.rs:411: 完成
+  src\ui\cli.rs:430: 思考中
+  src\ui\cli.rs:444: 已折叠 {} 步工具调用
+  src\ui\cli.rs:445: · {:.1}s · /expand 展开
+  src\ui\cli.rs:460: ! 本轮没有产出最终答复（任务可能被模型提前结束），输入 /expand 查看执行过程
+  src\ui\cli.rs:491: 思考中
+  src\ui\cli.rs:511: ┌─ 需要你选一个 ────────────────────────────
+  src\ui\cli.rs:527: 回车 = 不作答，直接继续；输入别的字样 = 当成你自己的回答
+  src\ui\cli.rs:532: └─ 请选择 >
+  src\ui\cli.rs:554: 思考中
+  src\ui\cli.rs:563: # 一级标题\n\n\\n## 二级标题\n\n\\n这是普通段落，包含 **加粗**、*斜体* 和 `行内代码`。\n\n\\n- 列表项一\n\\n- 列表项二\n\\n  - 嵌套项\n\n\\n> 引用块：说明性文字。\n\n\\n```python\n\\ndef hello(name: str) -> str:\n    return f\"你好, {name}\"\n\\n```\n…
+
+===== src\workplace.rs (98) =====
+  src\workplace.rs:100: 默认
+  src\workplace.rs:101: 选择工作区
+  src\workplace.rs:102: 完全访问
+  src\workplace.rs:242: [workplace] mode = \"fixed\" 必须同时给 root = \"<目录>\"\\n                         （想要「每段对话一块新地」请用 mode = \"default\"）
+  src\workplace.rs:251: [workplace] root = {} 无法创建: {e}
+  src\workplace.rs:255: [workplace] mode = {other:?} 认不出来。可用值：\"default\"（每段对话一块新地，默认）、\\n                 \"full\"（不受限）、\"fixed\"（配合 root 指定固定目录）
+  src\workplace.rs:418: 创建工作区失败（{}）: {e}
+  src\workplace.rs:454: 目录 {} 无法使用: {e}
+  src\workplace.rs:456: {} 不是一个目录
+  src\workplace.rs:465: 已切到「完全访问」：AOX 可以读写设备上的任何文件（含工作区之外）。
+  src\workplace.rs:468: 上面已经算过
+  src\workplace.rs:472: 已切到「选择工作区」：{}
+  src\workplace.rs:485: 已切到「默认」：本对话仍在 {} 里。
+  src\workplace.rs:490: 已切到「默认」：下一条消息发出时会在 workplace/ 下开一块新工作区。
+  src\workplace.rs:573: 工作区\n\n
+  src\workplace.rs:577:   档位：完全访问\n  \\n                     AOX 可以读写设备上的任何文件，不设边界。\n\n  \\n                     这是**显式**选的（config.toml 里写了 mode = \"full\"，或界面上切过）—— \\n                     配置默认是「默认」档（受限）。\n  想收紧：/workplace …
+  src\workplace.rs:582:   档位：默认（受限）\n  \\n                     根：还没定 —— 下一条消息发出时会在 {} 下开一块新工作区。\n
+  src\workplace.rs:588:   档位：{label}（受限）\n  根：{}\n  \\n                     写入与删除都被限制在这个目录里；**读取不受限**（整个设备都能读）。\n
+  src\workplace.rs:594: \n  ⚠️ 边界只管「宿主提供的能力」：宿主内置的文件工具，以及插件工具的路径参数。\n     \\n             它管不了一个不守规矩的插件自己 open() 文件 —— 那要 OS 级隔离（AppContainer）。\n
+  src\workplace.rs:689: 你给的是相对路径 {raw:?}，本档位不接受相对路径。\\n                 要改写成工作区内的**绝对路径**，工作区根是：{}。\\n                 原因：宿主与插件子进程的工作目录不是同一个，同一串相对路径在两边会指到\\n                 两个不同文件 —— 那种不一致比多写几个字符危险得多。
+  src\workplace.rs:693: {raw:?} 解析为 {}，它落在工作区之外（工作区根：{}）。
+  src\workplace.rs:698: 本档位下这段对话的工作区还没确定（它在用户发出第一条消息时创建），\\n                 所以还不能往工作区里写东西。
+  src\workplace.rs:711: 【权限边界】{what}\n\n\\n             这不是工具坏了，也不是参数写错了 —— 是当前工作区的权限边界。\\n             **不要重试这次调用，也不要换一种写法绕过它**（同一个越界目标怎么试都会被拒）。\n\n\\n             请把这个情况**转述给用户**：当前工作区只允许在边界之内**写入和删除**，\\n             所以你无…
+  src\workplace.rs:722: 已拦下一次越界访问：相对路径 {raw:?}（工作区根 {}）。\\n                 本档位只接受工作区内的绝对路径。
+  src\workplace.rs:726: 已拦下一次越界访问：{raw:?} → {}，工作区是 {}。\\n                 本次调用没有执行。（要放宽用 `/workplace default|<目录>|full`，\\n                 或改 config.toml 的 [workplace]）
+  src\workplace.rs:731: 工作区还没建立，这次写入/删除被拦下 —— 发一条消息后即可使用。
+  src\workplace.rs:874: ) {\n        Some(rest) => PathBuf::from(rest),\n        None => p,\n    }\n}\n\n/// 纯词法规格化：只消 `.` 与可消的 `..`，**不碰文件系统**（也不解开 symlink）。\nfn lexical(p: &Path) -> PathBuf {\n    let mut prefix = PathBuf:…
+  src\workplace.rs:892: .into());\n                }\n            }\n            Component::Normal(s) => stack.push(s.to_os_string()),\n        }\n    }\n    let mut out = prefix;\n    for s in stack {\n        out.push(s);\…
+  src\workplace.rs:942: ,\n            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond\n        )\n    }\n    #[cfg(not(windows))]\n    {\n        // 拿不到本地时区就如实按 UTC 记，不拿「东八区近似」骗人（与 store 同一口径）。\n        let s…
+  src\workplace.rs:963: ,\n            rem / 3600,\n            (rem % 3600) / 60,\n            rem % 60\n        )\n    }\n}\n\n/// 在 `base` 下挑一个还没被占用的目录名：`<stamp>`，撞了就 `<stamp>-2`、`<stamp>-3`…\n///\n/// 为什么需要它：时间戳只精确到秒，而「同…
+  src\workplace.rs:983: ));\n        if !cand.exists() {\n            return cand;\n        }\n    }\n    // 一千个都没空位：基本不可能（除非有人手工塞满）；照旧返回第一个，\n    // 让它去 `create_dir_all` 里正常成功 —— 静默复用比在这里 panic 好。\n    first\n}\n\n#[cfg(tes…
+  src\workplace.rs:1005: , Some(dir))\n    }\n\n    /// 命令的两个名字：`/workplace` 是正式名，`/workspace` 是**兼容旧名**（2026-10-04 统一命名）。\n    ///\n    /// 钉住三件事：① 两个名字都认；② 参数照剥（`/workplace default` → `default`）；\n    /// ③ 目录名恰好叫 `/workpla…
+  src\workplace.rs:1012: )` 会犯的错（它会反复剥前缀），\n    /// 用户拿到的是「现状」而不是「切换结果」，而且毫无提示。\n    #[test]\n    fn command_answers_to_both_names_and_parses_args() {\n        for name in [
+  src\workplace.rs:1047: );\n        assert_eq!(w.active_root(), None);\n    }\n\n    /// 受限档位：**相对路径一律拒绝**，且文案要给出根（模型靠它改写）。\n    #[test]\n    fn confined_rejects_relative_and_tells_the_root() {\n        let base = std::env::…
+  src\workplace.rs:1078: ),\n        }\n    }\n\n    /// `..` 逃逸：词法上看着像在里面，规格化后必须落在外面。\n    #[test]\n    fn dotdot_escape_is_caught() {\n        let base = std::env::temp_dir().join(
+  src\workplace.rs:1091: );\n\n        // 没逃出去的那种 `..` 要放行（不能把 `sub/../ok.txt` 也一起拒了）\n        let ok = base.join(
+  src\workplace.rs:1095: );\n    }\n\n    /// 大小写不敏感（Windows 语义）：路径前缀大小写不同不算越界。\n    #[test]\n    fn prefix_compare_ignores_ascii_case() {\n        if !cfg!(windows) {\n            return;\n        }\n        let base = std::…
+  src\workplace.rs:1109: );\n    }\n\n    /// `default` 档位：**根没定之前一律拒绝**，不能因为「还没建」而静默全放行。\n    #[test]\n    fn pending_is_rejected_not_silently_allowed() {\n        let app = std::env::temp_dir().join(
+  src\workplace.rs:1121: );\n        // 用 `normalize` 比前缀：`ensure_started` 交回的是规格化过的路径，\n        // 而 `temp_dir()` 给的那份可能还带着 8.3 短名 / 大小写差异（`canonicalize` 之后\n        // 就成了另一串字符），直接 `starts_with` 会假红。\n        assert!(dir.st…
+  src\workplace.rs:1126: ).to_string_lossy()).is_ok());\n        // 一段对话只建一次\n        assert!(w.ensure_started(&app).unwrap().is_none(), 
+  src\workplace.rs:1128: );\n        // 新对话才换一块地\n        w.reset_for_new_conversation();\n        let dir2 = w.ensure_started(&app).unwrap().unwrap();\n        assert_ne!(dir, dir2, 
+  src\workplace.rs:1151: path 参数要被抓到
+  src\workplace.rs:1152: 绝对路径要被抓到
+  src\workplace.rs:1153: Windows 绝对路径要被抓到
+  src\workplace.rs:1154: 嵌套的 dir 要被抓到
+  src\workplace.rs:1157: paths 数组里的项要被抓到
+  src\workplace.rs:1158: 同上
+  src\workplace.rs:1159: 通配符不是路径
+  src\workplace.rs:1162: URL 不是文件路径
+  src\workplace.rs:1164: 斜杠
+  src\workplace.rs:1164: 正文不该被当路径
+  src\workplace.rs:1173: 已拦下一次越界访问
+  src\workplace.rs:1174: 不要重试
+  src\workplace.rs:1174: 给用户的那份不该带「别重试」这种对模型说的话
+  src\workplace.rs:1175: 给模型的契约要比给用户的一行更长更完整
+  src\workplace.rs:1198: 选择工作区
+  src\workplace.rs:1198: 固定档位应报「选择工作区」：{text}
+  src\workplace.rs:1201: 正文里应当有根：{text}
+  src\workplace.rs:1204: report() 超过 5 秒没返回 —— 状态锁被重入了（死锁）
+  src\workplace.rs:1210: 应当建出一块新地
+  src\workplace.rs:1212: 默认
+  src\workplace.rs:1213: 选择工作区
+  src\workplace.rs:1213: default 档不该被报成「选择工作区」：{text}
+  src\workplace.rs:1232: 整段源码被当成路径了：{:?}
+  src\workplace.rs:1235: 这两个参数都不该命中：{hits:?}
+  src\workplace.rs:1241: `path` 键下的长值是路径，不能因为长度被放过
+  src\workplace.rs:1250: full 档必须报不受限
+  src\workplace.rs:1252: full 档必须放行 {p:?}
+  src\workplace.rs:1258: 受限档不能报不受限 —— 否则判定被整个跳过
+  src\workplace.rs:1260: 运行期切到 full 之后也必须短路
+  src\workplace.rs:1263: Pending 是全拒绝，绝不能报不受限
+  src\workplace.rs:1282: 越界的**写**必须被拒
+  src\workplace.rs:1284: 越界的**读**必须放行（新语义）
+  src\workplace.rs:1291: 读不该因为相对路径被拒
+  src\workplace.rs:1296: 地还没开也不该挡住读
+  src\workplace.rs:1327: 应当建出一块新地
+  src\workplace.rs:1329: default 档建成之后档位不该变成「选择工作区」
+  src\workplace.rs:1331: snapshot 与 mode 必须一致
+  src\workplace.rs:1332: snapshot 与 active_root 必须一致
+  src\workplace.rs:1361: 运行期点名挑的地要报「选择工作区」，实际 {m:?}
+  src\workplace.rs:1363: 存档里也要是 fixed，否则下回打开又变回默认
+  src\workplace.rs:1368: 应当建出一块新地
+  src\workplace.rs:1390: 新对话应当回到「默认」且根未定
+  src\workplace.rs:1399: 应当现建一块新地
+  src\workplace.rs:1402: 新对话的地应当在 workplace/ 下，实际 {}
+  src\workplace.rs:1422: 应当建出一块新地
+  src\workplace.rs:1426: 自建地也要进存档
+  src\workplace.rs:1430: 往返一圈必须一模一样
+  src\workplace.rs:1449: full 档下也不许丢自建地
+  src\workplace.rs:1451: 切回默认应当回到存档里那块
+  src\workplace.rs:1473: 首条消息应当建出一块地
+  src\workplace.rs:1483: 切回默认应当回到本对话那块地
+  src\workplace.rs:1485: 仍在
+  src\workplace.rs:1485: 提示语该说「仍在原来那块」，实际：{msg}
+  src\workplace.rs:1487: 不该再建第二块地
+  src\workplace.rs:1491: 来回切档不该攒出多个目录，实际 {made} 个
+  src\workplace.rs:1496: 新对话应当另建一块
+  src\workplace.rs:1497: 新对话本来就该是另一块地

@@ -13,10 +13,12 @@ use super::{AgentEvent, AuthDecision, ChoiceReply, Ui};
 use crate::history::UsageRecord;
 use crate::llm::{thousands, StreamSink};
 
-/// 把模型的思考过程与正文增量实时喂给共享状态，由等待动画在屏幕上滚动回显。
+/// Feeds the model's reasoning process and body-text deltas live into shared state, for the waiting
+/// animation to scroll back on screen.
 ///
-/// 它不直接画屏：渲染由 spinner 后台任务负责（80ms 一帧），
-/// 因此即便 Provider 高频回调也只是往缓冲区追加字符串，不会拖慢流式读取。
+/// It doesn't paint the screen directly: rendering is the spinner background task's job (one frame
+/// every 80ms), so even high-frequency Provider callbacks just append strings to a buffer and never
+/// slow down the streaming read.
 struct ReasoningSink {
     status: Arc<Status>,
 }
@@ -26,34 +28,36 @@ impl StreamSink for ReasoningSink {
         self.status.push_reasoning(delta);
     }
 
-    /// 正文也喂进去，只为数 token —— 正文本身由 `TurnLog` 留存并渲染。
+    /// The content is also fed in, solely to count tokens — the content itself is kept and rendered by `TurnLog`.
     fn on_content(&self, delta: &str) {
         self.status.push_content(delta);
     }
 
     fn on_finish(&self) {
-        // 一次响应结束 → 思考过程立刻消失（token 计数继续留着，一轮里会多次请求）
+        // One response ended → the reasoning process vanishes immediately (the token counter stays,
+        // since a turn makes several requests)
         self.status.clear_reasoning();
     }
 }
 
-/// 一次工具调用的记录（用于折叠 / 展开）
+/// A record of one tool call (used for folding / expanding)
 struct Step {
     name: String,
     args: String,
-    /// (是否错误, 结果摘要)
+    /// (is_error, result summary)
     result: Option<(bool, String)>,
 }
 
-/// 一轮任务（一次用户指令 → 模型+工具循环）的完整过程。
-/// 进行中只在终端显示一行状态；结束后折叠成一行摘要，按需展开。
+/// The complete process of one turn (one user instruction → model + tool loop).
+/// While it runs only one status line shows in the terminal; once done it folds into a one-line
+/// summary and expands on demand.
 struct TurnLog {
     steps: Vec<Step>,
-    /// 中间过程的助手说明（不单独展示，展开时可见）
+    /// The assistant's interim narration (not shown on its own, visible when expanded)
     interim: Vec<String>,
-    /// 过程中的提示 / 警告 / 错误
+    /// The info / warning / error notes along the way
     notes: Vec<(char, String)>,
-    /// 最终输出：最后一次不带工具调用的助手文本
+    /// The final output: the last assistant text without tool calls
     final_text: Option<String>,
     started: Instant,
 }
@@ -74,14 +78,14 @@ impl TurnLog {
     }
 }
 
-/// 命令行界面实现
+/// The command-line interface implementation
 pub struct CliUi {
     lines: Lines<BufReader<tokio::io::Stdin>>,
     spinner: Option<Spinner>,
     status: Option<Arc<Status>>,
-    /// 进行中的一轮任务
+    /// The turn in progress
     turn: Option<TurnLog>,
-    /// 最近一次已完成的任务，供 /expand 展开
+    /// The most recently finished turn, for `/expand` to unfold
     last: Option<TurnLog>,
 }
 
@@ -122,25 +126,26 @@ impl CliUi {
         }
     }
 
-    /// 中断当前任务：停止动画并丢弃半截记录（不回填到 /expand）。
+    /// Interrupt the current turn: stop the animation and discard the half-record (it is not fed
+    /// back to `/expand`).
     pub async fn abort_turn(&mut self) {
         self.stop_spinner().await;
         self.status = None;
         self.turn = None;
     }
 
-    /// 展开最近一次被折叠的任务过程。
+    /// Expand the most recently folded turn's process.
     pub fn expand_last_turn(&self) {
         let Some(t) = self.last.as_ref() else {
-            println!("{} {}", s::yellow("!"), s::dim("暂无可展开的记录（尚未完成过任务）"));
+            println!("{} {}", s::yellow("!"), s::dim(crate::i18n::t("Nothing to expand yet (no task has finished)")));
             return;
         };
         println!(
             "{}",
-            s::dim(&format!("──────────────── 上次任务过程 · {} 步 · {:.1}s ────────────────", t.steps.len(), t.elapsed()))
+            s::dim(&crate::tf!("──────────────── last task process · {} steps · {}s ────────────────", t.steps.len(), format!("{:.1}", t.elapsed())))
         );
         for (i, text) in t.interim.iter().enumerate() {
-            println!("{}", s::dim(&format!("[中间说明 {}]", i + 1)));
+            println!("{}", s::dim(&crate::tf!("[interim note {}]", i + 1)));
             println!("{}", s::render_markdown(text));
         }
         for (i, st) in t.steps.iter().enumerate() {
@@ -154,28 +159,29 @@ impl CliUi {
             match &st.result {
                 Some((false, p)) => println!("     {} {}", s::green("✓"), s::dim(&one_line(p, 200))),
                 Some((true, p)) => println!("     {} {}", s::red("✗"), s::red(&one_line(p, 200))),
-                None => println!("     {}", s::dim("（未完成）")),
+                None => println!("     {}", s::dim(crate::i18n::t("(unfinished)"))),
             }
         }
         if let Some(f) = &t.final_text {
-            println!("{}", s::dim("最终输出："));
+            println!("{}", s::dim(crate::i18n::t("Final output:")));
             println!("{}", s::render_markdown(f));
         }
         println!("{}", s::dim("────────────────────────────────────────────────────────────"));
     }
 
-    /// 回看**当前对话逐轮**的 token 账（`/usage`）。
+    /// Look back at the **current conversation's per-turn** token account (`/usage`).
     ///
-    /// 数据来自 agent 手里的账本 —— 也就是从对话文件读回来的那一份，所以切过对话、
-    /// 重启过程序都还在。逐轮列出来是有必要的：只给一个总数，就答不出「哪一轮最贵」，
-    /// 而最贵的那一轮往往正是出问题的那一轮。
+    /// The data comes from the ledger the agent holds — the very copy read back from the conversation
+    /// file, so it survives switching conversations and restarting the program. Listing it per turn
+    /// matters: a bare total can't answer "which turn was the most expensive", and the most expensive
+    /// turn is usually exactly the one that went wrong.
     pub fn show_usage(&self, log: &[UsageRecord]) {
         let rows: Vec<&UsageRecord> = log.iter().filter(|r| !r.is_empty()).collect();
         if rows.is_empty() {
             println!(
                 "{} {}",
                 s::yellow("!"),
-                s::dim("当前对话还没有用量记录（尚未完成过任务，或端点不返回 usage）")
+                s::dim(crate::i18n::t("This conversation has no usage records yet (no task has finished, or the endpoint does not return usage)"))
             );
             return;
         }
@@ -183,58 +189,60 @@ impl CliUi {
         println!();
         println!(
             "{}",
-            s::bold(&format!("token 用量 · 本次对话 {} 轮 · {} 次模型调用", rows.len(), calls))
+            s::bold(&crate::tf!("token usage · {} turns in this conversation · {} model calls", rows.len(), calls))
         );
         if let Some(v) = rows.last().and_then(|r| r.session_total) {
-            println!("  {}  {}", s::dim("合计"), s::bold_cyan(&thousands(v)));
+            println!("  {}  {}", s::dim(crate::i18n::t("Total")), s::bold_cyan(&thousands(v)));
         }
         println!();
         for r in &rows {
             let mut line = vec![
                 s::dim(&format!("#{:<3}", r.round)),
-                // 先把数字补齐再上色：ANSI 转义符也算字符，对上色后的串做宽度填充会错位
+                // Pad the number to width *before* colouring: ANSI escape codes count as characters,
+                // so width-padding an already-coloured string misaligns
                 s::bold_white(&format!("{:>9}", thousands(r.usage.total.unwrap_or(0)))),
-                s::dim(&format!("{} 次调用", r.calls)),
+                s::dim(&crate::tf!("{} calls", r.calls)),
             ];
             if let Some(v) = r.usage.prompt {
-                line.push(s::dim(&format!("输入 {}", thousands(v))));
+                line.push(s::dim(&crate::tf!("input {}", thousands(v))));
             }
             if let Some(v) = r.usage.completion {
-                line.push(s::dim(&format!("输出 {}", thousands(v))));
+                line.push(s::dim(&crate::tf!("output {}", thousands(v))));
             }
             if let Some(v) = r.usage.reasoning {
-                line.push(s::dim(&format!("推理 {}", thousands(v))));
+                line.push(s::dim(&crate::tf!("reasoning {}", thousands(v))));
             }
             if let Some(v) = r.usage.cached {
-                line.push(s::green(&format!("缓存命中 {}", thousands(v))));
+                line.push(s::green(&crate::tf!("cache hit {}", thousands(v))));
             }
             println!("  {}", line.join(&s::dim("  ·  ")));
         }
         if let Some(v) = rows.last().and_then(|r| r.last_prompt) {
             println!();
-            println!("  {} {}", s::dim("当前上下文"), s::bold_white(&thousands(v)));
+            println!("  {} {}", s::dim(crate::i18n::t("current context")), s::bold_white(&thousands(v)));
         }
         println!();
     }
 
-    /// 打印一轮结束的 token 明细。
+    /// Print the token breakdown for one finished turn.
     ///
-    /// 分三行是有取舍的：第一行放所有人都要看的输入 / 输出 / 合计，
-    /// 第二行是细项（推理、缓存命中），第三行才是调用次数与上下文规模。
-    /// 端点没给的项直接不出现 —— 宁可少一行，也不要拿 0 去冒充「没有消耗」。
+    /// Splitting into three lines is a deliberate trade-off: the first holds the input / output / total
+    /// everyone looks at, the second the sub-items (reasoning, cache hits), and the third the call count
+    /// and context size. Items the endpoint didn't report simply don't appear — better to drop a line than
+    /// to fake "zero consumption" with a 0.
     fn print_usage(r: &UsageRecord) {
         println!();
-        println!("{}", s::dim(&format!("  token 用量 · 第 {} 轮", r.round)));
+        println!("{}", s::dim(&crate::tf!("  token usage · round {}", r.round)));
 
         let mut row1: Vec<String> = Vec::new();
         if let Some(v) = r.usage.prompt {
-            row1.push(format!("{} {}", s::dim("输入"), s::bold_white(&thousands(v))));
+            row1.push(format!("{} {}", s::dim(crate::i18n::t("input")), s::bold_white(&thousands(v))));
         }
         if let Some(v) = r.usage.completion {
-            row1.push(format!("{} {}", s::dim("输出"), s::bold_white(&thousands(v))));
+            row1.push(format!("{} {}", s::dim(crate::i18n::t("output")), s::bold_white(&thousands(v))));
         }
         if let Some(v) = r.usage.total {
-            row1.push(format!("{} {}", s::dim("合计"), s::bold_cyan(&thousands(v))));
+            row1.push(format!("{} {}", s::dim(crate::i18n::t("Total")), s::bold_cyan(&thousands(v))));
         }
         if !row1.is_empty() {
             println!("    {}", row1.join(&s::dim("  ·  ")));
@@ -242,39 +250,40 @@ impl CliUi {
 
         let mut row2: Vec<String> = Vec::new();
         if let Some(v) = r.usage.reasoning {
-            row2.push(format!("{} {}", s::dim("其中推理"), s::bold_white(&thousands(v))));
+            row2.push(format!("{} {}", s::dim(crate::i18n::t("of which reasoning")), s::bold_white(&thousands(v))));
         }
         if let Some(v) = r.usage.cached {
-            row2.push(format!("{} {}", s::dim("缓存命中"), s::green(&thousands(v))));
+            row2.push(format!("{} {}", s::dim(crate::i18n::t("cache hit")), s::green(&thousands(v))));
         }
         if let Some(v) = r.usage.cache_miss {
-            row2.push(format!("{} {}", s::dim("缓存未命中"), s::dim(&thousands(v))));
+            row2.push(format!("{} {}", s::dim(crate::i18n::t("cache miss")), s::dim(&thousands(v))));
         }
         if !row2.is_empty() {
             println!("    {}", row2.join(&s::dim("  ·  ")));
         }
 
         let mut row3: Vec<String> =
-            vec![format!("{} {}", s::dim("模型调用"), s::bold_white(&format!("{} 次", r.calls)))];
+            vec![format!("{} {}", s::dim(crate::i18n::t("model calls")), s::bold_white(&crate::tf!("{} times", r.calls)))];
         if let Some(v) = r.last_prompt {
-            row3.push(format!("{} {}", s::dim("末次输入"), s::dim(&thousands(v))));
+            row3.push(format!("{} {}", s::dim(crate::i18n::t("last input")), s::dim(&thousands(v))));
         }
         if let Some(v) = r.session_total {
             row3.push(format!(
                 "{} {}",
-                s::dim("本次对话累计"),
-                s::dim(&format!("{}（{} 次调用）", thousands(v), r.session_calls))
+                s::dim(crate::i18n::t("this conversation total")),
+                s::dim(&crate::tf!("{} ({} calls)", thousands(v), r.session_calls))
             ));
         }
         println!("    {}", row3.join(&s::dim("  ·  ")));
         println!();
     }
 
-    /// 任务进行中的事件：折叠进缓冲，不在终端逐条刷屏。
+    /// Events while a turn is running: folded into the buffer rather than splashed line by line in
+    /// the terminal.
     fn emit_into_turn(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::AssistantText(text) => {
-                // 只有「不带工具调用的回复」才会走到这里，它就是最终输出
+                // Only "a reply without tool calls" reaches here, and that is the final output
                 if let Some(t) = self.turn.as_mut() {
                     if let Some(prev) = t.final_text.replace(text) {
                         t.interim.push(prev);
@@ -282,7 +291,7 @@ impl CliUi {
                 }
             }
             AgentEvent::InterimText(text) => {
-                // 伴随工具调用的过程性说明（如「我先看看有哪些插件」）——折叠进过程区
+                // The narration accompanying tool calls (e.g. "let me see which plugins there are") — folded into the process area
                 if let Some(t) = self.turn.as_mut() {
                     t.interim.push(text);
                 }
@@ -293,11 +302,11 @@ impl CliUi {
                 }
             }
             AgentEvent::ToolRunning { name, .. } => {
-                self.set_label(&format!("执行 {name}"));
+                self.set_label(&crate::tf!("running {}", name));
             }
             AgentEvent::ToolResult { name, is_error, preview } => {
                 if let Some(t) = self.turn.as_mut() {
-                    // 挂到最近一个同名且尚未回填结果的步骤上
+                    // Attach to the most recent step with the same name that has no result yet
                     match t.steps.iter_mut().rev().find(|s| s.name == name && s.result.is_none()) {
                         Some(st) => st.result = Some((is_error, preview)),
                         None => t.steps.push(Step {
@@ -307,14 +316,15 @@ impl CliUi {
                         }),
                     }
                 }
-                self.set_label("思考中");
+                self.set_label(crate::i18n::t("Thinking"));
             }
             AgentEvent::Info(m) => self.push_note('i', m),
             AgentEvent::Warn(m) => self.push_note('w', m),
             AgentEvent::Error(m) => self.push_note('e', m),
-            // 工具产出的图片：终端里没有能画图的地方。**静默丢掉**是有意的 ——
-            // 随行的提示语里已经把文件名列出来了（见 `attach` 的路径清单），
-            // 再补一行「有图但显示不了」只是噪音。
+            // An image produced by a tool: the terminal has nowhere to draw it. **Silently dropping
+            // it** is deliberate — the accompanying message already lists the filenames (see
+            // `attach`'s path list), and adding a "there's an image but it can't be shown" line
+            // would just be noise.
             AgentEvent::Images(_) => {}
         }
     }
@@ -333,22 +343,22 @@ impl CliUi {
         }
     }
 
-    /// 打印授权询问框并读取用户选择（不含动画控制）
+    /// Print the authorisation prompt and read the user's choice (without animation control)
     async fn ask_authorization(&mut self, tool_name: &str, args: &Value) -> AuthDecision {
         let pretty = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
         let width = term_width().saturating_sub(2);
         println!();
-        println!("{}", s::magenta("┌─ 授权请求 ────────────────────────────────"));
-        println!("{} {} {}", s::magenta("│"), s::dim("工具"), s::bold_cyan(tool_name));
+        println!("{}", s::magenta(crate::i18n::t("┌─ authorization request ────────────────────────────────")));
+        println!("{} {} {}", s::magenta("│"), s::dim(crate::i18n::t("tool")), s::bold_cyan(tool_name));
         for line in pretty.lines().take(20) {
             println!("{} {}", s::magenta("│"), s::dim(&clip(line, width)));
         }
         println!(
             "{} {}",
             s::magenta("│"),
-            s::dim("[y]允许一次   [a]本会话始终允许   [n]拒绝   (回车=y)")
+            s::dim(crate::i18n::t("[y] allow once   [a] always allow in this session   [n] deny   (enter = y)"))
         );
-        print!("{} ", s::magenta("└─ 请选择 >"));
+        print!("{} ", s::magenta(crate::i18n::t("└─ choose >")));
         loop {
             match self.read_line().await {
                 Ok(Some(line)) => {
@@ -358,7 +368,7 @@ impl CliUi {
                         "a" | "always" => return AuthDecision::AllowSession,
                         "n" | "no" => return AuthDecision::Deny,
                         _ => {
-                            print!("{} ", s::magenta("无效输入，请输入 y / a / n >"));
+                            print!("{} ", s::magenta(crate::i18n::t("invalid input; please enter y / a / n >")));
                             continue;
                         }
                     }
@@ -372,43 +382,43 @@ impl CliUi {
 #[async_trait]
 impl Ui for CliUi {
     async fn read_user_input(&mut self) -> Result<Option<String>> {
-        print!("\n{} ", s::bold_cyan("你 >"));
+        print!("\n{} ", s::bold_cyan(crate::i18n::t("you >")));
         self.read_line().await
     }
 
     fn emit(&mut self, event: AgentEvent) {
-        // 任务进行中：过程折叠进缓冲，只保留最终输出
+        // A turn is running: the process folds into the buffer, keeping only the final output
         if self.turn.is_some() {
             self.emit_into_turn(event);
             return;
         }
         match event {
-            // ── 助手回复：按 Markdown 渲染（标题/代码块/列表/表格）
+            // ── Assistant reply: rendered as Markdown (headings/code blocks/lists/tables)
             AgentEvent::AssistantText(text) | AgentEvent::InterimText(text) => {
                 println!();
                 println!("{}", s::render_markdown(&text));
             }
-            // ── 工具调用：黄色箭头 + 加粗工具名 + 暗色参数
+            // ── Tool call: a yellow arrow + bold tool name + dim arguments
             AgentEvent::ToolCall { name, args } => {
                 println!(
                     "{} {} {}",
                     s::yellow("→"),
                     s::bold_white(&name),
-                    s::dim(&format!("参数 {}", one_line(&args.to_string(), 200)))
+                    s::dim(&crate::tf!("args {}", one_line(&args.to_string(), 200)))
                 );
             }
             AgentEvent::ToolRunning { name, timeout_secs } => {
                 println!(
                     "  {}",
-                    s::dim(&format!("…{name} 执行中（超时 {timeout_secs} 秒，Ctrl+C 中断）"))
+                    s::dim(&crate::tf!("…{} running (timeout {}s, Ctrl+C to interrupt)", name, timeout_secs))
                 );
             }
-            // ── 工具结果：绿/红标记 + 单行摘要
+            // ── Tool result: a green/red marker + a one-line summary
             AgentEvent::ToolResult { name, is_error, preview } => {
                 let (mark, tag) = if is_error {
-                    (s::red("✗"), s::red("失败"))
+                    (s::red("✗"), s::red(crate::i18n::t("failed")))
                 } else {
-                    (s::green("✓"), s::green("完成"))
+                    (s::green("✓"), s::green(crate::i18n::t("done")))
                 };
                 println!(
                     "{} {} {}  {}",
@@ -427,7 +437,7 @@ impl Ui for CliUi {
 
     async fn turn_start(&mut self) {
         self.turn = Some(TurnLog::new());
-        self.status = Some(Status::new("思考中"));
+        self.status = Some(Status::new(crate::i18n::t("Thinking")));
         self.start_spinner().await;
     }
 
@@ -436,13 +446,13 @@ impl Ui for CliUi {
         self.status = None;
         let Some(t) = self.turn.take() else { return };
 
-        // 过程折叠为一行摘要；/expand 可按需展开
+        // The process folds into a one-line summary; `/expand` unfolds it on demand
         if !t.steps.is_empty() {
             println!(
                 "{} {} {}",
                 s::dim("▸"),
-                s::bold(&format!("已折叠 {} 步工具调用", t.steps.len())),
-                s::dim(&format!("· {:.1}s · /expand 展开", t.elapsed()))
+                s::bold(&crate::tf!("folded {} tool calls", t.steps.len())),
+                s::dim(&crate::tf!("· {}s · /expand to unfold", format!("{:.1}", t.elapsed())))
             );
         }
         for (kind, msg) in &t.notes {
@@ -453,11 +463,12 @@ impl Ui for CliUi {
                 println!();
                 println!("{}", s::render_markdown(text));
             }
-            // 兜底：正常轮次一定有最终答复，这里只在异常时提示，避免「结束却什么都没显示」
+            // Fallback: a normal turn always has a final reply, so this only prompts on an anomaly,
+            // avoiding "it ended but showed nothing"
             None if !t.steps.is_empty() => {
                 println!(
                     "{}",
-                    s::yellow("! 本轮没有产出最终答复（任务可能被模型提前结束），输入 /expand 查看执行过程")
+                    s::yellow(crate::i18n::t("! this turn produced no final reply (the task may have ended early); type /expand to see the process"))
                 );
             }
             None => {}
@@ -466,7 +477,8 @@ impl Ui for CliUi {
     }
 
     async fn turn_usage(&mut self, rec: &UsageRecord) {
-        // 端点不报 usage 就整块不显示 —— 拿一串 0 去糊弄用户比什么都不说更糟
+        // If the endpoint doesn't report usage, the whole block is hidden — fobbing the user off with
+        // a string of 0s is worse than saying nothing
         if rec.is_empty() {
             return;
         }
@@ -483,32 +495,34 @@ impl Ui for CliUi {
     }
 
     async fn authorize(&mut self, tool_name: &str, args: &Value) -> AuthDecision {
-        // 暂停动画，避免 spinner 覆盖授权框；问完再恢复
+        // Pause the animation so the spinner doesn't paint over the authorisation box; resume after asking
         let was_running = self.spinner.is_some();
         self.stop_spinner().await;
         let decision = self.ask_authorization(tool_name, args).await;
         if was_running {
-            self.set_label("思考中");
+            self.set_label(crate::i18n::t("Thinking"));
             self.start_spinner().await;
         }
         decision
     }
 
-    /// `ask_user` 的文本版：把选项编号打出来，读一行。
+    /// The text version of `ask_user`: print the numbered options and read one line.
     ///
-    /// 与授权框同一套外观（`┌─ … │ … └─ >`），也同一套理由：这是在**一轮任务中途**
-    /// 插进来的一次问答，得让用户一眼看出「现在轮到我了」。
+    /// The same look as the authorisation box (`┌─ … │ … └─ >`), and the same reasoning: this is a
+    /// question-answer injected **mid-turn**, so the user has to see at a glance that "it's my turn
+    /// now".
     ///
-    /// 容错刻意放宽：认不出是编号的输入就**当成自由回答**，而不是报「无效输入」重问。
-    /// 用户打「都用 B 方案吧」本来就是一种有效回答 —— 把它退回来说「请输入 A/B/C」，
-    /// 等于逼着他把想说的话翻译成一次点击。
+    /// The tolerance is deliberately loosened: input that isn't recognised as a label is **treated as
+    /// a free-form answer**, rather than reported as "invalid input" and re-asked. A user typing "let's
+    /// just go with plan B" is giving a valid answer — bouncing it back with "please enter A/B/C" is
+    /// forcing them to translate what they wanted to say into a single click.
     async fn choose(&mut self, question: &str, options: &[String]) -> ChoiceReply {
         let was_running = self.spinner.is_some();
         self.stop_spinner().await;
 
         let width = term_width().saturating_sub(2);
         println!();
-        println!("{}", s::magenta("┌─ 需要你选一个 ────────────────────────────"));
+        println!("{}", s::magenta(crate::i18n::t("┌─ pick one ────────────────────────────")));
         for line in question.lines() {
             println!("{} {}", s::magenta("│"), s::bold_cyan(&clip(line, width)));
         }
@@ -524,12 +538,12 @@ impl Ui for CliUi {
         println!(
             "{} {}",
             s::magenta("│"),
-            s::dim("回车 = 不作答，直接继续；输入别的字样 = 当成你自己的回答")
+            s::dim(crate::i18n::t("enter = give no answer and continue; anything else = treat it as your own answer"))
         );
 
         let mut reply = ChoiceReply::Cancelled;
         loop {
-            print!("{} ", s::magenta("└─ 请选择 >"));
+            print!("{} ", s::magenta(crate::i18n::t("└─ choose >")));
             let _ = std::io::Write::flush(&mut std::io::stdout());
             match self.read_line().await {
                 Ok(Some(line)) => {
@@ -537,7 +551,7 @@ impl Ui for CliUi {
                     if ans.is_empty() {
                         break;
                     }
-                    // 先认编号（A / a / 1），认不出就当自由回答
+                    // Try the label first (A / a / 1); if it isn't recognised, treat it as a free-form answer
                     if let Some(i) = crate::tool::ask::as_choice(ans, options.len()) {
                         reply = ChoiceReply::Picked(i);
                     } else {
@@ -545,37 +559,37 @@ impl Ui for CliUi {
                     }
                     break;
                 }
-                // EOF / 读失败：不能死循环，如实回「没作答」
+                // EOF / read failure: don't loop forever; honestly report "no answer given"
                 _ => break,
             }
         }
 
         if was_running {
-            self.set_label("思考中");
+            self.set_label(crate::i18n::t("Thinking"));
             self.start_spinner().await;
         }
         reply
     }
 }
 
-/// /demo：打印一段样例 Markdown 渲染效果，方便检查终端配色
+/// /demo: print a sample of Markdown rendering, handy for checking terminal colours
 pub fn print_demo() {
-    let sample = "# 一级标题\n\n\
-## 二级标题\n\n\
-这是普通段落，包含 **加粗**、*斜体* 和 `行内代码`。\n\n\
-- 列表项一\n\
-- 列表项二\n\
-  - 嵌套项\n\n\
-> 引用块：说明性文字。\n\n\
+    let sample = "# Heading 1\n\n\
+## Heading 2\n\n\
+This is an ordinary paragraph, with **bold**, *italic* and `inline code`.\n\n\
+- list item one\n\
+- list item two\n\
+  - nested item\n\n\
+> Blockquote: explanatory text.\n\n\
 ```python\n\
-def hello(name: str) -> str:\n    return f\"你好, {name}\"\n\
+def hello(name: str) -> str:\n    return f\"Hello, {name}\"\n\
 ```\n\n\
-| 工具 | 类型 | 状态 |\n\
+| Tool | Type | Status |\n\
 |------|------|------|\n\
 | fs_read | plugin | ok |\n\
 | create_plugin | meta | ok |\n";
     println!();
-    println!("{}", s::render_markdown(sample));
+    println!("{}", s::render_markdown(crate::i18n::t(sample)));
 }
 
 fn term_width() -> usize {
@@ -584,13 +598,13 @@ fn term_width() -> usize {
         .unwrap_or(100)
 }
 
-/// 折叠换行/多余空白，便于单行展示
+/// Flatten newlines / excess whitespace, for single-line display
 fn one_line(s: &str, max: usize) -> String {
     let joined = s.split_whitespace().collect::<Vec<_>>().join(" ");
     clip(&joined, max)
 }
 
-/// 按显示宽度截断（ASCII 记 1，其他记 2）
+/// Truncate by display width (ASCII counts as 1, everything else as 2)
 fn clip(s: &str, max: usize) -> String {
     let mut width = 0usize;
     let mut out = String::new();

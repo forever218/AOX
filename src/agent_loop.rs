@@ -1,31 +1,35 @@
-//! 循环缝（Loop 缝，第二形态）：把「跑完一整轮」从 `Agent` 里搬出来，变成可替换的能力。
+//! Loop seam (second form): move "run a whole turn" out of `Agent` and turn it into a replaceable capability.
 //!
-//! 阶段 4 的钩子只能**在循环内部**插五个点 —— 骨架本身还是焊死的。本模块把整段循环
-//! 交给一个 [`AgentLoop`] 实现，于是「裁剪上下文」「换一套重试策略」「甚至完全不同的
-//! 执行模型」都成了可替换的东西，而不是只能在固定骨架上挂钩子。
+//! The stage-4 hooks could only be inserted at five points **inside** the loop — the skeleton itself was
+//! still welded shut. This module hands the whole loop to an [`AgentLoop`] implementation, so
+//! "trim the context", "swap in a different retry policy", or even "a completely different execution
+//! model" all become replaceable things, instead of just hanging hooks off a fixed skeleton.
 //!
-//! # 为什么循环搬到外面，却要给它开 `Agent` 的写入口
+//! # Why you must open a `Agent` write path for a loop that lives outside
 //!
-//! `run_loop` 原先住在 `Agent` 里，用的是 `push_message` / `truncate_messages` / 回合记账
-//! 这些**私有**写入口。搬到 `AgentLoop` 之后它成了 `Agent` 的**同层协作者**，
-//! 所以 `Agent` 为此开了一组受控原语（`push_message` / `truncate_messages` / `messages` /
-//! `begin_turn` / `accrue_call` / `finish_turn`）。
+//! `run_loop` used to live in `Agent`, using **private** write paths like `push_message` /
+//! `truncate_messages` / per-turn accounting. After the move it becomes a **peer collaborator**
+//! of `Agent`, so `Agent` exposes a set of controlled primitives for it
+//! (`push_message` / `truncate_messages` / `messages` / `begin_turn` / `accrue_call` / `finish_turn`).
 //!
-//! 这**不是**「接口泄漏」—— 阶段 3 那条「接口上不出现路径」约束的是**后端实现细节**，
-//! 而这里是同一层的两个类型在协作。真正必须守住的那条线没有变：
-//! **`messages` 的唯一写入口是 `Agent::push_message`**（它同时写文件），
-//! 循环拿不到裸 `Vec<Message>`，也就造不出「内存里有、历史文件里没有」的错位。
+//! This is **not** "interface leakage" — the stage-3 rule "no paths on the interface" constrains
+//! **backend implementation details**, whereas here two types of the same layer are collaborating.
+//! The line that really must hold is unchanged: **the only write path for `messages` is
+//! `Agent::push_message`** (which also writes the file). The loop never gets a bare
+//! `Vec<Message>`, so it cannot create the mismatch of "in memory but not in the history file".
 //!
-//! # 本期只有一个实现
+//! # Only one implementation this cycle
 //!
-//! [`StandardLoop`] = 阶段 4 的 `Agent::run_loop` **逐语句搬运**，行为逐条等价。
-//! 它是 `config.toml [loop] impl` 唯一认的值 —— 别的值在 `Runtime::new` 里**启动即报错**，
-//! 与 `[store] backend` 同一条原则（写了却不生效是最难查的一类问题）。
+//! [`StandardLoop`] = the stage-4 `Agent::run_loop`, **moved statement by statement**, behaviour
+//! equivalent line for line. It is the only value `config.toml [loop] impl` accepts — any other
+//! value **fails at startup** in `Runtime::new`, the same principle as `[store] backend`
+//! (a setting that is written but never takes effect is the hardest class of bug to track down).
 //!
-//! [`StandardLoop`] 顺带兑现了**阶段 4 遗留清单的第 1 条：裁剪 / 改写历史**。
-//! 阶段 4 的 `before_request` 只敢开放「追加消息」（追加是唯一不需要 `rewrite` 的改动），
-//! 现在这条边界由 `[loop] max_rounds` 补上 —— 裁剪天然属于循环这一层：
-//! 它要同时动内存与对话文件，还要在裁完**重新拼请求**。
+//! [`StandardLoop`] also settles **item 1 of the stage-4 leftovers: trim / rewrite history**.
+//! The stage-4 `before_request` only dared to expose "append messages" (appending is the only
+//! change that needs no `rewrite`); now that boundary is filled in by `[loop] max_rounds` —
+//! trimming naturally belongs to the loop layer: it has to touch both memory and the conversation
+//! file, and it must **rebuild the request** after trimming.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,79 +46,85 @@ use crate::runtime::Runtime;
 use crate::tool::ToolOutput;
 use crate::ui::{AgentEvent, Ui};
 
-/// 一次「跑完一整轮」的实现。
+/// An implementation of "run one whole turn".
 ///
-/// `run` 接手时的状态：用户消息**已经**入列（`Agent::run_turn` 做的），本轮的账也已经开了
-/// （`Agent::begin_turn`）。返回 `Ok(())` 表示模型不再调用工具、本轮正常结束。
+/// State when `run` takes over: the user message is **already** enqueued (done by
+/// `Agent::run_turn`), and this turn's accounting has been opened (`Agent::begin_turn`).
+/// Returning `Ok(())` means the model is no longer calling tools and the turn ended normally.
 #[async_trait]
 pub trait AgentLoop: Send + Sync {
-    /// 实现名，即 `config.toml [loop] impl` 认的那个值。
+    /// Implementation name, i.e. the value `config.toml [loop] impl` accepts.
     fn name(&self) -> &str;
-    /// 跑完一整轮。
+    /// Run one whole turn.
     async fn run(&self, agent: &mut Agent, ui: &mut dyn Ui) -> Result<()>;
 }
 
-/// 已知的循环实现名。加实现时同步改这里与 [`build`]。
+/// Known loop implementation names. When adding an implementation, change this and [`build`] together.
 pub const IMPLS: [&str; 1] = ["standard"];
 
-/// 默认实现名。`config.toml` 里不写 `[loop] impl` 时用的就是它。
+/// Default implementation name. Used when `config.toml` has no `[loop] impl`.
 pub fn default_impl() -> &'static str {
     IMPLS[0]
 }
 
-/// 按配置造一个循环实现。
+/// Build a loop implementation from configuration.
 ///
-/// **认不出的名字直接报错**，不静默退回 `standard` —— 理由与 `store::backend` 完全相同：
-/// 配置写错却照常启动，表现就是「我明明写了别的实现，怎么还是原来那套」。
+/// **An unrecognized name is an error** — no silent fallback to `standard` — for exactly the same
+/// reason as `store::backend`: a mistyped config that still starts normally shows up as
+/// "I clearly wrote a different implementation, why is it still the old one?".
 pub fn build(cfg: &LoopConfig) -> Result<Arc<dyn AgentLoop>> {
     let name = cfg.implementor.trim();
     if name.is_empty() || name == default_impl() {
         return Ok(Arc::new(StandardLoop));
     }
-    bail!(
-        "未知的循环实现: {name}（当前可用: {}）\n\
-         请检查 config.toml 的 [loop] impl，或删掉它使用默认值。",
+    bail!(crate::tf!(
+        "unknown loop implementation: {} (available now: {})\nplease check the [loop] impl in config.toml, or remove it to use the default.",
+        name,
         IMPLS.join(" / ")
-    )
+    ))
 }
 
-/// `/loop` 命令的正文：现在生效的是哪个实现、上下文裁剪开没开。
+/// Body of the `/loop` command: which implementation is active now, and whether context trimming is on.
 pub fn report(rt: &Runtime) -> String {
     let cfg = &rt.config.loop_config;
     let trim = if cfg.max_rounds == 0 {
-        "关闭（max_rounds = 0，上下文不设上限）".to_string()
+        crate::i18n::t("Off (max_rounds = 0, context unbounded)").to_string()
     } else {
-        format!(
-            "保留最近 {} 轮（一轮从一条 user 消息开始）",
+        crate::tf!(
+            "keep the latest {} rounds (a round starts at one user message)",
             cfg.max_rounds
         )
     };
-    format!(
-        "循环实现: {}（可选: {}）\n\
-         上下文裁剪: {trim}\n\n\
-         改 config.toml 的 [loop] 段后重启生效；/hook 看钩子、/prompt 看提示词段。",
+    crate::tf!(
+        "loop implementation: {} (available: {})\ncontext trimming: {}\n\nchange the [loop] section in config.toml and restart for it to take effect; /hook lists the hooks, /prompt lists the prompt sections.",
         rt.loop_impl.name(),
-        IMPLS.join(" / ")
+        IMPLS.join(" / "),
+        trim
     )
 }
 
-/// 上下文裁剪的**切点**：返回「新的正文起点下标」，`messages[1..cut]` 会被丢掉。
+/// The **cut point** for context trimming: returns "the index of the new start of the body";
+/// `messages[1..cut]` will be dropped.
 ///
-/// `None` = 不需要裁（也包含「不该裁」，见下）。
+/// `None` = no trimming needed (this also covers "must not trim", see below).
 ///
-/// 规则：
-/// - `max_rounds == 0` → 不裁。这是默认值，也是「不写 `[loop]` 就与阶段 5 逐字节相同」的根据。
-/// - **轮次以 `role == "user"` 的消息为界**：一条 user 开启一轮，直到下一条 user 之前
-///   （assistant / tool 消息都归它）。宿主钩子注入的提示也是 user 消息，同样各占一轮。
-/// - 轮数没超过 `max_rounds` → 不裁。
-/// - 切点**天然落在一条 user 消息上**，所以不需要额外对齐：丢掉最老的整轮，剩下的后缀
-///   本身就是一个合法请求体 —— 不会出现「tool 结果留着、它的 assistant 被丢了」这种
-///   端点会直接 400 拒掉的状态。这条是整个裁剪机制唯一真正的危险点，见下面的 `debug_assert`。
+/// Rules:
+/// - `max_rounds == 0` → no trim. This is the default, and it is the basis for "no `[loop]` written
+///   means byte-identical to stage 5".
+/// - **A turn is delimited by a `role == "user"` message**: one user message opens a turn, and it
+///   runs until the next user message (assistant / tool messages all belong to it). Tips injected by
+///   the host hook are also user messages, so each occupies a turn too.
+/// - If the turn count does not exceed `max_rounds` → no trim.
+/// - The cut point **naturally lands on a user message**, so no extra alignment is needed: dropping
+///   the oldest whole turn leaves a suffix that is itself a legal request body — you never get the
+///   state where "a tool result remains while its assistant was dropped", which the endpoint would
+///   reject with a straight 400. This is the only genuinely dangerous point in the whole trimming
+///   mechanism; see the `debug_assert` below.
 fn trim_point(msgs: &[Message], max_rounds: usize) -> Option<usize> {
     if max_rounds == 0 {
         return None;
     }
-    // 下标 0 是 system 段，永远保留 —— 所以轮次从下标 1 开始数。
+    // Index 0 is the system section, always kept — so turn counting starts at index 1.
     let turns: Vec<usize> = msgs
         .iter()
         .enumerate()
@@ -126,11 +136,11 @@ fn trim_point(msgs: &[Message], max_rounds: usize) -> Option<usize> {
         return None;
     }
     let cut = turns[turns.len() - max_rounds];
-    debug_assert_eq!(msgs[cut].role, "user", "裁剪切点必须落在一条 user 消息上");
+    debug_assert_eq!(msgs[cut].role, "user", "the trim cut point must land on a user message");
     Some(cut)
 }
 
-/// 标准循环：阶段 4 的 `Agent::run_loop`，一行逻辑不改。
+/// Standard loop: the stage-4 `Agent::run_loop`, with not a line of logic changed.
 pub struct StandardLoop;
 
 #[async_trait]
@@ -140,85 +150,102 @@ impl AgentLoop for StandardLoop {
     }
 
     async fn run(&self, agent: &mut Agent, ui: &mut dyn Ui) -> Result<()> {
-        /// 模型返回「空回复」（无正文、无工具调用）时的重试上限。
-        /// 思考模型偶发会返回空 content（推理把输出额度吃光、上游抖动等），
-        /// 直接当成「任务结束」会让任务静默中断，所以先重试并明确报错。
+        /// Retry cap for when the model returns an "empty reply" (no text, no tool calls).
+        /// Thinking models occasionally return empty content (reasoning eats the whole output
+        /// budget, upstream jitter, etc.); treating that as "task finished" would silently abort
+        /// the task, so retry first and then report an explicit error.
         const MAX_EMPTY_RETRY: u32 = 2;
 
         let mut empty_retries = 0u32;
-        // 请求出错时的宿主兜底重试预算（`[hook] max_llm_retries`）。**每轮独立** ——
-        // 它活在 `run` 的局部，跨不过下一轮，所以「越聊越能重试」不会发生。
+        // Host fallback retry budget for request errors (`[hook] max_llm_retries`). **Independent
+        // per turn** — it lives in `run`'s locals and cannot cross into the next turn, so "the
+        // longer you chat the more retries you get" cannot happen.
         let mut llm_retries = 0usize;
-        // 钩子要能查系统的当前状态（工具表、插件表），而 `agent.messages()` 马上要借给
-        // `llm.chat`。先克隆一个 `Arc` 出来：钩子持它，既不与 `agent` 的借用打架，
-        // 也顺带保证了「钩子改不了 Agent 的内部状态」—— 它只能靠返回值影响循环。
+        // Hooks need to inspect the system's current state (tool table, plugin table), while
+        // `agent.messages()` is about to be lent to `llm.chat`. Clone an `Arc` out first: hooks
+        // hold it, which neither fights the borrow of `agent` nor — as a bonus — guarantees that
+        // "hooks cannot change Agent's internal state": they can only influence the loop through
+        // their return value.
         let rt = agent.rt().clone();
         let max_rounds = rt.config.loop_config.max_rounds;
         let max_llm_retries = rt.config.hook.max_llm_retries;
         loop {
-            // ── 上下文裁剪（阶段 4 遗留清单第 1 条）。
-            //    位置在「本轮请求拼出来之前」：裁完再拼，模型看到的就是裁过的上下文。
-            //    内存与对话文件一起动（`truncate_messages` 内部会 `Session::rewrite`），
-            //    否则重启读回来就是一段半截历史。
+            // ── Context trimming (item 1 of the stage-4 leftovers).
+            //    Placed "before this turn's request is assembled": assemble after trimming, so the
+            //    model sees the trimmed context.
+            //    Memory and the conversation file move together (`truncate_messages` calls
+            //    `Session::rewrite` internally); otherwise a restart reads back a half history.
             if let Some(cut) = trim_point(agent.messages(), max_rounds) {
                 let dropped = cut - 1;
-                // 注意用 `drop_oldest`（留尾部）而不是 `truncate_messages`（留头部）——
-                // 裁剪要的是「只留最近几轮」，方向反了会静默留下最老的上下文。
+                // Note it uses `drop_oldest` (keep the tail) rather than `truncate_messages`
+                // (keep the head) — trimming wants "keep only the most recent few turns", and
+                // getting the direction backwards silently keeps the oldest context.
                 agent.drop_oldest(cut);
-                ui.emit(AgentEvent::Info(format!(
-                    "上下文超过 {max_rounds} 轮，已丢掉最老的 {dropped} 条消息（内存与对话文件已同步回滚）。"
+                ui.emit(AgentEvent::Info(crate::tf!(
+                    "context exceeded {} rounds; dropped the oldest {} messages (memory and the conversation file were rolled back together).",
+                    max_rounds,
+                    dropped
                 )));
             }
 
-            // ── 钩子点 ① 请求前。
-            //    钩子拿到的是「本轮用哪些工具」与「要追加哪些消息」，**不是** `&mut messages`：
-            //    messages 的唯一写入口是 `push_message`（它同时写文件），把裸 Vec 交出去，
-            //    「内存里有、历史文件里没有」就是一分钟后必然发生的事。
+            // ── Hook point ① before request.
+            //    The hook receives "which tools this turn uses" and "which messages to append",
+            //    **not** `&mut messages`: the only write path for messages is `push_message` (which
+            //    also writes the file), and handing out a bare Vec makes "in memory but not in the
+            //    history file" a certainty within a minute.
             let mut req = hook::Request { tools: rt.tool_schemas().await, inject: Vec::new() };
             if let Verdict::Reject(why) = rt.hooks.before_request(&rt, &mut req).await {
-                bail!("本轮请求被宿主钩子拦下：{why}");
+                bail!(crate::tf!("this round's request was blocked by a host hook: {}", why));
             }
             for m in req.inject.drain(..) {
                 agent.push_message(m, None);
             }
             let schemas = req.tools;
 
-            ui.set_status("思考中").await;
-            // 把流式接收端交给 Provider：思考模型的推理过程会在等待期间实时回显。
-            // 单独写成一个语句（而不是直接在下面 match 结果）是为了让对 `agent.messages()`
-            // 的借用在这里就结束 —— 否则下面 `push_message` 要的 `&mut agent` 会冲突。
+            ui.set_status(crate::i18n::t("Thinking")).await;
+            // Hand the streaming receiver to the Provider: a thinking model's reasoning is echoed
+            // in real time while waiting. This is written as its own statement (rather than
+            // matching the result directly below) so the borrow of `agent.messages()` ends here —
+            // otherwise the `&mut agent` that `push_message` needs below would conflict.
             let chat = {
                 let sink = ui.stream_sink();
                 agent.llm().chat(agent.messages(), &schemas, sink.as_deref()).await
             };
             let reply = match chat {
                 Ok(r) => r,
-                // ── 钩子点 ⑤ 请求出错。
-                //    这是循环里唯一的「基础设施故障」出口（工具执行失败、空回复退出的
-                //    `bail!` 都不走这里）。没有钩子、或钩子都返回 `Propagate` 时，
-                //    这里就等价于原来的 `?`。
+                // ── Hook point ⑤ request error.
+                //    This is the loop's only "infrastructure failure" exit (the `bail!` for a failed
+                //    tool execution or an empty-reply exit does not go through here). With no hook,
+                //    or when all hooks return `Propagate`, this is equivalent to the original `?`.
                 Err(e) => match rt.hooks.on_error(&rt, &e).await {
-                    // 组件/钩子明确说要重试：按它给的提示注入后重来，**不看预算** ——
-                    // 防死循环是它自己的责任（见 `ErrorAction::Retry` 的文档）。
+                    // A component/hook explicitly says to retry: inject the tip it gives and start
+                    // over, **without consulting the budget** — preventing an infinite loop is its
+                    // own responsibility (see the docs of `ErrorAction::Retry`).
                     ErrorAction::Retry(note) => {
                         agent.push_message(Message::user(note), None);
                         continue;
                     }
-                    // 没人要求重试 —— 但「没人管」不该等于「一次都不试」。
-                    // `[hook] max_llm_retries` 就是给这种情况的配置兜底：偶发的上游抖动
-                    // 值得再问一次，而不必为此写一个组件。默认 0，所以**不写配置时
-                    // 这里与原实现逐字节等价**（直接抛出）。
+                    // Nobody asked for a retry — but "nobody is managing it" should not mean
+                    // "never even try once". `[hook] max_llm_retries` is the configured fallback for
+                    // exactly this: occasional upstream jitter is worth asking once more, without
+                    // having to write a component for it. Defaults to 0, so **with no config written
+                    // this is byte-identical to the original implementation** (throw straight away).
                     ErrorAction::Propagate => {
                         if llm_retries >= max_llm_retries {
                             return Err(e);
                         }
                         llm_retries += 1;
-                        ui.emit(AgentEvent::Warn(format!(
-                            "模型请求失败，宿主自动重试（第 {llm_retries}/{max_llm_retries} 次）：{e:#}"
+                        ui.emit(AgentEvent::Warn(crate::tf!(
+                            "model request failed; the host is retrying automatically (attempt {}/{}): {}",
+                            llm_retries,
+                            max_llm_retries,
+                            format!("{e:#}")
                         )));
                         agent.push_message(
-                            Message::user(format!(
-                                "（宿主提示）上一次模型请求失败：{e:#}。请继续完成刚才的任务。"
+                            Message::user(crate::tf!(
+                                "{} the previous model request failed: {}. Please continue the task you were on.",
+                                crate::history::HOST_PREFIX,
+                                format!("{e:#}")
                             )),
                             None,
                         );
@@ -226,79 +253,81 @@ impl AgentLoop for StandardLoop {
                     }
                 },
             };
-            // 记账：端点不给 usage 时各项是 None，accrue 会安静跳过
+            // Accounting: when the endpoint gives no usage, each item is None and accrue skips quietly.
             agent.accrue_call(&reply.usage);
 
-            // ── 钩子点 ② 回复后。
-            //    特意排在记账**之后**：被否决的那次调用的 token 是真花掉了，
-            //    不能因为它没被采用就不记账。
-            //    否决 = 视为一次无效回复 → 复用下面「空回复」那条重试路径（连上限一起），
-            //    不另造一套重试逻辑。
+            // ── Hook point ② after reply.
+            //    Deliberately placed **after** accounting: the tokens of a rejected call really were
+            //    spent, so it must not go unrecorded just because it was not adopted.
+            //    Rejection = treat as one invalid reply → reuse the "empty reply" retry path below
+            //    (retry cap included) rather than inventing a separate retry mechanism.
             let mut reply = reply;
             if let Verdict::Reject(why) = rt.hooks.after_reply(&rt, &mut reply).await {
                 if empty_retries < MAX_EMPTY_RETRY {
                     empty_retries += 1;
-                    ui.emit(AgentEvent::Warn(format!(
-                        "宿主钩子否决了这次回复（第 {empty_retries} 次）：{why}"
+                    ui.emit(AgentEvent::Warn(crate::tf!(
+                        "a host hook vetoed this reply (attempt {}): {}",
+                        empty_retries,
+                        why
                     )));
                     agent.push_message(
-                        Message::user(format!(
-                            "（宿主提示）你上一条回复被宿主规则否决：{why}。请调整后重试。"
+                        Message::user(crate::tf!(
+                            "{} your previous reply was vetoed by a host rule: {}. Please adjust and retry.",
+                            crate::history::HOST_PREFIX,
+                            why
                         )),
                         None,
                     );
                     continue;
                 }
-                bail!("模型回复连续 {} 次被宿主钩子否决：{why}", MAX_EMPTY_RETRY + 1);
+                bail!(crate::tf!("the model's reply was vetoed by host hooks {} times in a row: {}", MAX_EMPTY_RETRY + 1, why));
             }
 
             let msg = reply.message.clone();
             let calls = msg.tool_calls.clone().unwrap_or_default();
 
-            // 模型什么都没给（既无正文也无工具调用）——绝不能当成「任务正常结束」，
-            // 否则表现就是「任务静默中断、模型没有任何返回」。先重试，再明确报错。
+            // The model gave nothing at all (neither text nor tool calls) — it must never be treated
+            // as "task finished normally", otherwise the symptom is "the task silently aborts and the
+            // model returned nothing". Retry first, then report an explicit error.
             if reply.is_empty() {
                 if reply.truncated() {
-                    ui.emit(AgentEvent::Warn(format!(
-                        "模型输出被 max_tokens={} 截断且正文为空（推理 token 占满了输出额度）。",
+                    ui.emit(AgentEvent::Warn(crate::tf!(
+                        "model output was truncated by max_tokens={} and the content is empty (reasoning tokens filled the output budget).",
                         rt.config.provider.max_tokens.unwrap_or(0)
                     )));
                 }
                 if empty_retries < MAX_EMPTY_RETRY {
                     empty_retries += 1;
-                    ui.emit(AgentEvent::Warn(format!(
-                        "模型返回空回复（第 {empty_retries} 次），正在重试…"
+                    ui.emit(AgentEvent::Warn(crate::tf!(
+                        "the model returned an empty reply (attempt {}); retrying…",
+                        empty_retries
                     )));
                     agent.push_message(
-                        Message::user(
-                            "（宿主提示）你上一条回复是空的。若任务尚未完成，请继续调用工具；\
-                             若已完成，请用自然语言给出最终总结。",
-                        ),
+                        Message::user(crate::tf!(
+                            "{} your previous reply was empty. If the task is not done yet, keep calling tools; if it is done, give a final summary in natural language.",
+                            crate::history::HOST_PREFIX
+                        )),
                         None,
                     );
                     continue;
                 }
-                bail!(
-                    "模型连续 {} 次返回空回复，本轮任务已停止。\n\
-                     诊断：{}。可执行 `AOX_DEBUG_LLM=1 aox` 复现，原始响应会写入 logs/llm.jsonl。\n\
-                     常见原因：① 模型是思考模式但 max_tokens 太小（推理 token 也算额度）；\
-                     ② 上游限流/超时；③ 该模型不支持工具调用。",
+                bail!(crate::tf!(
+                    "the model returned an empty reply {} times in a row; this round has stopped.\ndiagnostics: {}. Reproduce with `AOX_DEBUG_LLM=1 aox`; the raw response is written to logs/llm.jsonl.\ncommon causes: ① the model is a thinking model but max_tokens is too small (reasoning tokens count against the quota); ② upstream rate limiting / timeout; ③ the model does not support tool calls.",
                     MAX_EMPTY_RETRY + 1,
                     reply.diag(),
-                );
+                ));
             }
             empty_retries = 0;
 
             if reply.truncated() {
-                ui.emit(AgentEvent::Warn(format!(
-                    "模型输出被 max_tokens={} 截断（{}），本轮内容可能不完整。\
-                     建议调大 config.toml 的 max_tokens（思考模型的推理 token 也计入额度）。",
+                ui.emit(AgentEvent::Warn(crate::tf!(
+                    "model output was truncated by max_tokens={} ({}); this round's content may be incomplete. Consider raising max_tokens in config.toml (a thinking model's reasoning tokens count against the quota too).",
                     rt.config.provider.max_tokens.unwrap_or(0),
                     reply.diag(),
                 )));
             }
 
-            // 有工具调用 → 这段文字只是过程说明；没有工具调用 → 才是最终答复
+            // If there are tool calls → this text is just process narration; no tool calls → it is the final answer
             if let Some(text) = msg.text().map(str::to_string) {
                 if calls.is_empty() {
                     ui.emit(AgentEvent::AssistantText(text));
@@ -308,30 +337,35 @@ impl AgentLoop for StandardLoop {
             }
             agent.push_message(msg, None);
             if calls.is_empty() {
-                break; // 任务结束
+                break; // task finished
             }
 
-            // 本次响应里的**工具产出文件**（`attach_file` 挂的、或插件在结果里声明的）。
-            // 收集起来，等这一批工具都跑完再统一注入一条 user 消息 —— 理由见下面那段。
+            // The **tool-produced files** of this response (attached by `attach_file`, or declared
+            // by a plugin in its result). Collect them, and inject a single user message once this
+            // whole batch of tools has finished — the reason is in the paragraph below.
             let mut produced: Vec<PathBuf> = Vec::new();
             for call in calls {
                 let name = call.function.name.clone();
                 let mut args: Value = match serde_json::from_str(&call.function.arguments) {
                     Ok(v) => v,
                     Err(e) => {
-                        // 参数不是合法 JSON 时还没有「可改的对象」，钩子无从插手 ——
-                        // 照原样回一条错误结果（与加钩子之前完全一致）。
-                        let out = ToolOutput::err(format!("工具参数不是合法 JSON: {e}"));
+                        // When the arguments are not valid JSON there is not yet an "object to
+                        // modify", so there is nothing for a hook to intervene in — return an error
+                        // result as-is (exactly as before hooks existed).
+                        let out = ToolOutput::err(crate::tf!("tool arguments are not valid JSON: {}", e));
                         ui.emit(AgentEvent::ToolCall { name: name.clone(), args: json!({}) });
                         ui.emit(AgentEvent::ToolResult { name: name.clone(), is_error: true, preview: out.content.clone() });
                         agent.push_message(Message::tool_result(&call.id, &name, out.content), Some(true));
                         continue;
                     }
                 };
-                // ── 钩子点 ③ 工具调用前：可改 args，可拦下（拦下就不执行工具）。
-                //    ⚠️ 带 tool_calls 的 assistant 消息此刻**已经落盘**，文件里留的是模型
-                //    原始参数 —— 这里改的只影响本次执行，**不回写历史**：历史要如实记录
-                //    「模型要了什么」，钩子只是宿主侧的执行策略。
+                // ── Hook point ③ before tool call: can modify args, can block (blocking skips the
+                //    tool execution).
+                //    ⚠️ The assistant message carrying tool_calls is **already persisted** at this
+                //    point, and what stays in the file is the model's original arguments — the change
+                //    here only affects this execution, **it does not write back to history**: history
+                //    must faithfully record "what the model asked for", and the hook is merely a
+                //    host-side execution policy.
                 if let Verdict::Reject(why) = rt.hooks.before_tool(&rt, &name, &mut args).await {
                     let out = ToolOutput::err(why);
                     ui.emit(AgentEvent::ToolCall { name: name.clone(), args: args.clone() });
@@ -341,8 +375,10 @@ impl AgentLoop for StandardLoop {
                 }
                 ui.emit(AgentEvent::ToolCall { name: name.clone(), args: args.clone() });
                 let mut output = agent.authorize_and_execute(ui, &name, args).await;
-                // ── 钩子点 ④ 工具结果后：可改结果，可拦下（拦下 = 整块换成带理由的错误）。
-                //    排在 `ui.emit` 之前 —— 界面与历史文件因此看到的是**同一份**（改过的）结果。
+                // ── Hook point ④ after tool result: can modify the result, can block (blocking =
+                //    replace the whole block with a reasoned error).
+                //    Placed before `ui.emit` — so the UI and the history file see the **same**
+                //    (modified) result.
                 if let Verdict::Reject(why) = rt.hooks.after_tool(&rt, &name, &mut output).await {
                     output = ToolOutput::err(why);
                 }
@@ -359,24 +395,27 @@ impl AgentLoop for StandardLoop {
                 );
             }
 
-            // ── 工具产出的文件 → 另起一条 **user** 消息
+            // ── Files produced by tools → open a separate **user** message
             //
-            // 这不是风格选择，是协议硬约束：端点在 `system` / `assistant` 消息里见到图片
-            // 直接 400（官方「使用限制」明写），而 `tool` 角色在 OpenAI 协议里 content
-            // 只能是字符串 —— **图片的合法落点只有 user 消息这一处**。
+            // This is not a style choice, it is a hard protocol constraint: the endpoint returns a
+            // straight 400 when it sees an image in a `system` / `assistant` message (stated plainly
+            // in the official "usage limits"), and the `tool` role in the OpenAI protocol can only
+            // carry a string in content — **the only legal landing spot for an image is a user
+            // message**.
             //
-            // 位置也是被这条约束定死的：必须排在刚推入的 tool 结果**之后**（tool 结果要
-            // 紧跟它对应的 assistant.tool_calls，中间插一条别的消息会让参数校验失败），
-            // 又要在下一次请求**之前**（否则这一轮的图赶不上这一轮）。
+            // The position is also pinned by that constraint: it must come **after** the tool result
+            // just pushed (a tool result must immediately follow its corresponding assistant
+            // tool_calls; inserting another message in between makes argument validation fail), and
+            // it must come **before** the next request (otherwise this turn's images miss this turn).
             if !produced.is_empty() {
                 let (msg, shown, problems) = produced_files_message(&produced);
                 for p in &problems {
-                    ui.emit(AgentEvent::Warn(format!("工具产出的附件没能传给模型：{p}")));
+                    ui.emit(AgentEvent::Warn(crate::tf!("the attachment produced by the tool could not be passed to the model: {}", p)));
                 }
                 if let Some(m) = msg {
                     agent.push_message(m, None);
-                    // 顺带让界面把这几张图**画出来** —— 模型看得见、人看不见，
-                    // 正是「图出来了」这句话最让人困惑的地方。
+                    // Also have the UI **draw** these images — "the image came out" is the most
+                    // confusing thing about a picture the model can see but the human cannot.
                     if !shown.is_empty() {
                         ui.emit(AgentEvent::Images(shown));
                     }
@@ -387,15 +426,17 @@ impl AgentLoop for StandardLoop {
     }
 }
 
-/// 组装「工具产出文件」那条 user 消息。
+/// Assemble the user message for "tool-produced files".
 ///
-/// 返回 `(要推入的消息, 真的挂上的路径, 要报给用户的说明)`。
-/// 消息为 `None` 表示一个都挂不上；「真的挂上的路径」给界面拿去**显示**图
-///（见 `AgentEvent::Images`）—— 报出去的必须只是成功的，否则界面会为一条
-/// 本来就被拦下的路径画一行「显示失败」，而那句话上面刚好已经有一条拦截原因。
+/// Returns `(message to push, paths actually attached, notes to report to the user)`.
+/// A message of `None` means none could be attached; "paths actually attached" is handed to the
+/// UI for **display** (see `AgentEvent::Images`) — only the successful ones may be reported, else
+/// the UI would draw a "display failed" line for a path that was already blocked, right below a
+/// blocking reason for that same path.
 ///
-/// 抽成**纯函数**（不碰 `Ui`）是为了能直接断言 —— 「必须是 user 消息、必须带 parts 数组」
-/// 这条协议约束值得一条不必真跑一轮循环的测试。
+/// Extracted as a **pure function** (not touching `Ui`) so it can be asserted directly — the
+/// protocol constraint "must be a user message, must carry a parts array" deserves a test that does
+/// not need to actually run a loop.
 fn produced_files_message(paths: &[PathBuf]) -> (Option<Message>, Vec<PathBuf>, Vec<String>) {
     let (items, mut problems) = crate::attach::probe_all(paths);
     if items.is_empty() {
@@ -403,10 +444,12 @@ fn produced_files_message(paths: &[PathBuf]) -> (Option<Message>, Vec<PathBuf>, 
     }
     let shown: Vec<PathBuf> = items.iter().map(|a| a.path.clone()).collect();
     let names = items.iter().map(|a| format!("- {}", a.name)).collect::<Vec<_>>().join("\n");
-    // 措辞说清「该看什么」：不说的话模型常会只根据文件名猜内容，那这张图就白发了
-    let note = format!(
-        "（宿主提示）以下是刚才那次工具调用产出的文件，图片内容已经直接发给你了 —— \
-         请直接看图判断，不要只根据文件名猜：\n{names}"
+    // The wording spells out "what to look at": without it the model often guesses content from the
+    // file name alone, and then sending that image was pointless
+    let note = crate::tf!(
+        "{} the files below were produced by the tool call just now; the image content has already been sent to you directly — judge by looking at the images instead of guessing from file names:\n{}",
+        crate::history::HOST_PREFIX,
+        names
     );
     match Message::user_with_files(&note, &items) {
         Ok(m) => (Some(m), shown, problems),
@@ -430,7 +473,7 @@ fn cap_chars(s: &str, cap: usize) -> String {
         s.to_string()
     } else {
         let total = s.chars().count();
-        format!("{}…\n[结果过长已截断，原长度 {total} 字符]", s.chars().take(cap).collect::<String>())
+        crate::tf!("{}…\n[result too long; truncated, original length {} characters]", s.chars().take(cap).collect::<String>(), total)
     }
 }
 
@@ -447,17 +490,17 @@ mod tests {
         }
     }
 
-    /// 一轮的完整形状：user → assistant(带工具调用) → tool 结果 → assistant(最终答复)。
+    /// The full shape of one turn: user → assistant(with tool call) → tool result → assistant(final answer).
     fn one_turn(n: usize) -> Vec<Message> {
         vec![
-            Message::user(format!("问题 {n}")),
-            Message::assistant(None, Some("想一下".into()), vec![call(n)]),
-            Message::tool_result(&format!("call-{n}"), "fs_read", format!("第 {n} 份内容")),
-            Message::assistant(Some(format!("答复 {n}")), None, vec![]),
+            Message::user(format!("question {n}")),
+            Message::assistant(None, Some("let me think".into()), vec![call(n)]),
+            Message::tool_result(&format!("call-{n}"), "fs_read", format!("content #{n}")),
+            Message::assistant(Some(format!("answer {n}")), None, vec![]),
         ]
     }
 
-    /// `turns` 轮的完整正文（下标 0 是 system 头）。
+    /// The full body of `turns` turns (index 0 is the system header).
     fn body(turns: usize) -> Vec<Message> {
         let mut v = vec![Message::system("SYS")];
         for n in 1..=turns {
@@ -468,39 +511,40 @@ mod tests {
 
     #[test]
     fn no_max_rounds_means_never_trim() {
-        assert_eq!(trim_point(&body(9), 0), None, "默认 max_rounds=0 必须完全不裁");
+        assert_eq!(trim_point(&body(9), 0), None, "with the default max_rounds=0, nothing must be trimmed");
     }
 
     #[test]
     fn under_or_equal_the_limit_is_untouched() {
         assert_eq!(trim_point(&body(2), 5), None);
-        assert_eq!(trim_point(&body(5), 5), None, "刚好等于上限不裁");
+        assert_eq!(trim_point(&body(5), 5), None, "exactly at the limit, no trim");
     }
 
     #[test]
     fn over_limit_cuts_oldest_whole_turns() {
         let msgs = body(3); // [sys, u1,a,t,a, u2,a,t,a, u3,a,t,a]
-        let cut = trim_point(&msgs, 2).expect("3 轮超过 2 轮上限，应当裁");
-        assert_eq!(cut, 5, "第 2 轮的 user 在第 5 位");
-        assert_eq!(msgs[cut].content.as_ref().and_then(|v| v.as_str()), Some("问题 2"));
-        assert_eq!(cut - 1, 4, "丢掉的是完整的一轮（4 条），不含 system");
+        let cut = trim_point(&msgs, 2).expect("3 rounds exceed a limit of 2, so it must trim");
+        assert_eq!(cut, 5, "round 2's user message is at index 5");
+        assert_eq!(msgs[cut].content.as_ref().and_then(|v| v.as_str()), Some("question 2"));
+        assert_eq!(cut - 1, 4, "what is dropped is a whole round (4 messages), not counting system");
     }
 
-    /// 裁剪唯一危险的地方：留下一条「tool 结果、但它的 assistant 已被丢掉」的消息，
-    /// 端点会直接 400。这条把「切点永远落在一条 user 上」这个不变式钉住 ——
-    /// 也正是它让「不需要额外对齐」这个结论成立。
+    /// The one dangerous spot in trimming: leaving a "tool result whose assistant was already
+    /// dropped" message, which makes the endpoint return a straight 400. This pins the invariant
+    /// that "the cut point always lands on a user message" — and it is exactly this that makes
+    /// "no extra alignment needed" hold.
     #[test]
     fn cut_always_lands_on_a_turn_start() {
         for turns in 1..8usize {
             let msgs = body(turns);
             for keep in 1..=turns {
                 if let Some(cut) = trim_point(&msgs, keep) {
-                    assert!(cut > 0 && cut < msgs.len(), "轮数 {turns} 保留 {keep} 时切点越界");
-                    assert_eq!(msgs[cut].role, "user", "轮数 {turns} 保留 {keep} 时切点歪了");
+                    assert!(cut > 0 && cut < msgs.len(), "with {turns} rounds keeping {keep}, the cut point is out of range");
+                    assert_eq!(msgs[cut].role, "user", "with {turns} rounds keeping {keep}, the cut point is off");
                     assert_eq!(
                         msgs[cut - 1].role,
                         "assistant",
-                        "丢弃段的最后一条应当是上一轮的收尾，否则就是把一轮劈成两半"
+                        "the last message of the dropped segment should be the previous round's tail, otherwise a round is split in half"
                     );
                 }
             }
@@ -511,64 +555,68 @@ mod tests {
     fn system_head_is_never_cut() {
         let msgs = body(4);
         let cut = trim_point(&msgs, 1).unwrap();
-        assert_eq!(msgs[0].role, "system", "system 永远在下标 0，不参与裁剪");
+        assert_eq!(msgs[0].role, "system", "system is always at index 0 and never trimmed");
         assert!(cut > 0);
     }
 
-    /// 轮数不够时即使 `max_rounds` 很大也不许裁 —— 「上限」是上限，不是「必须裁到只剩它」。
+    /// When there are not enough turns, no trim is allowed even if `max_rounds` is large — a "cap"
+    /// is a cap, not "trim until only that many remain".
     #[test]
     fn trim_never_grows_the_context() {
         for keep in [1usize, 2, 7] {
             let msgs = body(3);
             if let Some(cut) = trim_point(&msgs, keep) {
-                assert!(cut < msgs.len(), "裁剪只会变短，不会变长");
+                assert!(cut < msgs.len(), "trimming only shortens, never lengthens");
             }
         }
     }
 
-    /// 造一个不碰真实目录、也不认识任何 Provider 的 `Agent`（`log` 为 `None`，
-    /// 所以下面的 `push_message` 只动内存 —— 正好把「裁剪方向」单独隔离出来测）。
+    /// Build an `Agent` that touches no real directory and knows no Provider (`log` is `None`, so
+    /// `push_message` below only touches memory — which isolates the "trim direction" for testing).
     fn test_agent() -> Agent {
         let root = std::env::temp_dir().join("aox-loop-test");
         let rt = Runtime::new(crate::config::Config::dummy(), root.clone(), root.join("plugins"))
-            .expect("测试用运行时不应失败");
+            .expect("the test runtime should not fail");
         let llm: Arc<dyn crate::llm::LlmProvider> =
             Arc::new(crate::llm::UnavailableProvider { reason: "test".into() });
         Agent::new(llm, rt)
     }
 
-    /// ⚠️ 这条专门钉住**方向**：裁剪必须走 `Agent::drop_oldest`（留尾部），
-    /// 而不是 `truncate_messages`（留头部）。写实现时正是把二者搞混，
-    /// 结果「本轮输入被丢掉、最老的上下文还留着」—— 而且内存与文件**一致地错**，
-    /// 光看落盘内容根本发现不了。所以这条测试断言的是「留下哪几轮」。
+    /// ⚠️ This one pins the **direction** specifically: trimming must go through
+    /// `Agent::drop_oldest` (keep the tail), not `truncate_messages` (keep the head). While
+    /// implementing this the two were exactly what got confused, so the result was "this turn's
+    /// input is dropped while the oldest context stays" — and memory and file were **wrong in
+    /// agreement**, so looking only at what was persisted revealed nothing. That is why this test
+    /// asserts *which turns* remain.
     #[test]
     fn trimming_keeps_the_newest_turns_not_the_oldest() {
         let mut agent = test_agent();
         for m in body(3).into_iter().skip(1) {
             agent.push_message(m, None);
         }
-        assert_eq!(agent.messages().len(), 13, "1 条 system + 3 轮 × 4 条");
+        assert_eq!(agent.messages().len(), 13, "1 system message + 3 rounds × 4 messages");
 
-        let cut = trim_point(agent.messages(), 2).expect("3 轮超过 2 轮上限，应当裁");
+        let cut = trim_point(agent.messages(), 2).expect("3 rounds exceed a limit of 2, so it must trim");
         agent.drop_oldest(cut);
 
         let roles: Vec<&str> = agent.messages().iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles.len(), 9, "system + 最后 2 轮");
-        assert_eq!(roles[0], "system", "系统提示永远保留");
+        assert_eq!(roles.len(), 9, "system + the last 2 rounds");
+        assert_eq!(roles[0], "system", "the system prompt is always kept");
         assert_eq!(roles[1], "user");
         assert_eq!(
             agent.messages()[1].content.as_ref().and_then(|v| v.as_str()),
-            Some("问题 2"),
-            "留下的必须是**最新**两轮，不是最老两轮"
+            Some("question 2"),
+            "what remains must be the **latest** two rounds, not the oldest two"
         );
         assert_eq!(
             agent.messages().last().unwrap().content.as_ref().and_then(|v| v.as_str()),
-            Some("答复 3"),
-            "最后一轮要完整保留到它的最终答复"
+            Some("answer 3"),
+            "the last round must be kept whole through its final answer"
         );
     }
 
-    /// `drop_oldest` 的边界：切点没意义时一条都不动（宁可留着完整上下文，也不裁成空壳）。
+    /// The boundary of `drop_oldest`: when the cut point is meaningless, nothing moves (better to
+    /// keep the full context than trim it into an empty shell).
     #[test]
     fn drop_oldest_is_a_noop_on_meaningless_cuts() {
         let mut agent = test_agent();
@@ -578,31 +626,32 @@ mod tests {
         let before = agent.messages().len();
         for cut in [0usize, 1, before, before + 5] {
             agent.drop_oldest(cut);
-            assert_eq!(agent.messages().len(), before, "cut = {cut} 不该动任何东西");
+            assert_eq!(agent.messages().len(), before, "cut = {cut} should not touch anything");
         }
     }
 
     #[test]
     fn unknown_impl_is_an_error() {
         let cfg = LoopConfig { implementor: "react".into(), max_rounds: 0 };
-        let e = build(&cfg).err().expect("未知实现必须报错").to_string();
-        assert!(e.contains("react"), "报错要带上写错的那个名字: {e}");
-        assert!(e.contains("standard"), "报错要告诉用户当前可用的是什么: {e}");
+        let e = build(&cfg).err().expect("an unknown implementation must error").to_string();
+        assert!(e.contains("react"), "the error must include the misspelled name: {e}");
+        assert!(e.contains("standard"), "the error must tell the user what is currently available: {e}");
     }
 
     #[test]
     fn empty_or_default_impl_builds_standard() {
         for name in ["", "standard", "  standard  "] {
             let cfg = LoopConfig { implementor: name.into(), max_rounds: 0 };
-            let lp = build(&cfg).unwrap_or_else(|e| panic!("{name:?} 应可用: {e:#}"));
+            let lp = build(&cfg).unwrap_or_else(|e| panic!("{name:?} should be available: {e:#}"));
             assert_eq!(lp.name(), "standard");
         }
     }
 
-    /// 工具产出的图片必须变成一条 **user** 消息，且 `content` 是 parts 数组。
+    /// Images produced by tools must become a **user** message, with `content` being a parts array.
     ///
-    /// 这两条都是**协议硬要求**，不是风格：图片出现在 `tool` / `system` / `assistant`
-    /// 消息里端点直接 400；而只有 parts 数组装得下图片，纯字符串装不下。
+    /// Both are **hard protocol requirements**, not style: an image in a `tool` / `system` /
+    /// `assistant` message makes the endpoint return a straight 400, and only a parts array can hold
+    /// an image — a plain string cannot.
     #[test]
     fn produced_images_become_a_user_message_with_parts() {
         let d = std::env::temp_dir().join("aox-loop-produced");
@@ -613,21 +662,23 @@ mod tests {
 
         let (msg, _shown, problems) = produced_files_message(&[shot]);
         assert!(problems.is_empty(), "{problems:?}");
-        let msg = msg.expect("挂得上的文件必须产出一条消息");
-        assert_eq!(msg.role, "user", "图片只能出现在 user 消息里");
-        let parts = msg.content.as_ref().unwrap().as_array().expect("必须是 parts 数组");
+        let msg = msg.expect("an attachable file must produce a message");
+        assert_eq!(msg.role, "user", "images may only appear in user messages");
+        let parts = msg.content.as_ref().unwrap().as_array().expect("must be a parts array");
         assert!(parts.iter().any(|p| p["type"] == "image_url"), "{parts:?}");
-        // 前缀是给界面认的：带这个前缀的消息渲染成提示，而不是一枚用户气泡
-        assert!(msg.flat_text().starts_with("（宿主提示）"), "{}", msg.flat_text());
+        // The prefix is for the UI to recognize: a message with this prefix renders as a tip, not a user bubble
+        assert!(msg.flat_text().starts_with(crate::history::HOST_PREFIX), "{}", msg.flat_text());
         assert!(msg.flat_text().contains("shot.png"), "{}", msg.flat_text());
 
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 插件报了一条不存在的路径（插件作者最常犯的错）：**不能静默**。
+    /// A plugin reports a path that does not exist (the most common mistake a plugin author makes):
+    /// it **must not be silent**.
     ///
-    /// 静默的后果是双向的 —— 作者那边一直等一张永远不会出现的图，模型那边则完全
-    /// 不知道自己缺了东西，于是照着文件名猜内容。
+    /// The consequence of silence is two-way — the author keeps waiting for an image that will never
+    /// appear, while the model has no idea it is missing something and guesses content from the file
+    /// name.
     #[test]
     fn a_missing_produced_file_is_reported_not_swallowed() {
         let missing = std::env::temp_dir().join("aox-loop-no-such-file-xyz.png");
@@ -638,7 +689,8 @@ mod tests {
         assert!(problems[0].contains("no-such-file-xyz.png"), "{}", problems[0]);
     }
 
-    /// 一批里只有一半合格时：合格的要挂上，不合格的要出声 —— 不是整批丢掉。
+    /// When only half of a batch is valid: the valid ones must be attached and the invalid ones must
+    /// speak up — not drop the whole batch.
     #[test]
     fn one_bad_file_does_not_sink_the_whole_batch() {
         let d = std::env::temp_dir().join("aox-loop-mixed");
@@ -649,7 +701,7 @@ mod tests {
         let missing = d.join("missing.png");
 
         let (msg, _shown, problems) = produced_files_message(&[good, missing]);
-        assert!(msg.is_some(), "合格那个必须照挂");
+        assert!(msg.is_some(), "the qualifying one must still be attached");
         assert_eq!(problems.len(), 1, "{problems:?}");
 
         let _ = std::fs::remove_dir_all(&d);

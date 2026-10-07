@@ -1,19 +1,25 @@
-# prompt-core —— 系统提示词的分段拼装（core / protocol / env / rules）。
+# prompt-core -- assembling the system prompt from segments (core / protocol / env / rules).
 #
-# 段本身与拼装逻辑在 src/prompt.rs；这里写出的都是**等于不写的空值**，
-# 只为让 `--dump-config` 把这个键的存在与来源显示出来。
+# The segments themselves and the assembly logic live in src/prompt.rs; everything written here
+# is **an empty value equivalent to not writing it at all**, present only so `--dump-config`
+# can show that the key exists and where it came from.
 #
-# 想看当前实际拼出来的提示词：命令行输入 /prompt。
+# To see the prompt actually being assembled right now: type /prompt at the command line.
 
 [prompt]
-# 显式顺序：列出的段按此顺序排到最前，未列出的保持默认序跟在其后。
-# 空数组 = 完全按内置顺序 —— 与内置提示词**逐字节一致**。
+# Explicit order: the listed segments are moved to the front in this order, and unlisted ones
+# keep their default order after them.
+# An empty array = entirely the built-in order -- **byte for byte identical** to the built-in
+# prompt.
 order = []
-# 禁用段（内置段可用 core / protocol / env / rules）。空数组 = 一段都不禁用。
+# Segments to disable (the built-in ones are core / protocol / env / rules). An empty array
+# disables none of them.
 disable = []
-# 追加自定义段用 [[prompt.segment]]；id 与内置段同名时**整段替换**内置段。
-# 默认没有自定义段，这里就不写空的 segment 数组了，免得 dump 里多一行噪音。
+# To append custom segments, use [[prompt.segment]]; a segment whose id matches a built-in one
+# **replaces that built-in segment wholesale**.
+# There are no custom segments by default, so no empty `segment` array is written here -- it
+# would only add a line of noise to the dump.
 
 [agent]
-# 项目规则文件（RULES.md），存在则作为提示词的 rules 段注入。
+# Project rules file (RULES.md); if present it is injected as the prompt's rules segment.
 rules_file = "RULES.md"

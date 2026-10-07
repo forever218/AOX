@@ -1,30 +1,32 @@
-//! 代码块的语法高亮。
+//! Syntax highlighting for code blocks.
 //!
-//! 刻意**不引正则、也不为每种语言各写一套解析器**：一份通用的字符扫描 +
-//! 每语言一张配置表（注释符、字符串定界符、关键字）。对"代码块"这种只要看着
-//! 舒服的场景已经够用，而引正则会给这个零重依赖的项目加一个 crate，不划算。
+//! Deliberately **no regex, and no per-language parser**: one generic character scan plus a
+//! per-language config table (comment markers, string delimiters, keywords). That's plenty for
+//! "code blocks" where the goal is just to look pleasant, and pulling in regex would add a crate
+//! to this zero-heavy-dependency project — not worth it.
 //!
-//! 配色是低饱和的暖色系，彼此主要差在明度上 —— 界面的主语仍然是纸与墨，
-//! 高亮只负责"扫得过去"，不负责抢戏。
+//! The palette is a low-saturation warm set whose entries differ mainly in lightness — the UI's
+//! subject remains paper and ink, and highlighting only has to "scan well", not steal the show.
 
 use egui::Color32;
 
 use crate::theme::{self, Mode, P};
 
-// ────────────────────────────── 词法单元 ──────────────────────────────
+// ────────────────────────────── Tokens ──────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tok {
     Plain,
     Keyword,
-    /// 类型名：PascalCase、原始类型、`u32` 这类内建名
+    /// Type names: PascalCase, primitive types, built-in names like `u32`
     Type,
-    /// 紧跟左括号的标识符（函数名与调用点）、标签语言里的属性名
+    /// An identifier immediately followed by an open paren (function names and call sites), plus
+    /// attribute names in markup languages
     Func,
     Str,
     Num,
     Comment,
-    /// 预处理指令、宏、shell 变量、`<div>` 这样的标签名、以及「键名」形态的字符串
+    /// Preprocessor directives, macros, shell variables, tag names like `<div>`, and "key name"-shaped strings
     Meta,
 }
 
@@ -53,7 +55,7 @@ impl Spec {
     }
 }
 
-/// 纸底：赭红关键字、松绿类型、钢蓝函数、橄榄字符串、梅紫数字、暖灰注释、琥珀元信息。
+/// On paper: ochre-red keywords, pine-green types, steel-blue functions, olive strings, plum numerals, warm-grey comments, amber meta.
 const LIGHT: Spec = Spec {
     kw: Color32::from_rgb(0xA3, 0x4A, 0x2A),
     ty: Color32::from_rgb(0x1F, 0x7A, 0x6B),
@@ -64,7 +66,7 @@ const LIGHT: Spec = Spec {
     meta: Color32::from_rgb(0xB0, 0x7A, 0x1E),
 };
 
-/// 墨底：同一组色相整体提亮，注释保持最弱。
+/// On ink: the same hues brightened overall, with comments kept the weakest.
 const DARK: Spec = Spec {
     kw: Color32::from_rgb(0xE0, 0x8A, 0x6B),
     ty: Color32::from_rgb(0x6F, 0xC7, 0xB4),
@@ -75,7 +77,7 @@ const DARK: Spec = Spec {
     meta: Color32::from_rgb(0xD8, 0xB2, 0x6A),
 };
 
-/// 取某个词法单元在当前明暗模式下的颜色（运行时求值，切主题立即生效）。
+/// The color of a token under the current light/dark mode (evaluated at runtime, so switching theme takes effect immediately).
 pub fn color(t: Tok) -> Color32 {
     match theme::mode() {
         Mode::Light => LIGHT.of(t),
@@ -83,29 +85,29 @@ pub fn color(t: Tok) -> Color32 {
     }
 }
 
-// ────────────────────────────── 语言配置 ──────────────────────────────
+// ────────────────────────────── Language config ──────────────────────────────
 
 struct Cfg {
-    /// 行注释前缀
+    /// Line-comment prefixes
     line: &'static [&'static str],
-    /// 块注释定界符
+    /// Block-comment delimiters
     block: Option<(&'static str, &'static str)>,
-    /// 单行字符串定界符。Rust 刻意不含 `'` —— 否则生命周期 `&'a str` 会被当成
-    /// 字符字面量，把整行后半段都吃掉。
+    /// Single-line string delimiters. Rust deliberately omits the `'` — otherwise a lifetime
+    /// like `&'a str` would be read as a char literal and swallow the rest of the line.
     quotes: &'static [char],
-    /// 三引号跨行字符串（Python 文档串）
+    /// Triple-quoted multi-line strings (Python docstrings)
     triple: bool,
-    /// 反引号字符串（JS 模板串、shell 的 `$(...)`）
+    /// Backtick strings (JS template strings, shell's `$(...)`)
     backtick: bool,
-    /// 关键字
+    /// Keywords
     keywords: &'static [&'static str],
-    /// 内建类型
+    /// Built-in types
     types: &'static [&'static str],
-    /// 关键字是否忽略大小写（SQL）
+    /// Whether keywords ignore case (SQL)
     ci: bool,
-    /// 标签语言：`<tag>` 与属性名单独上色
+    /// Markup languages: `<tag>` and attribute names are colored separately
     markup: bool,
-    /// 行首的 `#` 是预处理指令而不是注释
+    /// A leading `#` is a preprocessor directive, not a comment
     hash_meta: bool,
 }
 
@@ -190,8 +192,8 @@ const JS: Cfg = Cfg {
     hash_meta: false,
 };
 
-/// C / C++ / Java / C# / Go / Kotlin / Swift 共用一张表：关键字取并集，
-/// 少写一份，也免得为了"某语言少一个关键字"去动结构。
+/// C / C++ / Java / C# / Go / Kotlin / Swift share one table: the union of their keywords.
+/// Writing one fewer copy also avoids touching the struct just because "some language lacks a keyword".
 const CL: Cfg = Cfg {
     line: &["//"],
     block: Some(("/*", "*/")),
@@ -258,7 +260,7 @@ const SQL: Cfg = Cfg {
     hash_meta: false,
 };
 
-/// JSON / TOML / YAML / INI：没有注释，靠字符串与字面量撑起可读性。
+/// JSON / TOML / YAML / INI: no comments; readability rests on strings and literals.
 const DATA: Cfg = Cfg {
     line: &["#"],
     block: None,
@@ -285,10 +287,10 @@ const MARKUP: Cfg = Cfg {
     hash_meta: false,
 };
 
-/// 按围栏后面的语言提示取配置；认不出来就退回"只高亮字符串与数字"。
+/// Pick a config from the language hint after the fence; if unrecognized, fall back to "highlight only strings and numbers".
 fn detect(hint: &str) -> &'static Cfg {
     let lower = hint.trim().to_ascii_lowercase();
-    // ```rust,ignore / ```js:line-numbers —— 只取第一段
+    // ```rust,ignore / ```js:line-numbers —— take only the first segment
     let h = lower.split(&['=', ':', ',', ' '][..]).next().unwrap_or("");
     match h {
         "rust" | "rs" => &RUST,
@@ -306,9 +308,9 @@ fn detect(hint: &str) -> &'static Cfg {
     }
 }
 
-// ────────────────────────────── 扫描 ──────────────────────────────
+// ────────────────────────────── Scan ──────────────────────────────
 
-/// 跨行状态：块注释与三引号字符串要一直记到下一行。
+/// Cross-line state: block comments and triple-quoted strings must be remembered into the next line.
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Normal,
@@ -339,7 +341,7 @@ fn find3(b: &[char], from: usize, q: char) -> Option<usize> {
     (from..b.len()).find(|&k| at3(b, k, q))
 }
 
-/// 跳过空白（用于"后面跟的是什么"这类前瞻）
+/// Skip whitespace (for lookahead of the form "what comes next")
 fn skip_ws(b: &[char], mut i: usize) -> usize {
     while i < b.len() && b[i].is_whitespace() {
         i += 1;
@@ -347,7 +349,7 @@ fn skip_ws(b: &[char], mut i: usize) -> usize {
     i
 }
 
-/// 后面（越过空白）是不是这个字符
+/// Whether the character after (past whitespace) is this one
 fn peek(b: &[char], i: usize, c: char) -> bool {
     b.get(skip_ws(b, i)) == Some(&c)
 }
@@ -358,12 +360,12 @@ fn has(hay: &[&str], w: &str, ci: bool) -> bool {
 
 fn classify(cfg: &Cfg, w: &str, b: &[char], start: usize, after: usize) -> Tok {
     if cfg.markup {
-        // `<div` / `</div` 的标签名
+        // Tag name of `<div` / `</div`
         if (start > 0 && b[start - 1] == '<') || (start > 1 && b[start - 1] == '/' && b[start - 2] == '<')
         {
             return Tok::Meta;
         }
-        // `href=` 这种属性名
+        // Attribute name like `href=`
         if peek(b, after, '=') {
             return Tok::Type;
         }
@@ -375,19 +377,19 @@ fn classify(cfg: &Cfg, w: &str, b: &[char], start: usize, after: usize) -> Tok {
         return Tok::Type;
     }
     if peek(b, after, '!') {
-        return Tok::Meta; // Rust 宏
+        return Tok::Meta; // Rust macro
     }
     if peek(b, after, '(') {
         return Tok::Func;
     }
-    // PascalCase 当类型：这条启发式比维护各语言类型表省事得多
+    // Treat PascalCase as a type: this heuristic is far cheaper than maintaining per-language type tables
     if w.chars().count() > 1 && w.starts_with(|c: char| c.is_uppercase()) {
         return Tok::Type;
     }
     Tok::Plain
 }
 
-/// 高亮整段代码，按行返回（每行若干个「文本 + 类别」）。
+/// Highlight a whole code block, returning line by line (each line is several "text + kind").
 pub fn highlight(code: &str, hint: &str) -> Vec<Vec<(String, Tok)>> {
     let cfg = detect(hint);
     let mut state = State::Normal;
@@ -398,10 +400,10 @@ fn scan_line(cfg: &Cfg, state: &mut State, line: &str) -> Vec<(String, Tok)> {
     let b: Vec<char> = line.chars().collect();
     let mut out: Vec<(String, Tok)> = Vec::new();
     let mut plain = String::new();
-    let head = skip_ws(&b, 0); // 行首第一个非空白字符的位置
+    let head = skip_ws(&b, 0); // position of the first non-whitespace character on the line
     let mut i = 0usize;
 
-    // 把 b[start..end] 收成一个 token；空串不进列表（否则会塞进一堆空 section）
+    // Collapse b[start..end] into one token; an empty string does not enter the list (otherwise it would stuff in a pile of empty sections)
     macro_rules! cut {
         ($from:expr, $to:expr, $tok:expr) => {{
             let s: String = b[$from..$to].iter().collect();
@@ -419,7 +421,7 @@ fn scan_line(cfg: &Cfg, state: &mut State, line: &str) -> Vec<(String, Tok)> {
     }
 
     while i < b.len() {
-        // 跨行状态先处理
+        // Handle cross-line state first
         match *state {
             State::Block => {
                 let close = cfg.block.map(|(_, c)| c).unwrap_or("*/");
@@ -448,29 +450,30 @@ fn scan_line(cfg: &Cfg, state: &mut State, line: &str) -> Vec<(String, Tok)> {
                         i = b.len();
                     }
                 }
-                // 这一行整段属于那个三引号字符串，收完必须回到 `while` 重判。
-                // 少了这句，`i` 会正好停在行尾（`"""doc` 在行尾闭合时就是如此），
-                // 下面的 `b[i]` 直接越界 panic。
+                // This whole line belongs to that triple-quoted string; after cutting we must go
+                // back to the `while` and re-evaluate. Without this line, `i` would stop exactly at
+                // the end of the line (which is what happens when `"""doc` closes at the line end),
+                // and the `b[i]` below would go out of bounds and panic.
                 continue;
             }
             State::Normal => {}
         }
 
-        // 行注释
+        // Line comment
         if cfg.line.iter().any(|p| at(&b, i, p)) {
             flush!();
             cut!(i, b.len(), Tok::Comment);
             i = b.len();
             continue;
         }
-        // 预处理指令 / 属性：只认行首
+        // Preprocessor directive / attribute: only recognized at the start of a line
         if cfg.hash_meta && b[i] == '#' && i == head {
             flush!();
             cut!(i, b.len(), Tok::Meta);
             i = b.len();
             continue;
         }
-        // 块注释
+        // Block comment
         if let Some((open, close)) = cfg.block {
             if at(&b, i, open) {
                 flush!();
@@ -490,7 +493,7 @@ fn scan_line(cfg: &Cfg, state: &mut State, line: &str) -> Vec<(String, Tok)> {
                 continue;
             }
         }
-        // 三引号字符串
+        // Triple-quoted string
         if cfg.triple && (b[i] == '"' || b[i] == '\'') && at3(&b, i, b[i]) {
             flush!();
             let start = i;
@@ -509,7 +512,7 @@ fn scan_line(cfg: &Cfg, state: &mut State, line: &str) -> Vec<(String, Tok)> {
             }
             continue;
         }
-        // 单行字符串
+        // Single-line string
         let c = b[i];
         if cfg.quotes.contains(&c) || (cfg.backtick && c == '`') {
             flush!();
@@ -527,13 +530,13 @@ fn scan_line(cfg: &Cfg, state: &mut State, line: &str) -> Vec<(String, Tok)> {
                 j += 1;
             }
             let j = j.min(b.len());
-            // 后面跟着冒号的字符串按"键名"上色：JSON、TOML、Python 字典都吃这一条
+            // A string followed by a colon is colored as a "key name": JSON, TOML, and Python dicts all hit this
             let tok = if peek(&b, j, ':') { Tok::Meta } else { Tok::Str };
             cut!(start, j, tok);
             i = j;
             continue;
         }
-        // shell 变量：$VAR / ${VAR} / $(cmd)
+        // Shell variable: $VAR / ${VAR} / $(cmd)
         if c == '$' && b.get(i + 1).is_some_and(|n| n.is_alphabetic() || *n == '_' || *n == '{') {
             flush!();
             let start = i;
@@ -550,7 +553,7 @@ fn scan_line(cfg: &Cfg, state: &mut State, line: &str) -> Vec<(String, Tok)> {
             i = j;
             continue;
         }
-        // 数字。紧跟在标识符后面的是标识符的一部分（`x1`），交给标识符分支
+        // Number. One glued to a preceding identifier is part of that identifier (`x1`), handled by the identifier branch
         if c.is_ascii_digit() && !(i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == '_')) {
             flush!();
             let start = i;
@@ -558,7 +561,7 @@ fn scan_line(cfg: &Cfg, state: &mut State, line: &str) -> Vec<(String, Tok)> {
             while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == '.' || b[j] == '_') {
                 j += 1;
             }
-            // 别把结尾的 `.` 吞掉（`foo.0`、省略号）
+            // Don't swallow a trailing `.` (`foo.0`, ellipsis)
             while j > start + 1 && b[j - 1] == '.' {
                 j -= 1;
             }
@@ -566,7 +569,7 @@ fn scan_line(cfg: &Cfg, state: &mut State, line: &str) -> Vec<(String, Tok)> {
             i = j;
             continue;
         }
-        // 标识符（只认 ASCII：中文直接当普通文本，不会被误判成函数）
+        // Identifier (ASCII only: CJK is treated as plain text and never misread as a function)
         if c.is_ascii_alphabetic() || c == '_' {
             let start = i;
             let mut j = i + 1;
@@ -613,7 +616,7 @@ mod tests {
         let rows = highlight("/* a\nb */ let x = 1;", "rust");
         assert_eq!(rows[0][0].1, Tok::Comment);
         assert_eq!(rows[1][0].1, Tok::Comment);
-        // 第二行注释结束之后才是真正的代码
+        // Only after the comment ends on the second line does the actual code begin
         assert!(rows[1].iter().any(|(_, k)| *k == Tok::Keyword));
     }
 
@@ -627,7 +630,7 @@ mod tests {
 
     #[test]
     fn rust_lifetime_is_not_a_string() {
-        // 生命周期 `&'a str` 不该把整行后半段吃掉
+        // A lifetime `&'a str` must not swallow the rest of the line
         let rows = highlight("fn f<'a>(x: &'a str) -> &'a str { x }", "rust");
         assert!(rows[0].iter().any(|(_, k)| *k == Tok::Keyword));
         assert!(rows[0].iter().any(|(t, _)| t.contains("'a")));
@@ -636,8 +639,8 @@ mod tests {
     #[test]
     fn json_keys_differ_from_values() {
         let k = kinds("{\"name\": \"aox\", \"n\": 1}", "json");
-        assert_eq!(k.iter().filter(|t| **t == Tok::Meta).count(), 2); // 两个键
-        assert_eq!(k.iter().filter(|t| **t == Tok::Str).count(), 1); // 一个值
+        assert_eq!(k.iter().filter(|t| **t == Tok::Meta).count(), 2); // two keys
+        assert_eq!(k.iter().filter(|t| **t == Tok::Str).count(), 1); // one value
     }
 
     #[test]
@@ -653,8 +656,8 @@ mod tests {
 
     #[test]
     fn unknown_language_still_highlights_strings() {
-        let k = kinds("a = \"x\" // 不是注释", "");
+        let k = kinds("a = \"x\" // not a comment", "");
         assert!(k.contains(&Tok::Str));
-        assert!(!k.contains(&Tok::Comment)); // 没语言就别乱认注释
+        assert!(!k.contains(&Tok::Comment)); // without a language, don't guess comments
     }
 }

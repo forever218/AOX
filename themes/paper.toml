@@ -1,17 +1,22 @@
-# 纸 · paper
+# Paper
 #
-# 出厂纸（亮色）的**完整定义** —— 与内置配色逐字节相同，所以：
+# The **complete definition** of the factory paper (light) palette -- byte for byte identical
+# to the built-in colours, so:
 #   aox-gui --theme themes/paper.toml
-# 看到的画面应与不指定 --theme 时**完全一样**（可以用来验证主题文件确实被读进去了）。
+# should look **exactly** the same as running without --theme (which is handy for proving that
+# the theme file really is being read).
 #
-# 改任意几行即可微调；只写想改的字段也行（其余继承内置）。
-# 颜色写法："#RRGGBB" / "#RRGGBBAA" / "#RGB"，或数组 [r, g, b] / [r, g, b, a]。
+# Change any lines you like to nudge it; writing only the fields you care about is fine too
+# (everything else inherits from the built-in).
+# Colours may be written as "#RRGGBB" / "#RRGGBBAA" / "#RGB", or as an array
+# [r, g, b] / [r, g, b, a].
 #
-# 本文件就是一份 `[theme]` 段，可以**整段粘进 config.toml**；
-# 反过来，把 config.toml 里的 [theme] 整段摘出来也能存成主题文件用。
+# This file **is** a `[theme]` section and can be **pasted wholesale into config.toml**;
+# conversely, lifting a `[theme]` section out of config.toml gives you a theme file.
 #
-# 注意明暗：下面 mode 的优先级**低于**你手动点过的那次切换
-# （记录在 <应用根>/.aox-gui-theme）；想让 mode 生效，先删掉那个文件。
+# Note on light/dark: the `mode` below has **lower** priority than a switch you made by hand
+# (which is recorded in <app root>/.aox-gui-theme); to make `mode` take effect, delete that
+# file first.
 
 [theme]
 mode = "light"

@@ -1,51 +1,56 @@
-//! 工作区：**模型的文件能力能被限制在哪**。
+//! Workspace: **where the model's file capabilities may be confined**.
 //!
-//! 这是沙箱方案 ③「把文件能力收回宿主」的宿主侧。它回答一个问题：
-//! 「这个路径，当前档位允许碰吗？」
+//! This is the host side of sandbox approach ③ "take file capability back to the host".
+//! It answers one question: "is this path allowed under the current tier?"
 //!
-//! # 三档
+//! # Three tiers
 //!
-//! | 档位 | 含义 | 判定 |
+//! | Tier | Meaning | Decision |
 //! |------|------|------|
-//! | `default`（**配置默认**） | 每段新对话在 `<应用根>/workplace/<YYYYMMDDHHMMSS>/` 开一块地 | 写·删只准这块地；**读不设限** |
-//! | `full` | 完全访问，与加工作区之前逐字节一致 | 一切放行 |
-//! | `fixed`（`root = "..."`） | 固定一块地（GUI 的「选择工作区」等价于它） | 同 `default` |
+//! | `default` (**config default**) | each new conversation opens a plot under `<app root>/workplace/<YYYYMMDDHHMMSS>/` | write·delete only allowed in this plot; **read unrestricted** |
+//! | `full` | full access, byte-for-byte identical to before the workspace layer was added | everything allowed |
+//! | `fixed` (`root = "..."`) | a fixed plot (the GUI's "choose workspace" is equivalent to it) | same as `default` |
 //!
-//! **配置默认是 `default`（受限）**，2026-10-05 由 `full` 改过来：用户要的就是
-//! 「每次启动**默认受限**」。于是「不写 `[workplace]` = 行为与加这一层之前一致」这条
-//! 不再成立 —— 不写就是受限档，想要不受限得显式写 `mode = "full"`。
-//! 另外 `/new` 一律回到 `default` 档（见 [`Workplace::reset_for_new_conversation`]）。
+//! **The config default is `default` (confined)**, changed from `full` on 2026-10-05: what the
+//! user wants is "**confined by default on every launch**". So the rule "omit `[workplace]` = behavior
+//! identical to before this layer" no longer holds — omitting it means the confined tier; to be
+//! unrestricted you must explicitly write `mode = "full"`.
+//! Also `/new` always returns to the `default` tier (see [`Workplace::reset_for_new_conversation`]).
 //!
-//! # 读写不对称（本模块最重要的一条）
+//! # Read/write asymmetry (the single most important rule of this module)
 //!
-//! 受限档位下**只挡落盘，不挡读**：
+//! Under the confined tier **only writes to disk are blocked, not reads**:
 //!
-//! - `read_file` / `list_dir`（[`Access::Read`]）：整个设备都能读，**不受工作区限制**，
-//!   连「地还没开」（[`Active::Pending`]）时也照读不误。
-//! - `write_file` / `remove`（[`Access::Write`]）：必须落在工作区内，相对路径一律拒。
+//! - `read_file` / `list_dir` ([`Access::Read`]): the whole device can be read, **not limited by the workspace**,
+//!   even while "the plot isn't opened yet" ([`Active::Pending`]) reads go through fine.
+//! - `write_file` / `remove` ([`Access::Write`]): must land inside the workspace; relative paths are always rejected.
 //!
-//! 理由是后果不对称：读是**取信息**，写删是**改设备**。想读一份散落在别处的资料
-//! （日志、配置、别处的项目）是很常见的正当需求，为它设一道提权流程只会把用户逼去
-//! 常开「完全访问」—— 边界反而更松；而「只能在划定的那块地里落笔」才是这个功能
-//! 真正要保住的东西。细节点见 [`Access`]。
+//! The reason is asymmetric consequence: reading is **taking information**, writing/deleting is **changing the
+//! device**. Wanting to read a piece of material scattered elsewhere (logs, config, another project) is a very
+//! common legitimate need; forcing an escalation flow for it would only push the user to keep "full access" on —
+//! the boundary ends up looser; whereas "only allowed to write within the delimited plot" is the thing this
+//! feature truly must protect. See [`Access`] for the details.
 //!
-//! # 两个必须讲清楚的语义
+//! # Two semantics that must be made clear
 //!
-//! **① 只看绝对路径。** 受限档位下**相对路径一律拒绝**。原因是宿主与插件子进程
-//! 的工作目录不是同一个（插件的 cwd 仍是应用根，见 `plugin::spawn_command`），
-//! 同一串 `config.toml` 在两边会指到两个不同文件 —— 那种「宿主以为在里面、
-//! 插件实际去了外面」的不一致，比多写几个字符危险得多。拒绝文案里会把根直接告诉模型。
+//! **① Absolute paths only.** Under the confined tier **relative paths are always rejected**. The reason is that
+//! the host and the plugin subprocess do not share the same working directory (the plugin's cwd is still the app
+//! root, see `plugin::spawn_command`), so the same string `config.toml` points to two different files on the two
+//! sides — that "host thinks it's inside, plugin actually went outside" inconsistency is far more dangerous than
+//! writing a few extra characters. The rejection message tells the model the root directly.
 //!
-//! **② 越界不是静默拦下。** 见 [`Reject::model_text`]：那是一份**给模型看的契约**，
-//! 三段是硬要求 —— 发生了什么 / 这是权限边界不是工具坏了、别重试 / 请转述用户并
-//! 告诉他怎么提权。少了任何一段，模型就会一路重试同一个越界调用，白烧轮次。
+//! **② Out-of-bounds is not silently blocked.** See [`Reject::model_text`]: it is a **contract shown to the model**,
+//! and its three parts are hard requirements — what happened / this is a permission boundary, not a broken tool,
+//! don't retry / please relay to the user and tell them how to escalate. If any part is missing, the model will
+//! keep retrying the same out-of-bounds call, wasting turns for nothing.
 //!
-//! # 边界在哪
+//! # Where the boundary is
 //!
-//! 这一层管的是「**宿主提供的能力**」：宿主内置的文件工具，以及插件工具声明的路径参数
-//! （宿主只能按参数名猜 —— 见 [`scan_paths`]，那是张粗网）。
-//! **它管不了一个不守规矩的插件自己 `open()` 文件** —— 那要 OS 级的 AppContainer，
-//! 不在本模块的能力范围内。别把它当沙箱用。
+//! This layer governs "**capabilities provided by the host**": the host's built-in file tools, and the path
+//! parameters declared by plugin tools (the host can only guess by parameter name — see [`scan_paths`], which is
+//! a coarse net).
+//! **It cannot govern a misbehaving plugin that `open()`s files on its own** — that needs OS-level AppContainer,
+//! which is outside this module's scope. Don't treat it as a sandbox.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -53,116 +58,140 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use crate::config::WorkplaceConfig;
+use crate::i18n::t;
+use crate::tf;
 
-/// 受限档位下的工作区子目录名（`<应用根>/workplace/`）。
+/// Subdirectory name for the workspace under the confined tier (`<app root>/workplace/`).
 pub const WORKPLACE_DIR: &str = "workplace";
 
-/// 宿主内置文件工具的**参数**里，表示「路径」的那个键。
+/// The key in the **parameters** of the host's built-in file tools that denotes "path".
 ///
-/// 单独抽出来是因为判定要精确读它：这些工具的 schema 是宿主自己定义的，
-/// 所以不需要猜（与插件工具那边的 [`scan_paths`] 形成对照）。
+/// Pulled out on its own because the check needs to read it precisely: these tools' schema is
+/// defined by the host itself, so no guessing is needed (contrast with [`scan_paths`] on the
+/// plugin-tools side).
 pub const PATH_ARG: &str = "path";
 
-/// 参数名命中这些词时，值被当作路径（只用于**插件工具**的粗网扫描）。
+/// When a parameter name hits one of these words, its value is treated as a path (only used for
+/// the **coarse scan** of plugin tools).
 ///
-/// 刻意保守：漏判只是「少一层粗网」，而误判会直接拒掉一次合法调用，那更烦人。
+/// Deliberately conservative: a miss only means "one less coarse net", but a false positive would
+/// directly reject a legitimate call, which is more annoying.
 ///
-/// 这张网**只负责「哪些值是路径」**，「拿它去读还是去写」由工具自己声明
-/// （[`crate::tool::Tool::access`]，插件侧是 `initialize` 里的 `"access": "read"`）：
-/// 声明了读的按读判（`check_access(Read)` 恒为 `Ok`，于是粗网对它是空操作），
-/// 没声明的按落盘判。所以插件作者的义务有两条 —— **（可选）声明路径参数、
-/// （按需）声明只读**；两条都不做，它就只能被当写拦下。
+/// This net **only decides "which values are paths"**; "use it for reading or writing" is declared
+/// by the tool itself ([`crate::tool::Tool::access`], on the plugin side it is `"access": "read"`
+/// inside `initialize`): declared-read is judged as read (`check_access(Read)` is always `Ok`, so
+/// the net is a no-op for it), undeclared is judged as write-to-disk. So a plugin author has two
+/// duties —— **(optionally) declare the path parameter, (as needed) declare read-only**; doing
+/// neither means it can only be blocked as a write.
 ///
-/// 这里**没有**给插件注入「工作区根」的机制（比如一个 `AOX_WORKSPACE_ROOT` 环境变量）：
-/// `default` 档位的根是**首条消息时**才建的，而插件进程在启动 / 被创建的那一刻就已经
-/// 拉起来了 —— 那一刻还没有值可注，注进去只能是个过期或空的东西。所以插件要守边界，
-/// 正确做法是**声明**，让宿主这层粗网来判（它判不准也只多拒一次，不会漏放行）。
+/// There is **no** mechanism to inject a "workspace root" into plugins (e.g. an
+/// `AOX_WORKSPACE_ROOT` env var): the `default` tier's root is only created at **the first
+/// message**, but the plugin process is already spun up at the moment it starts / gets created —
+/// at that moment there is no value to inject, and injecting would only yield a stale or empty
+/// thing. So for a plugin to respect the boundary, the correct approach is to **declare**, letting
+/// the host's coarse net do the judging (even if it misjudges, it only rejects one extra time, it
+/// never lets something through).
 const PATH_KEYS: &[&str] = &[
     "path", "paths", "file", "files", "filename", "filepath", "file_path", "dir", "dirs", "directory",
     "folder", "root", "src", "dst", "dest", "destination", "target", "cwd", "workdir", "working_dir",
     "save_to", "input_path", "output_path",
 ];
 
-/// 运行期档位。GUI / CLI 可以切，切完立刻生效（下一次工具调用就按新档位判）。
+/// The runtime tier. The GUI / CLI can switch it, taking effect immediately (the next tool call
+/// is judged under the new tier).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    /// 每段新对话开一块新地。
+    /// Each new conversation opens a fresh plot.
     Default,
-    /// 固定一块地。
+    /// A fixed plot.
     Fixed(PathBuf),
-    /// 不受限。
+    /// Unrestricted.
     Full,
 }
 
 impl Mode {
     pub fn label(&self) -> &'static str {
         match self {
-            Mode::Default => "默认",
-            Mode::Fixed(_) => "选择工作区",
-            Mode::Full => "完全访问",
+            Mode::Default => t("Default"),
+            Mode::Fixed(_) => t("Picked workspace"),
+            Mode::Full => t("Full access"),
         }
     }
 }
 
-/// 一次路径访问的**意图** —— 决定受限档位下工作区边界管不管它。
+/// The **intent** of a path access —— decides whether the workspace boundary governs it under the
+/// confined tier.
 ///
-/// 语义（2026-10-04 定为）：**读不设限，写和删限定在工作区里**。
+/// Semantics (set on 2026-10-04): **reads are unrestricted; writes and deletes are confined to the
+/// workspace**.
 ///
-/// 为什么不把「读」也一起管住：两者对设备造成的后果不对称 ——
-/// 读是**取信息**，读错了顶多是看到了不该看的内容；写、删是**改设备**，
-/// 一次越界就可能毁掉工作区之外的东西（而且是不可逆的）。想读一份散落在
-/// 别处的资料（日志、配置、别处的项目）是很常见的正当需求，为它开一道
-/// 提权流程只会逼着用户一直开「完全访问」，反而让边界形同虚设；
-/// 而「AOX 只能在划定的那块地里落笔」才是这个功能真正要保住的东西。
+/// Why not also govern "reads": the two have asymmetric consequences for the device ——
+/// reading is **taking information**; a misread at worst reveals something you shouldn't have seen,
+/// whereas writing/deleting is **changing the device**, and a single out-of-bounds action can
+/// destroy something outside the workspace (and irreversibly). Wanting to read a piece of material
+/// scattered elsewhere (logs, config, another project) is a very common legitimate need; opening an
+/// escalation flow for it would only push the user to keep "full access" on, making the boundary a
+/// facade; whereas "AOX can only write within the delimited plot" is the thing this feature truly
+/// must protect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
-    /// 只读（`read_file` / `list_dir`）：**整个设备都能读**，不受工作区限制。
+    /// Read-only (`read_file` / `list_dir`): **the whole device can be read**, not limited by the
+    /// workspace.
     Read,
-    /// 落盘（`write_file` / `remove`）：**必须落在工作区内**（`full` 档除外）。
+    /// Write-to-disk (`write_file` / `remove`): **must land inside the workspace** (except the
+    /// `full` tier).
     Write,
 }
 
-/// 当前生效状态。
+/// The currently effective state.
 ///
-/// 带 `Clone` 是为了让 [`Workplace::report`] 能「先取快照、再释放锁」地格式化 ——
-/// 见那里的注释（持锁时再调会重入锁的方法 = 死锁）。
+/// `Clone` is carried so that [`Workplace::report`] can format "take a snapshot first, then release
+/// the lock" —— see the comment there (calling a method that re-locks while holding the lock = deadlock).
 #[derive(Debug, Clone)]
 enum Active {
-    /// 不受限（配置就是 `full`）。
+    /// Unrestricted (config is `full`).
     Full,
-    /// 受限，但**根还没定**：`default` 档位、本对话还没发过消息。
+    /// Confined, but the **root is not yet decided**: `default` tier, this conversation hasn't
+    /// sent a message yet.
     ///
-    /// 单独留一个状态而不是拿 `Option` 把「不受限」和「还没定」混在一起：
-    /// 这两者的判定**相反**（前者全放行、后者全拒绝）。混成一个 `None` 就会
-    /// 出现「受限档位下因为还没建目录而静默全放行」——那是最坏的一种失效。
+    /// Kept as a separate state rather than folding "unrestricted" and "not yet decided" into one
+    /// `Option`: the two have **opposite** judgments (the former allows everything, the latter
+    /// rejects everything). Folding them into one `None` would yield "under the confined tier,
+    /// silent full allowance because the directory isn't built yet" —— the worst kind of failure.
     Pending,
-    /// 受限，根已定。
+    /// Confined, root already decided.
     At(PathBuf),
 }
 
-/// 一段对话的**工作区存档**（`.jsonl` 里 `kind:"workplace"` 那一行）。
+/// A conversation's **workspace record** (the `kind:"workplace"` line in `.jsonl`).
 ///
-/// 三个字段各回答一个问题：
-/// - `mode` / `root`：**当前**档位与它绑的地（`fixed` 是点名那块；`default` 是自建那块）；
-/// - `own`：本对话「默认」档自己的那块地 —— **即使在 `full` / `fixed` 档下也要留着**，
-///   否则「切走再切回默认」只能重新建一块，工作区就会无限累加。
+/// The three fields each answer a question:
+/// - `mode` / `root`: the **current** tier and the plot it is bound to (`fixed` is the named one;
+///   `default` is the self-built one);
+/// - `own`: this conversation's own plot under the "default" tier —— **must be kept even under the
+///   `full` / `fixed` tiers**, otherwise "switch away then switch back to default" can only rebuild
+///   a plot, and the workspaces accumulate without bound.
 ///
-/// 为什么存进对话文件而不是另开一个旁路文件：它属于这段对话。对话被删、被裁剪、
-/// 被换后端时，这条记录自然跟着走，不会留下孤儿。
+/// Why store it in the conversation file rather than a separate side file: it belongs to this
+/// conversation. When the conversation is deleted, trimmed, or has its backend swapped, this
+/// record naturally travels with it and leaves no orphans.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Record {
-    /// `"default"` / `"fixed"` / `"full"`。空串 = 认不出来（调用方应当当没有记录）。
+    /// `"default"` / `"fixed"` / `"full"`. Empty string = unrecognized (caller should treat as no
+    /// record).
     pub mode: String,
-    /// 当前档位绑的根；`full` 没有根。
+    /// The root bound to the current tier; `full` has no root.
     pub root: Option<PathBuf>,
-    /// 本对话「默认」档自建的那块地（还没建就是 `None`）。
+    /// This conversation's own plot under the "default" tier (is `None` if not yet built).
     pub own: Option<PathBuf>,
 }
 
 impl Record {
-    /// 写成 `.jsonl` 的一行（`kind` 由存储层补，见 `store::jsonl`）。
+    /// Serialize into one `.jsonl` line (`kind` is filled in by the storage layer, see
+    /// `store::jsonl`).
     ///
-    /// 与用量记录同一条规矩：**没有的字段不写**，不用空串或 `null` 去冒充。
+    /// Same rule as the usage records: **don't write fields that are absent**, don't fake them
+    /// with an empty string or `null`.
     pub fn to_value(&self) -> serde_json::Value {
         let mut v = serde_json::json!({ "mode": self.mode });
         let mut put = |key: &str, p: &Option<PathBuf>| {
@@ -175,7 +204,8 @@ impl Record {
         v
     }
 
-    /// 从一行读回来；**认不出的行返回 `None`**（缺 `mode`、或值不是字符串）。
+    /// Read back from one line; **unrecognized lines return `None`** (missing `mode`, or value
+    /// not a string).
     pub fn from_value(v: &serde_json::Value) -> Option<Self> {
         let mode = v.get("mode").and_then(|m| m.as_str())?.trim().to_lowercase();
         if mode.is_empty() {
@@ -191,45 +221,58 @@ impl Record {
     }
 }
 
-/// 运行期的档位与根。跟着 `Runtime` 走，CLI / GUI / selftest 共用同一份实现。
+/// The runtime tier and root. Travels with `Runtime`; CLI / GUI / selftest share one
+/// implementation.
 ///
-/// **不存配置**（曾经存过一份 `cfg`）：档位的判据是状态里的 `picked`，不是配置 ——
-/// 配置只用来定**启动那一刻**的档（见 `new`），此后一切以运行期状态为准。
-/// 留着那份配置只会诱使人再去「按配置推档位」，而那是踩过的坑（见 `State::picked`）。
+/// **Does not store config** (once stored a `cfg`): the tier's criterion is `picked` in the
+/// state, not config —— config only sets the tier **at the moment of startup** (see `new`), after
+/// which everything follows the runtime state. Keeping that config would only tempt people to
+/// "derive the tier from config" again, and that is a pit already fallen into (see
+/// `State::picked`).
 pub struct Workplace {
-    /// `std::sync::Mutex`：只在同步上下文读写，**从不跨 `await` 持锁**
-    /// （判定会在工具调用路径上跑，那个 future 必须保持 `Send`）。
+    /// `std::sync::Mutex`: only read/written in synchronous context, **never held across an
+    /// `await`** (the check runs on the tool-call path, and that future must stay `Send`).
     state: std::sync::Mutex<State>,
 }
 
 #[derive(Debug)]
 struct State {
     active: Active,
-    /// 本对话是否已经「开始」（= 已经建过/选定过根）。
-    /// `default` 档位靠它保证「一段对话只建一次目录」，而不是每轮都建一个。
+    /// Whether this conversation has "started" (= has already built / selected a root).
+    /// The `default` tier relies on it to guarantee "a conversation builds a directory only once",
+    /// rather than one per turn.
     started: bool,
-    /// **本对话「默认」档自己的那块地**（第一次发消息时建的）；`None` = 还没建。
+    /// **This conversation's own plot under the "default" tier** (built on the first message);
+    /// `None` = not yet built.
     ///
-    /// 必须与 `active` 分开记：`active` 会被切档覆盖。切到「完全访问」再切回「默认」时，
-    /// 光看 `active` 已经不知道原来那块地是哪一块，只能重新建 —— 结果是每切一个来回就多
-    /// 一个空目录，攒出一堆 `workplace/<时间戳>/`（用户 2026-10-05 报的）。
-    /// 有了它，「只要档位是默认，就还是本对话第一次建的那一块」才成立。
+    /// Must be recorded separately from `active`: `active` gets overwritten by tier switches. When
+    /// you switch to "full access" and back to "default", looking only at `active` you no longer
+    /// know which plot was the original one, and can only rebuild —— the result is one extra empty
+    /// directory per round trip, piling up a bunch of `workplace/<timestamp>/` (reported by a user
+    /// on 2026-10-05).
+    /// With this, "as long as the tier is default, it's still the first plot this conversation
+    /// built" holds.
     ///
-    /// 新建对话 / 打开另一段对话时清掉（新对话本来就该另开一块地）。
+    /// Cleared when a new conversation is created / another conversation is opened (a new
+    /// conversation should after all open a separate plot).
     own: Option<PathBuf>,
-    /// `active` 里的根是**用户点名挑的**（`fixed`，或运行期切档），还是 `default` 档现建的？
+    /// Is the root in `active` **a plot the user explicitly picked** (`fixed`, or a runtime tier
+    /// switch), or one built on the fly by the `default` tier?
     ///
-    /// 这条只能记在状态里，**不能拿 `cfg.mode` 推**：配置写 `default` 的用户照样能在运行期
-    /// 挑一块固定的地（`/workplace <目录>`、GUI 的选择器），那时档位是「选择工作区」而不是
-    /// 「默认」。以前拿配置推，于是同一个动作被说成两种档位：`set_mode` 报「已切到
-    /// 「选择工作区」：X」，紧接着 `snapshot()` 报「档位：默认」—— GUI 上表现为按钮写着
-    /// 「默认」、打勾也在「默认」上，而写入实际去了 X。（实机撞见的，2026-10-04 修。）
+    /// This can only live in the state, **it cannot be derived from `cfg.mode`**: a user whose
+    /// config says `default` can still pick a fixed plot at runtime (`/workplace <dir>`, or the
+    /// GUI selector), in which case the tier is "choose workspace" not "default". Previously it
+    /// was derived from config, so the same action was described as two tiers: `set_mode` reported
+    /// "switched to 'choose workspace': X", then `snapshot()` reported "tier: default" —— on the
+    /// GUI the button reads "default" and the check is on "default", yet writes actually went to X
+    /// (hit in production, fixed 2026-10-04).
     picked: bool,
 }
 
 impl Workplace {
-    /// 从配置构造。**认不出的 `mode` 在启动时直接报错**，不静默退回 `full` ——
-    /// 与 `[store] backend` / `[loop] impl` 同一条原则：写了却不生效是最难查的一类问题。
+    /// Construct from config. **An unrecognized `mode` errors at startup**, it does not silently
+    /// fall back to `full` —— same principle as `[store] backend` / `[loop] impl`: writing
+    /// something that has no effect is the hardest class of problem to debug.
     pub fn new(cfg: WorkplaceConfig, app_root: &Path) -> anyhow::Result<Self> {
         let mode = cfg.mode.trim().to_ascii_lowercase();
         let active = match mode.as_str() {
@@ -239,42 +282,47 @@ impl Workplace {
                 let raw = cfg.root.as_deref().unwrap_or("").trim();
                 if raw.is_empty() {
                     anyhow::bail!(
-                        "[workplace] mode = \"fixed\" 必须同时给 root = \"<目录>\"\
-                         （想要「每段对话一块新地」请用 mode = \"default\"）"
+                        t("[workplace] mode = \"fixed\" also needs root = \"<dir>\"\
+                         (for a fresh plot per conversation, use mode = \"default\")")
                     );
                 }
                 let p = PathBuf::from(raw);
                 let p = if p.is_absolute() { p } else { app_root.join(p) };
-                // 固定的工作区**现在就建**：用户在配置里点名了一块地，就该有那块地。
-                // `default` 档位不同 —— 那个要等首条消息（否则点了按钮没说话也会留空目录）。
+                // A fixed workspace is built **right now**: the user named a plot in config, so
+                // that plot should exist.
+                // Different from the `default` tier —— that one waits for the first message
+                // (otherwise clicking the button without speaking would also leave an empty dir).
                 let p = normalize(&p);
                 std::fs::create_dir_all(&p)
-                    .map_err(|e| anyhow::anyhow!("[workplace] root = {} 无法创建: {e}", p.display()))?;
+                    .map_err(|e| anyhow::anyhow!("{}", tf!("[workplace] failed to create root = {}: {}", p.display(), e)))?;
                 Active::At(p)
             }
-            other => anyhow::bail!(
-                "[workplace] mode = {other:?} 认不出来。可用值：\"default\"（每段对话一块新地，默认）、\
-                 \"full\"（不受限）、\"fixed\"（配合 root 指定固定目录）"
-            ),
+            other => anyhow::bail!(tf!(
+                "{} is not a recognised [workplace] mode. Valid values: \"default\" (a fresh plot per conversation, the default), \
+                 \"full\" (unrestricted), \"fixed\" (together with root: a fixed directory)",
+                format!("{other:?}")
+            )),
         };
         Ok(Self {
             state: std::sync::Mutex::new(State {
                 active,
                 started: matches!(mode.as_str(), "full" | "fixed"),
-                // 启动时还没有「本对话自建的地」—— 连这段对话本身都还没开始。
+                // At startup there is no "self-built plot for this conversation" yet —— the
+                // conversation itself hasn't even started.
                 own: None,
-                // 只有 `fixed` 档是「用户点名挑的」；`full` 没有根、`default` 的地是现建的。
+                // Only the `fixed` tier is "a plot the user explicitly picked"; `full` has no root,
+                // and the `default` tier's plot is built on the fly.
                 picked: mode == "fixed",
             }),
         })
     }
 
-    /// 应用根（建 `workplace/` 用）。
+    /// The app root (used to build `workplace/`).
     fn workdir_of(app_root: &Path) -> PathBuf {
         app_root.join(WORKPLACE_DIR)
     }
 
-    /// 当前生效的根；`None` = 不受限。
+    /// The currently effective root; `None` = unrestricted.
     pub fn active_root(&self) -> Option<PathBuf> {
         match &self.lock().active {
             Active::At(p) => Some(p.clone()),
@@ -282,31 +330,36 @@ impl Workplace {
         }
     }
 
-    /// 界面用的快照：**一次取锁**同时拿到「档位」与「当前生效的根」。
+    /// Snapshot for the UI: **lock once** while grabbing both the "tier" and the "currently
+    /// effective root".
     ///
-    /// 为什么不让调用方分别调 [`Workplace::mode`] 与 [`Workplace::active_root`]：
-    /// 那要取两次锁，而且两次之间状态可能已经被改掉（最典型的是首条消息刚好在建地），
-    /// 于是界面上的档位与目录对不上。**档位与根的映射只在这里写一遍** —— `mode()`
-    /// 也走它，免得将来两边改岔：`/workplace` 说「默认」而界面在「选择工作区」上打勾。
+    /// Why not let the caller call [`Workplace::mode`] and [`Workplace::active_root`]
+    /// separately: that would lock twice, and the state could be mutated between the two calls
+    /// (the classic case is the first message happening to be building the plot), so the UI's
+    /// tier and directory would disagree. **The tier↔root mapping is written only here** ——
+    /// `mode()` also goes through it, so they can't drift apart later: `/workplace` says
+    /// "default" while the UI has the check on "choose workspace".
     ///
-    /// ⚠️ **不要在持锁的上下文里调它** —— 它自己也要锁 `state`，而 `std::sync::Mutex`
-    /// 不可重入，嵌套调用会**整进程死锁**（[`Workplace::report`] 上一版就是这么挂的）。
-    /// 要么在取锁之前调，要么先取到快照。
+    /// ⚠️ **Do not call it while holding the lock** —— it also locks `state`, and
+    /// `std::sync::Mutex` is not reentrant, so a nested call would **deadlock the whole
+    /// process** (a previous version of [`Workplace::report`] died exactly this way).
+    /// Either call it before acquiring the lock, or grab the snapshot first.
     pub fn snapshot(&self) -> (Mode, Option<PathBuf>) {
         Self::snapshot_of(&self.lock())
     }
 
-    /// 「档位 + 根」的**唯一**映射。`snapshot` 与 `persisted` 都读它 ——
-    /// 免得将来两边改岔（一个说「默认」、另一个存成 `fixed`）。
+    /// The **single** source of the "tier + root" mapping. Both `snapshot` and `persisted` read
+    /// it —— so they can't drift apart later (one says "default", the other stores `fixed`).
     fn snapshot_of(st: &State) -> (Mode, Option<PathBuf>) {
         let mode = match &st.active {
             Active::Full => Mode::Full,
             Active::Pending => Mode::Default,
-            // ⚠️ 判据是**状态里的 `picked`**，不是配置里的 `cfg.mode`。配置写 `default` 的
-            // 用户照样能在运行期挑一块固定的地（`/workplace <目录>`、GUI 的选择器），
-            // 那时档位就是「选择工作区」；拿配置推会把同一个动作说成两种档位。
-            // 反过来 `default` 档现建的地报「默认」而不是「选择工作区」—— 它只是当时
-            // 现建了一块，不是用户点名的那一块。
+            // ⚠️ The criterion is **`picked` in the state**, not `cfg.mode` in config. A user
+            // whose config says `default` can still pick a fixed plot at runtime
+            // (`/workplace <dir>`, or the GUI selector), in which case the tier is "choose
+            // workspace"; deriving from config would describe the same action as two tiers.
+            // Conversely, a plot built on the fly by the `default` tier reports "default" not
+            // "choose workspace" —— it was just built at that moment, not a plot the user named.
             Active::At(_) if !st.picked => Mode::Default,
             Active::At(p) => Mode::Fixed(p.clone()),
         };
@@ -317,15 +370,16 @@ impl Workplace {
         (mode, root)
     }
 
-    /// 当前档位。等价于 `self.snapshot().0`。
+    /// The current tier. Equivalent to `self.snapshot().0`.
     pub fn mode(&self) -> Mode {
         self.snapshot().0
     }
 
-    /// 把当前状态压成**可存档**的形态（见 [`Record`]）。
+    /// Compress the current state into a **persistable** form (see [`Record`]).
     ///
-    /// **一次取锁**把三样一起取到：分两次取会出现「档位是切档之后的、`own` 是切档之前的」
-    /// 这种半截快照，存下去就再也还原不回来了。
+    /// **Lock once** to grab all three together: grabbing them in two passes would yield a
+    /// half snapshot like "tier is post-switch, `own` is pre-switch", which once persisted can
+    /// never be reconstructed.
     pub fn persisted(&self) -> Record {
         let st = self.lock();
         let (mode, root) = Self::snapshot_of(&st);
@@ -337,13 +391,16 @@ impl Workplace {
         Record { mode: mode.to_string(), root, own: st.own.clone() }
     }
 
-    /// 从对话存档里还原工作区（打开旧对话时用）。档位名认不出就退回「默认」，不猜。
+    /// Restore the workspace from a conversation record (used when opening an old conversation).
+    /// An unrecognized tier name falls back to "default", no guessing.
     ///
-    /// 两条都关键：
-    /// - **`default` 档的根若已存档就沿用**（`At` + `picked = false`），不要等首条消息
-    ///   现建一块 —— 那是「每次进入同一个对话都是不同的工作区」的原因；
-    /// - **`own` 也要一起还原** —— 少了它，「重开这段对话 → 切完全访问 → 切回默认」
-    ///   又会新建一块，也就是工作区累加的另一半来源。
+    /// Both points are critical:
+    /// - **If the `default` tier's root was saved, reuse it** (`At` + `picked = false`), don't
+    ///   wait for the first message to build a fresh one —— that is the cause of "every time I
+    ///   enter the same conversation it's a different workspace";
+    /// - **`own` must also be restored** —— without it, "reopen this conversation → switch to
+    ///   full access → switch back to default" would build a new plot again, which is the other
+    ///   half of the workspace-accumulation source.
     pub fn restore(&self, rec: &Record) {
         let mut st = self.lock();
         st.own = rec.own.clone();
@@ -351,26 +408,28 @@ impl Workplace {
             ("full", _) => {
                 st.active = Active::Full;
                 st.started = true;
-                st.picked = false; // 没有根，「点名挑的」无从谈起
+                st.picked = false; // no root, so "explicitly picked" doesn't apply
             }
-            // 用户当年点名的地 ⇒ 界面报「选择工作区」。
+            // A plot the user named back then ⇒ the UI reports "choose workspace".
             ("fixed", Some(p)) => {
                 st.active = Active::At(normalize(&p));
                 st.started = true;
                 st.picked = true;
             }
-            // `default` 档的地：沿用存档的根，但档位仍是「默认」。
+            // A `default`-tier plot: reuse the saved root, but the tier is still "default".
             ("default", Some(p)) => {
                 let p = normalize(&p);
                 st.active = Active::At(p.clone());
                 st.started = true;
                 st.picked = false;
-                // 老格式的记录没有 `own` 字段：`root` 就是那块自建地，拿它兜底。
+                // Old-format records have no `own` field: `root` is that self-built plot, use it
+                // as the fallback.
                 if st.own.is_none() {
                     st.own = Some(p);
                 }
             }
-            // `default` 没给根、或档位名认不出：回「还没定」，首条消息现建一块。
+            // `default` gave no root, or the tier name is unrecognized: back to "not yet
+            // decided", build a fresh plot on the first message.
             _ => {
                 st.active = Active::Pending;
                 st.started = false;
@@ -379,56 +438,66 @@ impl Workplace {
         }
     }
 
-    /// 开始一段新对话：**一律回到「默认」档**，并把「已开始」清掉。
+    /// Start a new conversation: **always return to the "default" tier**, and clear "started".
     ///
-    /// 用户 2026-10-04 定的语义：「新建对话，默认工作区应该是默认才对」——
-    /// 上一段对话里临时切过的档（`fixed` / `full`）**不再继承**。原先只在
-    /// `cfg.mode == "default"` 时才重置，于是「上一段对话挑了某个目录、点 + 之后新对话
-    /// 还在那个目录里」，看着就像新对话根本没换地。
+    /// Semantics set by the user on 2026-10-04: "for a new conversation, the default workspace
+    /// should be default" —— tiers temporarily switched in the previous conversation
+    /// (`fixed` / `full`) are **no longer inherited**. Originally it only reset when
+    /// `cfg.mode == "default"`, so "the previous conversation picked some directory, click +
+    /// and the new conversation is still in that directory" looked like the new conversation
+    /// never changed its plot.
     ///
-    /// ⚠️ **代价**（用户已确认接受）：配置里写 `mode = "fixed"` 的用户，只有
-    /// **本次启动的第一段对话**落在配置点名的那块地；之后每段新对话都是「默认」，
-    /// 会在 `workplace/` 下另开一块新地。想让固定地一直生效，得每段对话切一次。
+    /// ⚠️ **The cost** (the user has accepted it): for a user who writes `mode = "fixed"` in
+    /// config, only the **first conversation of this launch** lands in the config-named plot;
+    /// every subsequent new conversation is "default" and opens a fresh plot under `workplace/`.
+    /// To keep a fixed plot always in effect, you must switch per conversation.
     ///
-    /// **不在这里建目录** —— `default` 档位的目录要等**首条消息**才建
-    /// （用户点了「+」但没说话时，不该在磁盘上留下一个空目录）。
+    /// **No directory is built here** —— the `default` tier's directory waits for the **first
+    /// message** to be built (when the user clicks "+" but says nothing, no empty directory
+    /// should be left on disk).
     pub fn reset_for_new_conversation(&self) {
         let mut st = self.lock();
         st.started = false;
         st.active = Active::Pending;
         st.picked = false;
-        // 新对话要另开一块地：把「本对话自建的地」也清掉，否则它会去复用**上一段对话**
-        // 那块（那正是「新对话还带着上一个工作区」的另一半来源）。
+        // A new conversation must open a separate plot: clear "this conversation's own plot" too,
+        // otherwise it would reuse **the previous conversation's** plot (which is the other half
+        // of the "new conversation still carries the previous workspace" source).
         st.own = None;
     }
 
-    /// 本对话开始前确保根已定。返回 `Some(目录)` 表示**这正是本次调用建的**
-    /// （或本对话第一次确定），调用方应当用一条 `Info` 告知用户。
+    /// Ensure the root is decided before this conversation starts. Returning `Some(dir)` means
+    /// **this call is exactly the one that built it** (or first decided it for this conversation),
+    /// and the caller should notify the user with an `Info`.
     ///
-    /// 「每段对话一块新地」的语义就落在这里：`started` 保证一段对话只建一次。
+    /// The "one fresh plot per conversation" semantics land here: `started` guarantees a
+    /// conversation builds only once.
     pub fn ensure_started(&self, app_root: &Path) -> anyhow::Result<Option<PathBuf>> {
         let mut st = self.lock();
         if st.started {
             return Ok(None);
         }
-        // `Pending`：**唯一**需要真正动手建目录的分支，单独拎出来处理 ——
-        // 免得在借用 `st.active` 的期间又去写 `st.active`（借用检查器不让过，
-        // 而且把「读状态」与「写状态」分开读起来也更清楚）。
+        // `Pending`: the **only** branch that actually needs to build a directory; pulled out on
+        // its own —— so we don't write `st.active` while borrowing it (the borrow checker won't
+        // allow it, and separating "read state" from "write state" also reads more clearly).
         if matches!(st.active, Active::Pending) {
             let dir = normalize(&unique_dir(&Self::workdir_of(app_root), &stamp()));
             std::fs::create_dir_all(&dir)
-                .map_err(|e| anyhow::anyhow!("创建工作区失败（{}）: {e}", dir.display()))?;
+                .map_err(|e| anyhow::anyhow!("{}", tf!("failed to create the workspace ({}): {}", dir.display(), e)))?;
             st.active = Active::At(dir.clone());
-            // 现建的地 ⇒ 报「默认」而不是「选择工作区」（判据是 `picked`，见 `State`）。
+            // A plot built on the fly ⇒ reports "default" not "choose workspace" (criterion is
+            // `picked`, see `State`).
             st.picked = false;
-            // 记成「本对话自建的地」：此后无论切到哪一档、再切回默认，都是这一块
-            // （切一次就新建一个目录的话，`workplace/` 会被空目录堆满）。
+            // Record it as "this conversation's own plot": afterwards, no matter which tier you
+            // switch to and back to default, it's this same plot (if each switch built a new
+            // directory, `workplace/` would be filled with empty dirs).
             st.own = Some(dir.clone());
             st.started = true;
             return Ok(Some(dir));
         }
-        // `Full` / `At`：本对话第一次确定根，只记一下。`At` 的根要报回调用方，
-        // 好让它用一条 `Info` 告诉用户「这块地就是本次的工作区」。
+        // `Full` / `At`: first time this conversation decides its root, just record it. The
+        // `At` root must be reported back to the caller, so it can tell the user with an `Info`
+        // "this plot is this conversation's workspace".
         let root = match &st.active {
             Active::At(p) => Some(p.clone()),
             _ => None,
@@ -437,15 +506,18 @@ impl Workplace {
         Ok(root)
     }
 
-    /// 运行期切档位（CLI 的 `/workplace`、GUI 的按钮）。返回一句给用户看的结果。
+    /// Switch tier at runtime (CLI's `/workplace`, GUI's button). Returns a message for the
+    /// user.
     pub fn set_mode(&self, mode: Mode, app_root: &Path) -> anyhow::Result<String> {
-        // 切到「选择工作区」时**立刻建**：用户明确挑了一块地，就该有那块地
-        // （与配置里 fixed 档同一套语义）。相对路径相对**应用根**解释 ——
-        // 与 `new()` 里 `fixed` 档的处理保持一致，免得同一个相对路径在
-        // 配置里与 CLI 上落到两个地方。
+        // When switching to "choose workspace", build **immediately**: the user explicitly
+        // picked a plot, so that plot should exist (same semantics as the `fixed` tier in
+        // config). A relative path is resolved against the **app root** —— kept consistent with
+        // the `fixed` tier handling in `new()`, so the same relative path doesn't land in two
+        // places between config and CLI.
         let dir = match mode {
             Mode::Fixed(ref p) => {
-                // 相对路径按**应用根**解（与 `new()` 里 `fixed` 档同一套）。
+                // A relative path is resolved against the **app root** (same set as the `fixed`
+                // tier in `new()`).
                 let p = if p.is_absolute() { p.clone() } else { app_root.join(p) };
                 Some(normalize(&p))
             }
@@ -453,9 +525,9 @@ impl Workplace {
         };
         if let Some(d) = dir.as_ref() {
             std::fs::create_dir_all(d)
-                .map_err(|e| anyhow::anyhow!("目录 {} 无法使用: {e}", d.display()))?;
+                .map_err(|e| anyhow::anyhow!("{}", tf!("directory {} is unusable: {}", d.display(), e)))?;
             if !d.is_dir() {
-                anyhow::bail!("{} 不是一个目录", d.display());
+                anyhow::bail!("{}", tf!("{} is not a directory", d.display()));
             }
         }
         let mut st = self.lock();
@@ -463,33 +535,36 @@ impl Workplace {
             Mode::Full => {
                 st.active = Active::Full;
                 st.started = true;
-                st.picked = false; // 没有根，「点名挑的」无从谈起
-                Ok("已切到「完全访问」：AOX 可以读写设备上的任何文件（含工作区之外）。".into())
+                st.picked = false; // no root, so "explicitly picked" doesn't apply
+                Ok(t("Switched to \"Full access\": AOX can read and write any file on the machine (including outside the workspace).").into())
             }
             Mode::Fixed(_) => {
-                let d = dir.expect("上面已经算过");
+                let d = dir.expect("computed above just now");
                 st.active = Active::At(d.clone());
                 st.started = true;
-                st.picked = true; // 用户点名的地 ⇒ 界面报「选择工作区」
-                Ok(format!("已切到「选择工作区」：{}", d.display()))
+                st.picked = true; // a plot the user named ⇒ the UI reports "choose workspace"
+                Ok(tf!("Switched to \"Picked workspace\": {}", d.display()))
             }
             Mode::Default => {
                 st.picked = false;
                 let _ = app_root;
-                // **本对话已经为「默认」建过一块地 ⇒ 回到那一块，不再另建。**
-                // 见 `State::own`：切到「完全访问」再切回来就新建一个目录的话，
-                // `workplace/` 会被空目录堆满（用户 2026-10-05 报的）。
-                // 只有本对话还没建过，才回到「还没定」，等首条消息现建。
+                // **This conversation has already built a plot for "default" ⇒ go back to that
+                // one, don't build another.**
+                // See `State::own`: if switching to "full access" and back built a new directory,
+                // `workplace/` would be filled with empty dirs (reported by a user on
+                // 2026-10-05).
+                // Only if this conversation hasn't built one yet do we go back to "not yet
+                // decided" and wait for the first message to build.
                 match st.own.clone() {
                     Some(p) => {
                         st.active = Active::At(p.clone());
                         st.started = true;
-                        Ok(format!("已切到「默认」：本对话仍在 {} 里。", p.display()))
+                        Ok(tf!("Switched to \"Default\": this conversation stays in {}.", p.display()))
                     }
                     None => {
                         st.active = Active::Pending;
                         st.started = false;
-                        Ok("已切到「默认」：下一条消息发出时会在 workplace/ 下开一块新工作区。"
+                        Ok(t("Switched to \"Default\": a new workspace will be opened under workplace/ when the next message is sent.")
                             .into())
                     }
                 }
@@ -498,51 +573,62 @@ impl Workplace {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        // 判定发生在工具调用路径上，持锁时间是一次路径比较 —— 不会中毒。
-        // 真中毒了也不该 panic 打死整个 agent：退回「不受限」比让程序挂掉好，但要出声。
+        // The check happens on the tool-call path; the lock is held for one path comparison ——
+        // it can't be poisoned. Even if it were poisoned, it shouldn't panic and kill the whole
+        // agent: falling back to "unrestricted" is better than crashing the program, but it
+        // must make noise.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 当前是否**不受限**（`full` 档 = 一切放行）。
+    /// Whether the current state is **unrestricted** (`full` tier = everything allowed).
     ///
-    /// 给判定点做短路用。这一档下 `check` 算出来的东西**整个会被丢掉**（调用方只要
-    /// `.err()`），却要实打实付一次到几次 `canonicalize` —— 实测 65~224 µs，走的是文件系统。
-    /// 判定在**每一次工具调用**上都跑，而 `full` 档（`mode = "full"`，或界面上切了
-    /// 「完全访问」）下这份开销纯属白花；调用方先问一句这个，整条路径（含 `scan_paths`
-    /// 那张粗网）就跳过了。
+    /// Used as a short-circuit for the check point. Under this tier, what `check` computes is
+    /// **entirely discarded** (the caller only wants `.err()`), yet it pays for one to several
+    /// real `canonicalize` calls —— measured at 65~224 µs, going through the filesystem. The
+    /// check runs on **every tool call**, and under the `full` tier (`mode = "full"`, or the
+    /// user switched to "full access" in the UI) this cost is pure waste; if the caller asks
+    /// this first, the whole path (including the `scan_paths` coarse net) is skipped.
     ///
-    /// ⚠️ 2026-10-05 起**配置默认**是 `default`（受限），不再是 `full` —— 所以这条短路
-    /// 现在只对显式选了完全访问的用户生效，别再把「大多数用户走这条」当理由。
+    /// ⚠️ Since 2026-10-05 the **config default** is `default` (confined), no longer `full` ——
+    /// so this short-circuit now only applies to users who explicitly chose full access; don't
+    /// reason as if "most users go through this".
     ///
-    /// ⚠️ 与 [`Workplace::mode`] 同一个规矩：**不要在持锁的上下文里调它**。
+    /// ⚠️ Same rule as [`Workplace::mode`]: **don't call it while holding the lock**.
     pub fn is_unrestricted(&self) -> bool {
         matches!(self.lock().active, Active::Full)
     }
 
-    /// 判定一个「**落盘**」路径（写 / 删）。`Ok` = 规格化后的绝对路径，可直接交给文件 API。
+    /// Judge a **write-to-disk** path (write / delete). `Ok` = the normalized absolute path,
+    /// ready to hand to the file API.
     ///
-    /// 等价于 [`Workplace::check_access`]`(raw, Access::Write)`。保留这个名字是因为
-    /// 它是「受限」的默认含义 —— 调用方不特别说明时，要按最严的那档判。
+    /// Equivalent to [`Workplace::check_access`]`(raw, Access::Write)`. The name is kept
+    /// because it is the default meaning of "confined" —— when the caller doesn't specify, it
+    /// is judged under the strictest tier.
     pub fn check(&self, raw: &str) -> Result<PathBuf, Reject> {
         self.check_access(raw, Access::Write)
     }
 
-    /// 判定一个「**只读**」路径（读文件 / 列目录）。
+    /// Judge a **read-only** path (read file / list directory).
     ///
-    /// 按 [`Access::Read`] 的语义，它**不受工作区限制**，所以**从不返回 `Err`** ——
-    /// 仍然返回 `Result` 只是为了与 [`Workplace::check`] 同形：两层判定点（agent 与工具）
-    /// 用的是同一段调用代码，读/写只差一个 `Access`；将来若要收紧读，改动也只落在这里。
+    /// By the semantics of [`Access::Read`], it is **not limited by the workspace**, so it
+    /// **never returns `Err`** —— it still returns a `Result` only to share the shape with
+    /// [`Workplace::check`]: the two check points (agent and tool) use the same call code,
+    /// differing only by one `Access`; if reads are tightened later, the change lands only
+    /// here.
     pub fn check_read(&self, raw: &str) -> Result<PathBuf, Reject> {
         self.check_access(raw, Access::Read)
     }
 
-    /// 两种意图的**唯一**实现。
+    /// The **single** implementation for both intents.
     ///
-    /// - `Access::Read`：三种状态（`Full` / `Pending` / `At`）**一律放行**，只做规格化。
-    ///   刻意连 `Pending` 都不拒 —— 受限档下「地还没开」挡的是落盘，不该顺手把
-    ///   「读设备上任何一份文件」也一起禁掉（那正是新语义要开的那条路）。
-    /// - `Access::Write`：`Full` 放行；`Pending` 全拒（见 [`Active::Pending`]）；
-    ///   `At` 只认**区内绝对路径**（相对路径一律拒，见模块文档「① 只看绝对路径」）。
+    /// - `Access::Read`: all three states (`Full` / `Pending` / `At`) are **always allowed**,
+    ///   only normalization is done. Deliberately, even `Pending` is not rejected —— under the
+    ///   confined tier "plot not opened yet" blocks writes to disk, it shouldn't incidentally
+    ///   also ban "reading any file on the device" (that is exactly the path the new semantics
+    ///   opens up).
+    /// - `Access::Write`: `Full` is allowed; `Pending` is fully rejected (see
+    ///   [`Active::Pending`]); `At` only accepts **in-plot absolute paths** (relative paths are
+    ///   always rejected, see module doc "① absolute paths only").
     pub fn check_access(&self, raw: &str, access: Access) -> Result<PathBuf, Reject> {
         if access == Access::Read {
             return Ok(normalize(Path::new(raw)));
@@ -554,7 +640,7 @@ impl Workplace {
         };
         let p = Path::new(raw);
         if !p.is_absolute() {
-            // 见模块文档「① 只看绝对路径」。
+            // See module doc "① absolute paths only".
             return Err(Reject::Relative { root, raw: raw.to_string() });
         }
         let resolved = normalize(p);
@@ -564,79 +650,90 @@ impl Workplace {
         Ok(resolved)
     }
 
-    /// `/workplace` 的正文。
+    /// The body of `/workplace`.
     pub fn report(&self, app_root: &Path) -> String {
-        // ⚠️ **顺序是刻意反的，别顺手「优化」成「先取锁再算档位名」。**
-        // `std::sync::Mutex` 不可重入：先 `self.mode()`（它自己锁一次 state）拿档位名、
-        // **再**取状态快照，是对的；反过来在持锁期间调 `self.mode()` 就会**整进程死锁** ——
-        // 现象是「切到固定工作区之后再看一次 /workplace 就没反应了」。上一版正是这样。
+        // ⚠️ **The order is deliberately reversed; don't casually "optimize" it into "lock
+        // first, then compute the tier name".**
+        // `std::sync::Mutex` is not reentrant: first `self.mode()` (which locks state once
+        // itself) to get the tier name, **then** take the state snapshot — that is correct;
+        // the reverse, calling `self.mode()` while holding the lock, would **deadlock the whole
+        // process** —— the symptom is "after switching to a fixed workspace, viewing
+        // /workplace once more freezes". A previous version did exactly this.
         let label = self.mode().label();
         let active = self.lock().active.clone();
-        let mut out = String::from("工作区\n\n");
+        let mut out = String::from(t("Workspace\n\n"));
         match &active {
             Active::Full => {
-                out.push_str(
-                    "  档位：完全访问\n  \
-                     AOX 可以读写设备上的任何文件，不设边界。\n\n  \
-                     这是**显式**选的（config.toml 里写了 mode = \"full\"，或界面上切过）—— \
-                     配置默认是「默认」档（受限）。\n  想收紧：/workplace default 或 /workplace <目录>\n",
-                );
+                out.push_str(t(
+                    "  Tier: Full access\n  \
+                     AOX can read and write any file on the machine, with no boundary.\n\n  \
+                     This was chosen **explicitly** (mode = \"full\" in config.toml, or switched in the UI) — \
+                     the config default is the \"Default\" tier (confined).\n  To tighten: /workplace default or /workplace <dir>\n",
+                ));
             }
             Active::Pending => {
-                out.push_str(&format!(
-                    "  档位：默认（受限）\n  \
-                     根：还没定 —— 下一条消息发出时会在 {} 下开一块新工作区。\n",
+                out.push_str(&tf!(
+                    "  Tier: Default (confined)\n  \
+                     Root: not decided yet — sending the next message will open a fresh workspace under {}.\n",
                     Self::workdir_of(app_root).display()
                 ));
             }
             Active::At(p) => {
-                out.push_str(&format!(
-                    "  档位：{label}（受限）\n  根：{}\n  \
-                     写入与删除都被限制在这个目录里；**读取不受限**（整个设备都能读）。\n",
+                out.push_str(&tf!(
+                    "  Tier: {} (confined)\n  Root: {}\n  \
+                     Writes and deletes are confined to this directory; **reads are unrestricted** (the whole machine is readable).\n",
+                    label,
                     p.display()
                 ));
             }
         }
-        out.push_str(
-            "\n  ⚠️ 边界只管「宿主提供的能力」：宿主内置的文件工具，以及插件工具的路径参数。\n     \
-             它管不了一个不守规矩的插件自己 open() 文件 —— 那要 OS 级隔离（AppContainer）。\n",
-        );
+        out.push_str(t(
+            "\n  ⚠️ The boundary only governs \"host-provided capabilities\": the host's built-in file tools, and the path arguments of plugin tools.\n     \
+             it cannot stop a misbehaving plugin from open()ing files by itself — that needs OS-level isolation (AppContainer).\n",
+        ));
         out
     }
 }
 
-// ─────────────────────────── /workplace 命令 ───────────────────────────
+// ─────────────────────────── The /workplace command ───────────────────────────
 
-/// 本命令的两个名字：**第一个是正式名，后面的都是兼容旧名。**
+/// The command's two names: **the first is the canonical name, the rest are legacy aliases.**
 ///
-/// 2026-10-04 统一过一次命名 —— 这个词一律是 `workplace`（目录名 `<应用根>/workplace/`、
-/// 配置段 `[workplace]`、CLI 命令 `/workplace`，连 Rust 的模块与类型也在第二轮跟着改了）。
-/// 旧名「/workspace」是统一之前的那个，**留着**：用户有肌肉记忆，而这条命令一旦失效，
-/// 他看到的是「档位切不动」而不是「命令改名了」，几乎不可能自己查出来。
-/// 不写进 `/help`，当隐式别名。
+/// Naming was unified once on 2026-10-04 —— the word is uniformly `workplace` (the directory
+/// name `<app root>/workplace/`, the config section `[workplace]`, the CLI command
+/// `/workplace`, and even the Rust module and types were changed in a second pass). The old
+/// name "/workspace" predates the unification and is **kept**: users have muscle memory, and if
+/// this command stops working they'd see "tier won't switch" rather than "command renamed",
+/// which they'd almost never figure out on their own. Not listed in `/help`, treated as an
+/// implicit alias.
 const CMD_NAMES: [&str; 2] = ["/workplace", "/workspace"];
 
-/// `/workplace` 命令族的判定（CLI 的路由用，见 `main.rs` 里那串 `_ if ...::is_cmd(line)`）。
+/// The predicate for the `/workplace` command family (used by the CLI router, see the
+/// `_ if ...::is_cmd(line)` chain in `main.rs`).
 ///
-/// **判定与执行都放在这里**而不是 CLI 里，是为了让「切档位」只有一份实现、一份文案 ——
-/// 将来 GUI 若也要一条 `/workplace` 输入路径，直接复用即可，不会出现
-/// 「CLI 说切成功了、GUI 那边没切」这类两套逻辑的错位。
+/// **Both judgment and execution live here** rather than in the CLI, so that "switch tier" has
+/// only one implementation and one message —— if the GUI later also wants a `/workplace` input
+/// path, it can reuse directly, without the mismatch of "CLI says switched, GUI didn't" that
+/// two code paths would cause.
 pub fn is_cmd(line: &str) -> bool {
     cmd_arg(line).is_some()
 }
 
-/// 剥出命令后面的参数；`None` = 这一行根本不是本命令。
+/// Strip the argument after the command; `None` = this line is not the command at all.
 ///
-/// 用「按名匹配 + 剥一次前缀」而不是 `trim_start_matches`：后者会把前缀**反复**剥掉，
-/// 于是目录名叫 `/workplace`（或旧名「/workspace」）时，`/workplace /workplace` 这种完全合法的
-/// 写法会被剥成空串 —— 那正好等于「不带参数」，用户拿到的是现状而不是切换结果。
+/// Uses "match by name + strip one prefix" rather than `trim_start_matches`: the latter would
+/// strip the prefix **repeatedly**, so when the directory name is `/workplace` (or the old
+/// name "/workspace"), a perfectly legal `/workplace /workplace` would be stripped to an empty
+/// string —— which is exactly "no argument", and the user gets the current state instead of a
+/// switch result.
 fn cmd_arg(line: &str) -> Option<&str> {
     for name in CMD_NAMES {
         if line == name {
             return Some("");
         }
         if let Some(rest) = line.strip_prefix(name) {
-            // 只认「命令名 + 空格」这一种，避免 `/workplaceX` 也被当成 `/workplace X`。
+            // Only accept the form "command name + space", to avoid `/workplaceX` being treated
+            // as `/workplace X`.
             if let Some(arg) = rest.strip_prefix(' ') {
                 return Some(arg.trim());
             }
@@ -645,14 +742,17 @@ fn cmd_arg(line: &str) -> Option<&str> {
     None
 }
 
-/// 执行 `/workplace` 命令。
+/// Execute the `/workplace` command.
 ///
-/// - `/workplace`（不带参数）→ 打印当前档位与根
-/// - `/workplace full` → 完全访问（不受限）
-/// - `/workplace default` → 每段对话一块新地（**下一条消息**生效）
-/// - `/workplace <目录>` → 固定到该目录（相对路径相对**应用根**解释）
+/// - `/workplace` (no argument) → print the current tier and root
+/// - `/workplace full` → full access (unrestricted)
+/// - `/workplace default` → a fresh plot per conversation (takes effect on the **next
+///   message**)
+/// - `/workplace <dir>` → pin to that directory (a relative path is resolved against the **app
+///   root**)
 pub fn command(rt: &std::sync::Arc<crate::runtime::Runtime>, line: &str) -> anyhow::Result<String> {
-    // `is_cmd` 已经保证这行是本命令，所以取不到 `None`；真取不到就按「不带参数」办。
+    // `is_cmd` already guarantees this line is the command, so `None` won't happen; if it
+    // somehow does, treat it as "no argument".
     let arg = cmd_arg(line).unwrap_or("");
     if arg.is_empty() {
         return Ok(rt.workplace.report(&rt.root));
@@ -667,107 +767,119 @@ pub fn command(rt: &std::sync::Arc<crate::runtime::Runtime>, line: &str) -> anyh
     rt.workplace.set_mode(mode, &rt.root)
 }
 
-// ─────────────────────────── 越界契约 ───────────────────────────
+// ─────────────────────────── The out-of-bounds contract ───────────────────────────
 
-/// 一次越界。文案是**契约**，不是日志 —— 分 [`model_text`](Reject::model_text)
-/// 与 [`user_text`](Reject::user_text) 两份，因为读者不同、要的东西也不同。
+/// A single out-of-bounds event. The message is a **contract**, not a log —— split into
+/// [`model_text`](Reject::model_text) and [`user_text`](Reject::user_text) because the
+/// readers differ and want different things.
 #[derive(Debug, Clone)]
 pub enum Reject {
-    /// 受限档位下给了相对路径。
+    /// A relative path was given under the confined tier.
     Relative { root: PathBuf, raw: String },
-    /// 路径落在工作区之外。
+    /// The path falls outside the workspace.
     Outside { root: PathBuf, raw: String, resolved: PathBuf },
-    /// 受限档位，但本对话还没开始（根还没定）。
+    /// Confined tier, but this conversation hasn't started yet (root not decided).
     NotStarted,
 }
 
 impl Reject {
-    /// 给**模型**看的文本。三段是硬要求：
+    /// Text shown to the **model**. Its three parts are hard requirements:
     ///
-    /// ① 发生了什么（哪个路径、根在哪）② 这是权限边界不是工具坏了、**别重试**
-    /// ③ 请转述给用户并告诉他怎么提权。
+    /// ① what happened (which path, where the root is) ② this is a permission boundary, not a
+    /// broken tool, **don't retry** ③ please relay to the user and tell them how to escalate.
     ///
-    /// 为什么必须写「别重试」：模型面对一次工具失败的本能是换个写法再试一次
-    /// （`./x` → `x` → `../x`），而越界是**换不掉**的 —— 不写明就会一路烧轮次，
-    /// 而且它还会以为是自己参数写错了。
+    /// Why "don't retry" must be written: a model's instinct on a tool failure is to rewrite and
+    /// try again (`./x` → `x` → `../x`), but out-of-bounds is **un-rewritable** —— without
+    /// stating it, it burns turns all the way, and it will also think its own arguments were
+    /// wrong.
     pub fn model_text(&self) -> String {
-        // 每一支都要**自带根**：模型拿到的就这一段文本，它没法再去别处查。
+        // Every branch must **carry the root itself**: this text is all the model gets, and it has
+        // nowhere else to look it up.
         let what = match self {
-            Reject::Relative { root, raw } => format!(
-                "你给的是相对路径 {raw:?}，本档位不接受相对路径。\
-                 要改写成工作区内的**绝对路径**，工作区根是：{}。\
-                 原因：宿主与插件子进程的工作目录不是同一个，同一串相对路径在两边会指到\
-                 两个不同文件 —— 那种不一致比多写几个字符危险得多。",
+            Reject::Relative { root, raw } => tf!(
+                "You passed a relative path {} — this tier does not accept relative paths.\
+                 Rewrite it as an **absolute path inside the workspace**; the workspace root is: {}.\
+                 Why: the host and the plugin subprocess do not share a working directory, so the same relative path resolves to\
+                 two different files on the two sides — that inconsistency is far more dangerous than a few extra characters.",
+                format!("{raw:?}"),
                 root.display()
             ),
-            Reject::Outside { root, raw, resolved } => format!(
-                "{raw:?} 解析为 {}，它落在工作区之外（工作区根：{}）。",
+            Reject::Outside { root, raw, resolved } => tf!(
+                "{} resolves to {}, which lies outside the workspace (workspace root: {}).",
+                format!("{raw:?}"),
                 resolved.display(),
                 root.display()
             ),
             Reject::NotStarted => {
-                "本档位下这段对话的工作区还没确定（它在用户发出第一条消息时创建），\
-                 所以还不能往工作区里写东西。"
+                t("The workspace for this conversation is not decided yet in this tier (it is created when the user sends the first message),\
+                 so nothing can be written into it yet.")
                     .to_string()
             }
         };
-        // ⚠️ 下面这段是**给模型的操作说明**，它会被原样转述给用户 ——
-        // 所以里面只能写**真的存在**的入口。两条前端入口都要写全：
-        // CLI 的 `/workplace`，以及 GUI 输入框左下角那枚「工作区」按钮（三档 + 目录选择器，
-        // 2026-10-04 落地）。漏掉哪一条，走那条前端的用户就会收到一份「按不了的建议」。
+        // ⚠️ What follows is **operating instructions for the model**, and it will be relayed to
+        // the user verbatim —— so it may only mention entry points that **really exist**. Both
+        // frontend entry points must be written out: the CLI's `/workplace`, and the "workspace"
+        // button at the bottom-left of the GUI input box (three tiers + a directory picker, landed
+        // 2026-10-04). Miss one and users of that frontend get "advice they can't act on".
         //
-        // 还有一条容易漏的（新语义）：**读不受工作区限制**。不说清的话，模型读到
-        // 「被权限边界拦下」会连「读边界外的东西」也一起放弃、甚至去请求提权 ——
-        // 而那条路根本不需要提权。
-        format!(
-            "【权限边界】{what}\n\n\
-             这不是工具坏了，也不是参数写错了 —— 是当前工作区的权限边界。\
-             **不要重试这次调用，也不要换一种写法绕过它**（同一个越界目标怎么试都会被拒）。\n\n\
-             请把这个情况**转述给用户**：当前工作区只允许在边界之内**写入和删除**，\
-             所以你无法改动那个位置。注意：**读文件不受工作区限制** —— \
-             如果只是要读取边界之外的内容，直接读就可以了，不必提权。\
-             如果用户确实需要写或删那个位置，请告诉他可以这样提升权限：\n  \
-             - 界面：点输入框左下角的「工作区」，选「默认 / 选择工作区 / 完全访问」\n  \
-             - 命令行：`/workplace default`（每段对话一块新地）、`/workplace <目录>`（指定目录）\
-             或 `/workplace full`（完全访问，AOX 可读写设备上的任何文件）\n  \
-             - 或改 config.toml 的 `[workplace]`（mode = \"full\" / \"default\" / \"fixed\"）后重启\n\n\
-             在用户改变权限之前，请改用工作区内可行的方案完成剩下的部分，\
-             或者明确告诉用户这一步做不了、还需要什么。"
+        // There is one more easily-missed point (the new semantics): **reads are not restricted by
+        // the workspace**. Without saying so, a model that reads "blocked by a permission boundary"
+        // will give up on "reading outside the boundary" too, and may even ask for an escalation —
+        // when that path needs no escalation at all.
+        tf!(
+            "[Permission boundary] {}\n\n\
+             This is not a broken tool or a wrong argument — it is the current workspace's permission boundary.\
+             **Do not retry this call, and do not try to sneak around it another way** (the same out-of-bounds target will be refused no matter how you phrase it).\n\n\
+             Please **relay this to the user**: the current workspace only allows **writes and deletes** inside the boundary,\
+             so you cannot modify that location. Note: **reading files is not restricted by the workspace** — \
+             if you only need to read something outside the boundary, just read it; no escalation needed.\
+             If the user really needs to write or delete there, tell them the permission can be raised like this:\n  \
+             - UI: click \"Workspace\" at the bottom-left of the input box, choose \"Default / Picked workspace / Full access\"\n  \
+             - CLI: `/workplace default` (a fresh plot per conversation), `/workplace <dir>` (a fixed directory)\
+             or `/workplace full` (full access — AOX can read and write any file on the machine)\n  \
+             - or edit `[workplace]` in config.toml (mode = \"full\" / \"default\" / \"fixed\") and restart\n\n\
+             Until the user changes the permission, fall back to what is possible inside the workspace for the rest,\
+             or tell the user clearly that this step cannot be done and what is missing.",
+            what
         )
     }
 
-    /// 给**用户**看的一行（调用方用 `Warn` 事件发出去）。
+    /// The one line for the **user** (the caller sends it with a `Warn` event).
     ///
-    /// 与 `model_text` 分开写：模型要的是「别重试 + 怎么提权」，用户要的是
-    /// 「AOX 刚才想干什么、被什么挡住了」。同一段文字硬塞给两边，两边都不好用。
+    /// Written separately from `model_text`: the model wants "don't retry + how to escalate", the
+    /// user wants "what AOX just tried to do, and what blocked it". Cramming the same text into
+    /// both serves neither.
     pub fn user_text(&self) -> String {
         match self {
-            Reject::Relative { root, raw } => format!(
-                "已拦下一次越界访问：相对路径 {raw:?}（工作区根 {}）。\
-                 本档位只接受工作区内的绝对路径。",
+            Reject::Relative { root, raw } => tf!(
+                "Blocked an out-of-bounds access: relative path {} (workspace root {}).\
+                 This tier only accepts absolute paths inside the workspace.",
+                format!("{raw:?}"),
                 root.display()
             ),
-            Reject::Outside { root, raw, resolved } => format!(
-                "已拦下一次越界访问：{raw:?} → {}，工作区是 {}。\
-                 本次调用没有执行。（要放宽用 `/workplace default|<目录>|full`，\
-                 或改 config.toml 的 [workplace]）",
+            Reject::Outside { root, raw, resolved } => tf!(
+                "Blocked an out-of-bounds access: {} → {}, workspace is {}.\
+                 The call was not executed. (To loosen: `/workplace default|<dir>|full`,\
+                 or edit [workplace] in config.toml)",
+                format!("{raw:?}"),
                 resolved.display(),
                 root.display()
             ),
             Reject::NotStarted => {
-                "工作区还没建立，这次写入/删除被拦下 —— 发一条消息后即可使用。".to_string()
+                t("The workspace hasn't been created yet; this write/delete was blocked — send a message and it will work.").to_string()
             }
         }
     }
 }
 
-// ─────────────────────────── 参数扫描（粗网）───────────────────────────
+// ─────────────────────────── Argument scanning (the coarse net) ───────────────────────────
 
-/// 从一次调用的参数里挑出「像路径」的字符串，返回 `(参数名, 值)`。
+/// Pick the "path-like" strings out of one call's arguments, returning `(parameter name, value)`.
 ///
-/// **这是张粗网，只用于插件工具**：插件是黑盒，宿主只能按参数名猜。
-/// 宿主自己的文件工具不走这里 —— 它们的 schema 是我们定义的，直接读 `path`（见
-/// [`PATH_ARG`]）。误判会拒掉一次合法调用，所以名单刻意保守。
+/// **This is a coarse net, only for plugin tools**: a plugin is a black box, and the host can only
+/// guess by parameter name. The host's own file tools don't come through here —— their schema is
+/// one we define, so `path` is read directly (see [`PATH_ARG`]). A misjudgement would reject a
+/// legitimate call, so the list is deliberately conservative.
 pub fn scan_paths(args: &Value) -> Vec<(String, String)> {
     let mut out = Vec::new();
     walk(args, "", &mut out);
@@ -785,8 +897,9 @@ fn walk(v: &Value, prefix: &str, out: &mut Vec<(String, String)>) {
                             out.push((key, s.clone()));
                         }
                     }
-                    // 字符串数组：`paths = ["a", "b"]` 这种写法很常见，逐项判。
-                    // 元素名沿用数组名（`paths[0]` 之类的位置信息对模型没用）。
+                    // Arrays of strings: a form like `paths = ["a", "b"]` is very common, so judge
+                    // each item. Item names reuse the array name (positional info like `paths[0]`
+                    // is useless to the model).
                     Value::Array(items) => {
                         for item in items {
                             if let Value::String(s) = item {
@@ -811,33 +924,39 @@ fn walk(v: &Value, prefix: &str, out: &mut Vec<(String, String)>) {
     }
 }
 
-/// 值超过这个长度、或含换行，就**不再当成路径**（见 [`looks_like_path`]）。
+/// Once a value exceeds this length, or contains a newline, it is **no longer treated as a path**
+/// (see [`looks_like_path`]).
 ///
-/// 260 = Windows 传统的路径上限（`MAX_PATH`）。取它而不是别的数，是因为超过这个
-/// 长度的**参数值**几乎不可能是路径，只可能是源码 / 正文 / 日志。
+/// 260 = Windows' traditional path limit (`MAX_PATH`). It is chosen over any other number because a
+/// **parameter value** longer than this is almost never a path — only source code / body text /
+/// logs.
 const MAX_PATH_CHARS: usize = 260;
 
 fn looks_like_path(key: &str, val: &str) -> bool {
     if val.trim().is_empty() {
         return false;
     }
-    // ① 参数名像路径 —— 最可靠的一条。键名是插件**自己声明**的，它说这是路径就是路径，
-    //    值再长也照判（`path` 里真可能是条 300 字符的长路径）。
+    // ① The parameter name looks like a path —— the most reliable rule. The key name is declared
+    //    by the plugin **itself**: if it says this is a path, it is one, however long the value
+    //    (`path` really can hold a 300-character long path).
     if PATH_KEYS.contains(&key.to_ascii_lowercase().as_str()) {
         return true;
     }
-    // ② 键名没说话，就只能靠值的形态猜 —— 那先排除「一眼不是路径」的值：
-    //    含换行、或长过一个路径上限。
-    //    **这一条是必需的，不是洁癖**：插件工具的参数里常带整段源码 / 正文
-    //    （`create_plugin` 的 `source` 就是），那种字符串里几乎必然出现 `/`、`\` 或
-    //    `..` —— 光看值形态会把 2 KB 的源码整段当成一个路径，后果是受限档下
-    //    `create_plugin` 直接被拒（**功能坏了，不是慢**）、full 档每次白扫一遍。
-    //    用 `chars().count()` 而不是 `len()`：源码里的中文按字节算会提前触发闸门，
-    //    而路径长度是按字符数的。
+    // ② When the key name says nothing, we can only guess from the shape of the value —— and that
+    //    starts by ruling out values that are "obviously not paths":
+    //    containing a newline, or longer than a path limit.
+    //    **This rule is necessary, not fastidiousness**: a plugin tool's arguments routinely carry
+    //    a whole block of source code / body text (`create_plugin`'s `source` is one), and such a
+    //    string is almost bound to contain `/`, `\` or `..` —— judging by value shape alone would
+    //    take a 2 KB source block for a single path, whose consequence is that under the confined
+    //    tier `create_plugin` is rejected outright (**a broken feature, not a slow one**), and
+    //    under the full tier every call wastes a scan.
+    //    Use `chars().count()` rather than `len()`: non-ASCII in source code would trip the gate
+    //    early when counted in bytes, whereas path length is counted in characters.
     if val.contains('\n') || val.contains('\r') || val.chars().count() > MAX_PATH_CHARS {
         return false;
     }
-    // ③ 值本身明显是绝对路径（`/x`、`\x`、`X:\x`、`\\server\share`、`~/x`）
+    // ③ The value itself is obviously an absolute path (`/x`, `\x`, `X:\x`, `\\server\share`, `~/x`)
     let b = val.as_bytes();
     if b[0] == b'/' || b[0] == b'\\' || val.starts_with("~/") {
         return true;
@@ -845,30 +964,33 @@ fn looks_like_path(key: &str, val: &str) -> bool {
     if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
         return true;
     }
-    // ③ 含 `..` 分量 —— 这个词几乎只出现在路径里，而且它正是越界的常见写法
+    // ③ Contains a `..` component —— that token appears almost only in paths, and it is precisely
+    //    the common way to escape the boundary
     val.split(['/', '\\']).any(|seg| seg == "..")
 }
 
-// ─────────────────────────── 路径规格化与包含判定 ───────────────────────────
+// ─────────────────────────── Path normalization and containment ───────────────────────────
 
-/// 规格化：解开 symlink / 8.3 短名 / 大小写，并消掉 `.` 与可消的 `..`。
+/// Normalize: resolve symlinks / 8.3 short names / case, and cancel `.` and cancellable `..`.
 ///
-/// 对**还不存在**的路径（写文件时最常见）不能直接 `canonicalize`，所以退化成
-/// 「把最深的已存在祖先 canonicalize，再把剩下的尾巴拼回去」。
-/// 这一步是必须的：不这么做，`<工作区>/../..` 或一个指向别处的 symlink
-/// 就能让前缀比较得出错误结论。
+/// For a path that **doesn't exist yet** (most common when writing a file) `canonicalize` can't be
+/// called directly, so it degrades to "canonicalize the deepest existing ancestor, then append the
+/// remaining tail back". This step is necessary: without it, `<workspace>/../..` or a symlink
+/// pointing elsewhere could make the prefix comparison reach a wrong conclusion.
 fn normalize(p: &Path) -> PathBuf {
     let lex = lexical(p);
     let mut tail: Vec<OsString> = Vec::new();
     let mut cur = lex.clone();
     loop {
         if let Ok(c) = cur.canonicalize() {
-            // `canonicalize` 在 Windows 上返回 **verbatim 路径**（`\\?\C:\…`）—— 它才是
-            // 「解开 symlink / 8.3 短名」之后的那一份，判定必须用它；但把它**展示**出去
-            // （`/workplace`、越界文案、给模型的契约）会让用户以为出了错，模型照抄进工具
-            // 调用里也很难受。所以在**规格化的唯一出口**这里摘掉前缀：全模块的路径都从
-            // `normalize` 出来，于是判定与展示看到的是同一套形状，不会出现
-            // 「比较用它、显示用另一个」这种错位（`inside` 两侧也都是这个形状）。
+            // On Windows `canonicalize` returns a **verbatim path** (`\\?\C:\…`) —— that is the
+            // one after "resolving symlinks / 8.3 short names", and the judgement must use it; but
+            // **showing** it (in `/workplace`, the out-of-bounds text, the contract given to the
+            // model) would make users think something went wrong, and a model copying it into a
+            // tool call is awkward too. So the prefix is stripped at **the single exit of
+            // normalization**: all of this module's paths come out of `normalize`, so judgement and
+            // display see the same shape, and there's no mismatch of "compare with one, display
+            // with another" (`inside` gets the same shape on both sides).
             let mut out = strip_verbatim(c);
             for seg in tail.iter().rev() {
                 out.push(seg);
@@ -878,7 +1000,8 @@ fn normalize(p: &Path) -> PathBuf {
         let Some(name) = cur.file_name().map(|s| s.to_os_string()) else { break };
         tail.push(name);
         match cur.parent() {
-            // `parent()` 返回空 / 等于自己 ⇒ 到顶了（驱动器的根、或相对路径的起点）
+            // `parent()` returning empty / equal to itself ⇒ we've reached the top (a drive root,
+            // or the start of a relative path)
             Some(parent) if !parent.as_os_str().is_empty() && parent != cur => {
                 cur = parent.to_path_buf();
             }
@@ -888,11 +1011,12 @@ fn normalize(p: &Path) -> PathBuf {
     lex
 }
 
-/// 摘掉 Windows 的 verbatim 前缀：`\\?\C:\x` → `C:\x`、`\\?\UNC\s\share` → `\\s\share`。
+/// Strip Windows' verbatim prefix: `\\?\C:\x` → `C:\x`, `\\?\UNC\s\share` → `\\s\share`.
 ///
-/// 只在 [`normalize`] 的出口调一次。代价是超过 `MAX_PATH`（260 字符）的路径会失去
-/// verbatim 那层豁免 —— 本项目的场景（工作区、history、plugins 全在应用根附近）
-/// 根本到不了那个长度，而「每条边界文案里带着一串 `\\?\`」是天天能看见的。
+/// Called only once, at [`normalize`]'s exit. The cost is that paths beyond `MAX_PATH` (260 chars)
+/// lose that verbatim exemption —— this project's scenarios (workspace, history, plugins all sit
+/// near the app root) never reach that length, whereas "every boundary message carrying a string of
+/// `\\?\`" is something you'd see every day.
 fn strip_verbatim(p: PathBuf) -> PathBuf {
     let s = p.to_string_lossy().into_owned();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
@@ -904,14 +1028,16 @@ fn strip_verbatim(p: PathBuf) -> PathBuf {
     }
 }
 
-/// 纯词法规格化：只消 `.` 与可消的 `..`，**不碰文件系统**（也不解开 symlink）。
+/// Purely lexical normalization: cancel only `.` and cancellable `..`, **without touching the
+/// filesystem** (and without resolving symlinks).
 fn lexical(p: &Path) -> PathBuf {
     let mut prefix = PathBuf::new();
     let mut stack: Vec<OsString> = Vec::new();
     for c in p.components() {
         match c {
-            // 盘符与根直接落在结果头部，且**不可被 `..` 弹掉** —— 否则
-            // `C:\..\..\x` 会变成 `x`（相对路径），判定直接失效。
+            // A drive letter and the root land at the head of the result, and **cannot be popped
+            // by `..`** —— otherwise `C:\..\..\x` would become `x` (a relative path) and the
+            // judgement would fail outright.
             Component::Prefix(_) | Component::RootDir => prefix.push(c.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
@@ -929,10 +1055,11 @@ fn lexical(p: &Path) -> PathBuf {
     out
 }
 
-/// `p` 是否落在 `root` 之内（含等于 root）。
+/// Is `p` inside `root` (including being equal to root)?
 ///
-/// Windows 上逐段**大小写不敏感**比较（`C:` 与 `c:`、`Users` 与 `users` 是同一处）。
-/// 非 ASCII 的大小写折叠没做 —— 那种目录名极少出现在路径前缀里，而真要做对得上 Unicode 表。
+/// On Windows, compared segment by segment **case-insensitively** (`C:` and `c:`, `Users` and
+/// `users` are the same place). Non-ASCII case folding is not done —— such directory names almost
+/// never appear in a path prefix, and doing it properly would need the Unicode tables.
 fn inside(root: &Path, p: &Path) -> bool {
     let mut r = root.components();
     let mut q = p.components();
@@ -951,13 +1078,13 @@ fn inside(root: &Path, p: &Path) -> bool {
     }
 }
 
-// ─────────────────────────── 时间戳 ───────────────────────────
+// ─────────────────────────── Timestamps ───────────────────────────
 
-/// `<YYYYMMDDHHMMSS>` 本地时间戳（工作区目录名）。
+/// An `<YYYYMMDDHHMMSS>` local timestamp (the workspace directory name).
 ///
-/// 与 `store::jsonl` 的文件名走同一套口径（本地时间、零新增 crate）。这里只有
-/// 一次 `GetLocalTime` 调用，没有共享的逻辑 —— 为了十行 FFI 去把存储后端的时间
-/// 辅助函数抽公共层，改动面比收益大。
+/// Same convention as `store::jsonl`'s file names (local time, zero new crates). There is only one
+/// `GetLocalTime` call here, with no shared logic —— pulling the storage backend's time helper into
+/// a common layer for ten lines of FFI would touch more than it's worth.
 fn stamp() -> String {
     #[cfg(windows)]
     {
@@ -972,7 +1099,8 @@ fn stamp() -> String {
     }
     #[cfg(not(windows))]
     {
-        // 拿不到本地时区就如实按 UTC 记，不拿「东八区近似」骗人（与 store 同一口径）。
+        // If the local time zone isn't available, honestly record UTC rather than fooling anyone
+        // with an "approximate UTC+8" (same convention as store).
         let secs = crate::history::unix_now();
         let days = (secs / 86_400) as i64;
         let rem = secs % 86_400;
@@ -995,12 +1123,15 @@ fn stamp() -> String {
     }
 }
 
-/// 在 `base` 下挑一个还没被占用的目录名：`<stamp>`，撞了就 `<stamp>-2`、`<stamp>-3`…
+/// Pick a not-yet-taken directory name under `base`: `<stamp>`, and on a collision `<stamp>-2`,
+/// `<stamp>-3`…
 ///
-/// 为什么需要它：时间戳只精确到秒，而「同一秒里连开两段新对话」在快速点击或脚本化
-/// 驱动时真会发生。撞上时 `create_dir_all` 不会报错 —— 它会把第二段对话**悄悄塞进**
-/// 第一段的地里，两块地变成一块，而用户以为它们是分开的。`-N` 后缀是最便宜的去重：
-/// 正常情况（不同秒）永远走不到这里，名字里也不会多出无意义的随机数。
+/// Why it's needed: the timestamp is only accurate to the second, and "starting two new
+/// conversations within the same second" really does happen with fast clicking or scripted driving.
+/// On a collision `create_dir_all` won't error —— it would **quietly stuff** the second conversation
+/// into the first one's plot, merging two plots into one while the user believes they're separate.
+/// The `-N` suffix is the cheapest deduplication: in the normal case (different seconds) it's never
+/// reached, and the name never grows a meaningless random number.
 fn unique_dir(base: &Path, stamp: &str) -> PathBuf {
     let first = base.join(stamp);
     if !first.exists() {
@@ -1012,8 +1143,9 @@ fn unique_dir(base: &Path, stamp: &str) -> PathBuf {
             return cand;
         }
     }
-    // 一千个都没空位：基本不可能（除非有人手工塞满）；照旧返回第一个，
-    // 让它去 `create_dir_all` 里正常成功 —— 静默复用比在这里 panic 好。
+    // A thousand attempts all taken: essentially impossible (unless someone filled it by hand);
+    // return the first one anyway and let it succeed normally in `create_dir_all` —— silently
+    // reusing is better than panicking here.
     first
 }
 
@@ -1025,31 +1157,33 @@ mod tests {
     fn ws(mode: &str, root: Option<&str>) -> Workplace {
         let app = std::env::temp_dir().join("aox-ws-test");
         Workplace::new(WorkplaceConfig { mode: mode.into(), root: root.map(str::to_string) }, &app)
-            .expect("测试用配置应当合法")
+            .expect("test config should be valid")
     }
 
     fn fixed(dir: &str) -> Workplace {
         ws("fixed", Some(dir))
     }
 
-    /// 命令的两个名字：`/workplace` 是正式名，`/workspace` 是**兼容旧名**（2026-10-04 统一命名）。
+    /// The command's two names: `/workplace` is the canonical name, `/workspace` is the **legacy
+    /// name** (naming unified on 2026-10-04).
     ///
-    /// 钉住三件事：① 两个名字都认；② 参数照剥（`/workplace default` → `default`）；
-    /// ③ 目录名恰好叫 `/workplace` 时，`/workplace /workplace` **不能**被剥成空串 ——
-    /// 那是老写法 `trim_start_matches("/workplace")` 会犯的错（它会反复剥前缀），
-    /// 用户拿到的是「现状」而不是「切换结果」，而且毫无提示。
+    /// Pinning three things: ① both names are recognised; ② the argument is stripped properly
+    /// (`/workplace default` → `default`); ③ when the directory happens to be named `/workplace`,
+    /// `/workplace /workplace` must **not** be stripped to an empty string —— that is the mistake
+    /// the old `trim_start_matches("/workplace")` would make (it strips the prefix repeatedly),
+    /// handing the user "the current state" instead of "the switch result", with no hint at all.
     #[test]
     fn command_answers_to_both_names_and_parses_args() {
         for name in ["/workplace", "/workspace"] {
-            assert!(is_cmd(name), "{name} 应被认成命令");
-            assert_eq!(cmd_arg(name), Some(""), "{name} 不带参数时参数应为空");
+            assert!(is_cmd(name), "{name} should be recognised as the command");
+            assert_eq!(cmd_arg(name), Some(""), "{name} with no argument should yield an empty arg");
             assert_eq!(cmd_arg(&format!("{name} default")), Some("default"));
-            assert_eq!(cmd_arg(&format!("{name}   C:\\x ")), Some("C:\\x"), "多余空格要吃掉");
+            assert_eq!(cmd_arg(&format!("{name}   C:\\x ")), Some("C:\\x"), "extra spaces must be eaten");
         }
-        assert_eq!(cmd_arg("/workplace /workplace"), Some("/workplace"), "目录名与命令名同名也要剥对");
+        assert_eq!(cmd_arg("/workplace /workplace"), Some("/workplace"), "a dir named like the command must strip exactly one");
         assert_eq!(cmd_arg("/workspace /workspace"), Some("/workspace"));
         for other in ["/workplaceX", "/workplaces", "/work", "workplace", ""] {
-            assert!(!is_cmd(other), "{other:?} 不该被认成这条命令");
+            assert!(!is_cmd(other), "{other:?} must not be taken for this command");
         }
     }
 
@@ -1057,36 +1191,37 @@ mod tests {
     fn unknown_mode_is_an_error() {
         let app = std::env::temp_dir();
         let r = Workplace::new(WorkplaceConfig { mode: "sandbox".into(), root: None }, &app);
-        assert!(r.is_err(), "认不出的 mode 必须启动即报错，不静默退回 full");
+        assert!(r.is_err(), "an unknown mode must fail at startup, not silently fall back to full");
     }
 
     #[test]
     fn fixed_without_root_is_an_error() {
         let app = std::env::temp_dir();
         let r = Workplace::new(WorkplaceConfig { mode: "fixed".into(), root: None }, &app);
-        assert!(r.is_err(), "fixed 档没给 root 必须报错");
+        assert!(r.is_err(), "fixed without root must error");
     }
 
     #[test]
     fn full_lets_everything_through() {
         let w = ws("full", None);
         assert!(w.check("C:\\Windows\\System32").is_ok());
-        assert!(w.check("relative.txt").is_ok(), "不受限档位不该对相对路径挑刺");
+        assert!(w.check("relative.txt").is_ok(), "the unrestricted tier must not nitpick relative paths");
         assert_eq!(w.active_root(), None);
     }
 
-    /// 受限档位：**相对路径一律拒绝**，且文案要给出根（模型靠它改写）。
+    /// The confined tier: **relative paths are always rejected**, and the text must give the root
+    /// (the model relies on it to rewrite).
     #[test]
     fn confined_rejects_relative_and_tells_the_root() {
         let base = std::env::temp_dir().join("aox-ws-rel");
         std::fs::create_dir_all(&base).unwrap();
         let w = fixed(&base.to_string_lossy());
-        let e = w.check("config.toml").expect_err("相对路径必须被拒");
+        let e = w.check("config.toml").expect_err("a relative path must be rejected");
         let t = e.model_text();
-        assert!(t.contains("相对路径"), "{t}");
+        assert!(t.contains("relative path"), "{t}");
         assert!(t.contains(&normalize(&base).display().to_string()), "{t}");
-        assert!(t.contains("转述给用户"), "契约必须要求模型转述：{t}");
-        assert!(t.contains("不要重试"), "契约必须写明别重试：{t}");
+        assert!(t.contains("relay this to the user"), "the contract must tell the model to relay: {t}");
+        assert!(t.contains("Do not retry"), "the contract must say don't retry: {t}");
     }
 
     #[test]
@@ -1096,17 +1231,17 @@ mod tests {
         let w = fixed(&base.to_string_lossy());
 
         let inside = base.join("sub").join("a.txt");
-        assert!(w.check(&inside.to_string_lossy()).is_ok(), "工作区内的绝对路径应放行");
+        assert!(w.check(&inside.to_string_lossy()).is_ok(), "an absolute path inside the workspace must pass");
 
         let outside = base.parent().unwrap().join("aox-ws-outside.txt");
-        let e = w.check(&outside.to_string_lossy()).expect_err("工作区外必须被拒");
+        let e = w.check(&outside.to_string_lossy()).expect_err("outside the workspace must be rejected");
         match e {
             Reject::Outside { .. } => {}
-            other => panic!("应当是 Outside，实际 {other:?}"),
+            other => panic!("expected Outside, got {other:?}"),
         }
     }
 
-    /// `..` 逃逸：词法上看着像在里面，规格化后必须落在外面。
+    /// `..` escape: lexically it looks inside, but after normalization it must land outside.
     #[test]
     fn dotdot_escape_is_caught() {
         let base = std::env::temp_dir().join("aox-ws-dotdot");
@@ -1114,15 +1249,16 @@ mod tests {
         let w = fixed(&base.to_string_lossy());
 
         let escape = base.join("sub").join("..").join("..").join("evil.txt");
-        let e = w.check(&escape.to_string_lossy()).expect_err("`..` 逃逸必须被拒");
+        let e = w.check(&escape.to_string_lossy()).expect_err("a `..` escape must be rejected");
         assert!(matches!(e, Reject::Outside { .. }), "{e:?}");
 
-        // 没逃出去的那种 `..` 要放行（不能把 `sub/../ok.txt` 也一起拒了）
+        // A `..` that doesn't escape must be allowed (don't reject `sub/../ok.txt` along with it)
         let ok = base.join("sub").join("..").join("ok.txt");
-        assert!(w.check(&ok.to_string_lossy()).is_ok(), "留在工作区内的 `..` 应当放行");
+        assert!(w.check(&ok.to_string_lossy()).is_ok(), "a `..` staying inside the workspace must pass");
     }
 
-    /// 大小写不敏感（Windows 语义）：路径前缀大小写不同不算越界。
+    /// Case-insensitive (Windows semantics): a differing case in the path prefix is not
+    /// out-of-bounds.
     #[test]
     fn prefix_compare_ignores_ascii_case() {
         if !cfg!(windows) {
@@ -1133,30 +1269,32 @@ mod tests {
         let w = fixed(&base.to_string_lossy());
         let shouty = base.join("A.TXT");
         let lower = PathBuf::from(shouty.to_string_lossy().to_ascii_lowercase());
-        assert!(w.check(&lower.to_string_lossy()).is_ok(), "大小写不同不该判越界");
+        assert!(w.check(&lower.to_string_lossy()).is_ok(), "a case difference must not count as out-of-bounds");
     }
 
-    /// `default` 档位：**根没定之前一律拒绝**，不能因为「还没建」而静默全放行。
+    /// The `default` tier: **everything is rejected before the root is decided**, and it must not
+    /// be silently allowed just because "it isn't built yet".
     #[test]
     fn pending_is_rejected_not_silently_allowed() {
         let app = std::env::temp_dir().join("aox-ws-pending");
         let w = ws("default", None);
-        let e = w.check("C:\\Windows").expect_err("根没定就该拒，而不是放行");
+        let e = w.check("C:\\Windows").expect_err("with the root undecided it must reject, not pass");
         assert!(matches!(e, Reject::NotStarted), "{e:?}");
 
-        let dir = w.ensure_started(&app).unwrap().expect("应当建出一块新地");
-        assert!(dir.is_dir(), "目录应当真的建出来了");
-        // 用 `normalize` 比前缀：`ensure_started` 交回的是规格化过的路径，
-        // 而 `temp_dir()` 给的那份可能还带着 8.3 短名 / 大小写差异（`canonicalize` 之后
-        // 就成了另一串字符），直接 `starts_with` 会假红。
+        let dir = w.ensure_started(&app).unwrap().expect("a fresh plot should have been created");
+        assert!(dir.is_dir(), "the directory should really exist");
+        // Compare the prefix with `normalize`: what `ensure_started` hands back is a normalized
+        // path, whereas the one `temp_dir()` gives may still carry 8.3 short names / case
+        // differences (after `canonicalize` it becomes a different string), so a direct
+        // `starts_with` would go falsely red.
         assert!(dir.starts_with(normalize(&app.join(WORKPLACE_DIR))));
         assert!(w.check(&dir.join("x.txt").to_string_lossy()).is_ok());
-        // 一段对话只建一次
-        assert!(w.ensure_started(&app).unwrap().is_none(), "同一段对话不该重复建目录");
-        // 新对话才换一块地
+        // A conversation builds only once
+        assert!(w.ensure_started(&app).unwrap().is_none(), "the same conversation must not create the directory twice");
+        // Only a new conversation changes the plot
         w.reset_for_new_conversation();
         let dir2 = w.ensure_started(&app).unwrap().unwrap();
-        assert_ne!(dir, dir2, "新对话应当换一块新地");
+        assert_ne!(dir, dir2, "a new conversation should get a fresh plot");
         let _ = std::fs::remove_dir_all(app.join(WORKPLACE_DIR));
     }
 
@@ -1164,7 +1302,7 @@ mod tests {
     fn scan_paths_picks_path_like_values_only() {
         let args = serde_json::json!({
             "path": "config.toml",
-            "text": "这里有个 / 斜杠但不是路径",
+            "text": "this has a / slash but is not a path",
             "pattern": "*.rs",
             "abs": "/etc/passwd",
             "win": "D:\\data\\x.csv",
@@ -1175,39 +1313,45 @@ mod tests {
             "n": 3
         });
         let hits: Vec<String> = scan_paths(&args).into_iter().map(|(_, v)| v).collect();
-        assert!(hits.contains(&"config.toml".to_string()), "path 参数要被抓到");
-        assert!(hits.contains(&"/etc/passwd".to_string()), "绝对路径要被抓到");
-        assert!(hits.contains(&"D:\\data\\x.csv".to_string()), "Windows 绝对路径要被抓到");
-        assert!(hits.contains(&"plugins".to_string()), "嵌套的 dir 要被抓到");
-        // 数组里的相对名靠**键名**（`paths`）抓到 —— 键名不在名单里的话，光看值
-        // 是认不出 `b/c.txt` 的，而认不出来正是这张粗网「宁漏勿误伤」的代价。
-        assert!(hits.contains(&"a.txt".to_string()), "paths 数组里的项要被抓到");
-        assert!(hits.contains(&"b/c.txt".to_string()), "同上");
-        assert!(!hits.contains(&"*.rs".to_string()), "通配符不是路径");
+        assert!(hits.contains(&"config.toml".to_string()), "the path argument must be caught");
+        assert!(hits.contains(&"/etc/passwd".to_string()), "an absolute path must be caught");
+        assert!(hits.contains(&"D:\\data\\x.csv".to_string()), "a Windows absolute path must be caught");
+        assert!(hits.contains(&"plugins".to_string()), "a nested dir must be caught");
+        // A relative name inside an array is caught by the **key name** (`paths`) —— if the key
+        // name weren't on the list, `b/c.txt` couldn't be recognised by its value alone, and
+        // missing it is exactly the price of this coarse net's "rather miss than misfire".
+        assert!(hits.contains(&"a.txt".to_string()), "items in a paths array must be caught");
+        assert!(hits.contains(&"b/c.txt".to_string()), "same as above");
+        assert!(!hits.contains(&"*.rs".to_string()), "a glob is not a path");
         assert!(!hits.contains(&"3".to_string()));
-        // 含 `/` 但不是路径：URL 绝不能被抓 —— 一旦误判，受限档位下插件连取数据都做不了
-        assert!(!hits.contains(&"https://example.com/x".to_string()), "URL 不是文件路径");
-        // 键名不像路径、值又带着空格与正文 ⇒ 不判（粗网宁可漏，不可误伤）
-        assert!(!hits.iter().any(|h| h.contains("斜杠")), "正文不该被当路径");
+        // Contains `/` but isn't a path: a URL must never be caught —— a misfire would leave a
+        // plugin unable to even fetch data under the confined tier
+        assert!(!hits.contains(&"https://example.com/x".to_string()), "a URL is not a file path");
+        // The key name doesn't look like a path and the value carries spaces and prose ⇒ not
+        // judged (the coarse net would rather miss than misfire)
+        assert!(!hits.iter().any(|h| h.contains("slash")), "prose must not be taken for a path");
     }
 
-    /// 用户那一侧的文案必须说清「想干什么、被什么挡住」，而不是照抄给模型的那份。
+    /// The user-side text must make clear "what it was trying to do, and what blocked it", rather
+    /// than copying the model's copy of it.
     #[test]
     fn user_text_differs_from_model_text() {
         let w = fixed(&std::env::temp_dir().to_string_lossy());
         let e = w.check("relative.txt").unwrap_err();
         let (m, u) = (e.model_text(), e.user_text());
-        assert!(u.contains("已拦下一次越界访问"), "{u}");
-        assert!(!u.contains("不要重试"), "给用户的那份不该带「别重试」这种对模型说的话");
-        assert!(m.len() > u.len(), "给模型的契约要比给用户的一行更长更完整");
+        assert!(u.contains("Blocked an out-of-bounds access"), "{u}");
+        assert!(!u.contains("Do not retry"), "the user-facing line must not carry model-speak like don't-retry");
+        assert!(m.len() > u.len(), "the model contract should be longer and more complete than the user line");
     }
 
-    /// 回归：`report()` 曾经在**持有状态锁**的期间又调 `self.mode()`（它也要锁同一把
-    /// `std::sync::Mutex`）—— `Mutex` 不可重入，于是「切到固定工作区之后再执行一次
-    /// `/workplace`」把整个进程**钉死**（实机上是 exit=124，超时被杀）。
+    /// Regression: `report()` once called `self.mode()` **while holding the state lock** (it locks
+    /// the same `std::sync::Mutex`) —— `Mutex` is not reentrant, so "switch to a fixed workspace
+    /// then run `/workplace` once more" **pinned the whole process** (exit=124 on the real machine,
+    /// killed on timeout).
     ///
-    /// 用「另起线程 + 带超时的 recv」来钉它：真死锁时这里是**测试失败**，
-    /// 而不是让 `cargo test` 一起挂住 —— 挂住的测试比失败的测试更难查。
+    /// Pinned with "spawn a thread + receive with a timeout": on a real deadlock this is a **test
+    /// failure**, rather than hanging `cargo test` along with it —— a hung test is harder to track
+    /// down than a failing one.
     #[test]
     fn report_after_switching_does_not_deadlock() {
         let base = std::env::temp_dir().join("aox-ws-report");
@@ -1222,29 +1366,32 @@ mod tests {
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(text) => {
                 handle.join().unwrap();
-                assert!(text.contains("选择工作区"), "固定档位应报「选择工作区」：{text}");
+                assert!(text.contains("Picked workspace"), "the fixed tier must report Picked workspace: {text}");
                 assert!(
                     text.contains(&normalize(&base).display().to_string()),
-                    "正文里应当有根：{text}"
+                    "the body should contain the root: {text}"
                 );
             }
-            Err(_) => panic!("report() 超过 5 秒没返回 —— 状态锁被重入了（死锁）"),
+            Err(_) => panic!("report() did not return within 5s — the state lock was reentered (deadlock)"),
         }
 
-        // `default` 档建成之后**档位仍然是「默认」**，不能因为根是现建的就说成「选择工作区」
+        // After the `default` tier builds its plot, **the tier is still "default"** —— it must not
+        // be called "choose workspace" just because the root was built on the fly
         let app2 = std::env::temp_dir().join("aox-ws-report-default");
         let w2 = ws("default", None);
-        w2.ensure_started(&app2).unwrap().expect("应当建出一块新地");
+        w2.ensure_started(&app2).unwrap().expect("a fresh plot should have been created");
         let text = w2.report(&app2);
-        assert!(text.contains("默认"), "{text}");
-        assert!(!text.contains("选择工作区"), "default 档不该被报成「选择工作区」：{text}");
+        assert!(text.contains("Default"), "{text}");
+        assert!(!text.contains("Picked workspace"), "the default tier must not be reported as Picked workspace: {text}");
         let _ = std::fs::remove_dir_all(app2.join(WORKPLACE_DIR));
     }
 
-    /// 回归：**整段源码不能被当成路径**。7a 实测到的真实缺陷 ——
-    /// `create_plugin(source = "<2.2 KB 的插件源码>")` 里因为出现 `a/../b`，
-    /// 整段源码被判成「含 `..` 分量的路径」。后果两边都坏：受限档下 `create_plugin`
-    /// 直接被拒（**功能坏了**），full 档每次白烧约 1 ms（逐级 `canonicalize`）。
+    /// Regression: **a whole block of source code must not be taken for a path**. A real defect
+    /// measured in 7a —— in `create_plugin(source = "<2.2 KB of plugin source>")`, because `a/../b`
+    /// appeared, the whole source block was judged "a path containing a `..` component". The
+    /// consequence is bad on both sides: under the confined tier `create_plugin` is rejected
+    /// outright (**a broken feature**), and under the full tier every call burns about 1 ms for
+    /// nothing (a `canonicalize` at every level).
     #[test]
     fn multiline_source_is_not_treated_as_a_path() {
         let src = "import os\nsys.path.insert(0, os.path.join(d, \"..\"))\n# a/b/c\n".repeat(30);
@@ -1256,44 +1403,49 @@ mod tests {
         let hits = scan_paths(&args);
         assert!(
             !hits.iter().any(|(_, v)| v.contains("import os")),
-            "整段源码被当成路径了：{:?}",
+            "the whole source was taken for a path: {:?}",
             hits.iter().map(|(k, v)| (k.clone(), v.len())).collect::<Vec<_>>()
         );
-        assert!(hits.is_empty(), "这两个参数都不该命中：{hits:?}");
+        assert!(hits.is_empty(), "neither of these two arguments should be caught: {hits:?}");
 
-        // 但**键名权威**：同一个值挂在 `path` 键下，再长也照判（它真可能是条长路径）——
-        // 钉住「闸门只装在靠值形态猜的那几条路上」，别哪天顺手把键名那条也闸了。
+        // But the **key name is authoritative**: the same value hung under the `path` key is judged
+        // however long it is (it really can be a long path) —— pinning "the gate is only installed
+        // on the paths that guess by value shape", so that one day nobody gates the key-name path
+        // too.
         let long_path = format!("C:\\{}", "x".repeat(300));
         let hits = scan_paths(&serde_json::json!({ "path": long_path }));
-        assert_eq!(hits.len(), 1, "`path` 键下的长值是路径，不能因为长度被放过");
+        assert_eq!(hits.len(), 1, "a long value under the path key is a path; length must not excuse it");
     }
 
-    /// `is_unrestricted()` 是判定点**短路**的唯一依据（`full` 档下整条判定被跳过），
-    /// 所以它必须与「`check` 会不会拒」严格一致：它说 `true` 的时候，任何路径都必须能过。
-    /// 反过来说，哪天有人把 `Pending` 也划成 `true`，那就是「受限档位静默全放行」。
+    /// `is_unrestricted()` is the **only** basis for the check point's short-circuit (under the
+    /// `full` tier the whole check is skipped), so it must agree strictly with "will `check`
+    /// reject": whenever it says `true`, every path must pass. Conversely, the day someone marks
+    /// `Pending` as `true` too, that's "the confined tier silently allowing everything".
     #[test]
     fn is_unrestricted_agrees_with_check() {
         let full = ws("full", None);
-        assert!(full.is_unrestricted(), "full 档必须报不受限");
+        assert!(full.is_unrestricted(), "the full tier must report unrestricted");
         for p in ["relative.txt", "C:\\Windows\\System32", "/etc/passwd", "a/../../b"] {
-            assert!(full.check(p).is_ok(), "full 档必须放行 {p:?}");
+            assert!(full.check(p).is_ok(), "the full tier must pass {p:?}");
         }
 
         let base = std::env::temp_dir().join("aox-ws-unrestricted");
         std::fs::create_dir_all(&base).unwrap();
         let w = fixed(&base.to_string_lossy());
-        assert!(!w.is_unrestricted(), "受限档不能报不受限 —— 否则判定被整个跳过");
+        assert!(!w.is_unrestricted(), "a confined tier must not report unrestricted — otherwise the check is skipped entirely");
         w.set_mode(Mode::Full, &base).unwrap();
-        assert!(w.is_unrestricted(), "运行期切到 full 之后也必须短路");
+        assert!(w.is_unrestricted(), "after switching to full at runtime it must short-circuit too");
 
-        // `Pending`（default 档、还没发消息）是**全拒绝**，绝不能报不受限。
-        assert!(!ws("default", None).is_unrestricted(), "Pending 是全拒绝，绝不能报不受限");
+        // `Pending` (default tier, no message sent yet) **rejects everything**, and must never be
+        // reported as unrestricted.
+        assert!(!ws("default", None).is_unrestricted(), "Pending rejects everything and must never report unrestricted");
     }
 
-    /// 新语义（2026-10-04）：**读不设限 / 写删受限**。
+    /// The new semantics (2026-10-04): **reads unrestricted / writes and deletes confined**.
     ///
-    /// 拆开对拍，免得哪天「顺手统一」又把两边改回同一档。四个状态 × 两种意图都要钉：
-    /// 同一个越界路径，`check`（写）必须拒、`check_read`（读）必须放。
+    /// Compared side by side, so that one day a "convenient unification" doesn't merge the two back
+    /// into one tier. All four states × both intents must be pinned: for the same out-of-bounds
+    /// path, `check` (write) must reject and `check_read` (read) must pass.
     #[test]
     fn read_is_never_restricted_but_write_is() {
         let base = std::env::temp_dir().join("aox-ws-rw");
@@ -1302,64 +1454,71 @@ mod tests {
         let outside = outside.to_string_lossy().into_owned();
         let inside = base.join("sub").join("a.txt").to_string_lossy().into_owned();
 
-        // ① 固定档：越界路径 —— 写拒、读放；区内路径两种意图都放
+        // ① The fixed tier: an out-of-bounds path —— write rejects, read passes; an in-plot path
+        //    passes both intents
         let w = fixed(&base.to_string_lossy());
         assert!(
             matches!(w.check(&outside), Err(Reject::Outside { .. })),
-            "越界的**写**必须被拒"
+            "an out-of-bounds **write** must be rejected"
         );
-        assert!(w.check_read(&outside).is_ok(), "越界的**读**必须放行（新语义）");
+        assert!(w.check_read(&outside).is_ok(), "an out-of-bounds **read** must pass (the new semantics)");
         assert!(w.check(&inside).is_ok());
         assert!(w.check_read(&inside).is_ok());
 
-        // ② 相对路径：写拒（宿主与插件 cwd 不同，那层歧义是写才有的风险）；
-        //    读放 —— 读的后果只是「读到了别处的同名文件」，不值得为它拒掉一次正常读。
+        // ② Relative path: write rejects (the host and plugin have different cwds, and that
+        //    ambiguity is a risk only writes carry); read passes —— the consequence of reading is
+        //    only "read a same-named file elsewhere", not worth rejecting a normal read for
         assert!(matches!(w.check("config.toml"), Err(Reject::Relative { .. })));
-        assert!(w.check_read("config.toml").is_ok(), "读不该因为相对路径被拒");
+        assert!(w.check_read("config.toml").is_ok(), "a read must not be rejected for being relative");
 
-        // ③ `default` 还没开地（Pending）：写全拒、读照放 —— 否则「首条消息之前什么都读不到」
+        // ③ `default` with no plot opened yet (Pending): writes all rejected, reads still pass ——
+        //    otherwise "nothing can be read before the first message"
         let p = ws("default", None);
         assert!(matches!(p.check("C:\\Windows"), Err(Reject::NotStarted)));
-        assert!(p.check_read("C:\\Windows").is_ok(), "地还没开也不该挡住读");
+        assert!(p.check_read("C:\\Windows").is_ok(), "reads must not be blocked while the plot is not started yet");
 
-        // ④ full 档：两种意图都放（读的分支与 full 的写分支是两段代码，都要钉）
+        // ④ The full tier: both intents pass (the read branch and the full write branch are two
+        //    separate pieces of code, and both must be pinned)
         let f = ws("full", None);
         assert!(f.check(&outside).is_ok());
         assert!(f.check_read(&outside).is_ok());
     }
 
-    /// `snapshot()` 是**界面**唯一的取状态入口：一次取锁同时拿「档位」与「根」。
+    /// `snapshot()` is the **UI's** only state-fetching entry point: one lock acquisition grabs both
+    /// the "tier" and the "root".
     ///
-    /// 钉住两件事：
-    /// ① 它与 `mode()` / `active_root()` 说的是同一件事 —— 否则会出现「按钮上写默认、
-    ///    列表却在『选择工作区』上打勾」这种自相矛盾的界面；
-    /// ② 它自己**不会重入状态锁**（重入的话这一句永远回不来 —— 与
-    ///    `report_after_switching_does_not_deadlock` 同一个坑）。
+    /// Pinning two things:
+    /// ① It says the same thing as `mode()` / `active_root()` —— otherwise you'd get a
+    ///    self-contradictory UI of "the button says default, while the list has the tick on 'choose
+    ///    workspace'";
+    /// ② It does not itself **re-enter the state lock** (re-entering would mean that line never
+    ///    comes back —— the same pit as `report_after_switching_does_not_deadlock`).
     ///
-    /// 尤其是 `default` 档建成之后：档位必须**仍然是 `Default`**，只是根从 `None`
-    /// 变成了那条目录 —— 这正是 `snapshot()` 把「档位与根的映射」只写一遍的意义。
+    /// Especially after the `default` tier builds its plot: the tier must **still be `Default`**,
+    /// just with the root going from `None` to that directory —— which is precisely the point of
+    /// `snapshot()` writing the "tier-to-root mapping" only once.
     #[test]
     fn snapshot_agrees_with_mode_and_root() {
-        // full：档位 Full、根 None（不是「还没定」，是「不受限」）
+        // full: tier Full, root None (not "not yet decided" but "unrestricted")
         let full = ws("full", None);
         assert_eq!(full.snapshot(), (Mode::Full, None));
         assert_eq!(full.snapshot().0, full.mode());
 
-        // default 建地之前：档位 Default、根 None（**不是**不受限）
+        // default before building: tier Default, root None (**not** unrestricted)
         let app = std::env::temp_dir().join("aox-ws-snapshot");
         let d = ws("default", None);
         assert_eq!(d.snapshot(), (Mode::Default, None));
 
-        // default 建地之后：档位仍是 Default，但根有了
-        let dir = d.ensure_started(&app).unwrap().expect("应当建出一块新地");
+        // default after building: the tier is still Default, but the root now exists
+        let dir = d.ensure_started(&app).unwrap().expect("a fresh plot should have been created");
         let (m, r) = d.snapshot();
-        assert_eq!(m, Mode::Default, "default 档建成之后档位不该变成「选择工作区」");
+        assert_eq!(m, Mode::Default, "after the default plot is built the mode must not become Picked workspace");
         assert_eq!(r.as_deref(), Some(dir.as_path()));
-        assert_eq!(d.mode(), m, "snapshot 与 mode 必须一致");
-        assert_eq!(d.active_root(), r, "snapshot 与 active_root 必须一致");
+        assert_eq!(d.mode(), m, "snapshot and mode must agree");
+        assert_eq!(d.active_root(), r, "snapshot and active_root must agree");
         let _ = std::fs::remove_dir_all(app.join(WORKPLACE_DIR));
 
-        // fixed：档位带路径、根是它自己
+        // fixed: the tier carries a path, and the root is itself
         let base = std::env::temp_dir().join("aox-ws-snapshot-fixed");
         std::fs::create_dir_all(&base).unwrap();
         let f = fixed(&base.to_string_lossy());
@@ -1370,93 +1529,105 @@ mod tests {
         assert_eq!(f.active_root(), r);
     }
 
-    /// 档位的判据是**运行期怎么来的**，不是配置里写的什么（2026-10-04 修的 bug）。
+    /// The tier's criterion is **how it came about at runtime**, not what the config says (a bug
+    /// fixed on 2026-10-04).
     ///
-    /// 实机现象：配置写 `mode = "default"`，运行期又挑了一块固定的地 ——
-    /// `set_mode` 报「已切到「选择工作区」：X」，紧接着 `snapshot()` 报「档位：默认」。
-    /// 同一个动作两种说法，GUI 上就是「按钮写着默认、打勾也在默认上，而写入去了 X」。
+    /// Real-machine symptom: the config says `mode = "default"`, then at runtime a fixed plot is
+    /// picked —— `set_mode` reports "switched to 'choose workspace': X", and immediately afterwards
+    /// `snapshot()` reports "tier: default". One action, two descriptions; on the GUI that's "the
+    /// button says default, the tick is on default, yet writes go to X".
     #[test]
     fn snapshot_follows_the_runtime_origin_not_the_config() {
         let base = std::env::temp_dir().join("aox-ws-origin");
         std::fs::create_dir_all(base.join("picked")).unwrap();
 
-        // 配置 `default` + 运行期挑了一块固定的地 ⇒ 必须报「选择工作区」
+        // Config `default` + a fixed plot picked at runtime ⇒ must report "choose workspace"
         let w = ws("default", None);
         let d = base.join("picked");
         w.set_mode(Mode::Fixed(d.clone()), &base).unwrap();
         let (m, r) = w.snapshot();
-        assert!(matches!(m, Mode::Fixed(_)), "运行期点名挑的地要报「选择工作区」，实际 {m:?}");
+        assert!(matches!(m, Mode::Fixed(_)), "a runtime-picked plot must report Picked workspace, got {m:?}");
         assert_eq!(r, Some(normalize(&d)));
-        assert_eq!(w.persisted().mode, "fixed", "存档里也要是 fixed，否则下回打开又变回默认");
+        assert_eq!(w.persisted().mode, "fixed", "the record must say fixed, otherwise the next open falls back to default");
 
-        // 而 `default` 档现建的地仍然报「默认」（picked=false）
+        // Whereas a plot built on the fly by the `default` tier still reports "default"
+        // (picked=false)
         let w2 = ws("default", None);
         let app2 = std::env::temp_dir().join("aox-ws-origin-default");
-        w2.ensure_started(&app2).unwrap().expect("应当建出一块新地");
+        w2.ensure_started(&app2).unwrap().expect("a fresh plot should have been created");
         assert_eq!(w2.snapshot().0, Mode::Default);
         assert_eq!(w2.persisted().mode, "default");
         let _ = std::fs::remove_dir_all(app2.join(WORKPLACE_DIR));
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// 新建对话**一律回到「默认」档**（用户 2026-10-04 定的）。
+    /// A new conversation **always returns to the "default" tier** (decided by the user on
+    /// 2026-10-04).
     ///
-    /// 老实现只在 `cfg.mode == "default"` 时重置，于是「上一段对话挑了某个目录，
-    /// 点 + 之后新对话还在那个目录里」。现在无论配置写什么、上一段切到哪一档，
-    /// 翻页后一律是「默认」且根**尚未定**（等首条消息现建一块新地）。
+    /// The old implementation only reset when `cfg.mode == "default"`, so "the previous
+    /// conversation picked some directory, and after clicking + the new conversation is still in
+    /// that directory". Now, whatever the config says and whichever tier the previous one switched
+    /// to, after turning the page it is always "default" with the root **not yet decided** (waiting
+    /// for the first message to build a fresh plot).
     #[test]
     fn new_conversation_always_returns_to_default() {
         let base = std::env::temp_dir().join("aox-ws-newconv");
         std::fs::create_dir_all(base.join("picked")).unwrap();
         let app = std::env::temp_dir().join("aox-ws-newconv-app");
 
-        // 配置写 `fixed` 也一样：翻页后不再是那块固定的地
+        // Likewise with the config saying `fixed`: after turning the page it's no longer that fixed
+        // plot
         let w = fixed(&base.join("picked").to_string_lossy());
         assert!(matches!(w.snapshot().0, Mode::Fixed(_)));
         w.reset_for_new_conversation();
-        assert_eq!(w.snapshot(), (Mode::Default, None), "新对话应当回到「默认」且根未定");
+        assert_eq!(w.snapshot(), (Mode::Default, None), "a new conversation must return to Default with the root undecided");
 
-        // 切到「完全访问」之后翻页，同样回到「默认」（不是继承 full）
+        // After switching to "full access" and turning the page, likewise back to "default" (not
+        // inheriting full)
         w.set_mode(Mode::Full, &base).unwrap();
         assert_eq!(w.snapshot().0, Mode::Full);
         w.reset_for_new_conversation();
         assert_eq!(w.snapshot(), (Mode::Default, None));
 
-        // 「根未定」的语义要真的成立：下一条消息会现建一块**新**地（在 workplace/ 下）
-        let built = w.ensure_started(&app).unwrap().expect("应当现建一块新地");
+        // The "root not decided" semantics must really hold: the next message builds a **new** plot
+        // (under workplace/)
+        let built = w.ensure_started(&app).unwrap().expect("a fresh plot should be created on the spot");
         assert!(
             built.starts_with(normalize(&app.join(WORKPLACE_DIR))),
-            "新对话的地应当在 workplace/ 下，实际 {}",
+            "the new conversation's plot should live under workplace/, got {}",
             built.display()
         );
         let _ = std::fs::remove_dir_all(app.join(WORKPLACE_DIR));
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// `persisted()` 与 `restore()` 必须互为逆运算 —— 打开旧对话就是把存下来的那份放回去。
+    /// `persisted()` and `restore()` must be inverses of each other —— opening an old conversation
+    /// is just putting the saved one back.
     ///
-    /// 关键几点：`default` 档带根的那一支**根要沿用**（否则「同一段对话每次进去都是
-    /// 不同的工作区」）；`own` 也要进存档、并且在 `full` / `fixed` 档下**留着**
-    /// （否则「切走再切回默认」会另建一块）。
+    /// Key points: the `default`-tier-with-a-root branch **must reuse the root** (otherwise "every
+    /// time I enter the same conversation it's a different workspace"); `own` must also go into the
+    /// archive, and **stay** under the `full` / `fixed` tiers (otherwise "switch away and back to
+    /// default" builds another plot).
     #[test]
     fn persisted_and_restore_round_trip() {
         let base = std::env::temp_dir().join("aox-ws-persist");
         std::fs::create_dir_all(base.join("picked")).unwrap();
         let app = std::env::temp_dir().join("aox-ws-persist-app");
 
-        // ① default：地是现建的 → 存档里 mode=default，root 与 own 都是那块地
+        // ① default: the plot was built on the fly → the archive has mode=default, and both root
+        //    and own are that plot
         let w = ws("default", None);
-        let dir = w.ensure_started(&app).unwrap().expect("应当建出一块新地");
+        let dir = w.ensure_started(&app).unwrap().expect("a fresh plot should have been created");
         let saved = w.persisted();
         assert_eq!(saved.mode, "default");
         assert_eq!(saved.root.as_ref(), Some(&normalize(&dir)));
-        assert_eq!(saved.own.as_ref(), Some(&normalize(&dir)), "自建地也要进存档");
-        let fresh = ws("full", None); // 故意从别的档起 —— 还原要能压过它
+        assert_eq!(saved.own.as_ref(), Some(&normalize(&dir)), "the self-created plot must be recorded too");
+        let fresh = ws("full", None); // deliberately start from another tier —— restore must override it
         fresh.restore(&saved);
         assert_eq!(fresh.snapshot(), (Mode::Default, Some(normalize(&dir))));
-        assert_eq!(fresh.persisted(), saved, "往返一圈必须一模一样");
+        assert_eq!(fresh.persisted(), saved, "a round-trip must be identical");
 
-        // ② fixed：点名挑的地，`own` 为空
+        // ② fixed: a named plot, `own` empty
         let w = fixed(&base.join("picked").to_string_lossy());
         let saved = w.persisted();
         assert_eq!(saved.mode, "fixed");
@@ -1467,17 +1638,19 @@ mod tests {
         assert!(matches!(m, Mode::Fixed(_)), "{m:?}");
         assert_eq!(r, saved.root);
 
-        // ③ full：当前档位没有根，但**自建地要留着** —— 切回默认时靠它找回原来那块
+        // ③ full: the current tier has no root, but **the self-built plot must stay** —— switching
+        //    back to default relies on it to find the original plot again
         let own = normalize(&app.join(WORKPLACE_DIR).join("20260101000000"));
         let saved = Record { mode: "full".into(), root: None, own: Some(own.clone()) };
         let fresh = fixed(&base.join("picked").to_string_lossy());
         fresh.restore(&saved);
         assert_eq!(fresh.snapshot(), (Mode::Full, None));
-        assert_eq!(fresh.persisted().own.as_ref(), Some(&own), "full 档下也不许丢自建地");
+        assert_eq!(fresh.persisted().own.as_ref(), Some(&own), "even under full the self-created plot must be kept");
         fresh.set_mode(Mode::Default, &base).unwrap();
-        assert_eq!(fresh.snapshot(), (Mode::Default, Some(own)), "切回默认应当回到存档里那块");
+        assert_eq!(fresh.snapshot(), (Mode::Default, Some(own)), "switching back to default must return to the recorded plot");
 
-        // ④ 认不出的档位名（或 default 没给根）⇒ 回「还没定」，让首条消息现建
+        // ④ An unrecognized tier name (or `default` with no root) ⇒ back to "not yet decided",
+        //    letting the first message build
         let fresh = ws("full", None);
         fresh.restore(&Record { mode: "nonsense".into(), root: None, own: None });
         assert_eq!(fresh.snapshot(), (Mode::Default, None));
@@ -1486,10 +1659,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// **切走再切回「默认」要回到本对话原来那块地，不再新建。**
+    /// **Switching away and back to "default" must return to this conversation's original plot, not
+    /// build a new one.**
     ///
-    /// 用户 2026-10-05 报的：「新建对话 → 说第一句（建了一块地）→ 切完全访问 → 切回默认」
-    /// 又开一块新的，于是 `workplace/` 被空目录一块块堆满（「无穷无尽的工作区累加」）。
+    /// Reported by the user on 2026-10-05: "new conversation → say the first thing (a plot gets
+    /// built) → switch to full access → switch back to default" opened another one, so `workplace/`
+    /// got piled up with empty directories ("endless workspace accumulation").
     #[test]
     fn switching_back_to_default_reuses_the_conversation_own_dir() {
         let app = std::env::temp_dir().join("aox-ws-own");
@@ -1497,9 +1672,10 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
 
         let w = ws("default", None);
-        let first = w.ensure_started(&app).unwrap().expect("首条消息应当建出一块地");
+        let first = w.ensure_started(&app).unwrap().expect("the first message should create a plot");
 
-        // 来回切几次：每次都必须是同一块，且不再建目录
+        // Switch back and forth a few times: each time it must be the same plot, and no new
+        // directory is built
         for _ in 0..3 {
             w.set_mode(Mode::Full, &base).unwrap();
             assert_eq!(w.snapshot(), (Mode::Full, None));
@@ -1507,21 +1683,22 @@ mod tests {
             assert_eq!(
                 w.snapshot(),
                 (Mode::Default, Some(normalize(&first))),
-                "切回默认应当回到本对话那块地"
+                "switching back to default must return to this conversation's plot"
             );
-            assert!(msg.contains("仍在"), "提示语该说「仍在原来那块」，实际：{msg}");
-            // 首条消息那一步不该再建（`started` 仍为真 ⇒ 返回 None）
-            assert!(w.ensure_started(&app).unwrap().is_none(), "不该再建第二块地");
+            assert!(msg.contains("stays in"), "the message should say it stays in the same plot, got: {msg}");
+            // The first-message step must not build again (`started` is still true ⇒ returns None)
+            assert!(w.ensure_started(&app).unwrap().is_none(), "a second plot must not be created");
         }
 
         let made = std::fs::read_dir(app.join(WORKPLACE_DIR)).map(|d| d.count()).unwrap_or(0);
-        assert_eq!(made, 1, "来回切档不该攒出多个目录，实际 {made} 个");
+        assert_eq!(made, 1, "switching back and forth must not accumulate directories, got {made}");
 
-        // 只有**新对话**才另开一块：`reset_for_new_conversation` 会把自建地清掉
+        // Only a **new conversation** opens another one: `reset_for_new_conversation` clears the
+        // self-built plot
         w.reset_for_new_conversation();
         assert_eq!(w.snapshot(), (Mode::Default, None));
-        let second = w.ensure_started(&app).unwrap().expect("新对话应当另建一块");
-        assert_ne!(second, first, "新对话本来就该是另一块地");
+        let second = w.ensure_started(&app).unwrap().expect("a new conversation should create another plot");
+        assert_ne!(second, first, "a new conversation's plot should be a different one");
 
         let _ = std::fs::remove_dir_all(app.join(WORKPLACE_DIR));
         let _ = std::fs::remove_dir_all(&base);

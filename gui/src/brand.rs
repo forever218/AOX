@@ -1,16 +1,19 @@
-//! 首屏那张插画：亮色一套、暗色一套，按当前主题挑一张画在版心正中。
+//! The first-screen illustration: one set for light, one for dark; pick whichever matches the
+//! current theme and draw it centered in the column.
 //!
-//! # 为什么是内嵌的
+//! # Why it's embedded
 //!
-//! 两张图是 `include_bytes!` 进来的，不是从 `assets/` 里读的 —— 装完之后**只有一个 exe**，
-//! 不需要「assets 目录还在原位、权限还在、没被杀软挪走」。代价是 exe 大小：两张 PNG
-//! 共 363 KB（见 `docs/ARCH-ROADMAP.md` 的体积基准，这一项是专门记的）。
+//! The two images come from `include_bytes!`, not read from `assets/` — after install there is
+//! **just one exe**, with no need for "assets dir still in place, permissions intact, not moved
+//! by antivirus". The cost is exe size: the two PNGs total 363 KB (see the size budget in
+//! `docs/ARCH-ROADMAP.md`, which records this item specifically).
 //!
-//! # 为什么要两套图
+//! # Why two sets of images
 //!
-//! 这两张插画都是**透明底的黑线稿**，所以它们是「贴在界面底色上」的，而不是自带背景的
-//! 一张图 —— 亮色底与暗色底各需要一套（用户 2026-10-06 给的就是成对的）。也因此
-//! **换主题时只要换纹理**，不必重新解码。
+//! Both illustrations are **transparent black line art**, so they sit "on the UI background"
+//! rather than being a self-backed image — light and dark backgrounds each need a set (the user
+//! supplied a matching pair on 2026-10-06). Hence **switching theme only swaps the texture**,
+//! no re-decode needed.
 
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 
@@ -21,37 +24,39 @@ use aox::image::Bitmap;
 use crate::theme::{self, P};
 use crate::tex;
 
-/// 插画资源。两张都是 630×420 的透明底 PNG。
+/// The illustration assets. Both are 630×420 transparent-background PNGs.
 const LIGHT: &[u8] = include_bytes!("../../assets/light.png");
 const DARK: &[u8] = include_bytes!("../../assets/dark.png");
 
-/// 程序图标。与 `build.rs` 嵌进 exe 资源的是**同一个文件**，这里再嵌一份是拿它的像素
-/// 去喂窗口（原因见 [`window_icon`]）。7 帧、2.8 KB，重复嵌一次的代价可以忽略。
+/// The program icon. It is the **same file** that `build.rs` embeds as an exe resource; embedding
+/// a second copy here is to take its pixels and feed the window (see [`window_icon`] for why).
+/// 7 frames, 2.8 KB — the cost of embedding it twice is negligible.
 const ICO: &[u8] = include_bytes!("../../assets/aox.ico");
 
-/// 窗口图标：标题栏左上角、任务栏、Alt+Tab 都用它。
+/// The window icon: used by the title-bar top-left, the taskbar, and Alt+Tab.
 ///
-/// # 为什么不干脆让 Windows 用 exe 资源里那份
+/// # Why not just let Windows use the copy in the exe resource
 ///
-/// 那本来是最理想的路子（每个尺寸都能取到原生帧，一个像素都不用重采样）：
-/// `.with_icon(IconData::default())` 会让 eframe **跳过**它自己那个默认图标
-/// （黑底白字的「e」，用户 2026-10-06 报的就是它）。**但这条路实测不通** ——
-/// eframe 是跳过了，可 winit 仍会拿到那个 0×0 的 `IconData` 并给窗口装上一个无效
-/// HICON，标题栏于是画出一个系统的通用图标（一块「照片/窗口」样的灰块，比「e」还费解）。
-/// 所以只能喂**真像素**。
+/// That would have been the ideal route (every size could take a native frame, no resampling
+/// needed at all): `.with_icon(IconData::default())` makes eframe **skip** its own default icon
+/// (the black-on-white "e" the user reported on 2026-10-06). **But that route does not work in
+/// practice** — eframe skips it, yet winit still receives that 0×0 `IconData` and installs an
+/// invalid HICON on the window, so the title bar paints a system generic icon (a grey "photo/
+/// window" block, more confusing than the "e"). So we have to feed it **real pixels**.
 ///
-/// # 为什么挑这一档尺寸
+/// # Why this particular size
 ///
-/// `IconData` 只有**一个**尺寸，eframe 会拿它按 `SM_CXICON` / `SM_CXSMICON` 各缩放一次。
-/// 取自 [`theme::system_icon_size`]（也就是 `SM_CXICON`）那一帧：大的那档 1:1、
-/// 小的那档正好 2:1 —— 两档都干净。挑最大的 256 就不行：缩到 16 是 16:1，点阵会糊成一团。
+/// `IconData` carries only **one** size, and eframe scales it once each for `SM_CXICON` /
+/// `SM_CXSMICON`. Take the frame from [`theme::system_icon_size`] (that is, `SM_CXICON`): the
+/// larger bracket is 1:1 and the smaller one is exactly 2:1 — both clean. Picking the largest 256
+/// would not do: scaling down to 16 is 16:1, and the bitmap smears into a blob.
 pub fn window_icon() -> egui::IconData {
     let frames = ico_frames(ICO);
     let want = theme::system_icon_size().max(1) as u16;
     let pick = frames
         .iter()
         .find(|(size, _)| *size == want)
-        // 没有正好那一档就退而取最大的：宁可糊一点，也不要没有图标
+        // No exact bracket → fall back to the largest: better slightly blurry than no icon
         .or_else(|| frames.iter().max_by_key(|(size, _)| *size))
         .map(|(_, png)| *png);
 
@@ -64,21 +69,22 @@ pub fn window_icon() -> egui::IconData {
             width: bm.width as u32,
             height: bm.height as u32,
         },
-        // 解不开就交一张全透明的：宁可标题栏上没有图标，也不要杵一块「大概是什么」的图标
+        // Can't decode → hand back a fully transparent one: better no icon in the title bar than a "probably something" icon standing there
         Err(_) => invisible_icon(),
     }
 }
 
-/// 一枚 1×1 全透明的图标 —— 「这里不要有图标」的那条退路。
+/// A 1×1 fully transparent icon — the fallback for "there should be no icon here".
 fn invisible_icon() -> egui::IconData {
     egui::IconData { rgba: vec![0, 0, 0, 0], width: 1, height: 1 }
 }
 
-/// 把 ICO 拆成「边长 → 该帧的原始载荷」。
+/// Split an ICO into "edge length → that frame's raw payload".
 ///
-/// 结构很简单：6 字节目录头（保留 / 类型 / 帧数），随后每帧 16 字节目录项，载荷跟在后面。
-/// ⚠️ 目录项里宽高各占**一个字节**，所以 **0 表示 256**（256 塞不进一个字节）——
-/// 这正是「取 256 那帧」最容易静默失败的地方。
+/// The structure is simple: a 6-byte directory header (reserved / type / frame count), then a
+/// 16-byte directory entry per frame, with the payloads following after.
+/// ⚠️ Width and height each occupy **one byte** in a directory entry, so **0 means 256** (256
+/// doesn't fit in a byte) — this is exactly where "grab the 256 frame" most easily fails silently.
 fn ico_frames(ico: &[u8]) -> Vec<(u16, &[u8])> {
     let Some(head) = ico.get(0..6) else { return Vec::new() };
     let count = u16::from_le_bytes([head[4], head[5]]) as usize;
@@ -89,7 +95,7 @@ fn ico_frames(ico: &[u8]) -> Vec<(u16, &[u8])> {
         let size_of = |raw: u8| if raw == 0 { 256u16 } else { raw as u16 };
         let (w, h) = (size_of(entry[0]), size_of(entry[1]));
         if w != h {
-            continue; // 非正方形：这个项目里不会出现，跳过比猜一张强
+            continue; // Non-square: never happens in this project; skipping beats guessing at an image
         }
         let len = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
         let off = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
@@ -100,26 +106,28 @@ fn ico_frames(ico: &[u8]) -> Vec<(u16, &[u8])> {
     out
 }
 
-/// 插画最宽画到多少**逻辑点**。
+/// The widest the illustration may be drawn, in **logical points**.
 ///
-/// 这个数是取舍出来的：再宽就压过输入框、把首屏变成一张海报；再窄则看不清画的是什么。
-/// ⚠️ 别随手改小：630 px 的源图在 150% 缩放的屏幕上正好 1:1（420 × 1.5 = 630），
-/// 一改小就变成放大渲染，线稿的边会发虚。
+/// This number is a trade-off: any wider and it overpowers the input box, turning the first
+/// screen into a poster; any narrower and you can't make out what's drawn.
+/// ⚠️ Don't casually shrink it: the 630 px source image is exactly 1:1 on a 150%-scaled screen
+/// (420 × 1.5 = 630), and shrinking turns it into upscaled rendering where the line-art edges blur.
 const MAX_W: f32 = 420.0;
 
-/// 插画在给定宽度下占多高（逻辑点）。
+/// How tall the illustration occupies at a given width (logical points).
 ///
-/// 宽高比是**从 PNG 头里读**的，不是等解码完再问纹理 —— 首屏要在图还没解好之前
-/// 就把它的位置留出来，否则「解好的那一刻整块内容会往下跳一截」。
+/// The aspect ratio is **read from the PNG header**, not queried from the texture after decoding —
+/// the first screen must reserve its space before the image finishes decoding, otherwise "the
+/// moment it decodes, the whole block of content jumps down".
 pub fn height(dark: bool, max_w: f32) -> f32 {
     let (w, h) = ihdr(if dark { DARK } else { LIGHT });
     max_w.min(MAX_W) * h / w
 }
 
-/// 从 PNG 字节里读出 `(宽, 高)`。
+/// Read `(width, height)` straight from the PNG bytes.
 ///
-/// PNG 的 IHDR 永远紧跟在「8 字节签名 + 4 字节长度 + 4 字节 `IHDR`」之后，
-/// 宽高各是 4 字节大端。
+/// A PNG's IHDR always follows "8-byte signature + 4-byte length + 4-byte `IHDR`", with width
+/// and height each 4 bytes big-endian.
 fn ihdr(png: &[u8]) -> (f32, f32) {
     let be = |i: usize| {
         u32::from_be_bytes([png[i], png[i + 1], png[i + 2], png[i + 3]]) as f32
@@ -127,18 +135,19 @@ fn ihdr(png: &[u8]) -> (f32, f32) {
     (be(16), be(20))
 }
 
-/// 一张插画的一生。
+/// The life of one illustration.
 enum Slot {
-    /// 还没开始解（第一帧才会去起线程）
+    /// Not started decoding yet (only the first frame kicks off a thread)
     Idle,
     Loading(Receiver<Result<Bitmap, String>>),
     Ready(TextureHandle),
-    /// 解不开。**不再重试** —— 它是编译期固定的一段字节，这台机器上解不开就是解不开，
-    /// 每帧重来只是白烧 CPU。留一句话在屏幕上，别让首屏整块空着又不给原因。
+    /// Can't decode. **No retry** — it's a fixed blob of bytes from compile time; if this machine
+    /// can't decode it, that's that, and redoing it every frame just burns CPU for nothing. Leave a
+    /// line of text on screen so the first screen isn't a wordless blank block.
     Failed(String),
 }
 
-/// 首屏插画（`[亮, 暗]` 两套）。
+/// The first-screen illustration (`[light, dark]`, two sets).
 pub struct Art {
     slots: [Slot; 2],
 }
@@ -148,20 +157,22 @@ impl Art {
         Self { slots: [Slot::Idle, Slot::Idle] }
     }
 
-    /// 每帧一次：该起线程的起线程、该收结果的收结果。
+    /// Once per frame: kick off threads that should start, collect results that should be collected.
     ///
-    /// 两张**一起**解，而不是「用到哪张才解哪张」：一张 630×420 的解码是毫秒级，
-    /// 而「切主题的那一刻才开始解」会让切换后的头几帧空着 —— 那比多花几毫秒糟得多。
+    /// Both images decode **together**, rather than "decode whichever one gets used": a 630×420
+    /// decode is millisecond-scale, whereas "start decoding only the moment the theme switches"
+    /// leaves the first few frames blank after the switch — far worse than a few extra milliseconds.
     pub fn poll(&mut self, ctx: &Context) {
         let mut waiting = false;
         for (i, src) in [LIGHT, DARK].into_iter().enumerate() {
-            // 先把槽位取出来再回填：`match &mut self.slots[i]` 之后在分支里写 `self.slots[i]`
-            // 会同时借两次（egui 那边这叫「借用的体操」，这里用 `replace` 一步绕开）。
+            // Take the slot out first and write it back: `match &mut self.slots[i]` followed by
+            // writing `self.slots[i]` inside a branch would borrow it twice (egui people call this
+            // "borrow gymnastics"; here `replace` sidesteps it in one step).
             let slot = std::mem::replace(&mut self.slots[i], Slot::Idle);
             self.slots[i] = match slot {
                 Slot::Idle => {
                     let (tx, rx) = channel();
-                    // 解码是同步的、要过一遍 GDI+（见 `aox::image`），别占界面线程
+                    // Decoding is synchronous and goes through GDI+ (see `aox::image`); don't block the UI thread
                     std::thread::spawn(move || {
                         let _ = tx.send(aox::image::decode_bytes(src));
                     });
@@ -175,43 +186,47 @@ impl Art {
                         waiting = true;
                         Slot::Loading(rx)
                     }
-                    Err(TryRecvError::Disconnected) => Slot::Failed("解码线程提前结束了".into()),
+                    Err(TryRecvError::Disconnected) => Slot::Failed(aox::i18n::t("the decoder thread ended prematurely").into()),
                 },
                 other => other,
             };
         }
-        // 还在解就要求下一帧 —— egui 只在有输入时才重绘，不主动要就会永远停在「没解完」
+        // Still decoding → request the next frame: egui only repaints on input, so without
+        // asking it would stay frozen at "not done" forever
         if waiting {
             ctx.request_repaint();
         }
     }
 
-    /// 按当前主题把插画铺在 `ui` 里（水平居中由调用方保证），返回它占的高度。
+    /// Lay the illustration out in `ui` according to the current theme (horizontal centering is the
+    /// caller's job), returning the height it occupies.
     ///
-    /// 没画出来（还在解 / 解不开）返回 `0.0` —— 调用方据此决定垂直居中的算法，
-    /// 而不是「照着一个还没到的高度先把位置占了」。
+    /// If nothing was drawn (still decoding / can't decode) return `0.0` — the caller uses that to
+    /// decide its vertical-centering formula, rather than "reserving space for a height that hasn't arrived".
     pub fn show(&mut self, ui: &mut Ui, max_w: f32) -> f32 {
         let dark = theme::mode() == theme::Mode::Dark;
         let slot = &self.slots[if dark { 1 } else { 0 }];
         match slot {
             Slot::Ready(tex) => {
-                // 尺寸用 [`height`] 算出来的同一份数，而不是纹理自己的像素数 ——
-                // 两处独立算的话，「留白的高度」与「画出来的高度」会差一点点，
-                // 而这种差只会在垂直居中的时候露馅（画偏了半行）。
+                // The size uses the same number [`height`] computed, not the texture's own pixel
+                // count — computing it in two places would make "the reserved height" and "the drawn
+                // height" differ slightly, and that difference only shows up in vertical centering
+                // (drawn half a line off).
                 let size = Vec2::new(max_w.min(MAX_W), height(dark, max_w));
                 let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
                 ui.painter().image(
                     tex.id(),
                     rect,
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    // 不染色：画出来就是画本身的样子（主题差异靠**换图**，不靠滤镜）
+                    // No tinting: what's drawn is the art as-is (theme difference comes from
+                    // **swapping the image**, not a filter)
                     Color32::WHITE,
                 );
                 size.y
             }
             Slot::Failed(e) => {
                 ui.label(
-                    RichText::new(format!("插画显示不出来：{e}"))
+                    RichText::new(aox::tf!("cannot show the illustration: {}", e))
                         .color(P::text_faint())
                         .size(13.0),
                 );
@@ -226,24 +241,26 @@ impl Art {
 mod tests {
     use super::*;
 
-    /// ICO 目录要解得动：每帧都得取到真载荷，且「0 表示 256」这条要成立。
+    /// The ICO directory must be parseable: every frame has to yield a real payload, and the
+    /// "0 means 256" rule has to hold.
     ///
-    /// 为什么值得钉：`window_icon` 拿不到帧时是**悄悄**退成一张全透明图标的 ——
-    /// 不报错、不崩，只是标题栏上图标没了。所以「找得到」这件事必须有人盯着。
+    /// Why it's worth pinning: when `window_icon` can't find a frame it **silently** falls back to
+    /// a fully transparent icon — no error, no crash, just a vanished title-bar icon. So someone has
+    /// to watch over the "can it be found" question.
     #[test]
     fn every_ico_frame_is_reachable() {
         let frames = ico_frames(ICO);
-        assert!(frames.len() >= 5, "内嵌的 ico 应该有多档尺寸，实际只有 {}", frames.len());
+        assert!(frames.len() >= 5, "the embedded ico should have several sizes, but actually has {}", frames.len());
         for (size, payload) in &frames {
-            assert!((16..=256).contains(size), "尺寸不合理：{size}");
+            assert!((16..=256).contains(size), "unreasonable size: {size}");
             assert!(
                 payload.starts_with(&[0x89, b'P', b'N', b'G']),
-                "{size}×{size} 那帧不是 PNG 载荷"
+                "the {size}×{size} frame is not a PNG payload"
             );
         }
-        // 目录项里 0 表示 256：它必须被认出来，而不是当成「0×0」丢掉
-        assert!(frames.iter().any(|(s, _)| *s == 256), "256 那帧没被认出来");
-        // 32 是 `window_icon` 的兜底尺寸，一定要在
-        assert!(frames.iter().any(|(s, _)| *s == 32), "没有 32×32 那帧");
+        // A 0 in a directory entry means 256: it must be recognized, not dropped as "0×0"
+        assert!(frames.iter().any(|(s, _)| *s == 256), "the 256 frame was not recognized");
+        // 32 is `window_icon`'s fallback size, so it must be present
+        assert!(frames.iter().any(|(s, _)| *s == 32), "there is no 32×32 frame");
     }
 }

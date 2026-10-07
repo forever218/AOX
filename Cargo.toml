@@ -1,6 +1,8 @@
 [workspace]
-# 根 crate 仍是 CLI 主体；gui/ 是独立的图形界面 crate，二者共用 src/lib.rs 暴露的核心库。
-# default-members 保持为 ["."]，这样 `cargo build` / `cargo run` 的行为与加 GUI 之前完全一致。
+# The root crate is still the CLI proper; gui/ is a separate graphical crate, and the two share
+# the core library exposed by src/lib.rs.
+# default-members stays ["."], so `cargo build` / `cargo run` behave exactly as they did before
+# the GUI was added.
 members = [".", "gui"]
 default-members = ["."]
 resolver = "2"
@@ -27,33 +29,35 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 toml = "0.8"
 anyhow = "1"
 async-trait = "0.1"
-# 终端 Markdown 渲染（标题/代码块/列表/表格）
+# Terminal Markdown rendering (headings / code blocks / lists / tables)
 termimad = "0.34"
 
 [target.'cfg(windows)'.dependencies]
-# 让传统 conhost 也支持 ANSI 颜色（VT 处理 + UTF-8 输出代码页）；
-# 另外用 GetLocalTime 给历史记录生成「本地时间」文件名与显示串 ——
-# 这样就不必为了一个时间戳引入 chrono / time。
+# Let the legacy conhost support ANSI colours too (VT processing + UTF-8 output code page);
+# and use GetLocalTime to produce "local time" file names and display strings for history --
+# that way a single timestamp doesn't drag in chrono / time.
 windows-sys = { version = "0.59", features = [
     "Win32_System_Console",
     "Win32_Foundation",
     "Win32_System_SystemInformation",
-    # 历史列表要显示「最后一次对话时间」：FileTimeToLocalFileTime 在 Storage::FileSystem，
-    # FileTimeToSystemTime 在 System::Time，两个都得开。
+    # The history list shows "time of the last conversation": FileTimeToLocalFileTime lives in
+    # Storage::FileSystem and FileTimeToSystemTime in System::Time, so both have to be enabled.
     "Win32_Storage_FileSystem",
     "Win32_System_Time",
-    # 插件子进程的围栏（`src/sandbox.rs`）：Job Object 本体、找回并恢复主线程
-    # （`CreateToolhelp32Snapshot` + `OpenThread` + `ResumeThread`）、
-    # 以及 `CreateJobObjectW` 签名里的 SECURITY_ATTRIBUTES（Win32_Security）。
+    # Fencing plugin subprocesses (`src/sandbox.rs`): the Job Object itself, finding and resuming
+    # the main thread (`CreateToolhelp32Snapshot` + `OpenThread` + `ResumeThread`), and the
+    # SECURITY_ATTRIBUTES in `CreateJobObjectW`'s signature (Win32_Security).
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Security",
-    # 界面显示图片（`src/image.rs`）：GDI+ 解码本机图片文件。用系统自带的那份解码器，
-    # 而不是往二进制里塞一个（`image` 约 +300~500 KB、`png` 约 +100 KB 且只认 PNG）。
+    # Displaying images in the UI (`src/image.rs`): GDI+ decodes local image files. Use the
+    # decoder that ships with the system rather than packing one into the binary (`image` is
+    # about +300-500 KB; `png` about +100 KB and only understands PNG).
     "Win32_Graphics_GdiPlus",
-    # 内嵌的图片资源（首屏那张插画）在内存里、没有文件路径，得先包成一个 IStream
-    # 再交给 GDI+（`SHCreateMemStream`，在 Win32_UI_Shell）。
+    # The embedded image asset (the empty-state illustration) lives in memory with no file path,
+    # so it has to be wrapped in an IStream before GDI+ can take it (`SHCreateMemStream`, in
+    # Win32_UI_Shell).
     "Win32_UI_Shell",
 ] }
 

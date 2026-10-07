@@ -1,13 +1,14 @@
-//! 构建脚本：把图标与版本信息写进 Windows exe 资源。
+//! Build script: writes the icon and version information into the Windows exe resources.
 //!
-//! 直接调用 Windows SDK 的 rc.exe 生成 .res 再交给链接器，不用 winresource——
-//! 后者靠 reg.exe 查找 SDK，而本机安全策略禁止 reg.exe。
-//! 任何一步失败都只产出警告，不阻断构建（图标缺失不影响功能）。
+//! It calls the Windows SDK's rc.exe to produce a .res and hands it to the linker, rather than
+//! using winresource — the latter locates the SDK via reg.exe, and this machine's security policy
+//! forbids reg.exe. Any step failing only produces a warning and never blocks the build (a missing
+//! icon does not affect functionality).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// 本机已知存在的 SDK 目录（与 .cargo/config.toml 使用的版本一致）。
+/// SDK directories known to exist on this machine (the same versions `.cargo/config.toml` uses).
 const SDK_BIN_CANDIDATES: &[&str] = &[
     r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64",
     r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64",
@@ -16,46 +17,53 @@ const SDK_BIN_CANDIDATES: &[&str] = &[
 const VERSION: &str = "0.1.0";
 
 fn main() {
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+
+    // The language registry is **platform independent**, so do it first — non-Windows platforms
+    // must be able to build every language variant too.
+    emit_lang(&manifest_dir, &out_dir);
+
     if !cfg!(windows) {
         return;
     }
 
-    // 分发安全闸门：Windows 上必须静态链接 CRT。
+    // Distribution safety gate: on Windows the CRT must be statically linked.
     //
-    // 动态 CRT 会让 exe 的导入表带上 VCRUNTIME140.dll，而该 DLL **不是** Windows 自带组件
-    // （来自 VC++ 2015-2022 Redistributable），干净装机上会直接报「找不到 VCRUNTIME140.dll」
-    // 启动失败——这类问题本地永远复现不出来，只能在构建期拦。
+    // A dynamic CRT puts VCRUNTIME140.dll into the exe's import table, and that DLL is **not** a
+    // Windows built-in component (it comes from the VC++ 2015-2022 Redistributable), so on a clean
+    // install the program dies at startup with "VCRUNTIME140.dll not found" — the kind of problem
+    // that can never be reproduced locally, so it has to be caught at build time.
     //
-    // 判据用 CARGO_CFG_TARGET_FEATURE（cargo 为 build script 提供的目标特性列表，
-    // 已实测：加 flag 时含 crt-static、不加时不含），比 build script 自身的 cfg! 更贴近目标产物；
-    // 两者取或，避免 cargo 版本差异导致漏报。
+    // The signal used is CARGO_CFG_TARGET_FEATURE (cargo's target-feature list for the build
+    // script; measured: it contains crt-static when the flag is set and not when it isn't), which
+    // tracks the target artifact more closely than the build script's own cfg!. Take the OR of the
+    // two, to avoid a miss caused by cargo version differences.
     if !target_features().iter().any(|f| f == "crt-static") {
         println!(
-            "cargo:warning=AOX 未启用静态 CRT：产物将依赖 VCRUNTIME140.dll，\
-             在未安装 VC++ 运行库的 Windows 上无法启动。\
-             请在 .cargo/config.toml 的 [target.x86_64-pc-windows-msvc] 下加 \
-             rustflags = [\"-C\", \"target-feature=+crt-static\"]，或改用工装环境变量 \
-             RUSTFLAGS=\"-C target-feature=+crt-static\" 重新构建。"
+            "cargo:warning=AOX was built without a static CRT: the artifact will depend on \
+             VCRUNTIME140.dll and cannot start on Windows without the VC++ runtime installed. \
+             Please add rustflags = [\"-C\", \"target-feature=+crt-static\"] under \
+             [target.x86_64-pc-windows-msvc] in .cargo/config.toml, or rebuild with the \
+             environment variable RUSTFLAGS=\"-C target-feature=+crt-static\"."
         );
     }
 
     println!("cargo:rerun-if-changed=assets/aox.ico");
     println!("cargo:rerun-if-changed=build.rs");
 
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let ico = manifest_dir.join("assets").join("aox.ico");
     if !ico.exists() {
-        println!("cargo:warning=assets/aox.ico 不存在，跳过 exe 图标（可运行 tools/make_icon.py 生成）");
+        println!("cargo:warning=assets/aox.ico does not exist, skipping the exe icon (run tools/make_icon.py to generate it)");
         return;
     }
 
     let Some(rc_exe) = find_rc() else {
-        println!("cargo:warning=未找到 Windows SDK 的 rc.exe，跳过 exe 图标");
+        println!("cargo:warning=rc.exe from the Windows SDK was not found, skipping the exe icon");
         return;
     };
 
-    // .rc 里的反斜杠需要转义
+    // Backslashes inside the .rc need escaping.
     let ico_esc = ico.display().to_string().replace('\\', "\\\\");
     let rc_src = out_dir.join("aox.rc");
     let ver_commas = format!("{},0,0,0", VERSION.split('.').next().unwrap_or("0"));
@@ -91,7 +99,7 @@ END
 "#
     );
     if let Err(e) = std::fs::write(&rc_src, rc_text) {
-        println!("cargo:warning=写入 .rc 失败，跳过 exe 图标: {e}");
+        println!("cargo:warning=failed to write the .rc, skipping the exe icon: {e}");
         return;
     }
 
@@ -104,21 +112,22 @@ END
         .output()
     {
         Ok(o) if o.status.success() => {
-            // 把 .res 交给 link.exe（MSVC 链接器接受 .res 作为输入）
+            // Hand the .res to link.exe (the MSVC linker accepts .res as an input).
             println!("cargo:rustc-link-arg-bins={}", res.display());
         }
         Ok(o) => println!(
-            "cargo:warning=rc.exe 编译资源失败（不影响功能）: {}",
+            "cargo:warning=rc.exe failed to compile the resource (does not affect functionality): {}",
             String::from_utf8_lossy(&o.stderr).trim()
         ),
-        Err(e) => println!("cargo:warning=无法运行 rc.exe（不影响功能）: {e}"),
+        Err(e) => println!("cargo:warning=could not run rc.exe (does not affect functionality): {e}"),
     }
 }
 
-/// 目标平台当前启用的 rustc 特性列表。
+/// The target platform's currently enabled rustc features.
 ///
-/// 优先取 `CARGO_CFG_TARGET_FEATURE`（cargo 提供给 build script 的目标特性，逗号分隔）；
-/// 该变量缺失时退回 build script 自身的 `cfg!(target_feature=...)`。
+/// It prefers CARGO_CFG_TARGET_FEATURE (the target features cargo provides to the build script,
+/// comma separated); when that variable is missing it falls back to the build script's own
+/// `cfg!(target_feature=...)`.
 fn target_features() -> Vec<String> {
     if let Ok(v) = std::env::var("CARGO_CFG_TARGET_FEATURE") {
         return v.split(',').map(|s| s.trim().to_string()).collect();
@@ -130,7 +139,8 @@ fn target_features() -> Vec<String> {
     v
 }
 
-/// 定位 rc.exe：先查已知目录，再扫 Windows Kits（取最高版本）。
+/// Locate rc.exe: check the known directories first, then scan Windows Kits (taking the highest
+/// version).
 fn find_rc() -> Option<PathBuf> {
     for dir in SDK_BIN_CANDIDATES {
         let p = Path::new(dir).join("rc.exe");
@@ -147,4 +157,70 @@ fn find_rc() -> Option<PathBuf> {
         .collect();
     found.sort();
     found.pop().map(|v| v.join("x64").join("rc.exe"))
+}
+
+/// **The source language** — the literals in the code *are* this variant's final wording, so it
+/// **needs no catalogue**. It must match `SOURCE` in `src/i18n.rs` (i18n.rs's
+/// `catalog_presence_matches_source` test will catch the two drifting apart).
+const SOURCE_CODE: &str = "en";
+
+/// Generate the language registry (which `src/i18n.rs` `include!`s).
+///
+/// **One distribution speaks one language** — this is where "one language, one distribution" lands:
+/// the language is fixed at **compile time** and there is no in-app switch. Installing the English
+/// build gives you English throughout; installing the Chinese build gives you Chinese throughout,
+/// system prompt and tool descriptions switching along with everything else.
+///
+/// - `AOX_LANG` (language code, **defaults to `en`**): which language this binary speaks.
+///   For a non-source language only that one catalogue is `include_str!`ed — the other languages'
+///   strings **never enter the binary**; for the source language not even a catalogue is embedded
+///   (the literals are the wording).
+///
+/// The language code maps one-to-one onto `locales/<code>.toml`; a missing file fails the build
+/// outright — "a language was named but no catalogue was shipped" is the kind of trap that compiles
+/// fine and only shows up as an all-source-language screen at runtime, so it is better to blow up
+/// here.
+///
+/// Adding a language = ① `locales/<code>.toml`; ② add a `Lang` variant and detection arm in
+/// `src/i18n.rs`; ③ build with `AOX_LANG=<code>`.
+fn emit_lang(manifest_dir: &Path, out_dir: &Path) {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=locales");
+    println!("cargo:rerun-if-env-changed=AOX_LANG");
+
+    let code = std::env::var("AOX_LANG")
+        .unwrap_or_else(|_| "en".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if code.is_empty() {
+        panic!("AOX_LANG is empty: name at least one language, e.g. AOX_LANG=en or AOX_LANG=zh");
+    }
+
+    // The source language embeds no catalogue: the literals are the wording it wants.
+    let catalog = if code == SOURCE_CODE {
+        "\"\"".to_string()
+    } else {
+        let file = manifest_dir.join("locales").join(format!("{code}.toml"));
+        if !file.exists() {
+            panic!(
+                "AOX_LANG=`{code}` has no matching catalogue: {}\n\
+                 Adding a language takes three steps: ① locales/{code}.toml; ② add a Lang variant \
+                 and a from_code arm in src/i18n.rs; ③ build with AOX_LANG={code}.",
+                file.display()
+            );
+        }
+        println!("cargo:rerun-if-changed={}", file.display());
+        // `{:?}` yields the Rust-escaped string literal, which also handles Windows backslashes.
+        format!("include_str!({:?})", file.display().to_string())
+    };
+
+    let src = format!(
+        "// Generated by build.rs, **do not edit by hand** (edit build.rs or the AOX_LANG env var).\n\
+         /// Which language this binary speaks.\n\
+         pub const CODE: &str = {code:?};\n\n\
+         /// The one catalogue this binary embedded; empty string for the source-language build.\n\
+         pub const CATALOG: &str = {catalog};\n"
+    );
+    std::fs::write(out_dir.join("langs.rs"), src)
+        .unwrap_or_else(|e| panic!("failed to write langs.rs: {e}"));
 }

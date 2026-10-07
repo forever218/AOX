@@ -1,94 +1,116 @@
-# AOX 界面定制层（UI 缝）· 立项书
+# AOX UI customization layer (the UI seam) · project charter
 
-- **状态**：**已立项，缓做**（2026-10-03 由用户决定从阶段 6 移出，单独立项；不属阶段 6 范围）
-- **来源**：用户提出「能不能让整个界面的元素和布局都进入『用户调用 AI 更改』的范围」，
-  举例为「加一个宠物 / 改 hithere 文字 / 删掉输入预设 / 改输入框样式」，
-  类比「界面是 HTML，用户做 JS/CSS 注入」（**仅为类比，非真注入**）。
-- **前身**：`docs/ARCH-ROADMAP.md` 阶段 6 的「追加议题：界面定制层（UI 缝）与行为沙箱」一节 ——
-  原文保留在 ROADMAP 里不删，本文件是它的立项版（补齐待办与决策项）。
+- **Status**: **chartered, deferred** (moved out of stage 6 by user decision on 2026-10-03 and
+  chartered separately; not part of stage 6)
+- **Origin**: the user asked "can the whole interface's elements and layout be brought into the
+  range of 'the user asks the AI to change it'", giving examples like "add a pet / change the
+  hi-there text / remove the input presets / restyle the input box", by analogy with "the
+  interface is HTML and the user injects JS/CSS" (**an analogy only, not real injection**).
+- **Predecessor**: the section "additional topic: UI customization layer (UI seam) and
+  behaviour sandbox" in stage 6 of `docs/ARCH-ROADMAP.md` -- the original text stays in the
+  ROADMAP and is not deleted; this file is the chartered version (with the to-dos and
+  decisions filled in).
 
 ---
 
-## 一、目标：四类能力，按风险递增
+## 1. The goal: four tiers of capability, ascending in risk
 
-| 档 | 能力 | 用户举的例子 | 真正需要 AI 吗 |
+| Tier | Capability | The user's example | Does it really need AI? |
 |---|---|---|---|
-| ① | **文本覆盖** | 改 hithere 文字 | 不需要，纯配置即可 |
-| ② | **样式 / 属性覆盖** | 改输入框圆角、配色、字号 | 不需要，纯配置即可 |
-| ③ | **结构显隐** | 删掉输入预设 | 才咬合「让 AI 写东西」 |
-| ④ | **插槽内注入新组件** | 加一个宠物 | 才咬合「让 AI 写东西」 |
+| ① | **text overrides** | change the hi-there text | no, plain config is enough |
+| ② | **style / property overrides** | change the input box radius, colours, font size | no, plain config is enough |
+| ③ | **structural show/hide** | remove the input presets | *this* is where "let the AI write things" bites |
+| ④ | **injecting new components into slots** | add a pet | *this* is where "let the AI write things" bites |
 
-> ①② 根本不需要 AI（配置层就够）；**③④ 才是这个议题真正的价值** —— 也就是下面说的
-> 「让 AI 当**离线定制作者**」。换言之：如果只做 ①②，那这个立项可以缩成「多写几个 `[ui]` 配置项」，
-> 不必引入任何脚本或引擎。
+> ① and ② don't need AI at all (the config layer suffices); **③ and ④ are the real value in
+> this topic** -- which is what "the AI as an **offline customization author**" below means.
+> Put another way: if only ① and ② were built, this charter could shrink to "write a few more
+> `[ui]` config items" and would need no scripting or engine at all.
 
-## 二、为什么这不是「把现有代码配置化」
+## 2. Why this isn't "turning the existing code into configuration"
 
-- egui 是**即时模式**：没有 DOM、没有可寻址节点树，无法像 CSS 选择器那样「选中某个元素」。
-- GUI 呈现层是 **7712 行手写调用**（`app.rs` 2698 / `activity.rs` 2206 / `theme.rs` 803 /
-  `markdown.rs` 712 / `syntax.rs` 660 / `bridge.rs` 540），`ui.*` 调用约 **350 处**，
-  **零元素注册表**（现有 6 处 `Id::new` / `push_id` 只服务 egui 内部状态，不构成可寻址节点）。
-- → 所以这不是「把现有代码配置化」，而是**新增一层保留模式定制层**：
-  **元素语义 id + 属性覆盖 + 具名插槽 + 沙箱化补丁**。
+- egui is **immediate mode**: no DOM, no addressable node tree, so nothing like a CSS selector
+  can "select an element".
+- The GUI presentation layer is **7,712 lines of hand-written calls** (`app.rs` 2698 /
+  `activity.rs` 2206 / `theme.rs` 803 / `markdown.rs` 712 / `syntax.rs` 660 / `bridge.rs` 540),
+  with about **350 `ui.*` call sites**, and **zero element registry** (the 6 existing
+  `Id::new` / `push_id` uses serve egui's internal state only and are not addressable nodes).
+- → so this is not "turning the existing code into configuration" but **adding a retained-mode
+  customization layer on top**: **semantic element ids + property overrides + named slots +
+  sandboxed patches**.
 
-## 三、AI 的定位：离线定制作者（不是运行时 UI 生成器）
+## 3. Where the AI sits: offline customization author (not a runtime UI generator)
 
-流程：**读元素清单**（id 表 + 可用属性 + 当前值）→ **产出补丁或插件** →
-**人工审阅后落地**成可命名、可分享、可回滚的**定制包**。
+Flow: **read the element manifest** (id table + available properties + current values) →
+**produce a patch or a plugin** → **land it after human review** as a nameable, shareable,
+rollbackable **customization pack**.
 
-- **不是**运行时每帧生成 UI —— 那会同时输掉延迟、成本、可复现性与可审计性。
-- 骨架直接对齐阶段 5 的 `profile → bundle → patch`（只加一个 `[ui]` 分支）。
-- **「加宠物」的自然形态**：给插件加「**UI 贡献**」能力（插件声明往哪个**具名插槽**放自绘内容），
-  而不是让 AI 直接构造界面。宠物 = 一个预置插件 + 一条插槽声明。
+- **Not** generating UI every frame at runtime -- that loses on latency, cost, reproducibility
+  and auditability all at once.
+- The skeleton lines up directly with stage 5's `profile → bundle → patch` (just one more
+  `[ui]` branch).
+- **The natural shape of "add a pet"**: give plugins a "**UI contribution**" capability
+  (a plugin declares which **named slot** it draws into), rather than letting the AI construct
+  interface directly. A pet = one preinstalled plugin + one slot declaration.
 
-## 四、三条硬约束（写入验收前提）
+## 4. Three hard constraints (written into the acceptance criteria)
 
-1. **元素 id 是长期契约**：必须用**语义 id**（如 `input.preset[remove]`）而非位置式，
-   并长期维护兼容 —— **这是本方案最大的持续成本**，也是它与「随手改改」的本质区别。
-2. **布局不做任意重排**：只开放「插槽内部」与「属性覆盖」，不抽象通用布局语言
-   （成本与收益不成比例）。
-3. **必须可降级**：任何补丁 / 脚本的**解析或求值失败都要回落默认界面**（不得白屏、不得崩溃）；
-   属性白名单 + 体量上限 + 能力申请统一进 `AuthPolicy`。
+1. **Element ids are a long-term contract**: they must be **semantic ids** (e.g.
+   `input.preset[remove]`) rather than positional, and must stay compatible over the long run --
+   **this is the largest ongoing cost of the design**, and the essential difference between it
+   and "just tweak it as you go".
+2. **No arbitrary layout reflow**: only "inside a slot" and "property overrides" are opened up;
+   no general layout language is abstracted (cost and benefit are out of proportion).
+3. **Must degrade gracefully**: a **parse or evaluation failure of any patch / script falls back
+   to the default interface** (no blank screen, no crash); the property allow-list, the size
+   caps and the capability requests all go into `AuthPolicy` together.
 
-## 五、开工前必须先拍板的三件事
+## 5. Three things that must be settled before work starts
 
-| # | 决策 | 说明 |
+| # | Decision | Notes |
 |---|---|---|
-| 1 | **引擎选型**（仅当走进程内） | 见下表。只有「每帧绘制」真要做时才**必须**进程内 |
-| 2 | **宠物怎么实现** | ①进程内脚本（每帧绘制）vs ②**子进程 + 声明式动画规格**（组件产出动画描述、宿主照渲染）—— ②是「表达力换体积」，可继续走 **+0 KB** 路线 |
-| 3 | **体积怎么记** | 单列一档 1.2 MB，或按 `installer/*.iss` 的 `#ifdef` 模式出**独立包**（已有 `BUNDLE_PYTHON` 先例：3.2 MB → 11.9 MB） |
+| 1 | **engine choice** (only if in-process) | see the table below. In-process is **mandatory** only if "draw every frame" is really needed |
+| 2 | **how the pet is implemented** | ① in-process script (draw every frame) vs ② **subprocess + declarative animation spec** (the component emits an animation description and the host renders it) -- ② trades expressiveness for size and can keep the **+0 KB** route |
+| 3 | **how to account for the size** | a separate 1.2 MB tier, or a **separate package** following the `#ifdef` pattern in `installer/*.iss` (there is already the `BUNDLE_PYTHON` precedent: 3.2 MB → 11.9 MB) |
 
-引擎候选（体积增量为**实测前**的估计，来自 ROADMAP 阶段 6 选型表）：
+Engine candidates (size deltas are **pre-measurement** estimates, from the stage-6 selection
+table in the ROADMAP):
 
-| 方案 | 体积增量 | 备注 |
+| Option | Size delta | Notes |
 |---|---|---|
-| `mlua`（vendored Lua） | +0.3~0.6 MB | 脚本化提示词/主题/hook 足够，沙箱可控；**但引入 C 编译依赖**，要与「静态 CRT / 单 exe」的构建链重新对齐 |
-| `wasmi`（纯 Rust 解释器） | +0.5~1.2 MB | **唯一真沙箱**（wasm 线性内存隔离）；但写脚本得先有 wasm 工具链，与「AI 随手写脚本」的定位打架 |
-| `rhai`（纯 Rust 脚本） | +0.8~1.5 MB | 无 C 依赖、语法接近 Rust、AI 最易写；**倾向项** |
-| Wasmer | +10~20 MB | 超标 |
-| Wasmtime（JIT） | +15~30 MB | **禁用** —— 会毁掉「几 MB」的体质 |
+| `mlua` (vendored Lua) | +0.3~0.6 MB | enough for scripted prompts / themes / hooks, sandbox is controllable; **but it pulls in a C build dependency**, which has to be re-aligned with the "static CRT / single exe" toolchain |
+| `wasmi` (pure-Rust interpreter) | +0.5~1.2 MB | **the only true sandbox** (wasm linear-memory isolation); but writing scripts needs a wasm toolchain first, which fights the "the AI dashes off a script" positioning |
+| `rhai` (pure-Rust scripting) | +0.8~1.5 MB | no C dependency, syntax close to Rust, easiest for an AI to write; **the preferred option** |
+| Wasmer | +10~20 MB | over budget |
+| Wasmtime (JIT) | +15~30 MB | **forbidden** -- it would wreck the "a few MB" physique |
 
-若将来确实需要 JIT：走 `cargo build --features wasm-jit` **单独出包**，主包不动。
+If a JIT really is needed later: `cargo build --features wasm-jit` **as a separate package**,
+with the main package untouched.
 
-## 六、与阶段 6（6a / 6b）的关系：6b 不烧桥
+## 6. Relationship to stage 6 (6a / 6b): 6b burns no bridges
 
-- 6b 的 `ComponentHook` 实现的是**已有的** `trait Hook`；它内部怎么拿到 `Verdict`
-  （子进程 RPC 还是进程内求值）是**实现细节**。
-- → **6b 选子进程不烧桥**：将来真需要进程内，是**再加一个 provider**
-  （`HookChain` 里可以同时挂两种来源），不是推倒重来。
-- 本项目依赖 6a / 6b 的产出（`AgentLoop` / 组件注册表 / 能力申请通道），
-  但**可以晚于它们很久**再开工，互不阻塞。
+- 6b's `ComponentHook` implements the **already existing** `trait Hook`; how it obtains a
+  `Verdict` internally (subprocess RPC or in-process evaluation) is an **implementation
+  detail**.
+- → **6b choosing a subprocess burns no bridges**: if in-process really is needed later, that is
+  **one more provider** (a `HookChain` can hold both kinds of source at once), not a rewrite.
+- This project depends on the output of 6a / 6b (`AgentLoop` / the component registry / the
+  capability-request channel), but can start **long after** them without blocking either way.
 
-## 七、待办清单
+## 7. To-do list
 
-- [ ] 确认「本期做 / 继续缓做」
-- [ ] 拍板引擎（若走进程内）或确认「宠物走声明式动画规格」（若继续 +0 KB）
-- [ ] 盘点 GUI 元素并定**语义 id 表**（`app` / `activity` / `markdown` 三块为主）
-- [ ] 定 `[ui]` 配置形状（对齐阶段 5 的 `profile → bundle → patch`）
-- [ ] 属性白名单 + 体量上限 + 降级路径（失败回落默认界面）
-- [ ] 一个最小 demo：改一处文本 + 隐藏一个按钮 + 插槽里放一个宠物
+- [ ] settle "build this release / keep deferring"
+- [ ] settle the engine (if in-process) or confirm "the pet goes the declarative animation spec
+      route" (if continuing at +0 KB)
+- [ ] inventory the GUI elements and fix the **semantic id table** (mainly `app` / `activity` /
+      `markdown`)
+- [ ] fix the `[ui]` config shape (aligned with stage 5's `profile → bundle → patch`)
+- [ ] property allow-list + size caps + degradation path (failures fall back to the default
+      interface)
+- [ ] a minimal demo: change one piece of text + hide one button + put a pet in a slot
 
-## 八、风险
+## 8. Risk
 
-**高**。这是唯一同时动「**体积**」与「**安全面**」的议题，且引入一份需要**长期维护**的契约
-（元素语义 id）。建议在 6a / 6b 落地并稳定运行一段时间之后再启动。
+**High**. This is the only topic that touches **size** and **attack surface** at the same time,
+and it introduces a **long-term-maintained** contract (semantic element ids). Recommend starting
+it only after 6a / 6b have landed and run stably for a while.

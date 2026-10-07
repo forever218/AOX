@@ -1,20 +1,25 @@
-# store-jsonl —— 对话历史的存储形态：一次对话一个文件（JSONL）。
+# store-jsonl -- the storage form of conversation history: one file per conversation (JSONL).
 #
-# 值等于代码默认（`StoreConfig` / `HistoryConfig` 的 `#[serde(default)]`）——
-# 与 `tools.toml` 同理，写出来是为了让 `--dump-config` 能显示来源。
+# The values equal the code defaults (the `#[serde(default)]` on `StoreConfig` /
+# `HistoryConfig`) -- the same reasoning as `tools.toml`: writing them out is what lets
+# `--dump-config` show the provenance.
 #
-# 这是「存储缝」的配置入口：调用方一律按对话 id 说话，不关心历史落在哪儿、以什么格式落。
-# 将来会有别的后端（比如把所有对话收进一个 sqlite 库）—— 那时「换后端」就是
-# 在这里换一个 bundle（或叠一层 patch），而不是改代码。
+# This is the configuration entry point of the "storage seam": callers speak purely in terms
+# of a conversation id and care neither where history lands nor in what format.
+# There will be other backends one day (all conversations in one sqlite database, say) --
+# then "swap the backend" means swapping one bundle here (or layering a patch), not changing
+# code.
 
 [store]
-# 存储后端名。**认不出的名字会在启动时直接报错**，不会静默退回 jsonl ——
-# 否则你写了别的后端、却还在往 jsonl 里写，这种问题最难查。
+# Storage backend name. **An unrecognized name errors out at startup** rather than quietly
+# falling back to jsonl -- otherwise you'd have asked for another backend and still be
+# writing into jsonl, which is the hardest kind of problem to track down.
 backend = "jsonl"
 
 [history]
-# 关掉后不再新开文件（已存在的历史仍然可读、可查看）。
+# With this off, no new file is opened (existing history stays readable and viewable).
 enabled = true
-# 最多保留多少个对话（按时间，新的优先）；0 = 不限制。
-# 只在新建对话时裁剪，所以不会删掉正在写的那个。
+# How many conversations to keep at most (by time, newest first); 0 = unlimited.
+# Pruning happens only when a conversation is created, so the one currently being written is
+# never deleted.
 keep = 200

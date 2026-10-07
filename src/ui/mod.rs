@@ -9,38 +9,44 @@ use serde_json::Value;
 use crate::history::UsageRecord;
 use crate::llm::StreamSink;
 
-/// Agent 流向 UI 的事件。GUI 实现可以直接订阅这个事件流做渲染。
+/// Events flowing from the Agent to the UI. A GUI implementation can subscribe to this event stream
+/// and render directly.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    /// 助手的**最终答复**：这条文本之后没有再调用任何工具，任务结束。
+    /// The assistant's **final reply**: text after which no more tools are called and the task ends.
     AssistantText(String),
-    /// 助手在「还有工具要调用」时说的过程性文字（如「我先看看有哪些插件」）。
-    /// 属于过程说明，应折叠进过程区，不能当成最终答案展示。
+    /// Interim text the assistant emits while it "still has tools to call" (e.g. "let me see which
+    /// plugins there are").
+    /// It is process narration, so it must be folded into the process area and never shown as the
+    /// final answer.
     InterimText(String),
-    /// 即将执行一次工具调用
+    /// About to execute a tool call
     ToolCall { name: String, args: Value },
-    /// 工具已通过授权，开始执行（可能耗时）
+    /// The tool passed authorisation and is starting to run (may take a while)
     ToolRunning { name: String, timeout_secs: u64 },
-    /// 工具调用完成
+    /// The tool call finished
     ToolResult { name: String, is_error: bool, preview: String },
     Info(String),
     Warn(String),
     Error(String),
-    /// 宿主刚刚把**工具产出的图片**挂进了对话（见 `crate::attach`）。
+    /// The host has just attached **an image produced by a tool** to the conversation (see
+    /// `crate::attach`).
     ///
-    /// 单开一条事件、而不是把路径塞进那条 `Warn` 里：`Warn` 是**给人看的一句话**，
-    /// 而这里是**给人看的画面**。图形界面拿它把图渲染出来；命令行没有可渲染的地方，
-    /// 直接忽略即可（文件名已经在那句话里列出来了）。
+    /// A separate event rather than stuffing paths into that `Warn`: `Warn` is **a sentence for a
+    /// human to read**, whereas this is **a picture for a human to see**. The GUI takes it and
+    /// renders the image; the command line has nowhere to render, so it can simply ignore it (the
+    /// filenames are already listed in that sentence).
     ///
-    /// `#[allow(dead_code)]` 的理由：`src/main.rs`（CLI bin）会把同一批模块再编译
-    /// 一遍，而它只写 `Images(_)`、从不读里面的路径 —— 于是那个字段在 bin 里被判成
-    /// 死代码，`lib` 侧却明明在用。**不要**为此动模块结构（与 `TRAPS.md` 里记的
-    /// 「bin 与 lib 各编译一遍同名模块」那条同一个原因）。
+    /// Why `#[allow(dead_code)]`: `src/main.rs` (the CLI bin) compiles the same batch of modules a
+    /// second time, and there it only ever writes `Images(_)` and never reads the paths inside it —
+    /// so that field is judged dead code in the bin, even though the `lib` side is plainly using it.
+    /// **Do not** touch the module structure for this (same cause as the "bin and lib each compile
+    /// the same-named modules" entry in `TRAPS.md`).
     #[allow(dead_code)]
     Images(Vec<std::path::PathBuf>),
 }
 
-/// 授权询问结果
+/// The outcome of an authorisation prompt
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthDecision {
     Allow,
@@ -48,67 +54,75 @@ pub enum AuthDecision {
     Deny,
 }
 
-/// 用户对一次「选项提问」的回答（`ask_user` 的返回值来源）。
+/// The user's answer to one "multiple-choice question" (`ask_user`'s return-value source).
 ///
-/// 三支对应三种**真实发生过**的情形，措辞也不同（见 `tool::ask::interact`）：
-/// 点了某一项 / 没点、自己打了一段字 / 压根没答。把它们合成 `Option<String>`
-/// 会把「自己打的字」与「点了选项」混成一件事 —— 而模型对这两者的处理不一样
-///（前者要多问一句「你是这个意思吗」，后者直接照做）。
+/// The three variants correspond to three **genuinely distinct** situations, with different wording too (see `tool::ask::interact`):
+/// picked an option / didn't pick, but typed a line / didn't answer at all. Collapsing them into `Option<String>`
+/// would merge "typed something" with "picked an option" into one thing — yet the model handles the two differently
+/// (for the former it must ask "is that what you meant?", for the latter it just complies).
 #[derive(Debug, Clone)]
 pub enum ChoiceReply {
-    /// 点了第 n 项（0 基）
+    /// Picked option n (0-based)
     Picked(usize),
-    /// 没点选项，直接打了一段字
+    /// Didn't pick an option, just typed a line
     Text(String),
-    /// 没答（界面关掉了，或者断了）
+    /// No answer (the interface was closed, or the connection dropped)
     Cancelled,
 }
 
-/// UI 抽象层 —— 为后续图形化预留的接口。
-/// Agent 主循环只依赖这个 trait；CLI 是一个实现，未来 egui/Tauri 界面是另一个实现。
+/// The UI abstraction — the interface kept in reserve for a future graphical front end.
+/// The Agent main loop depends only on this trait; the CLI is one implementation, and a future
+/// egui/Tauri interface is another.
 #[async_trait]
 pub trait Ui: Send {
-    /// 读取一行用户输入；Ok(None) 表示退出（EOF 或用户主动退出）
+    /// Read one line of user input; Ok(None) means exit (EOF or the user quitting)
     async fn read_user_input(&mut self) -> Result<Option<String>>;
-    /// 展示 Agent 事件
+    /// Show an Agent event
     fn emit(&mut self, event: AgentEvent);
-    /// 就一次工具调用向用户请求授权
+    /// Ask the user for authorisation for one tool call
     async fn authorize(&mut self, tool_name: &str, args: &Value) -> AuthDecision;
 
-    /// 就一道「选择题」问用户一次，等他作答（`ask_user` 的落地）。
+    /// Ask the user one "multiple-choice question" and wait for the answer (the landing point of
+    /// `ask_user`).
     ///
-    /// 默认实现返回 [`ChoiceReply::Cancelled`]：不覆盖它的 UI 不会因为缺这个能力而崩，
-    /// 只会让 `ask_user` 得到「用户没作答」—— 那正是实情（这个界面确实没法问）。
-    /// 两个前端（CLI / GUI）都实现了它。
+    /// The default implementation returns [`ChoiceReply::Cancelled`]: a UI that doesn't override it
+    /// won't crash for lack of the capability, it just leaves `ask_user` with "the user didn't
+    /// answer" — which is the truth (this interface really can't ask). Both front ends (CLI / GUI)
+    /// implement it.
     async fn choose(&mut self, _question: &str, _options: &[String]) -> ChoiceReply {
         ChoiceReply::Cancelled
     }
 
-    /// 一轮任务开始（用户发出指令，模型+工具循环开始）。
-    /// UI 可在此开启等待动画、准备接收本轮事件。
+    /// A turn starts (the user issued an instruction, the model + tool loop begins).
+    /// The UI may start its waiting animation here and get ready to receive this turn's events.
     async fn turn_start(&mut self) {}
-    /// 一轮任务结束（模型不再调用工具）。
-    /// UI 可在此停止动画，并把中间过程折叠成一行摘要。
+    /// A turn ends (the model stops calling tools).
+    /// The UI may stop the spinner here and fold the middle process into a one-line summary.
     async fn turn_end(&mut self) {}
-    /// 一轮任务的 token 账。
+    /// The token account for one turn.
     ///
-    /// 参数就是**落进对话文件的那一行**（`kind:"usage"`），所以界面显示的账与
-    /// 存档里的账不可能对不上。里面有轮次、时刻、本轮各项、以及截至本轮的对话累计。
+    /// The argument is **the very line that lands in the conversation file** (`kind:"usage"`), so
+    /// the account shown in the interface can never disagree with the one on disk. It holds the turn
+    /// number, the timestamp, this turn's items, and the conversation total up to this turn.
     ///
-    /// 特意排在 `turn_end` **之后**调用：那时等待动画已经撤掉，
-    /// CLI 才能干干净净地把明细打在光标当前行，而不是被 spinner 的重绘盖过去。
+    /// It is deliberately called **after** `turn_end`: by then the waiting animation has been torn
+    /// down, so the CLI can print the detail cleanly on the cursor's current line instead of being
+    /// painted over by a spinner redraw.
     ///
-    /// 端点不支持 usage 时 `rec.is_empty()` 为真，UI 直接跳过这段展示即可。
+    /// When the endpoint doesn't support usage, `rec.is_empty()` is true and the UI can simply skip
+    /// this display.
     async fn turn_usage(&mut self, _rec: &UsageRecord) {}
-    /// 更新进行中的状态提示（如「思考中」「执行 fs_read」）。
-    /// 默认空实现；GUI 可映射为状态栏文字。
+    /// Update the in-progress status label (e.g. "Thinking", "Running fs_read").
+    /// An empty default implementation; the GUI can map it to status-bar text.
     async fn set_status(&mut self, _label: &str) {}
 
-    /// 提供一个「流式增量接收端」：Provider 在流式返回时把模型的思考过程推给它，
-    /// UI 可以即时展示（CLI 是在等待动画区域滚动回显，显示完即消失）。
+    /// Provide a "streaming delta sink": while streaming, the Provider pushes the model's reasoning
+    /// process into it and the UI can show it live (the CLI scrolls it in the waiting area, and it
+    /// disappears once shown).
     ///
-    /// 返回 None 表示本 UI 不展示流式过程。默认实现即 None，
-    /// 所以 GUI 想显示思考流时只需覆盖这一个方法，核心循环无需改动。
+    /// Returning None means this UI doesn't show the streaming process. The default implementation
+    /// is None, so when the GUI wants to show the reasoning stream it only needs to override this one
+    /// method, with no change to the core loop.
     fn stream_sink(&self) -> Option<Box<dyn StreamSink + Send + Sync + '_>> {
         None
     }

@@ -1,25 +1,32 @@
-# strict —— 第二个例子 bundle。**不进出厂选择**，是「一个小 bundle 只改几个键」的样板。
+# strict -- a second example bundle. It is **not part of the factory choice**; it is a
+# template for "one small bundle that changes a handful of keys".
 #
-# 它不写 `bundles = [...]`：它是个**叶子**，只贡献值。用法（在你的 aox.toml 里）：
+# It writes no `bundles = [...]`: it is a **leaf** and only contributes values. Usage (in your
+# aox.toml):
 #
 #   [profiles.strict]
 #   bundles = ["core", "strict"]
 #
-# 因为层栈是「先展开 core 的全部子 bundle，最后才轮到 strict」，所以这里改的键
-# 会稳稳盖住出厂选择 —— 这正是「换一套更保守的策略」应该有的形态：
-# 换 bundle 列表，不改 core 一个字。
+# Because the layer stack is "expand all of core's sub-bundles first, and only then strict",
+# the keys changed here reliably cover the factory choice -- which is exactly the shape that
+# "switch to a more conservative policy" should take: swap the bundle list, change not a word
+# of core.
 #
-# 读这个文件的人应该能一眼看出它比出厂严在哪儿：元工具禁掉、插件工具降成询问、
-# 工具超时收紧。范围越小越好读。
+# Whoever reads this file should see at a glance where it is stricter than the factory: meta
+# tools blocked, plugin tools downgraded to ask, tool timeout tightened. The smaller the scope,
+# the easier it reads.
 
 [auth]
-# 造插件、删插件这类**改动系统自身**的操作：本套直接禁掉，不给模型开口子的机会。
+# Operations that **change the system itself**, such as creating or deleting plugins: blocked
+# outright here, giving the model no opening at all.
 meta_tools = "deny"
-# 模型自己造出来的插件工具不再自动放行，每次都要你点头。
+# Tools from plugins the model built for itself are no longer allowed automatically; every one
+# of them needs your nod.
 plugin_tools = "ask"
 
 [agent]
-# 工具超时从出厂的 60 秒收紧到 30 秒。
-# （注意这里只写了这一项：`agent` 表在 tools.toml 里还定义了 max_result_chars，
-#   两层是**深合**的，所以那一项仍然有效 —— 不是覆盖掉整张表。）
+# Tool timeout tightened from the factory 60 seconds to 30.
+# (Note that only this one field is written: the `agent` table also defines max_result_chars in
+#  tools.toml, and the two layers are **deep-merged**, so that field still applies -- this is
+#  not overwriting the whole table.)
 tool_timeout_secs = 30

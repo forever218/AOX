@@ -3,27 +3,31 @@ use serde_json::Value;
 
 use crate::attach::{self, Attachment};
 
-/// 对话消息，直接对齐 OpenAI chat.completions 的 wire 格式。
+/// Conversation messages, aligned directly with OpenAI chat.completions' wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
-    /// assistant 发起工具调用时 content 可能为 null，因此始终序列化该字段。
+    /// When an assistant initiates a tool call, `content` may be null, so this field is always serialized.
     ///
-    /// **类型是 `Value` 而不是 `String`**（2026-10-05 为附件改的）：OpenAI 兼容协议里
-    /// 纯文字是 JSON 字符串、带附件是 parts 数组，同一个字段承载两种形状。
-    /// 改这一处就够 —— `openai.rs` 的 `build_body` 本来就把 `messages` 原样透传，
-    /// 序列化交给 serde，所以协议层零改动。
+    /// **The type is `Value`, not `String`** (changed on 2026-10-05 for attachments): in the
+    /// OpenAI-compatible protocol plain text is a JSON string while attachments make it a parts
+    /// array, so the same field carries both shapes. Changing just this one spot is enough —
+    /// `openai.rs`'s `build_body` already passes `messages` through untouched and lets serde do
+    /// the serialization, so the protocol layer needs zero changes.
     ///
-    /// ⚠️ **纯文字仍然序列化成 JSON 字符串**（[`Self::plain`] 就是这么建的），
-    /// 所以老对话文件、老端点、以及不发图的那条路径**逐字节不变** —— 这是本次改动
-    /// 必须成立的零漂移条件，由 `plain_text_stays_a_json_string` 钉住。
+    /// ⚠️ **Plain text still serializes as a JSON string** (that is how [`Self::plain`] builds it),
+    /// so old conversation files, old endpoints, and the no-image path stay **byte-for-byte
+    /// identical** — this zero-drift guarantee is a hard requirement for this change and is pinned
+    /// by `plain_text_stays_a_json_string`.
     pub content: Option<Value>,
-    /// 思考模式（DeepSeek thinking，如 deepseek-flash / deepseek-reasoner）返回的推理内容。
+    /// Reasoning content returned by thinking mode (DeepSeek thinking, e.g. deepseek-flash /
+    /// deepseek-reasoner).
     ///
-    /// ⚠️ 必须原样回传给 API：只要历史里存在「带 tool_calls 的 assistant 消息」，
-    /// DeepSeek 就要求它连同 reasoning_content 一起送回，否则整次请求被 400 拒绝：
+    /// ⚠️ Must be passed back to the API verbatim: as long as a "assistant message with tool_calls"
+    /// exists in the history, DeepSeek requires it to be sent back together with reasoning_content,
+    /// otherwise the whole request is rejected with 400:
     /// "The `reasoning_content` in the thinking mode must be passed back to the API."
-    /// 这正是「多步任务中途静默断掉」的元凶。
+    /// This is exactly what makes multi-step tasks silently break midway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,7 +49,7 @@ pub struct ToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
-    /// OpenAI 协议中参数是 JSON 字符串
+    /// In the OpenAI protocol arguments are a JSON string
     pub arguments: String,
 }
 
@@ -58,13 +62,16 @@ impl Message {
         Self::plain("user", content)
     }
 
-    /// 带附件的用户消息。
+    /// A user message with attachments.
     ///
-    /// **附件只能进 user 消息** —— 端点在 `system` / `assistant` 消息里见到图片直接 400
-    /// （官方「使用限制」明写）。这条不是风格问题，是协议硬约束，所以本函数是唯一的
-    /// 附件入口：想在别处塞图片，函数签名就先拦住了。
+    /// **Attachments may only go into user messages** — the endpoint returns 400 on the spot if it
+    /// sees an image in a `system` / `assistant` message (explicitly stated in the official "usage
+    /// limits"). This is not a style choice but a hard protocol constraint, so this function is the
+    /// sole entry point for attachments: if you want to sneak an image elsewhere, the function
+    /// signature blocks it first.
     ///
-    /// 没有附件时退化成 [`Self::user`]（纯字符串），保证老路径逐字节不变。
+    /// With no attachments it degrades to [`Self::user`] (a plain string), keeping the old path
+    /// byte-for-byte identical.
     pub fn user_with_files(text: &str, files: &[Attachment]) -> Result<Self, String> {
         if files.is_empty() {
             return Ok(Self::user(text));
@@ -97,10 +104,11 @@ impl Message {
         }
     }
 
-    /// 组装一条 assistant 消息。
+    /// Build an assistant message.
     ///
-    /// 流式累加的结果也走这里，确保「流式」与「非流式」两条路径产出的字段完全一致
-    /// （尤其是思考模式必须回传的 reasoning_content）。
+    /// The streamed accumulation also goes through here, so that the "streaming" and
+    /// "non-streaming" paths produce exactly the same fields (in particular
+    /// `reasoning_content`, which thinking models must pass back).
     pub fn assistant(
         content: Option<String>,
         reasoning_content: Option<String>,
@@ -116,21 +124,24 @@ impl Message {
         }
     }
 
-    /// 去掉首尾空白的正文；全空白视为「没有内容」。
+    /// The trimmed body text; all-whitespace counts as "no content".
     ///
-    /// **只认纯字符串**：带附件的 parts 数组返回 `None` —— 调用点想显示「用户说了什么」
-    /// 时应该用 [`Self::flat_text`]，那里的语义是「给人看的一行文本」而不是「模型的正文」。
-    /// 保留这个严格语义是因为它在主循环里判定「模型是不是没说话」（`assistant` 的响应
-    /// 永远是字符串），放宽会把空 parts 也当成有话说。
+    /// **Only plain strings are recognized**: a parts array from an attachment returns `None` — when
+    /// a call site wants to show "what the user said" it should use [`Self::flat_text`], whose
+    /// semantics are "one line of text for a human to read" rather than "the model's body". This
+    /// strict semantics is kept because the main loop uses it to decide "did the model say nothing":
+    /// an `assistant` response is always a string, and loosening it would treat empty parts as
+    /// having said something.
     pub fn text(&self) -> Option<&str> {
         self.content.as_ref()?.as_str().map(str::trim).filter(|t| !t.is_empty())
     }
 
-    /// 任意形状的 content → 「给人看的一段文本」。
+    /// Any shape of content → "a piece of text for a human to read".
     ///
-    /// 历史渲染、`.jsonl` 回读、界面气泡都走它：parts 数组把各 `text` 块拼起来，
-    /// 图片与文件块换成 `[图片: 名字]` 这类占位符（附件本体不在内容里，占位才是
-    /// 那段历史真正留下的东西）。
+    /// History rendering, `.jsonl` re-reading, and UI bubbles all go through it: a parts array
+    /// concatenates the `text` blocks, and image/file blocks are swapped for placeholders like
+    /// `[image]` / `[file: name]` (the attachment body itself isn't in the content; the placeholder
+    /// is what that slice of history actually keeps).
     pub fn flat_text(&self) -> String {
         let Some(v) = &self.content else {
             return String::new();
@@ -139,7 +150,7 @@ impl Message {
             return s.to_string();
         }
         let Some(parts) = v.as_array() else {
-            // 既不是字符串也不是数组：如实吐出 JSON，好过悄悄显示成空白
+            // Neither a string nor an array: emit the JSON as-is rather than silently showing blank
             return v.to_string();
         };
         let mut out = String::new();
@@ -147,16 +158,16 @@ impl Message {
             match p.get("type").and_then(|t| t.as_str()) {
                 Some("text") => {
                     let Some(t) = p.get("text").and_then(|t| t.as_str()) else { continue };
-                    // 附件清单是宿主加的，不是用户说的话 —— 见 `attach::ATTACH_MARK`
+                    // The attachment list is added by the host, not something the user said — see `attach::ATTACH_MARK`
                     if t.starts_with(attach::ATTACH_MARK) {
                         continue;
                     }
                     out.push_str(t);
                 }
-                Some("image_url") => out.push_str("[图片]"),
+                Some("image_url") => out.push_str(crate::i18n::t("[image]")),
                 Some("file") => {
-                    let name = p.get("filename").and_then(|f| f.as_str()).unwrap_or("附件");
-                    out.push_str(&format!("[文件: {name}]"));
+                    let name = p.get("filename").and_then(|f| f.as_str()).unwrap_or(crate::i18n::t("attachment"));
+                    out.push_str(&crate::tf!("[file: {}]", name));
                 }
                 _ => {}
             }
@@ -164,7 +175,7 @@ impl Message {
         out.trim().to_string()
     }
 
-    /// 换掉正文（纯文本）。`hook` 改写模型回复时用。
+    /// Replaces the body text (plain text). Used when a `hook` rewrites the model's reply.
     pub fn set_text(&mut self, s: impl Into<String>) {
         self.content = Some(Value::String(s.into()));
     }
@@ -174,8 +185,9 @@ impl Message {
 mod tests {
     use super::*;
 
-    /// **零漂移的关键断言**：没有附件时，一条 user 消息序列化出来必须与改类型之前
-    /// 逐字节相同 —— `content` 是 JSON 字符串，不是 `[{...}]`。
+    /// **The key zero-drift assertion**: with no attachment, a serialised user message must be
+    /// byte-for-byte identical to before the type changed — `content` is a JSON string, not
+    /// `[{...}]`.
     #[test]
     fn plain_text_stays_a_json_string() {
         let v = serde_json::to_value(Message::user("hi")).unwrap();
@@ -193,20 +205,20 @@ mod tests {
         std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x00").unwrap();
 
         let a = Attachment::probe(&png).unwrap();
-        let m = Message::user_with_files("看这张", &[a]).unwrap();
+        let m = Message::user_with_files("look at this", &[a]).unwrap();
 
-        assert!(m.text().is_none(), "parts 数组不该被当成「模型的正文」");
+        assert!(m.text().is_none(), "a parts array must not be taken for the model's text");
         let flat = m.flat_text();
-        assert!(flat.contains("看这张"), "{flat}");
-        assert!(flat.contains("[图片]"), "{flat}");
+        assert!(flat.contains("look at this"), "{flat}");
+        assert!(flat.contains("[image]"), "{flat}");
 
         let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
     fn user_with_files_without_files_is_the_old_message() {
-        let a = Message::user_with_files("你好", &[]).unwrap();
-        let b = Message::user("你好");
+        let a = Message::user_with_files("hello", &[]).unwrap();
+        let b = Message::user("hello");
         assert_eq!(serde_json::to_value(&a).unwrap(), serde_json::to_value(&b).unwrap());
     }
 }

@@ -1,24 +1,32 @@
-//! 宿主内置的**文件工具** —— 沙箱方案 ③ 的落地形态。
+//! The host's built-in **file tools** — the concrete form of sandbox approach ③.
 //!
-//! 为什么要宿主自己提供，而不是继续让模型写 `fs` 插件：
+//! Why the host provides them itself instead of letting the model keep writing
+//! `fs` plugins:
 //!
-//! 模型自己写的文件插件**只能在它自己的代码里自律**，宿主看不见它拿什么路径去干了什么。
-//! 而这几个工具的参数与实现都在宿主手里 —— 所以「路径必须先过工作区判定」
-//! 这件事**无法被绕过**（除非模型不用它们、改自己造插件，那属于另一类风险，
-//! 见 `docs/SANDBOX.md` 的威胁模型）。
+//! A file plugin the model wrote itself **can only be self-disciplined inside its
+//! own code**; the host cannot see what path it used to do what. These tools, by
+//! contrast, keep both parameters and implementation in the host's hands — so
+//! "the path must first pass the workplace check" **cannot be bypassed** (unless
+//! the model simply doesn't use them and writes its own plugin instead, which is
+//! a different class of risk; see the threat model in `docs/SANDBOX.md`).
 //!
-//! 判定在两处做，是刻意的纵深：
-//! 1. `Agent::authorize_and_execute` —— 所有工具调用的唯一收口，**早于授权**。
-//!    在那儿拦下的好处是能顺带给用户发一条 `Warn`（工具拿不到 `Ui`）。
-//! 2. 每个工具自己的 `call` 开头 —— 防止有人绕过循环直接 `Runtime::execute`
-//!    （`selftest` 就是这么调的）。少一层的话，那条路径上判定是空的。
+//! The check happens in two places, deliberately in depth:
+//! 1. `Agent::authorize_and_execute` — the single funnel for all tool calls,
+//!    **before authorization**. Intercepting there has the bonus of being able to
+//!    send the user a `Warn` (tools have no access to `Ui`).
+//! 2. The start of each tool's own `call` — guards against someone bypassing the
+//!    loop and calling `Runtime::execute` directly (`selftest` does exactly that).
+//!    Without this layer the check would be empty on that path.
 //!
-//! 两处都走 `workplace` 模块的**同一套判定**（读用 `check_read`、写删用 `check`，
-//! 分野见 [`crate::workplace::Access`]）与同一份文案（[`crate::workplace::Reject`]），
-//! 所以不存在「两套规则」。
+//! Both places go through the **same check** in the `workplace` module (reading
+//! uses `check_read`, writing/removing use `check`; the split is described in
+//! [`crate::workplace::Access`]) and the same wording
+//! ([`crate::workplace::Reject`]), so there is no "two sets of rules".
 //!
-//! **读不设限、写删受限**（2026-10-04 定的语义）：`read_file` / `list_dir` / `attach_file`
-//! 只把路径规格化就去开文件 —— 整个设备都能读；`write_file` / `remove` 才真正过工作区边界。
+//! **Reading is unrestricted, writing/removing are not** (semantics settled on
+//! 2026-10-04): `read_file` / `list_dir` / `attach_file` only normalize the path
+//! and open the file — the whole device is readable; only `write_file` / `remove`
+//! actually cross the workplace boundary.
 
 use std::sync::Arc;
 
@@ -29,7 +37,7 @@ use super::{host_tool_access, Tool, ToolKind, ToolOutput, HOST_FILE_TOOLS};
 use crate::runtime::Runtime;
 use crate::workplace::PATH_ARG;
 
-/// 五个宿主文件工具。
+/// The five host file tools.
 pub fn host_file_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadFileTool),
@@ -40,34 +48,39 @@ pub fn host_file_tools() -> Vec<Arc<dyn Tool>> {
     ]
 }
 
-/// 单次读文件的字节上限。超过就截断并**明说截断了** ——
-/// 悄悄截断会让模型基于残缺内容下结论，是「静默出错」里最坏的一种。
+/// Per-call byte cap when reading a file. Beyond it, truncate and **say so
+/// explicitly** — silently truncating would make the model draw conclusions from
+/// partial content, the worst kind of "silent failure".
 const READ_LIMIT: usize = 200_000;
-/// 列目录时的条目上限，理由同上。
+/// Entry cap when listing a directory, for the same reason.
 const LIST_LIMIT: usize = 300;
 
-/// 判定一次「**落盘**」的 `path` 参数（写 / 删），顺便把「越界」统一成给模型的契约文本。
+/// Check a `path` argument for a **write to disk** (write / remove), and unify
+/// "out of bounds" into the contract text handed to the model.
 fn guard(rt: &Arc<Runtime>, raw: &str) -> Result<std::path::PathBuf, ToolOutput> {
     rt.workplace.check(raw).map_err(|r| ToolOutput::err(r.model_text()))
 }
 
-/// 判定一次「**只读**」的 `path` 参数（读文件 / 列目录）。
+/// Check a `path` argument for a **read-only** operation (read file / list dir).
 ///
-/// 按 [`crate::workplace::Access::Read`] 的语义，读**不受工作区限制**，所以这里
-/// 不会返回错误，只把路径规格化后交出去。**刻意与 [`guard`] 分开写**：让「读和写
-/// 不是同一档」这件事在调用点上一眼可见 —— 若两者共用一个 `guard`，哪天有人给读也
-/// 套上边界，代码上完全看不出变化。
+/// Per [`crate::workplace::Access::Read`], reading is **not restricted by the
+/// workplace**, so this never returns an error — it just normalizes the path and
+/// hands it back. **Deliberately written separately from [`guard`]**: it makes
+/// "read and write are not the same tier" visible at a glance at the call site —
+/// if the two shared one `guard`, the day someone puts a boundary on reads too,
+/// the code would show no change at all.
 fn guard_read(rt: &Arc<Runtime>, raw: &str) -> std::path::PathBuf {
-    // `check_read` 恒为 `Ok`（读从不被拒）；真出了意外也不该 panic，退回原样路径。
+    // `check_read` is always `Ok` (reads are never refused); and even an unexpected
+    // failure must not panic, so fall back to the raw path.
     rt.workplace.check_read(raw).unwrap_or_else(|_| std::path::PathBuf::from(raw))
 }
 
-/// 取必填的 `path` 参数。
+/// Fetch the required `path` argument.
 fn path_arg(args: &Value) -> Result<&str, ToolOutput> {
     args.get(PATH_ARG)
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| ToolOutput::err(format!("缺少参数 {PATH_ARG}（必须是字符串路径）")))
+        .ok_or_else(|| ToolOutput::err(crate::tf!("missing parameter {} (must be a string path)", PATH_ARG)))
 }
 
 // ---------------------------------------------------------------- read_file
@@ -82,20 +95,22 @@ impl Tool for ReadFileTool {
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
-    /// 读 / 写按**名字**分（见 `host_tool_access`）—— 这几道工具的 schema 是我们
-    /// 自己写的，所以一眼可判；插件那条路做不到，只能靠插件声明（见 `Tool::access`）。
+    /// Read / write are split by **name** (see `host_tool_access`) — these tools'
+    /// schemas are ones we wrote ourselves, so the split is decidable at a glance;
+    /// the plugin path cannot do that and must rely on the plugin's declaration
+    /// (see `Tool::access`).
     fn access(&self) -> crate::workplace::Access {
         host_tool_access(self.name())
     }
     fn description(&self) -> &str {
-        "读取一个文本文件并返回其内容（宿主提供）。读取不受工作区限制 —— 设备上的任何文件都能读。"
+        crate::i18n::t("Read a text file and return its content (provided by the host). Reads are not restricted by the workspace — any file on the device can be read.")
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                PATH_ARG: {"type": "string", "description": "要读取的文件路径（绝对路径；读取不受工作区限制）"},
-                "max_bytes": {"type": "integer", "description": "最多读取多少字节，默认 200000"}
+                PATH_ARG: {"type": "string", "description": crate::i18n::t("Path of the file to read (absolute; reads are not restricted by the workspace)")},
+                "max_bytes": {"type": "integer", "description": crate::i18n::t("Maximum bytes to read; default 200000")}
             },
             "required": [PATH_ARG]
         })
@@ -106,11 +121,12 @@ impl Tool for ReadFileTool {
             Ok(p) => p,
             Err(e) => return e,
         };
-        // 读走 `guard_read`：**不受工作区限制**（2026-10-04 语义）。
+        // Reads go through `guard_read`: **not restricted by the workplace**
+        // (2026-10-04 semantics).
         let path = guard_read(rt, raw);
         if path.is_dir() {
-            return ToolOutput::err(format!(
-                "{} 是一个目录，不是文件。要看里面有什么请用 list_dir。",
+            return ToolOutput::err(crate::tf!(
+                "{} is a directory, not a file. Use list_dir to see what is inside.",
                 path.display()
             ));
         }
@@ -122,21 +138,24 @@ impl Tool for ReadFileTool {
             .min(READ_LIMIT);
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
-            Err(e) => return ToolOutput::err(format!("读取 {} 失败: {e}", path.display())),
+            Err(e) => return ToolOutput::err(crate::tf!("failed to read {}: {}", path.display(), e)),
         };
         if bytes.iter().take(8192).any(|b| *b == 0) {
-            return ToolOutput::err(format!(
-                "{} 看起来是二进制文件（含 NUL 字节），本工具只读文本。",
+            return ToolOutput::err(crate::tf!(
+                "{} looks like a binary file (contains NUL bytes); this tool reads text only.",
                 path.display()
             ));
         }
         let truncated = bytes.len() > limit;
-        // 截断可能落在多字节字符中间，所以用 lossy 而不是直接 from_utf8 失败
+        // Truncation may land in the middle of a multi-byte character, so use
+        // lossy instead of failing outright with from_utf8
         let body = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]).into_owned();
-        let mut out = format!("{}（{} 字节）\n", path.display(), bytes.len());
+        let mut out = crate::tf!("{} ({} bytes)\n", path.display(), bytes.len());
         if truncated {
-            out.push_str(&format!(
-                "⚠️ 文件超过 {limit} 字节，**下面只是前 {limit} 字节**，不是全文。\n"
+            out.push_str(&crate::tf!(
+                "⚠️ the file exceeds {} bytes; **the text below is only the first {} bytes**, not the whole file.\n",
+                limit,
+                limit
             ));
         }
         out.push_str(&body);
@@ -156,21 +175,23 @@ impl Tool for WriteFileTool {
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
-    /// 读 / 写按**名字**分（见 `host_tool_access`）—— 这几道工具的 schema 是我们
-    /// 自己写的，所以一眼可判；插件那条路做不到，只能靠插件声明（见 `Tool::access`）。
+    /// Read / write are split by **name** (see `host_tool_access`) — these tools'
+    /// schemas are ones we wrote ourselves, so the split is decidable at a glance;
+    /// the plugin path cannot do that and must rely on the plugin's declaration
+    /// (see `Tool::access`).
     fn access(&self) -> crate::workplace::Access {
         host_tool_access(self.name())
     }
     fn description(&self) -> &str {
-        "把一个字符串写进文本文件（覆盖写，宿主提供，受工作区限制）。路径必须是工作区内的绝对路径；父目录默认自动创建。"
+        crate::i18n::t("Write a string into a text file (overwrite; provided by the host; subject to the workspace). The path must be an absolute path inside the workspace; parent directories are created automatically by default.")
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                PATH_ARG: {"type": "string", "description": "要写入的文件路径（绝对路径，且在工作区内）"},
-                "content": {"type": "string", "description": "文件内容（整份覆盖）"},
-                "create_dirs": {"type": "boolean", "description": "父目录不存在时是否自动创建，默认 true"}
+                PATH_ARG: {"type": "string", "description": crate::i18n::t("Path of the file to write (absolute, inside the workspace)")},
+                "content": {"type": "string", "description": crate::i18n::t("File content (full overwrite)")},
+                "create_dirs": {"type": "boolean", "description": crate::i18n::t("Whether to create missing parent directories automatically; default true")}
             },
             "required": [PATH_ARG, "content"]
         })
@@ -187,37 +208,37 @@ impl Tool for WriteFileTool {
         };
         let content = match args.get("content").and_then(|v| v.as_str()) {
             Some(c) => c,
-            None => return ToolOutput::err("缺少参数 content（必须是字符串）"),
+            None => return ToolOutput::err(crate::i18n::t("missing parameter content (must be a string)")),
         };
         if path.is_dir() {
-            return ToolOutput::err(format!("{} 是一个目录，不能当文件写。", path.display()));
+            return ToolOutput::err(crate::tf!("{} is a directory and cannot be written as a file.", path.display()));
         }
         let create_dirs = args.get("create_dirs").and_then(|v| v.as_bool()).unwrap_or(true);
         if create_dirs {
             if let Some(parent) = path.parent() {
                 if !parent.exists() {
                     if let Err(e) = std::fs::create_dir_all(parent) {
-                        return ToolOutput::err(format!("创建父目录 {} 失败: {e}", parent.display()));
+                        return ToolOutput::err(crate::tf!("failed to create parent directory {}: {}", parent.display(), e));
                     }
                 }
             }
         } else if let Some(parent) = path.parent() {
             if !parent.is_dir() {
-                return ToolOutput::err(format!(
-                    "父目录 {} 不存在（create_dirs = false，所以没有自动创建）",
+                return ToolOutput::err(crate::tf!(
+                    "parent directory {} does not exist (create_dirs = false, so it was not created automatically)",
                     parent.display()
                 ));
             }
         }
         let existed = path.exists();
         match std::fs::write(&path, content.as_bytes()) {
-            Ok(()) => ToolOutput::ok(format!(
-                "已{} {}（{} 字节）",
-                if existed { "覆盖" } else { "创建" },
+            Ok(()) => ToolOutput::ok(crate::tf!(
+                "{} {} ({} bytes)",
+                if existed { crate::i18n::t("Overwrote") } else { crate::i18n::t("Created") },
                 path.display(),
                 content.len()
             )),
-            Err(e) => ToolOutput::err(format!("写入 {} 失败: {e}", path.display())),
+            Err(e) => ToolOutput::err(crate::tf!("failed to write {}: {}", path.display(), e)),
         }
     }
 }
@@ -234,29 +255,32 @@ impl Tool for ListDirTool {
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
-    /// 读 / 写按**名字**分（见 `host_tool_access`）—— 这几道工具的 schema 是我们
-    /// 自己写的，所以一眼可判；插件那条路做不到，只能靠插件声明（见 `Tool::access`）。
+    /// Read / write are split by **name** (see `host_tool_access`) — these tools'
+    /// schemas are ones we wrote ourselves, so the split is decidable at a glance;
+    /// the plugin path cannot do that and must rely on the plugin's declaration
+    /// (see `Tool::access`).
     fn access(&self) -> crate::workplace::Access {
         host_tool_access(self.name())
     }
     fn description(&self) -> &str {
-        "列出目录内容（宿主提供）。列出不受工作区限制。不传 path 时列出当前工作区根。目录名带 `/` 后缀。"
+        crate::i18n::t("List a directory's contents (provided by the host). Listing is not restricted by the workspace. With no `path`, the current workspace root is listed. Directory names carry a trailing `/`.")
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                PATH_ARG: {"type": "string", "description": "要列出的目录（绝对路径）；省略 = 工作区根"}
+                PATH_ARG: {"type": "string", "description": crate::i18n::t("Directory to list (absolute path); omitted = workspace root")}
             },
             "required": []
         })
     }
 
     async fn call(&self, args: Value, rt: &Arc<Runtime>) -> ToolOutput {
-        // 不传 path = 工作区根（不受限档位下退化成应用根）。
-        // 这条路径**模型没有指定任何位置**，所以不需要判定 —— 根是宿主自己给的。
+        // No path = the workspace root (under an unrestricted tier this degrades to the app root).
+        // On this path the **model specified no location at all**, so no check is needed — the root is given by the host itself.
         let dir = match args.get(PATH_ARG).and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
-            // 列目录也是「只读」：走 `guard_read`，不受工作区限制。
+            // Listing is "read-only" too: go through `guard_read`, not restricted
+            // by the workplace.
             Some(raw) => guard_read(rt, raw),
             None => match rt.workplace.active_root() {
                 Some(p) => p,
@@ -264,16 +288,17 @@ impl Tool for ListDirTool {
             },
         };
         if !dir.exists() {
-            return ToolOutput::err(format!("{} 不存在", dir.display()));
+            return ToolOutput::err(crate::tf!("{} does not exist", dir.display()));
         }
         if !dir.is_dir() {
-            return ToolOutput::err(format!("{} 不是目录。要读文件请用 read_file。", dir.display()));
+            return ToolOutput::err(crate::tf!("{} is not a directory. Use read_file to read a file.", dir.display()));
         }
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
-            Err(e) => return ToolOutput::err(format!("列出 {} 失败: {e}", dir.display())),
+            Err(e) => return ToolOutput::err(crate::tf!("failed to list {}: {}", dir.display(), e)),
         };
-        // 目录在前、同类按名字排 —— 读起来才有结构，而不是文件系统的返回顺序
+        // Directories first, then same kind sorted by name — so it reads with
+        // structure, rather than in filesystem-return order
         let mut items: Vec<(bool, String, u64)> = Vec::new();
         for e in entries.flatten() {
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -282,16 +307,16 @@ impl Tool for ListDirTool {
         }
         items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let total = items.len();
-        let mut out = format!("{}（{} 项）\n", dir.display(), total);
+        let mut out = crate::tf!("{} ({} entries)\n", dir.display(), total);
         for (is_dir, name, size) in items.iter().take(LIST_LIMIT) {
             if *is_dir {
                 out.push_str(&format!("  {name}/\n"));
             } else {
-                out.push_str(&format!("  {name}  ({size} 字节)\n"));
+                out.push_str(&crate::tf!("  {}  ({} bytes)\n", name, size));
             }
         }
         if total > LIST_LIMIT {
-            out.push_str(&format!("  …另有 {} 项未列出（上限 {LIST_LIMIT}）\n", total - LIST_LIMIT));
+            out.push_str(&crate::tf!("  …{} more entries not listed (limit {})\n", total - LIST_LIMIT, LIST_LIMIT));
         }
         ToolOutput::ok(out)
     }
@@ -299,17 +324,24 @@ impl Tool for ListDirTool {
 
 // ---------------------------------------------------------------- attach_file
 
-/// 把本机文件**挂给模型看** —— 图片会真的进入下一次请求，模型能看见内容。
+/// **Hand a local file to the model to look at** — an image really enters the
+/// next request and the model can see its content.
 ///
-/// 为什么需要它：`read_file` 只读文本（二进制直接拒），于是「截图 → 分析」这条路
-/// 只有路径可传，模型手里永远是一串字符。图片的合法落点只有 `user` 消息（端点在
-/// system / assistant 里见到图片直接 400），而工具结果走的是 `tool` 角色 ——
-/// 所以这道工具**不把图片塞进返回值**，只把路径报上去，由主循环另起一条 user 消息注入
-/// （见 `agent_loop` 的收尾一段、`crate::attach`）。
+/// Why it is needed: `read_file` only reads text (binaries are refused outright),
+/// so the "screenshot → analyze" path would only ever carry a path and the model
+/// would be stuck with a string of characters. The only legal landing spot for an
+/// image is a `user` message (the endpoint returns 400 outright when it sees an
+/// image in system / assistant), whereas tool results travel under the `tool`
+/// role — so this tool **does not stuff the image into its return value**; it only
+/// reports the path, and the main loop spins up a separate user message to inject
+/// it (see the closing section of `agent_loop`, `crate::attach`).
 ///
-/// 访问意图是**只读**（见 `tool::host_tool_access`）：挂载只是把文件递出去，不落盘，
-/// 没有「写坏别处」的风险 —— 与 `read_file` 同一档，不受工作区限制。这也是刻意的：
-/// 插件把截图写在工作区里是常态，但用户想把桌面上的图递给模型也该成立。
+/// The access intent is **read-only** (see `tool::host_tool_access`): attaching
+/// just hands the file out and writes nothing to disk, so there is no risk of
+/// "breaking something elsewhere" — the same tier as `read_file`, not restricted
+/// by the workplace. That too is deliberate: a plugin writing screenshots into the
+/// workplace is the norm, but a user wanting to hand the model a picture on their
+/// desktop should also work.
 pub(crate) struct AttachFileTool;
 
 #[async_trait]
@@ -320,21 +352,21 @@ impl Tool for AttachFileTool {
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
-    /// 读 / 写按**名字**分（见 `host_tool_access`）—— 这几道工具的 schema 是我们
-    /// 自己写的，所以一眼可判；插件那条路做不到，只能靠插件声明（见 `Tool::access`）。
+    /// Read / write are split by **name** (see `host_tool_access`) — these tools'
+    /// schemas are ones we wrote ourselves, so the split is decidable at a glance;
+    /// the plugin path cannot do that and must rely on the plugin's declaration
+    /// (see `Tool::access`).
     fn access(&self) -> crate::workplace::Access {
         host_tool_access(self.name())
     }
     fn description(&self) -> &str {
-        "把一个本机文件挂给模型看（宿主提供）。图片（JPEG/PNG/GIF/WebP）会**真的发给模型**，\
-         模型能看见内容；其它格式也会照发，由端点决定收不收。\
-         截图 / 图表 / 扫描件这类要「看」的东西用它，不要用 read_file（那个只读文本）。"
+        crate::i18n::t("Hand a local file to the model so it can see it (provided by the host). Images (JPEG/PNG/GIF/WebP) are **really sent to the model** and the model can see the content; other formats are sent too, and the endpoint decides whether to accept them. Use this for things that must be *looked at* — screenshots / charts / scans; do not use read_file (that one reads text only).")
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                PATH_ARG: {"type": "string", "description": "要挂上的文件路径（绝对路径；不受工作区限制）"}
+                PATH_ARG: {"type": "string", "description": crate::i18n::t("Path of the file to attach (absolute; not restricted by the workspace)")}
             },
             "required": [PATH_ARG]
         })
@@ -345,23 +377,26 @@ impl Tool for AttachFileTool {
             Ok(p) => p,
             Err(e) => return e,
         };
-        // 与 read_file 同一档：只读，只做路径规格化，不过工作区边界。
+        // Same tier as read_file: read-only, only normalizes the path, does not
+        // cross the workplace boundary.
         let path = guard_read(rt, raw);
         match crate::attach::Attachment::probe(path.clone()) {
             Ok(a) => {
                 let what = match a.kind {
-                    Some(k) => format!("图片（{}）", k.mime()),
-                    None => "文件（非图片，端点可能不支持这个格式）".to_string(),
+                    Some(k) => crate::tf!("image ({})", k.mime()),
+                    None => crate::i18n::t("file (not an image; the endpoint may not support this format)").to_string(),
                 };
-                // 结果里如实说明「挂上了什么、大概多大」：模型因此知道下一步该期待
-                // 「看得见一张图」还是「可能收到一句不支持的报错」。
-                ToolOutput::ok(format!(
-                    "已挂上{}：{}（{} 字节）。它的内容会在你的下一次请求里出现。",
+                // State truthfully in the result "what was attached and roughly how
+                // big": the model thus knows whether to expect "an image it can see"
+                // next or "possibly an unsupported-format error".
+                ToolOutput::ok(crate::tf!(
+                    "Attached {}: {} ({} bytes). Its content will appear in your next request.",
                     what,
                     path.display(),
                     a.size
                 ))
-                // 真正的载荷在这里交给主循环 —— **不塞进返回值**
+                // The real payload is handed to the main loop here — **not stuffed
+                // into the return value**
                 .with_attach(vec![path])
             }
             Err(e) => ToolOutput::err(e),
@@ -381,20 +416,22 @@ impl Tool for RemoveTool {
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
-    /// 读 / 写按**名字**分（见 `host_tool_access`）—— 这几道工具的 schema 是我们
-    /// 自己写的，所以一眼可判；插件那条路做不到，只能靠插件声明（见 `Tool::access`）。
+    /// Read / write are split by **name** (see `host_tool_access`) — these tools'
+    /// schemas are ones we wrote ourselves, so the split is decidable at a glance;
+    /// the plugin path cannot do that and must rely on the plugin's declaration
+    /// (see `Tool::access`).
     fn access(&self) -> crate::workplace::Access {
         host_tool_access(self.name())
     }
     fn description(&self) -> &str {
-        "删除一个文件或空目录（宿主提供，受工作区限制）。删非空目录必须显式 recursive = true。"
+        crate::i18n::t("Delete a file or an empty directory (provided by the host; subject to the workspace). Deleting a non-empty directory requires an explicit recursive = true.")
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                PATH_ARG: {"type": "string", "description": "要删除的路径（绝对路径，且在工作区内）"},
-                "recursive": {"type": "boolean", "description": "是否递归删除非空目录，默认 false"}
+                PATH_ARG: {"type": "string", "description": crate::i18n::t("Path to delete (absolute, inside the workspace)")},
+                "recursive": {"type": "boolean", "description": crate::i18n::t("Whether to delete a non-empty directory recursively; default false")}
             },
             "required": [PATH_ARG]
         })
@@ -409,43 +446,46 @@ impl Tool for RemoveTool {
             Ok(p) => p,
             Err(e) => return e,
         };
-        // 别把工作区根自己删了 —— 那会让本对话剩下所有文件操作都无处可去。
-        // 这一条与权限无关，纯粹是「删了就没法继续干活」的保护。
+        // Don't delete the workplace root itself — that would leave every remaining
+        // file operation in this conversation with nowhere to go. This has nothing
+        // to do with permissions; it's purely a "delete it and you can't keep
+        // working" protection.
         if rt.workplace.active_root().as_deref() == Some(path.as_path()) {
-            return ToolOutput::err(format!(
-                "{} 是当前工作区根，不能删除它自己。要清理内容请删里面的条目。",
+            return ToolOutput::err(crate::tf!(
+                "{} is the current workspace root and cannot delete itself. To clean up its contents, delete the entries inside it.",
                 path.display()
             ));
         }
         if !path.exists() {
-            return ToolOutput::err(format!("{} 不存在", path.display()));
+            return ToolOutput::err(crate::tf!("{} does not exist", path.display()));
         }
         let recursive = args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
         let is_dir = path.is_dir();
         if is_dir {
             if !recursive {
-                // 非空目录不给删：这是「一次手滑删掉一整棵树」的唯一闸门
+                // A non-empty directory won't be deleted: this is the only gate
+                // against "one slip wipes out a whole tree"
                 let non_empty = std::fs::read_dir(&path).map(|mut it| it.next().is_some()).unwrap_or(false);
                 if non_empty {
-                    return ToolOutput::err(format!(
-                        "{} 是非空目录。要真的递归删掉它，请显式传 recursive = true。",
+                    return ToolOutput::err(crate::tf!(
+                        "{} is a non-empty directory. To really delete it recursively, pass recursive = true explicitly.",
                         path.display()
                     ));
                 }
             }
             let r = if recursive { std::fs::remove_dir_all(&path) } else { std::fs::remove_dir(&path) };
             match r {
-                Ok(()) => ToolOutput::ok(format!(
-                    "已删除目录 {}（{}）",
+                Ok(()) => ToolOutput::ok(crate::tf!(
+                    "Deleted directory {} ({})",
                     path.display(),
-                    if recursive { "递归" } else { "空目录" }
+                    if recursive { crate::i18n::t("recursive") } else { crate::i18n::t("empty dir") }
                 )),
-                Err(e) => ToolOutput::err(format!("删除目录 {} 失败: {e}", path.display())),
+                Err(e) => ToolOutput::err(crate::tf!("failed to delete directory {}: {}", path.display(), e)),
             }
         } else {
             match std::fs::remove_file(&path) {
-                Ok(()) => ToolOutput::ok(format!("已删除文件 {}", path.display())),
-                Err(e) => ToolOutput::err(format!("删除文件 {} 失败: {e}", path.display())),
+                Ok(()) => ToolOutput::ok(crate::tf!("Deleted file {}", path.display())),
+                Err(e) => ToolOutput::err(crate::tf!("failed to delete file {}: {}", path.display(), e)),
             }
         }
     }
@@ -457,18 +497,22 @@ mod tests {
     use crate::config::{Config, WorkplaceConfig};
     use crate::runtime::Runtime;
 
-    /// 造一个「固定工作区」的运行时，用来验证工具确实受边界约束。
+    /// Build a runtime with a "fixed workplace", to verify the tools really are
+    /// bound by the boundary.
     ///
-    /// 必须真的把工具注册进去：`Runtime::execute` 是按注册表找人，绕过注册表就没得测。
-    /// 这正是本模块与 `workplace` 模块单测的分工 —— 那边测判定，这边测「判定真的接在
-    /// 工具调用路径上」。
+    /// The tools must genuinely be registered: `Runtime::execute` looks people up
+    /// by registry, and bypassing the registry leaves nothing to test. This is
+    /// exactly the division of labour between this module and the `workplace`
+    /// unit tests — that side tests the decision, this side tests that "the
+    /// decision really is wired into the tool-call path".
     async fn rt_with_ws(dir: &std::path::Path) -> Arc<Runtime> {
         let mut cfg = Config::dummy();
         cfg.workplace = WorkplaceConfig { mode: "fixed".into(), root: Some(dir.to_string_lossy().into()) };
-        // 解释器解析走不通也无所谓：本模块的测试不启插件
-        let rt = Runtime::new(cfg, dir.to_path_buf(), dir.join("plugins")).expect("运行时应当能建起来");
+        // It doesn't matter if interpreter resolution fails: this module's tests
+        // don't start plugins
+        let rt = Runtime::new(cfg, dir.to_path_buf(), dir.join("plugins")).expect("the runtime should build");
         for t in host_file_tools() {
-            rt.register(t).await.expect("注册宿主文件工具应当成功");
+            rt.register(t).await.expect("registering host file tools should succeed");
         }
         rt
     }
@@ -488,17 +532,20 @@ mod tests {
 
         let w = rt.execute(HOST_FILE_TOOLS[1], json!({PATH_ARG: f.to_string_lossy(), "content": "你好\n"})).await;
         assert!(!w.is_error, "{}", w.content);
-        assert!(f.exists(), "父目录应当被自动创建");
+        assert!(f.exists(), "the parent directory should be created automatically");
 
         let r = rt.execute(HOST_FILE_TOOLS[0], json!({PATH_ARG: f.to_string_lossy()})).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("你好"), "内容应当读回来：{}", r.content);
+        assert!(r.content.contains("你好"), "the content should read back: {}", r.content);
     }
 
-    /// **写**越界必须被拦，且给模型的那份要带上三段契约。
+    /// An out-of-bounds **write** must be blocked, and the copy handed to the
+    /// model must carry the three-part contract.
     ///
-    /// 注意是「写」：读不受工作区限制（见 `read_outside_is_allowed_but_remove_is_not`），
-    /// 所以这条只能挂在 `write_file` 上 —— 挂在 `read_file` 上会变成一条永远绿的假测试。
+    /// Note it's "write": reads are not restricted by the workplace (see
+    /// `read_outside_is_allowed_but_remove_is_not`), so this can only hang off
+    /// `write_file` — hanging it off `read_file` would make it a permanently green
+    /// fake test.
     #[tokio::test]
     async fn outside_write_is_refused_with_the_contract() {
         let d = tmp("outside");
@@ -506,41 +553,44 @@ mod tests {
         let bad = d.parent().unwrap().join("aox-hostfs-evil.txt");
         let out = rt.execute(HOST_FILE_TOOLS[1], json!({PATH_ARG: bad.to_string_lossy(), "content": "x"})).await;
         assert!(out.is_error);
-        assert!(!bad.exists(), "越界的写入绝不能真的发生");
-        assert!(out.content.contains("权限边界"), "{}", out.content);
-        assert!(out.content.contains("不要重试"), "{}", out.content);
-        assert!(out.content.contains("转述给用户"), "{}", out.content);
+        assert!(!bad.exists(), "an out-of-bounds write must never actually happen");
+        assert!(out.content.contains("permission boundary"), "{}", out.content);
+        assert!(out.content.contains("Do not retry"), "{}", out.content);
+        assert!(out.content.contains("relay this to the user"), "{}", out.content);
     }
 
-    /// 新语义（2026-10-04）：**读不受工作区限制** —— 区外的文件读得到、区外的目录列得出；
-    /// 而**删**仍然受限。两件事一起钉，免得哪天又被「统一」回一档
-    /// （只钉一边的话，「读通过了」也可能只是读压根没走判定，那是漏了，不是语义对）。
+    /// New semantics (2026-10-04): **reading is not restricted by the workplace**
+    /// — out-of-bounds files are readable and out-of-bounds directories listable;
+    /// but **removal** is still restricted. Pin both together, so nobody later
+    /// "unifies" them back into one tier (pinning only one side means "read passed"
+    /// could just be that reading never went through the check at all — that's a
+    /// leak, not correct semantics).
     #[tokio::test]
     async fn read_outside_is_allowed_but_remove_is_not() {
         let d = tmp("rdout");
         let rt = rt_with_ws(&d).await;
-        // 工作区**外面**的一个文件与目录
+        // A file and a directory **outside** the workplace
         let out_dir = d.parent().unwrap().join("aox-hostfs-outside-dir");
         let _ = std::fs::remove_dir_all(&out_dir);
         std::fs::create_dir_all(&out_dir).unwrap();
         let f = out_dir.join("note.txt");
         std::fs::write(&f, "外面的内容").unwrap();
 
-        // 读：放行
+        // Read: allowed
         let r = rt.execute(HOST_FILE_TOOLS[0], json!({PATH_ARG: f.to_string_lossy()})).await;
-        assert!(!r.is_error, "读区外文件必须放行（新语义）：{}", r.content);
+        assert!(!r.is_error, "reading a file outside the workspace must be allowed (new semantics): {}", r.content);
         assert!(r.content.contains("外面的内容"), "{}", r.content);
 
-        // 列目录：同样放行
+        // List directory: equally allowed
         let l = rt.execute(HOST_FILE_TOOLS[2], json!({PATH_ARG: out_dir.to_string_lossy()})).await;
-        assert!(!l.is_error, "列区外目录必须放行：{}", l.content);
+        assert!(!l.is_error, "listing a directory outside the workspace must be allowed: {}", l.content);
         assert!(l.content.contains("note.txt"), "{}", l.content);
 
-        // 删：仍然被拦，且文件必须还在
+        // Remove: still blocked, and the file must still be there
         let rm = rt.execute(HOST_FILE_TOOLS[3], json!({PATH_ARG: f.to_string_lossy()})).await;
-        assert!(rm.is_error, "删区外文件必须被拦：{}", rm.content);
-        assert!(f.exists(), "越界的删除绝不能真的发生");
-        assert!(rm.content.contains("权限边界"), "{}", rm.content);
+        assert!(rm.is_error, "deleting a file outside the workspace must be intercepted: {}", rm.content);
+        assert!(f.exists(), "an out-of-bounds delete must never actually happen");
+        assert!(rm.content.contains("permission boundary"), "{}", rm.content);
 
         let _ = std::fs::remove_dir_all(&out_dir);
     }
@@ -554,7 +604,7 @@ mod tests {
         std::fs::write(sub.join("inner.txt"), "x").unwrap();
 
         let denied = rt.execute(HOST_FILE_TOOLS[3], json!({PATH_ARG: sub.to_string_lossy()})).await;
-        assert!(denied.is_error, "非空目录不该被一次手滑删掉");
+        assert!(denied.is_error, "a non-empty directory must not be deleted by a single slip");
         assert!(sub.exists());
 
         let forced = rt
@@ -569,7 +619,7 @@ mod tests {
         let d = tmp("root");
         let rt = rt_with_ws(&d).await;
         let out = rt.execute(HOST_FILE_TOOLS[3], json!({PATH_ARG: d.to_string_lossy(), "recursive": true})).await;
-        assert!(out.is_error, "工作区根不能被删");
+        assert!(out.is_error, "the workspace root must not be deletable");
         assert!(d.exists());
     }
 
@@ -581,7 +631,7 @@ mod tests {
         let rt = rt_with_ws(&d).await;
         let out = rt.execute(HOST_FILE_TOOLS[2], json!({})).await;
         assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.contains("folder/"), "目录应带 / 后缀：{}", out.content);
+        assert!(out.content.contains("folder/"), "directories should carry a trailing /: {}", out.content);
         assert!(out.content.contains("a.txt"), "{}", out.content);
     }
 }

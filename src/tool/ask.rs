@@ -1,22 +1,26 @@
-//! `ask_user` —— 让模型把「选择题」交给界面，而不是写在正文里等用户打字。
+//! `ask_user` — lets the model hand a "multiple-choice question" to the interface, instead of
+//! writing it into the body text and waiting for the user to type.
 //!
-//! # 为什么需要它
+//! # Why it is needed
 //!
-//! 模型想请用户做决定时，天然会写成正文里的一句「你选 1 还是 2？」。那句话对宿主
-//! **完全不可见** —— 它就是一段普通文本，宿主没有任何机制接住它。后果是：用户必须
-//! 自己打字回答，而且他打的字与模型的编号对不对得上全靠运气（「1」是上面第一个
-//! 还是下面第一个？），错了谁也不会发现。
+//! When the model wants the user to make a decision, it naturally writes a line like "do you pick 1
+//! or 2?" into the body. That line is **completely invisible** to the host — it's just ordinary
+//! text, and the host has no mechanism to catch it. The consequence: the user has to type the answer
+//! themselves, and whether their typing lines up with the model's numbering is pure luck ("1" is the
+//! first one above or the first one below?), and nobody notices if it's wrong.
 //!
-//! 所以这里给模型一个**结构化**的出口：`ask_user(question, options[])`。宿主拿到之后
-//! 把它画成输入框上方的一排可点选项，等用户点（或打字），再把结果作为工具结果交回去。
+//! So the model is given a **structured** outlet here: `ask_user(question, options[])`. The host
+//! takes it and draws it as a row of clickable options above the input box, waits for the user to
+//! click (or type), and hands the result back as a tool result.
 //!
-//! # 为什么它不在 `Tool::call` 里实现
+//! # Why it isn't implemented in `Tool::call`
 //!
-//! 「问用户」必须拿到 `Ui`，而 `Tool::call(args, rt)` 的签名里没有它 —— 整条工具调用
-//! 路径（含插件那条 RPC）都不带界面。授权那条路（`Ui::authorize`）也是因此才走 Agent。
-//! 所以这道工具由 [`crate::agent::Agent::authorize_and_execute`] **特判**：
-//! 名字命中 [`ASK_TOOL`] 时把 `Ui` 递进 [`interact`]，`call` 永远不会被调到
-//!（留一个兜底实现，只为「万一有人绕过 Agent 直接 execute」时给一句能看懂的话）。
+//! "Asking the user" needs a `Ui`, and `Tool::call(args, rt)`'s signature doesn't have one — the
+//! whole tool-call path (including the plugin RPC) carries no interface. The authorisation path
+//! (`Ui::authorize`) goes through the Agent for exactly this reason. So this tool is **special-cased**
+//! by [`crate::agent::Agent::authorize_and_execute`]: when the name matches [`ASK_TOOL`] the `Ui` is
+//! passed into [`interact`], and `call` is never reached (a fallback implementation is kept only so
+//! that "if someone bypasses the Agent and executes directly" there is a comprehensible sentence).
 
 use std::sync::Arc;
 
@@ -27,14 +31,16 @@ use super::{Tool, ToolKind, ToolOutput};
 use crate::runtime::Runtime;
 use crate::ui::{ChoiceReply, Ui};
 
-/// 工具名。Agent 特判与这里**引同一个常量** —— 改了名字不会出现「特判失效、
-/// 工具被当普通工具跑」那种静默错位（`HOST_FILE_TOOLS` 也是同一个理由）。
+/// The tool name. The Agent's special case and this spot **reference the same constant** — so a
+/// rename cannot produce the silent misalignment of "the special case stops matching and the tool
+/// runs as an ordinary one" (same reasoning as `HOST_FILE_TOOLS`).
 pub const ASK_TOOL: &str = "ask_user";
 
-/// 一次最多几个选项。
+/// The maximum number of options at once.
 ///
-/// 上限不是随手定的：选项槽是输入框上方**一条横排**，超过 6 个就得换行，
-/// 而它存在的意义正是「一眼扫完、点一下」。再多就该分两轮问。
+/// The limit isn't arbitrary: the option slot is **a single horizontal row** above the input box,
+/// and more than 6 would have to wrap — yet its entire point is "glance once, click once". Beyond
+/// that it should be asked in two rounds.
 pub const MAX_OPTIONS: usize = 6;
 
 pub fn ask_tools() -> Vec<Arc<dyn Tool>> {
@@ -48,26 +54,25 @@ impl Tool for AskUser {
     fn name(&self) -> &str {
         ASK_TOOL
     }
-    /// 报 `Host`：它是宿主自带的能力（与文件工具同类），不是插件、也不动宿主自身。
-    /// `workplace_reject` 那条路对它无害 —— 它的参数里没有 `path`，第一句就返回了。
+    /// Report `Host`: it is a capability built into the host (the same class as the file tools), not a
+    /// plugin, and it doesn't touch the host itself. The `workplace_reject` path does it no harm —
+    /// there is no `path` in its arguments, so the first check returns.
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
     fn description(&self) -> &str {
-        "请用户在几个选项里挑一个，并**等他作答**（会暂停当前这轮）。\
-         需要用户做决定时用它 —— 在正文里写「你选 1 还是 2？」是没用的：那是纯文本，\
-         用户得自己打字，他打的字与你的编号对不对得上也没人保证。\
-         选项会自动编号，界面还会附一条「自己输入」。返回值是用户选中的那一项，\
-         或者他自己打的一段话（那也是一种有效回答，不要因此重新问一遍）。"
+        crate::i18n::t("Ask the user to pick one of a few options and **wait for the answer** (this pauses the current round). Use it when the user must make a decision — writing \"do you choose 1 or 2?\" in the body text is useless: that is plain text, the user has to type it themselves, and nothing guarantees what they type matches your numbering. Options are numbered automatically, and the UI adds a \"type your own\" entry. The return value is the option the user picked, or a paragraph they typed themselves (that is a valid answer too — do not ask the same question again because of it).")
     }
     fn parameters(&self) -> Value {
         parameters()
     }
     async fn call(&self, _args: Value, _rt: &Arc<Runtime>) -> ToolOutput {
-        // 正常情况下走不到这里（见模块文档）。真走到了，说明调用方绕开了 Agent，
-        // 那句话要能让看日志的人立刻明白缺的是什么。
-        ToolOutput::err(format!(
-            "{ASK_TOOL} 必须由宿主主循环处理（它需要把界面递进来），不能直接执行"
+        // Under normal circumstances this is unreachable (see the module docs). If it really is
+        // reached, the caller has bypassed the Agent, and the sentence has to make it immediately
+        // clear to whoever reads the log what's missing.
+        ToolOutput::err(crate::tf!(
+            "{} must be handled by the host's main loop (it needs the UI handed in) and cannot be executed directly",
+            ASK_TOOL
         ))
     }
 }
@@ -78,80 +83,83 @@ fn parameters() -> Value {
         "properties": {
             "question": {
                 "type": "string",
-                "description": "要问用户的一句话。写清在选什么（例如「这份报告按哪种口径统计？」）"
+                "description": crate::i18n::t("One sentence to ask the user. Make clear what is being chosen (e.g. \"which basis should this report be computed on?\")")
             },
             "options": {
                 "type": "array",
                 "items": {"type": "string"},
                 "minItems": 2,
                 "maxItems": MAX_OPTIONS,
-                "description": "候选答案，2~6 个。**只写正文，不要自己编号** —— 宿主会加 A/B/C…。\
-                                每个选项要能独立看懂，不要写「同上」或「选第一个」"
+                "description": crate::i18n::t("Candidate answers, 2-6 of them. **Write the body only, do not number them yourself** — the host adds A/B/C…. Each option must stand on its own; do not write \"same as above\" or \"pick the first one\"")
             }
         },
         "required": ["question", "options"]
     })
 }
 
-/// 把 `ask_user` 的参数拆成 `(问题, 选项)`。错误给的是**给模型看**的话。
+/// Split `ask_user`'s arguments into `(question, options)`. Errors are phrased **for the model to read**.
 ///
-/// 抽成纯函数是为了能单测：这里最容易出的错是「悄悄吞掉空选项」，
-/// 而吞掉之后模型收到的是一个少了一项的选项槽，双方都不知道少了什么。
+/// Extracted as a pure function so it's unit-testable: the easiest mistake here is "silently swallowing an
+/// empty option", after which the model receives an option slot missing one entry, and neither side knows what's gone.
 pub fn parse(args: &Value) -> Result<(String, Vec<String>), String> {
     let question = args
         .get("question")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("{ASK_TOOL} 缺少 question（要给用户一句能看懂的问题）"))?
+        .ok_or_else(|| crate::tf!("{} is missing question (give the user a question they can understand)", ASK_TOOL))?
         .to_string();
 
     let raw = args
         .get("options")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| format!("{ASK_TOOL} 的 options 必须是字符串数组"))?;
+        .ok_or_else(|| crate::tf!("{}'s options must be an array of strings", ASK_TOOL))?;
 
     let mut options: Vec<String> = Vec::with_capacity(raw.len());
     for o in raw {
         let s = o
             .as_str()
-            .ok_or_else(|| format!("{ASK_TOOL} 的 options 里有非字符串项：{o}"))?
+            .ok_or_else(|| crate::tf!("{}'s options contains a non-string entry: {}", ASK_TOOL, o))?
             .trim()
             .to_string();
         if s.is_empty() {
-            return Err(format!("{ASK_TOOL} 的 options 里有空选项 —— 去掉它再调用"));
+            return Err(crate::tf!("{}'s options contains an empty entry — remove it and call again", ASK_TOOL));
         }
         options.push(s);
     }
     if options.len() < 2 {
-        return Err(format!(
-            "{ASK_TOOL} 至少要两个选项（给了 {} 个）。只有一个可能就不用问了，直接做",
+        return Err(crate::tf!(
+            "{} needs at least two options ({} given). If there is only one possibility there is nothing to ask — just do it",
+            ASK_TOOL,
             options.len()
         ));
     }
     if options.len() > MAX_OPTIONS {
-        // 截断而不是报错：多几个选项不算错，只是界面摆不下。
+        // Truncate rather than error: a few extra options aren't a mistake, they just don't fit on screen.
         options.truncate(MAX_OPTIONS);
     }
     Ok((question, options))
 }
 
-/// 选项的编号字符：0 → `A`、1 → `B` …
+/// The labelling character for an option: 0 → `A`, 1 → `B` …
 ///
-/// 用字母而不是数字：正文里模型常常自己带数字（「1. 2. 3.」），而用户复述时
-/// 「我选了 A」不会有歧义。超过 26 个也不会发生（上限 6）。
+/// Letters rather than digits: the model often writes its own numbers in the body ("1. 2. 3."), and
+/// when the user echoes back "I picked A" there is no ambiguity. More than 26 can't happen (the limit
+/// is 6).
 pub fn letter(i: usize) -> char {
     (b'A' + (i % 26) as u8) as char
 }
 
-/// 把用户敲的一行认成「第几项」。认不出返回 `None`。
+/// Read a line the user typed as "which option". Returns `None` when it can't be recognised.
 ///
-/// 认这些写法：`A` / `a` / `A.` / `a)` / `1` / `1.` —— 界面给的是字母，但用户看着
-/// 一串选项敲数字也很自然（模型常在正文里用数字编号）。两种都收。
+/// It accepts these forms: `A` / `a` / `A.` / `a)` / `1` / `1.` — the interface gives letters, but a
+/// user looking at a list of options typing a digit is only natural too (the model often numbers its
+/// body text). Both are accepted.
 ///
-/// 刻意**只认单个字符**（可带一个尾标点）：`ab` 不是选项，`A4 纸` 也不是 ——
-/// 那种输入应当原样交给模型当自由回答，而不是猜成 A。猜错的代价是模型拿一个
-/// 用户没做过的选择继续往下做，而用户根本没机会发现。
+/// It deliberately **accepts only a single character** (optionally with one trailing punctuation):
+/// `ab` is not an option, nor is `A4 paper` — such input should be handed to the model verbatim as a
+/// free-form answer, rather than guessed as A. The cost of guessing wrong is the model carrying on
+/// with a choice the user never made, and the user having no chance to notice.
 pub fn as_choice(s: &str, n: usize) -> Option<usize> {
     let t = s.trim().trim_end_matches(['.', '。', ')', '）', '、', ':']);
     if t.chars().count() != 1 {
@@ -162,7 +170,8 @@ pub fn as_choice(s: &str, n: usize) -> Option<usize> {
         return (i < n).then_some(i);
     }
     let d = c.to_digit(10)? as usize;
-    // 数字按 **1 基** 认（用户看到的是「1. 2. 3.」）；越界就不认，交给自由回答那条路
+    // Digits are read as **1-based** (what the user sees is "1. 2. 3."); out of range means
+    // unrecognised, and it goes down the free-form-answer path
     (d >= 1 && d <= n).then(|| d - 1)
 }
 
@@ -171,7 +180,7 @@ fn letter_index(c: char) -> Option<usize> {
     u.is_ascii_uppercase().then(|| (u as u8 - b'A') as usize)
 }
 
-/// 问一次用户。由 Agent 在拿到 `Ui` 的地方调用（见模块文档）。
+/// Ask the user once. Called by the Agent wherever it has a `Ui` (see the module docs).
 pub async fn interact(args: Value, ui: &mut dyn Ui) -> ToolOutput {
     let (question, options) = match parse(&args) {
         Ok(v) => v,
@@ -179,19 +188,19 @@ pub async fn interact(args: Value, ui: &mut dyn Ui) -> ToolOutput {
     };
     match ui.choose(&question, &options).await {
         ChoiceReply::Picked(i) => match options.get(i) {
-            // 把「编号 + 原文」一起回给模型：它后面复述这个选择时，用户能对上。
-            Some(text) => ToolOutput::ok(format!("用户选了 {}. {text}", letter(i))),
-            None => ToolOutput::err("界面回了一个不存在的选项下标（内部错误），请重新问一次"),
+            // Hand back "label + original text" together: when the model later echoes the choice, the
+            // user can match it up.
+            Some(text) => ToolOutput::ok(crate::tf!("the user chose {}. {}", letter(i), text)),
+            None => ToolOutput::err(crate::i18n::t("the UI returned a non-existent option index (internal error); ask again")),
         },
         ChoiceReply::Text(t) => {
-            // 特意点明「这也是有效回答」：模型很容易把「用户没点选项」读成「用户没回答」，
-            // 于是把同一个问题再问一遍 —— 那是最让人恼火的一种循环。
-            ToolOutput::ok(format!("用户没有点选项，直接回答了：{t}"))
+            // It deliberately spells out "this is a valid answer too": the model easily reads "the
+            // user didn't click an option" as "the user didn't answer", and then asks the same
+            // question all over again — which is the most infuriating kind of loop.
+            ToolOutput::ok(crate::tf!("the user did not click an option and answered directly: {}", t))
         }
         ChoiceReply::Cancelled => ToolOutput::err(
-            "用户没有作答（他关掉了选项、或者界面断了）。\
-             不要再问同一个问题：要么按你的默认判断继续做，并把「我按 X 做了」说清楚；\
-             要么把决定留给用户的下一条消息。",
+            crate::i18n::t("The user gave no answer (they closed the options, or the UI dropped). Do not ask the same question again: either continue with your own default judgment and state clearly that you went with X, or leave the decision to the user's next message."),
         ),
     }
 }
@@ -202,26 +211,27 @@ mod tests {
 
     #[test]
     fn parses_a_normal_question() {
-        let args = json!({"question": "  按哪种口径统计？ ", "options": [" 左边 ", "右边"]});
+        let args = json!({"question": "  Which basis for the stats? ", "options": [" left ", "right"]});
         let (q, o) = parse(&args).unwrap();
-        assert_eq!(q, "按哪种口径统计？", "首尾空白要去掉");
-        assert_eq!(o, vec!["左边".to_string(), "右边".to_string()]);
+        assert_eq!(q, "Which basis for the stats?", "leading/trailing whitespace must be trimmed");
+        assert_eq!(o, vec!["left".to_string(), "right".to_string()]);
     }
 
-    /// 空选项**必须报错**，不能悄悄吞掉：吞掉之后模型收到的是一个少了一格的选项槽，
-    /// 双方都不知道少了什么，而用户点的编号与模型以为的编号从此错位。
+    /// An empty option **must be an error**, never silently swallowed: after swallowing, the model
+    /// receives an option slot missing one entry, neither side knows what's gone, and the index the
+    /// user clicks is misaligned with the one the model believes in from then on.
     #[test]
     fn empty_or_non_string_options_are_rejected_not_swallowed() {
         let e = parse(&json!({"question": "q", "options": ["a", "  "]})).unwrap_err();
-        assert!(e.contains("空选项"), "{e}");
+        assert!(e.contains("an empty entry"), "{e}");
         let e = parse(&json!({"question": "q", "options": ["a", 1]})).unwrap_err();
-        assert!(e.contains("非字符串"), "{e}");
+        assert!(e.contains("a non-string entry"), "{e}");
     }
 
     #[test]
     fn a_single_option_is_not_a_question() {
-        let e = parse(&json!({"question": "q", "options": ["只有一个"]})).unwrap_err();
-        assert!(e.contains("至少要两个"), "{e}");
+        let e = parse(&json!({"question": "q", "options": ["the only one"]})).unwrap_err();
+        assert!(e.contains("at least two options"), "{e}");
     }
 
     #[test]
@@ -230,13 +240,14 @@ mod tests {
         assert!(e.contains("question"), "{e}");
     }
 
-    /// 超过上限是**截断**而不是报错：多给几个不算错，只是界面摆不下。
+    /// Exceeding the limit is **truncation**, not an error: a few extra ones aren't a mistake, they
+    /// just don't fit on screen.
     #[test]
     fn too_many_options_are_truncated_not_rejected() {
-        let opts: Vec<String> = (0..9).map(|i| format!("选项{i}")).collect();
+        let opts: Vec<String> = (0..9).map(|i| format!("option {i}")).collect();
         let (_, o) = parse(&json!({"question": "q", "options": opts})).unwrap();
         assert_eq!(o.len(), MAX_OPTIONS);
-        assert_eq!(o[0], "选项0", "截断要留前面几个，不是随机丢");
+        assert_eq!(o[0], "option 0", "truncation must keep the first few, not drop them randomly");
     }
 
     #[test]
@@ -246,7 +257,8 @@ mod tests {
         assert_eq!(letter(5), 'F');
     }
 
-    /// 认编号要**准**，不能贪：认错的代价是模型拿一个用户没做过的选择继续往下做。
+    /// Recognising a label must be **precise**, never greedy: recognising wrongly costs the model
+    /// carrying on with a choice the user never made.
     #[test]
     fn choice_parsing_accepts_letters_and_numbers_but_nothing_fuzzy() {
         let n = 3;
@@ -261,11 +273,11 @@ mod tests {
             ("2.", 1),
             ("3、", 2),
         ] {
-            assert_eq!(as_choice(input, n), Some(want), "{input:?} 应当认成第 {want} 项");
+            assert_eq!(as_choice(input, n), Some(want), "{input:?} should be recognised as item {want}");
         }
-        // 这些**不该**被认成选项 —— 它们该原样当自由回答交给模型
-        for input in ["", "ab", "A4 纸", "第 1 个", "A B", "是", "0", "4"] {
-            assert_eq!(as_choice(input, n), None, "{input:?} 不该被认成选项");
+        // These **should not** be recognized as options — they should be handed back to the model verbatim as free-form answers
+        for input in ["", "ab", "A4 paper", "the 1st", "A B", "yes", "0", "4"] {
+            assert_eq!(as_choice(input, n), None, "{input:?} must not be recognised as an option");
         }
     }
 }

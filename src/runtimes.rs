@@ -1,26 +1,31 @@
-//! 插件运行时的「解析」与「装配」。
+//! Plugin runtime "resolution" and "installation".
 //!
-//! ## 一、解释器解析（三档，CLI / GUI / selftest 共用）
+//! ## 1. Interpreter resolution (three tiers, shared by CLI / GUI / selftest)
 //!
-//! 1. `config.toml` 的 `[runtimes]` 写了**显式路径** → 直接用，不做任何猜测；
-//! 2. 该字段是**裸命令**（`python` / `node` / `rustc`）且应用目录下存在内置运行时
-//!    `<app_root>/runtime/<lang>/<exe>` → 用内置的那份；
-//! 3. 都不是 → 保持裸命令，交给 `PATH`。
+//! 1. `config.toml`'s `[runtimes]` has an **explicit path** → use it directly, no guessing;
+//! 2. The field is a **bare command** (`python` / `node` / `rustc`) and a built-in runtime
+//!    exists under the app directory `<app_root>/runtime/<lang>/<exe>` → use the built-in one;
+//! 3. Neither → keep the bare command and leave it to `PATH`.
 //!
-//! 第 2 档是这套设计的支点：**把运行时放进应用目录就自动生效**，用户不必改配置，
-//! 我们也不需要往系统 `PATH` 或用户环境变量里写任何东西（无侵入、卸载即消失）。
+//! Tier 2 is the fulcrum of this design: **dropping a runtime into the app directory makes it
+//! take effect automatically**, with no config change needed, and we write nothing into the
+//! system `PATH` or the user's environment variables (non-invasive, gone on uninstall).
 //!
-//! ## 二、装配
+//! ## 2. Installation
 //!
-//! 只自动装配 Python（Node 单文件 80 MB 以上，不适合捆绑；rust 插件运行期本就不需要任何东西）。
-//! 顺序：已存在 → 本地离线包 → 下载（离线包与非默认源都不需要网络）。
+//! Only Python is installed automatically (a Node single file is over 80 MB, unfit for
+//! bundling; rust plugins need nothing at runtime anyway).
+//! Order: already exists → local offline pack → download (the offline pack and non-default
+//! sources need no network).
 //!
-//! **刻意不引入任何新 crate**：
-//! - 下载复用已在依赖里的 `reqwest`（`chunk()` 不需要额外 feature）；
-//! - 解压用系统自带 `tar.exe`（bsdtar，Win10 1803+），回退 PowerShell `Expand-Archive`；
-//! - 校验用系统自带 `certutil -hashfile ... SHA256`。
+//! **Deliberately introduces no new crate**:
+//! - Downloading reuses `reqwest`, already in the dependency tree (`chunk()` needs no extra feature);
+//! - Extraction uses the system's own `tar.exe` (bsdtar, Win10 1803+), falling back to PowerShell
+//!   `Expand-Archive`;
+//! - Verification uses the system's own `certutil -hashfile ... SHA256`.
 //!
-//! 三条路都是「系统已有能力」，因此装配链路没有给宿主增加任何体积与依赖。
+//! All three paths are "capabilities the system already has", so the installation chain adds no
+//! size or dependency to the host.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -32,26 +37,27 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::config::RuntimesConfig;
 use crate::plugin::ProcessFlags;
 
-/// 离线运行时包的约定文件名。
-/// 放到 **exe 同目录** / 应用根 / `<应用根>/runtime` / `%LOCALAPPDATA%\AOX` 下都会被自动发现，
-/// 这是完全离线的装配路径。
+/// The agreed filename of the offline runtime pack.
+/// Placing it in the **exe's directory** / the app root / `<app_root>/runtime` /
+/// `%LOCALAPPDATA%\AOX` gets it discovered automatically — a fully offline installation path.
 pub const PACK_NAME: &str = "aox-python-runtime.zip";
 
-/// 默认下载源：CPython 官方「嵌入式发行版」（约 10 MB，解压约 21 MB）。
+/// The default download source: CPython's official "embeddable distribution" (about 10 MB, ~21 MB extracted).
 pub const DEFAULT_PYTHON_URL: &str =
     "https://www.python.org/ftp/python/3.13.7/python-3.13.7-embed-amd64.zip";
 
-/// 与 [`DEFAULT_PYTHON_URL`] 配套的官方 SHA-256。
-/// 只对默认源生效；用了自定义 `python_url` 又想校验时，自行在 `[runtimes]` 填 `python_sha256`。
+/// The official SHA-256 that goes with [`DEFAULT_PYTHON_URL`].
+/// Applies only to the default source; if you use a custom `python_url` and still want
+/// verification, fill in `python_sha256` yourself under `[runtimes]`.
 pub const DEFAULT_PYTHON_SHA256: &str =
     "f6cca216a359be84797cabb54149ce5e062afb16cc7567eb7fc51cacb2d86b65";
 
-/// 明确拒绝自动装配 Node 的理由（体积）。
+/// The reason Node auto-installation is explicitly refused (size).
 pub const NODE_MANUAL_HINT: &str =
-    "Node 运行时单文件就超过 80 MB，不适合自动装配。请自行安装 Node.js 后确保 `node` 在 PATH 中，\
-     或在 config.toml 的 [runtimes] node 写入完整路径。";
+    "The Node runtime is over 80 MB as a single file, so it is not suitable for auto-install. Install Node.js \
+     yourself and make sure `node` is on PATH, or write its full path under [runtimes] node in config.toml.";
 
-// ─────────────────────────── 语言 ───────────────────────────
+// ─────────────────────────── Languages ───────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
@@ -71,7 +77,7 @@ impl Lang {
         }
     }
 
-    /// 内置运行时目录里的可执行文件名。
+    /// The executable filename inside the built-in runtime directory.
     pub fn exe(self) -> &'static str {
         if cfg!(windows) {
             match self {
@@ -85,28 +91,28 @@ impl Lang {
     }
 }
 
-// ─────────────────────────── 状态 ───────────────────────────
+// ─────────────────────────── Status ───────────────────────────
 
-/// 解释器的来源，用于 `/runtime` 报告与系统提示。
+/// An interpreter's origin, used by the `/runtime` report and the system prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
-    /// `config.toml` 里写死的路径
+    /// A path hard-coded in `config.toml`
     Config,
-    /// 应用目录内置运行时
+    /// The built-in runtime under the app directory
     Builtin,
-    /// `PATH` 里找到的
+    /// Found in `PATH`
     Path,
-    /// 找不到
+    /// Not found
     Missing,
 }
 
 impl Origin {
     pub fn label(self) -> &'static str {
         match self {
-            Origin::Config => "config.toml 指定",
-            Origin::Builtin => "应用目录内置",
+            Origin::Config => crate::i18n::t("set in config.toml"),
+            Origin::Builtin => crate::i18n::t("built into the app directory"),
             Origin::Path => "PATH",
-            Origin::Missing => "未找到",
+            Origin::Missing => crate::i18n::t("not found"),
         }
     }
 }
@@ -114,7 +120,7 @@ impl Origin {
 #[derive(Debug, Clone)]
 pub struct Status {
     pub lang: Lang,
-    /// 最终使用的命令（绝对路径或裸命令）
+    /// The command finally used (an absolute path or a bare command)
     pub command: String,
     pub origin: Origin,
 }
@@ -125,7 +131,8 @@ impl Status {
     }
 }
 
-/// 状态的一行文本表示。CLI 的 `/runtime` 报告与 GUI 的关于窗口共用同一份文案。
+/// A one-line textual representation of the status. The CLI's `/runtime` report and the GUI's
+/// About window share the same wording.
 pub fn one_line(st: &Status) -> String {
     format!(
         "{} {:<7} {}  [{}]",
@@ -136,31 +143,33 @@ pub fn one_line(st: &Status) -> String {
     )
 }
 
-// ─────────────────────────── 解析 ───────────────────────────
+// ─────────────────────────── Resolution ───────────────────────────
 
-/// 「裸命令」= 不含任何路径分量，因此可以安全地被内置运行时替代。
+/// A "bare command" = containing no path component, hence safe to be replaced by the built-in
+/// runtime.
 ///
-/// 带 `/`、`\` 或 `:`（盘符）的值都视为用户显式指定的路径，绝不覆盖。
+/// Values containing `/`, `\` or `:` (a drive letter) are all treated as paths the user
+/// explicitly specified and are never overwritten.
 fn is_bare(cmd: &str) -> bool {
     let t = cmd.trim();
     !t.is_empty() && !t.contains(['/', '\\', ':'])
 }
 
-/// 内置运行时目录：`<app_root>/runtime/<lang>`。
+/// The built-in runtime directory: `<app_root>/runtime/<lang>`.
 pub fn builtin_dir(root: &Path, lang: Lang) -> PathBuf {
     root.join("runtime").join(lang.key())
 }
 
-/// 内置运行时的可执行文件；只有真的存在才返回。
+/// The built-in runtime's executable; returned only when it really exists.
 pub fn builtin_exe(root: &Path, lang: Lang) -> Option<PathBuf> {
     let p = builtin_dir(root, lang).join(lang.exe());
     p.is_file().then_some(p)
 }
 
-/// `PATH` 里查找可执行文件——标准库没有 `which`，自己写十几行。
+/// Look up an executable in `PATH` — the standard library has no `which`, so here are a dozen lines.
 fn find_in_path(cmd: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    // Windows 上按 PATHEXT 的常见子集找；其余平台只有裸名。
+    // On Windows, search a common subset of PATHEXT; other platforms have only the bare name.
     let exts: &[&str] = if cfg!(windows) {
         &["", ".exe", ".cmd", ".bat", ".com"]
     } else {
@@ -193,9 +202,10 @@ fn cfg_set(cfg: &mut RuntimesConfig, lang: Lang, v: String) {
     }
 }
 
-/// 三档解析，就地改写 `cfg`。
+/// The three-tier resolution, rewriting `cfg` in place.
 ///
-/// 只在「配置值是裸命令」时才用内置运行时覆盖——用户显式写的路径一律尊重。
+/// The built-in runtime only overrides when "the config value is a bare command" — a path the
+/// user wrote explicitly is always respected.
 pub fn resolve(cfg: &mut RuntimesConfig, root: &Path) {
     for lang in Lang::ALL {
         let cur = cfg_get(cfg, lang);
@@ -208,11 +218,13 @@ pub fn resolve(cfg: &mut RuntimesConfig, root: &Path) {
     }
 }
 
-/// 只做静态判定，**不启动任何子进程**——这条路径在每次启动时都会走到，不能为此变慢。
+/// Static judgment only, **starting no subprocess** — this path is walked on every startup and
+/// must not be slowed down for it.
 ///
-/// 注意：`cfg` 必须是**原始**（未经过 [`resolve`]）的配置。
-/// 只有拿原始值才能判断出「来源」是 `config.toml 指定` 还是 `应用目录内置`；
-/// 若传入解析后的快照，所有内置运行时都会被误标成前者。
+/// Note: `cfg` must be the **raw** config (not passed through [`resolve`]).
+/// Only the raw value lets us tell whether the "origin" is `config.toml` or `built-in under the
+/// app directory`; passing the resolved snapshot would mislabel every built-in runtime as the
+/// former.
 pub fn status(root: &Path, cfg: &RuntimesConfig) -> Vec<Status> {
     Lang::ALL
         .into_iter()
@@ -238,7 +250,8 @@ pub fn status(root: &Path, cfg: &RuntimesConfig) -> Vec<Status> {
         .collect()
 }
 
-/// 跑一次 `--version` 取版本行。只在用户显式查询 `/runtime` 时调用。
+/// Run `--version` once to get the version line. Called only when the user explicitly queries
+/// `/runtime`.
 pub fn probe_version(command: &str) -> Option<String> {
     let mut cmd = Command::new(command);
     cmd.arg("--version");
@@ -249,15 +262,16 @@ pub fn probe_version(command: &str) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
-// ─────────────────────────── 对外文案 ───────────────────────────
+// ─────────────────────────── User-facing wording ───────────────────────────
 
-/// `/runtime` 的报告文本。
+/// The `/runtime` report text.
 pub fn status_report(root: &Path, cfg: &RuntimesConfig) -> String {
-    let mut s = String::from("插件运行时：\n");
+    let mut s = String::from(crate::i18n::t("Plugin runtimes:\n"));
     for st in status(root, cfg) {
         s.push_str("  ");
         s.push_str(&one_line(&st));
-        // 只有真的能用才去跑一次版本探测，避免为「未找到」白起进程
+        // Probe the version only when it is really usable, to avoid spawning a process for a
+        // path that was never found
         if st.ok() {
             if let Some(v) = probe_version(&st.command) {
                 s.push_str(&format!("  ·  {v}"));
@@ -265,71 +279,74 @@ pub fn status_report(root: &Path, cfg: &RuntimesConfig) -> String {
         }
         s.push('\n');
     }
-    s.push_str(&format!("  内置运行时目录: {}\n", root.join("runtime").display()));
-    s.push_str(&format!("  离线包约定名:   {PACK_NAME}（放在 exe 同目录或应用根即可）\n"));
+    s.push_str(&crate::tf!("  built-in runtime directory: {}\n", root.join("runtime").display()));
+    s.push_str(&crate::tf!("  offline pack name:   {} (place it next to the exe or in the app root)\n", PACK_NAME));
     if let Some(p) = find_offline_pack(root) {
-        s.push_str(&format!("  已发现离线包:   {}\n", p.display()));
+        s.push_str(&crate::tf!("  offline pack found:   {}\n", p.display()));
     }
     s
 }
 
-/// 启动横幅用的一行提示；Python 就绪时返回 `None`，让启动输出保持干净。
+/// The one-line hint for the startup banner; returns `None` when Python is ready, keeping
+/// startup output clean.
 pub fn missing_hint(root: &Path, cfg: &RuntimesConfig) -> Option<String> {
     let st = status(root, cfg);
     let py = st.iter().find(|s| s.lang == Lang::Python)?;
     if py.ok() {
         return None;
     }
-    Some(format!(
-        "未检测到 Python，python 插件不可用（文件读写、系统信息等能力都靠它）。\
-         输入 /runtime install python 可安装内置运行时（约 10 MB，装到 {}）。",
+    Some(crate::tf!(
+        "Python was not detected, so python plugins are unavailable (file I/O, system info and other capabilities all depend on it). \
+         Run /runtime install python to install a bundled runtime (about 10 MB, into {}).",
         builtin_dir(root, Lang::Python).display()
     ))
 }
 
-/// 写进系统提示的「运行时环境」段，避免模型反复创建注定失败的插件。
+/// The "run environment" segment written into the system prompt, to keep the model from
+/// repeatedly creating doomed plugins.
 pub fn prompt_section(root: &Path, cfg: &RuntimesConfig) -> String {
     let st = status(root, cfg);
-    // 开头必须带换行：本段是紧接在上一段末尾（以「。」结束）拼接的
-    let mut s = String::from("\n- 可用插件运行时：");
+    // The leading newline is required: this segment is concatenated right after the end of the
+    // previous one (which ends with a period)
+    let mut s = String::from(crate::i18n::t("\n- Available plugin runtimes:"));
     for x in &st {
         s.push_str("\n  - ");
         s.push_str(x.lang.key());
         s.push_str(": ");
         if x.ok() {
-            s.push_str(&format!("{}（{}）", x.command, x.origin.label()));
+            s.push_str(&crate::tf!("{} ({})", x.command, x.origin.label()));
         } else {
-            s.push_str("缺失");
+            s.push_str(crate::i18n::t("missing"));
         }
     }
     let py_missing = st.iter().any(|x| x.lang == Lang::Python && !x.ok());
     let rustc_missing = st.iter().any(|x| x.lang == Lang::Rustc && !x.ok());
     if py_missing {
         s.push_str(
-            "\n- **本机没有 Python**：不要创建 language=\"python\" 的插件，那一定会失败。\
-             可以改用 language=\"rust\"（编译产物运行期不需要任何运行时）；\
-             或先让用户执行 /runtime install python 安装内置运行时，再重试。",
+            crate::i18n::t("\n- **No Python on this machine**: do not create a plugin with language=\"python\" — it will certainly fail. Use language=\"rust\" instead (a compiled artifact needs no runtime at run time); or ask the user to run /runtime install python to install the bundled runtime, then retry."),
         );
     }
     if rustc_missing {
         s.push_str(
-            "\n- 本机没有 rustc：**创建** rust 插件会失败，但已经编译好的 rust 插件可以正常加载运行。",
+            crate::i18n::t("\n- No rustc on this machine: **creating** a rust plugin will fail, but an already-compiled rust plugin loads and runs fine."),
         );
     }
     s
 }
 
-// ─────────────────────────── 离线包发现 ───────────────────────────
+// ─────────────────────────── Offline pack discovery ───────────────────────────
 
-/// 当前进程 exe 所在目录。
+/// The directory holding the current process's exe.
 ///
-/// 这里不复用 `crate::paths::exe_dir()`：`src/paths.rs` 只挂在 lib 上（CLI 的 bin 根
-/// 没有声明它），而本模块要同时被 bin 与 lib 编译——保持零模块耦合，行为才一致。
+/// `crate::paths::exe_dir()` is not reused here: `src/paths.rs` hangs off lib only (the CLI's bin
+/// root doesn't declare it), whereas this module is compiled by both bin and lib — keeping zero
+/// module coupling is what keeps the behaviour consistent.
 fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
-/// 离线包候选位置，按优先级：exe 同目录 → 应用根 → 应用根/runtime → %LOCALAPPDATA%\AOX。
+/// Offline pack candidate locations, by priority: exe directory → app root → app root/runtime →
+/// %LOCALAPPDATA%\AOX.
 pub fn find_offline_pack(root: &Path) -> Option<PathBuf> {
     let mut v = Vec::new();
     if let Some(d) = exe_dir() {
@@ -343,27 +360,28 @@ pub fn find_offline_pack(root: &Path) -> Option<PathBuf> {
     v.into_iter().find(|p| p.is_file())
 }
 
-// ─────────────────────────── 系统能力封装 ───────────────────────────
+// ─────────────────────────── System-capability wrappers ───────────────────────────
 
-/// 免依赖的 SHA-256：调系统自带 `certutil`。
-/// 装配链里唯一需要哈希的地方，因此不值得为此引入 `sha2`。
+/// Dependency-free SHA-256: calls the system's own `certutil`.
+/// The only place in the installation chain that needs a hash, so it isn't worth pulling in `sha2`.
 fn sha256_of(path: &Path) -> Result<String> {
     let mut cmd = Command::new("certutil");
     cmd.arg("-hashfile").arg(path).arg("SHA256");
     cmd.hide_console();
     let out = cmd
         .output()
-        .context("调用 certutil 计算校验和失败（系统缺少 certutil？）")?;
+        .context(crate::i18n::t("failed to compute the checksum with certutil (is certutil missing?)"))?;
     let text = String::from_utf8_lossy(&out.stdout);
-    // certutil 输出三行：标题 / 哈希（可能夹空格）/ 完成提示——只认那行 64 位十六进制。
+    // certutil prints three lines: a heading / the hash (possibly with spaces) / a completion
+    // note — only the 64-digit hex line counts.
     text.lines()
         .map(|l| l.trim().replace(' ', ""))
         .find(|l| l.len() == 64 && l.chars().all(|c| c.is_ascii_hexdigit()))
         .map(|l| l.to_lowercase())
-        .ok_or_else(|| anyhow!("无法从 certutil 输出中解析 SHA-256：\n{}", text.trim()))
+        .ok_or_else(|| anyhow!(crate::tf!("could not parse SHA-256 from the certutil output:\n{}", text.trim())))
 }
 
-/// 解压 zip。优先系统自带 `tar.exe`（bsdtar），失败回退 PowerShell。
+/// Extract a zip. Prefers the system's own `tar.exe` (bsdtar), falling back to PowerShell.
 fn extract_zip(zip: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)?;
 
@@ -383,18 +401,19 @@ fn extract_zip(zip: &Path, dest: &Path) -> Result<()> {
         dest.display()
     ));
     ps.hide_console();
-    let out = ps.output().context("解压失败：tar 与 PowerShell 都无法调用")?;
+    let out = ps.output().context(crate::i18n::t("extraction failed: neither tar nor PowerShell could be invoked"))?;
     if !out.status.success() {
-        bail!(
-            "解压 {} 失败：\n{}",
+        bail!(crate::tf!(
+            "failed to extract {}:\n{}",
             zip.display(),
             String::from_utf8_lossy(&out.stderr).trim()
-        );
+        ));
     }
     Ok(())
 }
 
-/// 有些分发包把内容塞在一个顶层目录里；解压后拉平一层，保证 `<dest>/python.exe` 就位。
+/// Some distributions stuff the content into a single top-level directory; after extraction,
+/// flatten one level so `<dest>/python.exe` lands in place.
 fn flatten_single_dir(dest: &Path) -> Result<()> {
     if dest.join(Lang::Python.exe()).is_file() {
         return Ok(());
@@ -404,7 +423,7 @@ fn flatten_single_dir(dest: &Path) -> Result<()> {
         .filter(|e| e.path().is_dir())
         .collect();
     if dirs.len() != 1 {
-        return Ok(()); // 结构不属于这种情况，交给后面的存在性校验报错
+        return Ok(()); // Not this shape; leave it to the existence check later to error
     }
     let inner = dirs[0].path();
     for e in std::fs::read_dir(&inner)? {
@@ -415,7 +434,7 @@ fn flatten_single_dir(dest: &Path) -> Result<()> {
     Ok(())
 }
 
-// ─────────────────────────── 下载 ───────────────────────────
+// ─────────────────────────── Download ───────────────────────────
 
 async fn download(url: &str, dest: &Path, progress: &mut dyn FnMut(&str)) -> Result<()> {
     let client = reqwest::Client::builder()
@@ -425,17 +444,18 @@ async fn download(url: &str, dest: &Path, progress: &mut dyn FnMut(&str)) -> Res
         .get(url)
         .send()
         .await
-        .with_context(|| format!("请求失败：{url}"))?
+        .with_context(|| crate::tf!("request failed: {}", url))?
         .error_for_status()
-        .with_context(|| format!("服务端拒绝了请求：{url}"))?;
+        .with_context(|| crate::tf!("the server rejected the request: {}", url))?;
 
     let total = resp.content_length();
     let mut file =
-        std::fs::File::create(dest).with_context(|| format!("无法创建 {}", dest.display()))?;
+        std::fs::File::create(dest).with_context(|| crate::tf!("cannot create {}", dest.display()))?;
     let mut got: u64 = 0;
     let mut last_bucket = u64::MAX;
-    // 逐块写盘：`chunk()` 不需要额外 feature；用同步 File 是因为装配只发生一次，
-    // 且阻塞的是 agent 线程而非 UI 线程。
+    // Write to disk chunk by chunk: `chunk()` needs no extra feature, and a synchronous File is
+    // fine because installation happens only once and what blocks is the agent thread, not the UI
+    // thread.
     while let Some(chunk) = resp.chunk().await? {
         file.write_all(&chunk)?;
         got += chunk.len() as u64;
@@ -443,10 +463,11 @@ async fn download(url: &str, dest: &Path, progress: &mut dyn FnMut(&str)) -> Res
             let pct = got.saturating_mul(100) / t.max(1);
             if pct / 10 != last_bucket {
                 last_bucket = pct / 10;
-                progress(&format!(
-                    "下载中 {pct}%（{:.1}/{:.1} MB）",
-                    got as f64 / 1048576.0,
-                    t as f64 / 1048576.0
+                progress(&crate::tf!(
+                    "Downloading {}% ({}/{} MB)",
+                    pct,
+                    format!("{:.1}", got as f64 / 1048576.0),
+                    format!("{:.1}", t as f64 / 1048576.0)
                 ));
             }
         }
@@ -454,51 +475,51 @@ async fn download(url: &str, dest: &Path, progress: &mut dyn FnMut(&str)) -> Res
     file.flush()?;
     if let Some(t) = total {
         if got != t {
-            bail!("下载不完整：收到 {got} 字节，Content-Length 为 {t}");
+            bail!(crate::tf!("incomplete download: received {} bytes, Content-Length was {}", got, t));
         }
     }
     Ok(())
 }
 
-// ─────────────────────────── 装配 ───────────────────────────
+// ─────────────────────────── Installation ───────────────────────────
 
-/// 校验（可选）→ 解压 → 拉平 → 存在性检查。
+/// Verify (optional) → extract → flatten → existence check.
 fn unpack(zip: &Path, staging: &Path, expect_sha: Option<&str>, downloaded: bool, progress: &mut dyn FnMut(&str)) -> Result<()> {
     if let Some(expect) = expect_sha {
         let expect = expect.trim();
         if !expect.is_empty() {
-            progress("校验 SHA-256…");
+            progress(crate::i18n::t("verifying SHA-256…"));
             let got = sha256_of(zip)?;
             if !got.eq_ignore_ascii_case(expect) {
                 if downloaded {
-                    // 下坏了/被篡改的包别留着，否则下次又踩同一个坑
+                    // Don't keep a corrupted/tampered pack, or the next run hits the same pit
                     let _ = std::fs::remove_file(zip);
                 }
                 bail!(
-                    "运行时包校验失败：\n  期望 {expect}\n  实际 {got}\n\
-                     （若这是你自己托管的包，请在 [runtimes] 里更新 python_sha256）"
+                    crate::tf!("runtime pack verification failed:\n  expected {}\n  actual {}\n(if this is a pack you host yourself, update python_sha256 under [runtimes])", expect, got)
                 );
             }
-            progress("校验通过");
+            progress(crate::i18n::t("verification passed"));
         } else {
-            progress("未配置 python_sha256，跳过校验");
+            progress(crate::i18n::t("python_sha256 is not configured; skipping verification"));
         }
     } else {
-        progress("未配置 python_sha256，跳过校验");
+        progress(crate::i18n::t("python_sha256 is not configured; skipping verification"));
     }
-    progress("解压…");
+    progress(crate::i18n::t("extracting…"));
     extract_zip(zip, staging)?;
     flatten_single_dir(staging)?;
     if !staging.join(Lang::Python.exe()).is_file() {
-        bail!("解压后没有找到 {}，包结构可能不正确", Lang::Python.exe());
+        bail!(crate::tf!("{} was not found after extraction; the pack layout may be wrong", Lang::Python.exe()));
     }
     Ok(())
 }
 
-/// 装配 Python 运行时到 `<app_root>/runtime/python`，返回该目录。
+/// Install the Python runtime to `<app_root>/runtime/python` and return that directory.
 ///
-/// 顺序：已存在 → 本地离线包 → 下载。`progress` 收到的是给人看的一行行进度文本
-/// （CLI 直接打印；GUI 丢弃或转投活动流）。
+/// Order: already exists → local offline pack → download. `progress` receives line-by-line
+/// progress text meant for humans (the CLI prints it; the GUI discards it or routes it to the
+/// activity stream).
 pub async fn install_python(
     root: &Path,
     cfg: &RuntimesConfig,
@@ -506,7 +527,7 @@ pub async fn install_python(
 ) -> Result<PathBuf> {
     let dest = builtin_dir(root, Lang::Python);
     if builtin_exe(root, Lang::Python).is_some() {
-        progress(&format!("内置 Python 运行时已存在：{}", dest.display()));
+        progress(&crate::tf!("the built-in Python runtime already exists: {}", dest.display()));
         return Ok(dest);
     }
 
@@ -516,12 +537,12 @@ pub async fn install_python(
     }
 
     match find_offline_pack(root) {
-        // ---- 1) 本地离线包：完全不碰网络
+        // ---- 1) Local offline pack: never touches the network
         Some(pack) => {
-            progress(&format!("发现离线运行时包：{}", pack.display()));
+            progress(&crate::tf!("offline runtime pack found: {}", pack.display()));
             unpack(&pack, &staging, cfg.python_sha256.as_deref(), false, progress)?;
         }
-        // ---- 2) 下载
+        // ---- 2) Download
         None => {
             let url = cfg
                 .python_url
@@ -530,7 +551,8 @@ pub async fn install_python(
                 .filter(|s| !s.is_empty())
                 .unwrap_or(DEFAULT_PYTHON_URL)
                 .to_string();
-            // 校验值：显式配置优先；否则仅对默认官方源套用内置校验值
+            // Checksum: explicit config wins; otherwise the built-in checksum applies only to the
+            // default official source
             let expect = cfg
                 .python_sha256
                 .as_deref()
@@ -543,10 +565,11 @@ pub async fn install_python(
             std::fs::create_dir_all(&cache)?;
             let name = url.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(PACK_NAME);
             let zip = cache.join(name);
-            progress(&format!("下载运行时：{url}"));
+            progress(&crate::tf!("downloading runtime: {}", url));
             download(&url, &zip, progress).await?;
             let res = unpack(&zip, &staging, expect.as_deref(), true, progress);
-            // 装配完成（无论成败）都清掉下载缓存，避免在应用目录里留一个 10 MB 的残骸
+            // Clear the download cache once installation is done (success or not), leaving no
+            // 10 MB wreck in the app directory
             let _ = std::fs::remove_dir_all(&cache);
             res?;
         }
@@ -559,53 +582,53 @@ pub async fn install_python(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::rename(&staging, &dest)
-        .with_context(|| format!("无法把解压结果移动到 {}", dest.display()))?;
+        .with_context(|| crate::tf!("cannot move the extracted result to {}", dest.display()))?;
 
-    progress(&format!(
-        "运行时已就位：{}",
+    progress(&crate::tf!(
+        "the runtime is in place: {}",
         dest.join(Lang::Python.exe()).display()
     ));
     Ok(dest)
 }
 
-// ─────────────────────────── `/runtime` 命令 ───────────────────────────
+// ─────────────────────────── The `/runtime` command ───────────────────────────
 
-/// `/runtime` 的子命令。
+/// The `/runtime` subcommands.
 ///
-/// 解析与执行都放在这里，CLI 与 GUI 只负责「把结果写到哪」——
-/// 两边共用同一份逻辑与文案，不会出现行为分叉。
+/// Parsing and execution both live here; the CLI and GUI only decide "where the result gets
+/// written" — both share one set of logic and wording, so the behaviour can't fork.
 pub enum Cmd {
     Status,
     Dir,
     Install(Lang),
 }
 
-/// 解析一行 `/runtime ...`（调用前请先用 [`is_cmd`] 判定前缀）。
+/// Parse one `/runtime ...` line (check the prefix with [`is_cmd`] first).
 pub fn parse_cmd(line: &str) -> Result<Cmd> {
     let mut parts = line.split_whitespace();
-    let _ = parts.next(); // "/runtime" 本身
+    let _ = parts.next(); // "/runtime" itself
     match parts.next() {
         None | Some("status") => Ok(Cmd::Status),
         Some("dir") => Ok(Cmd::Dir),
         Some("install") => match parts.next().unwrap_or("python") {
             "python" => Ok(Cmd::Install(Lang::Python)),
-            "node" => bail!(NODE_MANUAL_HINT),
-            other => bail!("不支持的运行时: {other}（可选：python）"),
+            "node" => bail!(crate::i18n::t(NODE_MANUAL_HINT)),
+            other => bail!(crate::tf!("unsupported runtime: {} (available: python)", other)),
         },
         Some(other) => bail!(
-            "未知的 /runtime 子命令: {other}\n\
-             用法: /runtime [status] | /runtime install [python] | /runtime dir"
+            crate::tf!("Unknown /runtime subcommand: {}\nUsage: /runtime [status] | /runtime install [python] | /runtime dir", other)
         ),
     }
 }
 
-/// 这一行是不是 `/runtime` 命令（宿主自己处理，不发给模型）。
+/// Whether this line is a `/runtime` command (handled by the host, not sent to the model).
 pub fn is_cmd(line: &str) -> bool {
     line == "/runtime" || line.starts_with("/runtime ")
 }
 
-/// 装配运行时，并在成功后**立刻让它生效**（`refresh_runtimes`，无需重启进程）。
-/// 返回给人看的总结文本；`progress` 收到装配过程的一行行进度。
+/// Install a runtime and, on success, **make it take effect immediately** (`refresh_runtimes`,
+/// with no process restart).
+/// Returns a summary text meant for humans; `progress` receives line-by-line installation progress.
 pub async fn install(
     rt: &std::sync::Arc<crate::runtime::Runtime>,
     lang: Lang,
@@ -616,14 +639,13 @@ pub async fn install(
             let dir = install_python(&rt.root, &rt.config.runtimes, progress).await?;
             rt.refresh_runtimes();
             let ver = probe_version(&rt.runtimes().python)
-                .unwrap_or_else(|| "（没能取到版本号）".into());
-            Ok(format!(
-                "Python 运行时已装配：{}\n  {ver}\n  \
-                 已立即生效：之后新建的 python 插件直接用它；\
-                 此前因缺少 python 而加载失败的插件，重启程序后会自动恢复。",
-                dir.display()
+                .unwrap_or_else(|| crate::i18n::t("(could not get the version number)").into());
+            Ok(crate::tf!(
+                "Python runtime installed: {}\n  {}\n  It takes effect immediately: newly created python plugins use it; plugins that previously failed to load for lack of python recover automatically after a restart.",
+                dir.display(),
+                ver
             ))
         }
-        other => bail!("{} 不支持自动装配", other.key()),
+        other => bail!(crate::tf!("{} does not support auto-install", other.key())),
     }
 }

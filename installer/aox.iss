@@ -1,37 +1,43 @@
 ; ============================================================================
-;  AOX 安装脚本（Inno Setup）
+;  AOX installer script (Inno Setup)
 ;
-;  编译（推荐用构建脚本，它会自动编译两遍产出两种变体）：
+;  Build (the build script is recommended: it compiles twice and produces both
+;  variants):
 ;      bash tools/build_installer.sh
-;  手动编译单个变体：
-;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" installer\aox.iss                                -> 主包
-;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" --define=BUNDLE_PYTHON=1 installer\aox.iss       -> 捆绑变体
+;  Build a single variant by hand:
+;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" installer\aox.iss                                -> main package
+;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" --define=BUNDLE_PYTHON=1 installer\aox.iss       -> bundled variant
 ;
-;  定义一律写长式 --define=。旧式的 /D名字=值 在 Git Bash 里会被 MSYS 当成 Unix 路径
-;  改写（/DAppVersion=0.1.0 -> <Git 安装目录>/DAppVersion=0.1.0），ISCC 于是把它算成
-;  第二个 script filename，报 “You may not specify more than one script filename.”
-;  产物：
-;      dist\AOX-Setup-<版本>.exe                 （主包，不捆绑运行时，约 3 MB）
-;      dist\AOX-Setup-<版本>-with-python.exe     （捆绑变体，约 11.5 MB）
+;  Always write definitions in the long form, --define=. The old-style /Dname=value gets
+;  rewritten by MSYS as a Unix path under Git Bash (/DAppVersion=0.1.0 becomes
+;  <Git install dir>/DAppVersion=0.1.0), and ISCC then counts it as a second script
+;  filename and reports "You may not specify more than one script filename."
+;  Outputs:
+;      dist\AOX-Setup-<version>.exe                 (main package, no runtime bundled, ~3 MB)
+;      dist\AOX-Setup-<version>-with-python.exe     (bundled variant, ~11.5 MB)
 ;
-;  设计要点：
-;    * 采用「当前用户」安装（PrivilegesRequired=lowest），装到
-;      %LOCALAPPDATA%\Programs\AOX —— 因为 AOX 运行时要在自己的目录下
-;      写 config.toml 和 plugins/，装在 Program Files 会因无写权限而失效。
-;    * 不打包 config.toml（避免把个人 API key 装进去），由程序首次运行自动生成。
-;    * 不打包 plugins/：宿主启动时会自动创建 plugins/sdk。
-;    * 卸载不删除 plugins/ 与 history/：前者是模型积累的能力，后者是用户的对话记录。
-;    * 也不预建 history/：目录由程序在第一次真正对话时自己创建，
-;      只跑 /help 的会话不会留下空文件。
-;    * 主包不带任何运行时；需要 python 能力时，用户可以 /runtime install python
-;      按需装配（离线包或下载），或用上面那个 -with-python 变体一次装好。
+;  Design notes:
+;    * Installs for the **current user only** (PrivilegesRequired=lowest), into
+;      %LOCALAPPDATA%\Programs\AOX -- because AOX needs to write config.toml and plugins/
+;      inside its own directory at runtime, and under Program Files it would have no write
+;      permission and break.
+;    * config.toml is not packaged (so a personal API key is never baked into the installer);
+;      the program generates one on first run.
+;    * plugins/ is not packaged either: the host creates plugins/sdk on startup.
+;    * Uninstalling does not delete plugins/ or history/: the former is capability the model
+;      has accumulated, the latter is the user's conversation record.
+;    * history/ isn't pre-created either: the directory is made by the program on the first
+;      real conversation, so a session that only runs /help leaves no empty file behind.
+;    * The main package carries no runtime at all; when python is needed the user can run
+;      /runtime install python to provision it on demand (offline archive or download), or
+;      use the -with-python variant above and get everything in one go.
 ; ============================================================================
 
 #define AppName        "AOX"
 
-; 版本号可由命令行覆盖，避免与 Cargo.toml 脱节：
+; The version can be overridden from the command line, so it can't drift from Cargo.toml:
 ;     ISCC --define=AppVersion=1.2.3 installer\aox.iss
-; tools/build_installer.sh 会自动从 Cargo.toml 读取并传入。
+; tools/build_installer.sh reads it from Cargo.toml and passes it in automatically.
 #ifndef AppVersion
   #define AppVersion "0.1.0"
 #endif
@@ -41,13 +47,15 @@
 #define AppExeName     "aox.exe"
 #define ProjectRoot    ".."
 
-; ── 可选变体：把 Python 运行时装进安装包 ──────────────────────────────────
-;      ISCC --define=AppVersion=1.2.3 --define=BUNDLE_PYTHON=1 installer\aox.iss
-;   产出 AOX-Setup-<版本>-with-python.exe，装完即可用 python 插件（离线可用）。
-;   体积：不捆绑约 3 MB；捆绑后约 13.5 MB（运行时解压后约 21 MB）。
+; ── optional variant: bundle the Python runtime into the installer ──────────────────────────────────
+;     ISCC --define=AppVersion=1.2.3 --define=BUNDLE_PYTHON=1 installer\aox.iss
+; Produces AOX-Setup-<version>-with-python.exe; python plugins work straight after install
+; (usable offline).
+; Size: ~3 MB unbundled; ~13.5 MB bundled (the runtime is ~21 MB once unpacked).
 ;
-;   两种变体共用这一个脚本，靠条件编译区分——不维护第二份 .iss，
-;   否则「改了一处忘了另一处」是迟早的事。
+; Both variants share this one script and are told apart by conditional compilation -- no
+; second .iss is maintained, because "changed it here, forgot it there" is only a matter of
+; time.
 #ifdef BUNDLE_PYTHON
   #define OutputSuffix "-with-python"
 #else
@@ -75,7 +83,8 @@ DisableProgramGroupPage=yes
 DisableDirPage=no
 AllowNoIcons=yes
 
-; 仅当前用户安装：保证安装目录可写，程序能正常生成 config.toml 与插件
+; Current-user install only: guarantees the install directory is writable, so the program can
+; generate config.toml and plugins
 PrivilegesRequired=lowest
 ChangesEnvironment=yes
 
@@ -92,7 +101,7 @@ LicenseFile={#ProjectRoot}\LICENSE
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
-; 防止同一用户重复安装
+; Stop the same user from installing twice
 SetupMutex=AOX_Setup_Mutex
 
 [Languages]
@@ -116,19 +125,23 @@ Source: "{#ProjectRoot}\config.example.toml";          DestDir: "{app}"; Flags: 
 Source: "{#ProjectRoot}\README.md";                    DestDir: "{app}"; Flags: ignoreversion isreadme
 Source: "{#ProjectRoot}\LICENSE";                      DestDir: "{app}"; Flags: ignoreversion
 #ifdef BUNDLE_PYTHON
-; 捆绑变体：Python 运行时直接装进应用目录。宿主启动时会自动发现
-; <应用根>\runtime\python\python.exe（三档解析的第 2 档），无需改任何配置，
-; 也不会往系统 PATH 或用户环境变量里写东西。
-; 运行时由 tools/build_installer.sh 的 ensure_runtime 下载并解压到 runtime\python\。
+; Bundled variant: the Python runtime goes straight into the application directory. The host
+; discovers <app root>\runtime\python\python.exe on startup (tier 2 of the three-tier
+; resolution), with no configuration change and nothing written into the system PATH or the
+; user's environment.
+; The runtime is downloaded and unpacked into runtime\python\ by ensure_runtime in
+; tools/build_installer.sh.
 Source: "{#ProjectRoot}\runtime\python\*"; DestDir: "{app}\runtime\python"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 #endif
 
 [UninstallDelete]
-; 运行时是「机器相关、可随时重新装配」的数据（约 21 MB），卸载时清掉；
-; 而 plugins\ 是模型积累的能力、history\ 是用户的对话记录，两者都是用户数据，必须保留
-; （见文件头的设计要点）。这两个目录都不在这里列出，Inno 就不会碰它们。
-; 该目录只在「捆绑版」或「用户自己 /runtime install 过」时才存在。
+; The runtime is "machine-specific, re-provisionable at any time" data (~21 MB), so it is
+; removed on uninstall; whereas plugins\ is capability the model accumulated and history\ is
+; the user's conversation record -- both are user data and must be kept (see the design notes
+; at the top of this file). Neither directory is listed here, so Inno won't touch them.
+; That directory only exists in the bundled build, or once the user has run
+; /runtime install themselves.
 Type: filesandordirs; Name: "{app}\runtime"
 
 [Icons]
@@ -136,7 +149,7 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename
 Name: "{autodesktop}\{#AppName}";  Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\aox.ico"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Registry]
-; 可选：把安装目录加入当前用户 PATH（不重复添加）
+; Optional: add the install directory to the current user's PATH (without duplicating it)
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
     ValueData: "{olddata};{app}"; Tasks: addtopath; Check: NeedsAddPath('{app}')
 
@@ -144,7 +157,8 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchApp}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
 
 [Code]
-// 只有当 PATH 中尚无该目录时才写入，避免反复安装把 PATH 撑长
+// Only write when the directory isn't already in PATH, so repeated installs don't keep
+// stretching PATH
 function NeedsAddPath(Param: string): Boolean;
 var
   OrigPath: string;

@@ -3,10 +3,11 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// 分层组合清单（阶段 5）：把「读一份配置」变成「合成一个层栈」。
+/// Layered composition manifest (stage 5): turn "read one config" into "compose a layer stack".
 ///
-/// 合成出来的仍是一棵普通的 TOML 树 —— 本文件里的 `Config` 形状一个字段都没动，
-/// 所以「配置模型」与「配置来源」是两件独立的事（设计原则 P1）。
+/// What comes out is still an ordinary TOML tree — not a single field of the `Config` shape in
+/// this file changed, so "the config model" and "the config source" stay two independent things
+/// (design principle P1).
 pub mod layer;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -26,30 +27,32 @@ pub struct Config {
     pub prompt: PromptConfig,
     #[serde(default)]
     pub hook: HookConfig,
-    /// `config.toml` 的 `[loop]` 段（循环缝的第二形态，见 `src/agent_loop.rs`）。
+    /// The `[loop]` section of `config.toml` (the loop seam's second form, see `src/agent_loop.rs`).
     ///
-    /// Rust 字段名带下划线是因为 `loop` 是关键字 —— **TOML 那边的键仍然叫 `loop`**
-    /// （靠 `rename` 对上），配置文件里看到的就是 `[loop]`。
+    /// The Rust field name carries an underscore because `loop` is a keyword — **the TOML key is
+    /// still `loop`** (matched via `rename`), so what you see in the config file is `[loop]`.
     #[serde(default, rename = "loop")]
     pub loop_config: LoopConfig,
-    /// `config.toml` 的 `[sandbox]` 段（插件子进程的围栏，见 `src/sandbox.rs`）。
+    /// The `[sandbox]` section of `config.toml` (the plugin child-process fence, see `src/sandbox.rs`).
     #[serde(default)]
     pub sandbox: SandboxConfig,
-    /// `config.toml` 的 `[workplace]` 段（模型的文件边界，见 `src/workplace.rs`）。
+    /// The `[workplace]` section of `config.toml` (the model's file boundary, see `src/workplace.rs`).
     ///
-    /// 与 `[sandbox]` 是两层：它管「能碰哪些文件」，不管「子进程怎么跑」。
+    /// Two layers apart from `[sandbox]`: this one governs "which files may be touched", not
+    /// "how child processes run".
     ///
-    /// ⚠️ **TOML 里的段名是 `[workplace]`，旧名 `[workspace]` 仍然认**（`alias`）。
-    /// 2026-10-04 统一过一次命名：**这个词一律是 `workplace`** —— 目录名
-    /// `<应用根>/workplace/`、CLI 命令 `/workplace`、配置段 `[workplace]`；
-    /// 第二轮连 Rust 侧的模块与类型（`src/workplace.rs` / `Workplace` /
-    /// `WorkplaceConfig`）也一起改了，于是再没有第二种拼法。
+    /// ⚠️ **The TOML section name is `[workplace]`; the old name `[workspace]` is still accepted**
+    /// (`alias`). Naming was unified once on 2026-10-04: **the word is always `workplace`** — the
+    /// directory name `<app root>/workplace/`, the CLI command `/workplace`, the config section
+    /// `[workplace]`; the second pass also renamed the Rust-side module and types
+    /// (`src/workplace.rs` / `Workplace` / `WorkplaceConfig`), so there is no second spelling left.
     ///
-    /// **别删那个 `alias`**：少一个别名，已经写好的 `config.toml` 会**静默**退回 `full`
-    /// （serde 认不出的段直接忽略，不报错）—— 正是「写了却不生效」那一类最难查的问题。
+    /// **Do not delete that `alias`**: without it, an already-written `config.toml` **silently**
+    /// falls back to `full` (serde ignores sections it doesn't recognize without erroring) — exactly
+    /// the "written but not in effect" class of problem that is hardest to track down.
     #[serde(default, rename = "workplace", alias = "workspace")]
     pub workplace: WorkplaceConfig,
-    /// GUI 专用外观配置。CLI 的 bin 目标也会编译本文件，但读不到这个字段。
+    /// GUI-only appearance config. The CLI bin target compiles this file too, but cannot read this field.
     #[allow(dead_code)]
     #[serde(default)]
     pub theme: ThemeConfig,
@@ -63,9 +66,9 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
-    /// 是否以 SSE 流式方式请求（默认 true）。
-    /// 开启后思考模型的推理过程可以实时回显；若某个端点不接受
-    /// stream / stream_options，设为 false 即回退为等完整响应。
+    /// Whether to request via SSE streaming (default true).
+    /// With it on, a thinking model's reasoning can be echoed in real time; if some endpoint does
+    /// not accept stream / stream_options, set it false to fall back to waiting for the full response.
     #[serde(default = "default_true")]
     pub stream: bool,
 }
@@ -83,13 +86,13 @@ impl ProviderConfig {
         }
         if let Some(env_name) = &self.api_key_env {
             let v = std::env::var(env_name)
-                .with_context(|| format!("环境变量 {env_name} 未设置，无法获取 API key"))?;
+                .with_context(|| crate::tf!("environment variable {} is not set, cannot get the API key", env_name))?;
             if !v.trim().is_empty() {
                 return Ok(v);
             }
         }
         Err(anyhow!(
-            "未配置 API key：请在 config.toml 的 [provider] 中设置 api_key 或 api_key_env"
+            crate::i18n::t("no API key configured: set api_key or api_key_env under [provider] in config.toml")
         ))
     }
 
@@ -104,13 +107,14 @@ impl ProviderConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-// 整表可缺项：`[auth]` 只写 `meta_tools` 时，`plugin_tools` 取代码默认。
-// 这与 `[prompt]` / `[history]` / `[store]` / `[theme.metrics]` 早就有的行为一致 ——
-// 阶段 5 的分层组合会产出「一张表的局部」（某一层只改一个键），整表必填会让它直接解析失败，
-// 而报错信息（missing field）指向的是合成结果，用户会完全摸不着头脑。
+// The whole table is optional: when `[auth]` only sets `meta_tools`, `plugin_tools` takes its
+// code default. This matches the long-standing behavior of `[prompt]` / `[history]` / `[store]` /
+// `[theme.metrics]`. Stage-5 layered composition can produce "a slice of one table" (a single
+// layer changing just one key); requiring the whole table would make that layer fail to parse, and
+// the error (missing field) would point at the composed result, leaving the user completely lost.
 #[serde(default)]
 pub struct AuthConfig {
-    /// ask | auto | deny
+    /// One of: ask | auto | deny
     pub meta_tools: String,
     /// ask | auto | deny
     pub plugin_tools: String,
@@ -125,8 +129,9 @@ impl Default for AuthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-// 同上：`[agent]` 由两个 bundle 各写一部分（tools 写超时与截断、prompt-core 写规则文件），
-// 整表必填会让这层组合直接失败。
+// Same as above: `[agent]` is written in parts by two bundles (tools writes the timeout and
+// truncation, prompt-core writes the rules file); requiring the whole table would make that
+// composition fail outright.
 #[serde(default)]
 pub struct AgentConfig {
     pub rules_file: Option<String>,
@@ -141,19 +146,19 @@ impl Default for AgentConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-// 同上：`[runtimes]` 只写 `python` 时，`node` / `rustc` 取代码默认。
+// Same as above: when `[runtimes]` sets only `python`, `node` / `rustc` take their code defaults.
 #[serde(default)]
 pub struct RuntimesConfig {
-    /// 值写成**裸命令**（`python` / `node` / `rustc`）时，宿主会依次尝试
-    /// 「应用目录内置运行时 `<app_root>/runtime/<lang>/<exe>`」→「PATH」；
-    /// 写成**完整路径**则直接采用，不做任何替换。
+    /// When the value is a **bare command** (`python` / `node` / `rustc`), the host tries in order:
+    /// "runtime bundled in the app directory `<app_root>/runtime/<lang>/<exe>`" → "PATH";
+    /// when it is a **full path** it is used directly, with no substitution.
     pub python: String,
     pub node: String,
     pub rustc: String,
-    /// 覆盖 Python 运行时下载源（默认 CPython 官方嵌入式包，见 `runtimes::DEFAULT_PYTHON_URL`）。
+    /// Override the Python runtime download source (default: the official CPython embeddable package, see `runtimes::DEFAULT_PYTHON_URL`).
     #[serde(default)]
     pub python_url: Option<String>,
-    /// 期望的 SHA-256。留空时：默认源用内置的官方校验值，自定义源则不校验。
+    /// The expected SHA-256. When empty: the default source uses the built-in official checksum, while a custom source is not verified.
     #[serde(default)]
     pub python_sha256: Option<String>,
 }
@@ -170,15 +175,15 @@ impl Default for RuntimesConfig {
     }
 }
 
-/// 对话历史落盘。
+/// Conversation history persistence.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HistoryConfig {
-    /// 是否把对话写入 `<应用根>/history/`。关掉后不再新开文件，
-    /// 但已有的历史仍然可读可查看（`/history`、GUI 侧边栏照常工作）。
+    /// Whether to write conversations into `<app root>/history/`. Once off, no new files are opened,
+    /// but existing history remains readable and viewable (`/history`, the GUI sidebar still work).
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 最多保留多少个对话（按时间，新的优先）；0 = 不限制。
-    /// 只在新建对话时裁剪，所以不会删掉正在写的那个。
+    /// How many conversations to keep at most (by time, newest first); 0 = unlimited.
+    /// Trimming happens only when a new conversation is created, so the one being written is never deleted.
     #[serde(default = "default_history_keep")]
     pub keep: usize,
 }
@@ -193,11 +198,12 @@ impl Default for HistoryConfig {
     }
 }
 
-/// 对话历史的**存储后端**（阶段 3 抽出的存储缝，见 `src/store.rs`）。
+/// The **storage backend** for conversation history (the storage seam extracted in stage 3, see `src/store.rs`).
 ///
-/// 本期只有 `"jsonl"` 一种实现：一次对话一个文件，落在 `<应用根>/history/`。
-/// **认不出的值会在启动时报错退出**，不会静默退回 jsonl —— 配置写错却照常启动，
-/// 表现就是「我明明写了别的后端，怎么还在写 jsonl」，而这类问题最难查。
+/// This cycle has only one implementation, `"jsonl"`: one file per conversation, under
+/// `<app root>/history/`. **An unrecognized value errors out at startup**, rather than silently
+/// falling back to jsonl — a mistyped config that still starts shows up as "I clearly set another
+/// backend, why is it still writing jsonl?", and that class of problem is the hardest to track down.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StoreConfig {
     #[serde(default = "default_store_backend")]
@@ -205,7 +211,7 @@ pub struct StoreConfig {
 }
 
     fn default_store_backend() -> String {
-        // 默认后端名只在 `store` 模块里写一遍，配置侧引用它 —— 免得两边各写一个字面量。
+        // The default backend name is written once, in the `store` module, and referenced from the config side — so the two don't each spell out a literal.
         crate::store::default_backend().to_string()
     }
 
@@ -215,92 +221,101 @@ impl Default for StoreConfig {
     }
 }
 
-/// 系统提示词的组装方式（段的重排 / 禁用 / 追加）。
+/// How the system prompt is assembled (reordering / disabling / appending segments).
 ///
-/// 段本身与拼装逻辑在 `src/prompt.rs`；这里只是用户在 `config.toml` 里的那份覆盖。
-/// 默认全部为空 = 完全按内置顺序走，与历史版本的硬编码提示词**逐字节相同**。
+/// The segments themselves and the assembly logic live in `src/prompt.rs`; this is just the user's
+/// override in `config.toml`. All fields empty by default = follow the built-in order exactly,
+/// **byte-identical** to the historical hard-coded prompt.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PromptConfig {
-    /// 显式顺序：列出的段 id 按此顺序排到最前，未列出的保持默认序跟在其后。
+    /// Explicit order: the listed segment ids are sorted to the front in this order, and the
+    /// unlisted ones keep their default order after them.
     ///
-    /// 所以「只把 env 挪到最前」只需写 `order = ["env"]`，不必把四段全列一遍。
+    /// So "move only env to the front" needs just `order = ["env"]`, no need to list all four.
     #[serde(default)]
     pub order: Vec<String>,
-    /// 要禁用的段 id（内置段可用 `core` / `protocol` / `env` / `rules`）。
+    /// Segment ids to disable (built-in segments may use `core` / `protocol` / `env` / `rules`).
     #[serde(default)]
     pub disable: Vec<String>,
-    /// 追加（或按同 id 覆盖内置）的段。
+    /// Segments to append (or to override a built-in segment by the same id).
     #[serde(default)]
     pub segment: Vec<PromptSegmentConfig>,
 }
 
-/// `config.toml` 里的一个自定义提示词段。
+/// A custom prompt segment in `config.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptSegmentConfig {
-    /// 段 id；与内置段同名（`core` / `protocol`）时**整段替换**内置段。
+    /// Segment id; when it matches a built-in segment (`core` / `protocol`) the **whole segment replaces** the built-in one.
     pub id: String,
-    /// 展示名，缺省用 id。
+    /// Display name; defaults to the id.
     #[serde(default)]
     pub title: Option<String>,
     pub body: String,
-    /// 排序键，缺省 50（排在内置段与运行环境之后）。
+    /// Sort key, default 50 (after the built-in segments and the runtime environment).
     #[serde(default)]
     pub order: Option<i32>,
 }
 
-/// 循环钩子（阶段 4 的 Loop 缝，实现见 `src/hook.rs`）。
+/// Loop hooks (the stage-4 Loop seam, implemented in `src/hook.rs`).
 ///
-/// 这一段**全空 = 一个钩子都不注册**，`run_loop` 走的路与 Loop 缝之前逐条一致。
+/// **This whole section empty = not a single hook registered**, and `run_loop` takes exactly the
+/// same path as before the Loop seam.
 ///
-/// 注意分工：这里管「**放行之后**要不要动东西」，不负责「放不放行」——
-/// 拦截工具是授权问题，归 `[auth]`（它的 override 键支持 `fs_*` 这样的通配）。
+/// Note the division of labour: this governs "whether to change things **after releasing**", not
+/// "whether to release at all" — blocking a tool is an authorization concern and belongs to
+/// `[auth]` (whose override keys support wildcards like `fs_*`).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct HookConfig {
-    /// 给指定工具自动补参数，写法：
+    /// Auto-fill arguments for the given tools, written like:
     ///
     /// ```toml
     /// [hook.tool_args_default.fs_read_file]
     /// encoding = "utf-8"
     /// ```
     ///
-    /// **只补模型没给的那个键**，模型显式传的值一律不动 —— 覆盖模型的显式意图会造出
-    /// 「模型说 A、工具收到 B」这种最难查的失效模式。
+    /// **Only fills keys the model did not give**; values the model passed explicitly are never
+    /// touched — overriding the model's explicit intent creates the hardest-to-track failure mode
+    /// of "the model said A, the tool received B".
     #[serde(default)]
     pub tool_args_default: HashMap<String, HashMap<String, toml::Value>>,
 
-    /// 模型请求出错时，宿主**自己**重试几次（配置驱动兜底，不需要任何钩子/组件）。
+    /// How many times the host retries **on its own** when a model request errors (a config-driven
+    /// fallback that needs no hook/component).
     ///
-    /// 与 `[loop] max_rounds` 同属「不写脚本也能生效」的那一类：组件可以返回
-    /// `retry(note)` 做有针对性的一次降级，但没有组件时，偶发的上游抖动照样值得
-    /// 重试一次。计数是**每轮**的（`AgentLoop::run` 走一次算一轮），所以不会
-    /// 在一段长对话里累积成「越聊越能重试」。
+    /// Like `[loop] max_rounds`, this belongs to the "works without writing a script" category: a
+    /// component can return `retry(note)` for a targeted one-shot degradation, but with no component
+    /// an occasional upstream jitter is still worth one retry. The count is **per turn**
+    /// (`AgentLoop::run` running once is one turn), so it never accumulates into "the longer you chat
+    /// the more retries you get" across a long conversation.
     ///
-    /// `0`（默认）= 不重试，错误原样抛出 —— 与阶段 4 逐字节一致。
+    /// `0` (default) = no retry, the error is thrown as-is — byte-identical to stage 4.
     #[serde(default)]
     pub max_llm_retries: usize,
 }
 
-/// 主循环（阶段 6 · 6a 的循环缝第二形态，实现见 `src/agent_loop.rs`）。
+/// The main loop (the loop seam's second form from stage 6 · 6a, implemented in `src/agent_loop.rs`).
 ///
-/// 阶段 4 的钩子只能在**循环内部**插五个点，骨架本身还是焊死的；这一段决定
-/// **用哪个循环骨架**，并顺带给出「上下文裁剪」这个只有循环层才做得出的能力
-/// （它要同时动内存与对话文件，还要在裁完重新拼请求）。
+/// The stage-4 hooks could only insert five points **inside the loop**, the skeleton was still
+/// welded shut; this section decides **which loop skeleton to use**, and along the way provides the
+/// "context trimming" capability that only the loop layer can offer (it has to touch both memory and
+/// the conversation file, and rebuild the request after trimming).
 ///
-/// 默认（整段不写）= `standard` + 不裁剪，行为与阶段 5 **逐字节相同**。
+/// Default (whole section unwritten) = `standard` + no trimming, **byte-identical** to stage 5.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LoopConfig {
-    /// 用哪个循环实现。**本期只认 `standard`** —— 别的值在 `Runtime::new` 里
-    /// **启动即报错**，不静默退回（与 `[store] backend` 同一条原则：
-    /// 写了却不生效是最难查的一类问题）。
+    /// Which loop implementation to use. **This cycle only recognizes `standard`** — any other value
+    /// **errors out at startup** in `Runtime::new`, no silent fallback (the same principle as
+    /// `[store] backend`: a setting written but never taking effect is the hardest class of bug).
     #[serde(rename = "impl")]
     pub implementor: String,
-    /// 上下文最多保留多少个「用户轮次」；`0`（默认）= 不裁剪。
+    /// How many "user turns" to keep at most in the context; `0` (default) = no trimming.
     ///
-    /// 一轮以一条 `role == "user"` 的消息为界（宿主钩子注入的提示也是 user 消息，
-    /// 同样各占一轮）。裁剪只从**最老的整轮**开始丢，且永远保留系统提示那一条 ——
-    /// 所以裁完的上下文本身就是一个合法请求体，不会留下「tool 结果还在、
-    /// 它的 assistant 已经被丢掉」这种端点会直接拒绝的半截消息。
+    /// A turn is delimited by one `role == "user"` message (tips injected by the host hook are also
+    /// user messages, so each occupies a turn too). Trimming always drops from the **oldest whole
+    /// turn**, and always keeps the system-prompt message — so the trimmed context is itself a legal
+    /// request body, and never leaves the half-message "a tool result remains while its assistant was
+    /// already dropped", which the endpoint would reject outright.
     pub max_rounds: usize,
 }
 
@@ -311,64 +326,70 @@ impl Default for LoopConfig {
 }
 
 fn default_loop_impl() -> String {
-    // 默认实现名只在 `agent_loop` 模块里写一遍，配置侧引用它 —— 免得两边各写一个字面量。
+    // The default implementation name is written once, in the `agent_loop` module, and referenced from the config side — so the two don't each spell out a literal.
     crate::agent_loop::default_impl().to_string()
 }
 
-/// 插件子进程的**围栏**（Job Object，见 `src/sandbox.rs`）。
+/// The plugin child-process **fence** (Job Object, see `src/sandbox.rs`).
 ///
-/// 默认**开着**，而且默认值就是「对合法插件零影响」的那一组：允许插件再开 8 个子进程、
-/// 关闭即全灭、USER 对象隔离。它们一次拿掉 fork bomb、孤儿进程、
-/// 以及插件伸手碰宿主窗口/剪贴板这三件事。
+/// **On** by default, and the default values are exactly the set that has "zero impact on legitimate
+/// plugins": allow a plugin to open 8 more child processes, kill everything when it closes, isolate
+/// the USER object. Together they remove the fork bomb, orphan processes, and a plugin reaching for
+/// the host's windows/clipboard.
 ///
-/// ⚠️ 这一段的默认值**不是**「零漂移」—— 它是刻意的加固，`enabled = false` 可退回原样。
-/// 但请注意它**管不了文件与网络**：那两样要 AppContainer（见 docs 的方案对照）。
+/// ⚠️ The defaults of this section are **not** "zero drift" — it is a deliberate hardening, and
+/// `enabled = false` reverts it. Note however that it **cannot govern files and the network**: those
+/// two need AppContainer (see the options comparison in docs).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SandboxConfig {
-    /// 总开关。关掉后不再建 Job、也不加 `CREATE_SUSPENDED`，与围栏之前逐字节一致。
+    /// Master switch. Once off, no Job is built and no `CREATE_SUSPENDED` is added, byte-identical to before the fence.
     pub enabled: bool,
-    /// 每个插件**最多能再开几个子进程**（**不含插件自己**）。
+    /// How many child processes **each plugin may open at most** (**not counting the plugin itself**).
     ///
-    /// `0` = 禁止插件开子进程（唯一能把这条路锁死的档）；默认 `8`。
+    /// `0` = forbid the plugin from opening child processes (the only tier that locks this path shut); default `8`.
     ///
-    /// 为什么默认不再是 `1`：以前这个数字是「**含插件自己**的进程总数」，直接写进 Job，
-    /// 于是默认值 1 等于「Job 里只准有 1 个进程」—— 插件自己就占满，任何靠子进程干活的
-    /// 插件（调 `curl` / `git` / 解释器）一概 `WinError 1816`（配额不足），
-    /// 表现是「插件莫名其妙干不了活」。平台那个「含自己」的口径现在收在
-    /// [`SandboxConfig::job_process_limit`] 一处，配置这一层只说用户关心的事。
+    /// Why the default is no longer `1`: that number used to be "the total process count **including
+    /// the plugin itself**", written straight into the Job, so a default of 1 meant "only 1 process
+    /// allowed in the Job" — the plugin itself filled it, and any plugin that does work via a child
+    /// process (calling `curl` / `git` / an interpreter) got `WinError 1816` (quota exceeded), showing
+    /// up as "the plugin inexplicably cannot do its job". The platform's "including self" convention
+    /// now lives in one place, [`SandboxConfig::job_process_limit`], and this config layer speaks
+    /// only of what the user cares about.
     ///
-    /// 为什么仍留一个**有限的小额度**（而不是不限）：fork bomb 靠并发翻倍，
-    /// 把并发封顶它就起不来（子进程还自动继承这个 Job，跑不出围栏）。
-    /// 要放开就写一个大数，**别写 0** —— 这里的 0 是「一个都不许」，
-    /// 与 `max_memory_mb = 0`（不限）方向相反：问「允许几个」时 0 就是 0 个，
-    /// 而内存那个 0 只是「不设上限」的简写。
+    /// Why keep a **finite small allowance** (rather than unlimited): a fork bomb relies on concurrent
+    /// doubling, and capping concurrency stops it (child processes also inherit this Job automatically,
+    /// so they cannot escape the fence). To loosen it, write a large number, **not 0** — a 0 here means
+    /// "not a single one allowed", the opposite direction from `max_memory_mb = 0` (unlimited): when
+    /// asking "how many are allowed", 0 means 0, whereas that memory 0 is just shorthand for "no cap".
     ///
-    /// 注意这是**每个插件一份**的额度（一个插件一个 Job），不是全局预算 ——
-    /// 否则一个插件把额度吃光，别的插件连启动都启动不了。
+    /// Note this is an allowance **per plugin** (one Job per plugin), not a global budget — otherwise
+    /// one plugin could eat the whole allowance and the others could not even start.
     pub max_processes: u32,
-    /// 每个插件进程的提交内存上限，单位 MB。`0`（默认）= 不限。
+    /// Commit-memory cap for each plugin process, in MB. `0` (default) = unlimited.
     ///
-    /// ⚠️ 为什么默认关：超限是**整个进程被内核结束**，不是一次分配失败 ——
-    /// 一个偏紧的帽子会把「合法但吃内存」的插件直接打死，而且从插件侧看不到任何原因，
-    /// 表现就是「插件老是莫名其妙重启」。想开就明确地开。
+    /// ⚠️ Why off by default: exceeding it **kills the whole process in the kernel**, rather than
+    /// being one failed allocation — a tight cap would simply kill a "legitimate but memory-hungry"
+    /// plugin, with no visible reason from the plugin side, showing up as "the plugin keeps
+    /// inexplicably restarting". Turn it on deliberately if you want it.
     pub max_memory_mb: usize,
-    /// 禁止插件使用宿主进程的 USER 对象（窗口 / 剪贴板 / 桌面 / 全局原子）。
-    /// 插件进程本来就不需要这些 —— 它的全部通信都走 stdin/stdout 管道。
+    /// Forbid the plugin from using the host process's USER object (windows / clipboard / desktop / global atoms).
+    /// A plugin process doesn't need these anyway — all its communication goes through the stdin/stdout pipes.
     pub ui_limits: bool,
 }
 
 impl SandboxConfig {
-    /// 真正写进 Job 的 `ActiveProcessLimit`。
+    /// The `ActiveProcessLimit` actually written into the Job.
     ///
-    /// `+1` 是**平台语义**不是配置语义：`JOB_OBJECT_LIMIT_ACTIVE_PROCESS` 数的是
-    /// **整个 Job** 里的进程数，而插件自己就占一个名额。把这一层收在这里（唯一一处），
-    /// 配置里的 [`max_processes`](SandboxConfig::max_processes) 才真的是
-    /// 「插件能再开几个子进程」—— 否则用户得自己在脑子里 +1，而漏掉这一步的后果
-    /// 恰恰是「默认配置下插件干不了活」。
+    /// The `+1` is **platform semantics**, not config semantics: `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`
+    /// counts processes in the **whole Job**, and the plugin itself takes one slot. Keeping this layer
+    /// here (the one place) is what makes [`max_processes`](SandboxConfig::max_processes) in the config
+    /// really mean "how many more child processes the plugin may open" — otherwise the user would have
+    /// to +1 in their head, and the consequence of missing that step is exactly "the plugin cannot do
+    /// its job under the default config".
     ///
-    /// `saturating_add`：配置写 `u32::MAX` 也不会回绕成 0（0 在 Job 里是「不限」，
-    /// 那是另一个意思，不能因为一个手滑的极端值撞上去）。
+    /// `saturating_add`: a config of `u32::MAX` will not wrap to 0 (0 in a Job means "unlimited", which
+    /// is a different meaning, and must not be hit by one careless extreme value).
     pub fn job_process_limit(&self) -> u32 {
         self.max_processes.saturating_add(1)
     }
@@ -380,55 +401,60 @@ impl Default for SandboxConfig {
     }
 }
 
-/// 工作区边界（沙箱方案 ③「把文件能力收回宿主」的配置面，见 `src/workplace.rs`）。
+/// The workspace boundary (the config surface of sandbox option ③ "take the file capability back to
+/// the host", see `src/workplace.rs`).
 ///
-/// 它与 `[sandbox]` 是**两件事**，别混：
-/// - `[sandbox]` 管的是**插件子进程**能不能开子进程 / 吃内存 / 碰宿主窗口（进程围栏）；
-/// - `[workplace]` 管的是**模型这次能碰哪些文件**（写入与删除的路径边界；读不设限）。
+/// It and `[sandbox]` are **two different things**, don't conflate them:
+/// - `[sandbox]` governs whether a **plugin child process** can open child processes / eat memory /
+///   touch host windows (a process fence);
+/// - `[workplace]` governs **which files the model may touch this time** (the path boundary for writes
+///   and deletes; reads are unrestricted).
 ///
-/// 默认 `mode = "default"`（每段对话在 `workplace/` 下开一块新地）。**2026-10-05 由
-/// `"full"` 改成这个** —— 兑现用户最初那句「每次启动**默认受限**」。
+/// Default `mode = "default"` (each conversation opens a fresh dir under `workplace/`). **Changed from
+/// `"full"` to this on 2026-10-05** — honoring the user's original "**confined by default** on every start".
 ///
-/// ⚠️ 代价：「不写 `[workplace]` 配置 = 与加这一层之前逐字节一致」这条**不再成立**。
-/// 现在不写就是受限档（写入与删除只准落在 `workplace/<时间戳>/`，读仍然不受限）；
-/// 想要不受限得显式写 `mode = "full"`，或在界面上切「完全访问」（那是一次运行期选择，
-/// 只对当前这段对话有效）。
+/// ⚠️ The cost: "no `[workplace]` config = byte-identical to before this layer" **no longer holds**.
+/// Writing nothing now means the confined tier (writes and deletes may only land in
+/// `workplace/<timestamp>/`, reads remain unrestricted); to be unrestricted you must explicitly write
+/// `mode = "full"`, or switch to "full access" in the UI (that is a runtime choice, valid only for the
+/// current conversation).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct WorkplaceConfig {
-    /// `"default"`（**默认**：每段对话在 `<应用根>/workplace/<时间戳>/` 开一块新地）/
-    /// `"full"`（不受限）/ `"fixed"`（配合 `root` 指定固定目录）。
+    /// `"default"` (**default**: each conversation opens a fresh dir under `<app root>/workplace/<timestamp>/`) /
+    /// `"full"` (unrestricted) / `"fixed"` (with `root` naming a fixed directory).
     ///
-    /// **认不出的值在启动时报错**，不静默退回默认档 —— 与 `[store] backend` /
-    /// `[loop] impl` 同一条原则：写了却不生效是最难查的一类问题。
+    /// **An unrecognized value errors out at startup**, no silent fallback to the default tier — the
+    /// same principle as `[store] backend` / `[loop] impl`: a setting written but never taking effect
+    /// is the hardest class of bug to track down.
     pub mode: String,
-    /// `mode = "fixed"` 时的固定工作区目录。相对路径相对**应用根**解释。
+    /// The fixed workspace directory when `mode = "fixed"`. A relative path is interpreted relative to the **app root**.
     pub root: Option<String>,
 }
 
 impl Default for WorkplaceConfig {
     fn default() -> Self {
-        // ⚠️ 出厂默认是 `default`（受限），不是 `full` —— 见上面 `WorkplaceConfig` 的注释。
+        // ⚠️ The factory default is `default` (confined), not `full` — see the `WorkplaceConfig` comments above.
         Self { mode: "default".into(), root: None }
     }
 }
 
-// ─────────────────────────── 界面外观（GUI 主题）───────────────────────────
+// ─────────────────────────── Appearance (GUI theme) ───────────────────────────
 //
-// 这一段只描述**数据**，不认识 egui。原因有两个：
-//   ① `gui::theme::Palette` 里装的是 `egui::Color32`，而 `Color32` 没实现 `Deserialize`；
-//   ② 核心库 `aox` 不该依赖 egui（GUI 是可选前端，CLI 用不到）。
-// 所以这里放「纯数据颜色 + 逐字段覆盖」，由 GUI 侧换算成 `Color32` 并叠加到内置配色上。
+// This section describes **data** only and does not know about egui. Two reasons:
+//   ① `gui::theme::Palette` holds `egui::Color32`, and `Color32` does not implement `Deserialize`;
+//   ② the core library `aox` should not depend on egui (the GUI is an optional frontend, the CLI doesn't use it).
+// So this holds "plain colour data + per-field overrides", which the GUI side converts into `Color32` and layers onto the built-in palette.
 
-/// 一个颜色值。
+/// A colour value.
 ///
-/// 接受这几种写法（`config.toml` / 主题文件里都能用）：
-/// - `"#RRGGBB"`　不透明
-/// - `"#RRGGBBAA"`　带 alpha（`AA` 为**不透明度**，`FF` = 完全不透明）
-/// - `"#RGB"`　三位简写
-/// - `[r, g, b]` / `[r, g, b, a]`　数组形式
+/// Accepts these forms (usable in both `config.toml` and theme files):
+/// - `"#RRGGBB"` opaque
+/// - `"#RRGGBBAA"` with alpha (`AA` is **opacity**, `FF` = fully opaque)
+/// - `"#RGB"` three-digit shorthand
+/// - `[r, g, b]` / `[r, g, b, a]` array form
 ///
-/// 前导 `#` 可省略。
+/// The leading `#` may be omitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RgbColor {
     pub r: u8,
@@ -440,13 +466,13 @@ pub struct RgbColor {
 impl RgbColor {
     fn parse_hex(s: &str) -> Option<Self> {
         let t = s.trim().trim_start_matches('#');
-        // 注意 `get` 会检查字符边界：万一混进非 ASCII，这里直接判为非法而不是 panic。
+        // Note `get` checks character boundaries: should non-ASCII sneak in, this is judged invalid rather than panicking.
         let byte = |i: usize| u8::from_str_radix(t.get(i..i + 2)?, 16).ok();
         match t.len() {
             6 => Some(Self { r: byte(0)?, g: byte(2)?, b: byte(4)?, a: 255 }),
             8 => Some(Self { r: byte(0)?, g: byte(2)?, b: byte(4)?, a: byte(6)? }),
             3 => {
-                // 三位简写：每个 nibble 复制一遍（`#abc` → `#aabbcc`）
+                // Three-digit shorthand: each nibble duplicated (`#abc` → `#aabbcc`)
                 let nib =
                     |i: usize| -> Option<u8> { Some(u8::from_str_radix(t.get(i..i + 1)?, 16).ok()? * 17) };
                 Some(Self { r: nib(0)?, g: nib(1)?, b: nib(2)?, a: 255 })
@@ -467,12 +493,12 @@ impl<'de> Deserialize<'de> for RgbColor {
             type Value = RgbColor;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("颜色：\"#RRGGBB\" / \"#RRGGBBAA\" / \"#RGB\" 或 [r, g, b(, a)]")
+                f.write_str(crate::i18n::t("color: \"#RRGGBB\" / \"#RRGGBBAA\" / \"#RGB\" or [r, g, b(, a)]"))
             }
 
             fn visit_str<E: serde::de::Error>(self, s: &str) -> std::result::Result<RgbColor, E> {
                 RgbColor::parse_hex(s).ok_or_else(|| {
-                    E::custom(format!("无法解析颜色 {s:?}：应为 #RRGGBB / #RRGGBBAA / #RGB"))
+                    E::custom(crate::tf!("cannot parse the color {}: expected #RRGGBB / #RRGGBBAA / #RGB", format!("{s:?}")))
                 })
             }
 
@@ -493,7 +519,7 @@ impl<'de> Deserialize<'de> for RgbColor {
                 }
                 match n {
                     3 | 4 => Ok(RgbColor { r: v[0], g: v[1], b: v[2], a: v[3] }),
-                    _ => Err(serde::de::Error::custom("颜色数组需要 3 或 4 个分量（每个 0~255）")),
+                    _ => Err(serde::de::Error::custom(crate::i18n::t("a color array needs 3 or 4 components (each 0-255)"))),
                 }
             }
         }
@@ -502,10 +528,10 @@ impl<'de> Deserialize<'de> for RgbColor {
     }
 }
 
-/// 一套配色的**逐字段覆盖**。只写想改的字段，其余继承内置（纸 / 墨）。
+/// A **per-field override** of one palette. Write only the fields you want to change; the rest inherit the built-in (paper / ink).
 ///
-/// 字段与 `gui/src/theme.rs` 的 `Palette` 一一对应、顺序一致，方便对照。
-/// 全部留空 = 与内置配色**逐像素相同**。
+/// The fields correspond one-to-one and in the same order as `gui/src/theme.rs`'s `Palette`, for easy comparison.
+/// All empty = **pixel-identical** to the built-in palette.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct PaletteConfig {
@@ -518,51 +544,53 @@ pub struct PaletteConfig {
     pub text: Option<RgbColor>,
     pub text_dim: Option<RgbColor>,
     pub text_faint: Option<RgbColor>,
-    /// 单色方案里的强调色（亮色模式下几乎全黑，暗色模式下几乎全白）
+    /// The accent colour in the monochrome scheme (almost all black in light mode, almost all white in dark mode)
     pub ink: Option<RgbColor>,
     pub ink_soft: Option<RgbColor>,
     pub user_bg: Option<RgbColor>,
     pub code_bg: Option<RgbColor>,
-    /// 行内代码的「芯片」底色（刻意与 `code_bg` 不同深浅）
+    /// The "chip" background for inline code (deliberately a different shade from `code_bg`)
     pub code_chip: Option<RgbColor>,
     pub quote_bar: Option<RgbColor>,
-    /// 反白块底色（错误提示）
+    /// Background of the reversed block (error notices)
     pub reverse_bg: Option<RgbColor>,
     pub on_reverse: Option<RgbColor>,
-    /// 悬浮卡片的投影色
+    /// Shadow colour of floating cards
     pub shadow: Option<RgbColor>,
-    /// **整套配色里唯一的色相**：危险动作（目前只有「完全访问」那一处用）。
+    /// **The only hue in the whole palette**: dangerous actions (currently used only for "full access").
     ///
-    /// 其余字段刻意只用明度表达语义，但「越界之后没有任何边界」值得破一次例 ——
-    /// 它是唯一一个点下去就越过所有保护的开关，明度层次表达不出「这不是普通选项」。
-    /// 仍然是一项普通可覆盖的调色板字段（与 `gen_themes.py` 的字段对拍保持一致）：
-    /// 主题作者若真要去掉这点红，那是他自己的选择，不该在合并层里被静默忽略。
+    /// The other fields deliberately express semantics with lightness alone, but "after crossing the
+    /// line there is no boundary at all" deserves one exception — it is the only switch that, once
+    /// clicked, bypasses every protection, and a lightness scale cannot express "this is not an
+    /// ordinary option". It is still an ordinary, overridable palette field (kept in step with
+    /// `gen_themes.py`'s fields): if a theme author really wants to remove this bit of red, that is
+    /// their choice, and it must not be silently ignored in the merge layer.
     pub danger: Option<RgbColor>,
 }
 
-/// 界面的字号与尺度。每项都留了内置默认值，只写想改的那几项即可。
+/// The UI's font sizes and scale. Every item has a built-in default, so you need only write the ones you want to change.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MetricsConfig {
-    /// 正文字号，全套界面以它为基准
+    /// Body font size, the baseline for the whole UI
     pub body_size: f32,
-    /// 标题（Heading）
+    /// Headings
     pub heading_size: f32,
-    /// 按钮文字
+    /// Button text
     pub button_size: f32,
-    /// 小字
+    /// Small text
     pub small_size: f32,
-    /// 等宽（代码块）
+    /// Monospace (code blocks)
     pub mono_size: f32,
-    /// 卡片圆角
+    /// Card corner radius
     pub card_radius: u8,
-    /// 控件间距 `[水平, 垂直]`
+    /// Item spacing `[horizontal, vertical]`
     pub item_spacing: [f32; 2],
-    /// 按钮内边距 `[水平, 垂直]`
+    /// Button padding `[horizontal, vertical]`
     pub button_padding: [f32; 2],
-    /// 交互控件的最小高度
+    /// Minimum height of interactive controls
     pub interact_height: f32,
-    /// 缩进
+    /// Indent
     pub indent: f32,
 }
 
@@ -583,38 +611,38 @@ impl Default for MetricsConfig {
     }
 }
 
-/// 字体文件路径。留空则继续按「环境变量 → 内置候选表」的顺序自动查找。
+/// Font file paths. When empty, continue auto-searching in the order "environment variable → built-in candidate table".
 #[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct FontsConfig {
-    /// 正文 / 中文回退（等价环境变量 `AOX_GUI_FONT`）
+    /// Body / CJK fallback (equivalent to the environment variable `AOX_GUI_FONT`)
     pub cjk: Option<String>,
-    /// 粗体（`AOX_GUI_FONT_BOLD`）
+    /// Bold (`AOX_GUI_FONT_BOLD`)
     pub bold: Option<String>,
-    /// 衬线，次级标题用（`AOX_GUI_FONT_SERIF`）
+    /// Serif, used for subheadings (`AOX_GUI_FONT_SERIF`)
     pub serif: Option<String>,
-    /// 品牌字，首屏大招呼用（`AOX_GUI_FONT_BRAND`）
+    /// Brand font, used for the first-screen big greeting (`AOX_GUI_FONT_BRAND`)
     pub brand: Option<String>,
-    /// 等宽，代码块用（`AOX_GUI_FONT_MONO`）
+    /// Monospace, used for code blocks (`AOX_GUI_FONT_MONO`)
     pub mono: Option<String>,
 }
 
-/// GUI 外观配置：`config.toml` 的 `[theme]`，或用 `--theme <file>` 指定的整份主题文件。
+/// GUI appearance config: `config.toml`'s `[theme]`, or a whole theme file given with `--theme <file>`.
 ///
-/// `--theme` 的文件会**整体取代** `config.toml` 的 `[theme]`（不是逐字段叠加），
-/// 所以一份主题文件要么写全，要么期望用内置值补齐。
+/// A `--theme` file **wholly replaces** `config.toml`'s `[theme]` (not a field-by-field layering),
+/// so a theme file is either complete or expected to be filled in with built-in values.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct ThemeConfig {
-    /// 初始明暗：`"light"` / `"dark"`。
+    /// Initial light/dark: `"light"` / `"dark"`.
     ///
-    /// **优先级最低**：用户上次手动切过主题时，以那份记录为准（见 GUI 的
-    /// `.aox-gui-theme`）；只有从未切换过才用这里的值，都没有则用「墨」（暗色）。
+    /// **Lowest priority**: if the user manually switched theme before, that record wins (see the GUI's
+    /// `.aox-gui-theme`); this value is used only if it was never switched, and if neither exists, "ink" (dark) is used.
     pub mode: Option<String>,
-    /// 「纸」（亮色）这一套的覆盖
+    /// Overrides for the "paper" (light) set
     #[serde(default)]
     pub light: PaletteConfig,
-    /// 「墨」（暗色）这一套的覆盖
+    /// Overrides for the "ink" (dark) set
     #[serde(default)]
     pub dark: PaletteConfig,
     #[serde(default)]
@@ -623,22 +651,23 @@ pub struct ThemeConfig {
     pub fonts: FontsConfig,
 }
 
-#[allow(dead_code)] // 只有 GUI 会调（`--theme <file>`）；CLI 不认这个参数，但 bin 目标也会编译本文件
+#[allow(dead_code)] // Only the GUI calls it (`--theme <file>`); the CLI doesn't accept this argument, but the bin target compiles this file too
 impl ThemeConfig {
-    /// 从一段 TOML 文本解析主题。**两种写法都接受**：
+    /// Parse a theme from a TOML text. **Both forms are accepted**:
     ///
-    /// - **裸主题**：`mode` / `[metrics]` / `[dark]` … 直接写在顶层；
-    /// - **带 `[theme]` 表**：与 `config.toml` 里的写法完全相同。
+    /// - **bare theme**: `mode` / `[metrics]` / `[dark]` … written directly at the top level;
+    /// - **with a `[theme]` table**: exactly as written in `config.toml`.
     ///
-    /// 之所以两种都认，是为了「能用也能粘」：`themes/*.toml` 用的是后者，
-    /// 所以整段可以原样粘进 `config.toml` 的 `[theme]`；反过来也能把 `config.toml`
-    /// 里的 `[theme]` 整段摘出来单独存成主题文件。
+    /// Both are accepted so it is "usable and pasteable": `themes/*.toml` uses the latter, so the whole
+    /// block can be pasted as-is into `config.toml`'s `[theme]`; conversely, the `[theme]` block from
+    /// `config.toml` can be lifted out whole and saved as a standalone theme file.
     fn from_toml_text(text: &str) -> Result<Self> {
         let value: toml::Value = toml::from_str(text)?;
-        // `mode` 写在文件开头（也就是 `[theme]` 之外）是很自然的写法，而 TOML 会把它
-        // 归到文档根上。先把它取出来，下面表里没有时兜底 —— 免得「明明写了 mode 却不生效」。
+        // Writing `mode` at the top of the file (i.e. outside `[theme]`) is very natural, and TOML puts
+        // it on the document root. Pull it out first as a fallback for when the table below lacks it —
+        // avoiding "I clearly wrote mode but it doesn't take effect".
         let root_mode = value.get("mode").and_then(|v| v.as_str()).map(str::to_string);
-        // 有 `[theme]` 就用它，没有就把整份文件当主题
+        // Use `[theme]` if present, otherwise treat the whole file as the theme
         let node = value.get("theme").cloned().unwrap_or(value);
         let mut cfg = <ThemeConfig as Deserialize>::deserialize(node)?;
         if cfg.mode.is_none() {
@@ -647,33 +676,34 @@ impl ThemeConfig {
         Ok(cfg)
     }
 
-    /// 读取一份独立主题文件（`--theme <path>`）。
+    /// Load a standalone theme file (`--theme <path>`).
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
-            .with_context(|| format!("找不到主题文件 {}", path.display()))?;
+            .with_context(|| crate::tf!("theme file not found: {}", path.display()))?;
         Self::from_toml_text(&text)
-            .with_context(|| format!("主题文件 {} 不能当作主题使用", path.display()))
+            .with_context(|| crate::tf!("theme file {} cannot be used as a theme", path.display()))
     }
 }
 
 impl Config {
-    /// 读**单一份** TOML 成 `Config`（不对它做任何分层合成）。
+    /// Read a **single** TOML into `Config` (no layered composition done to it).
     ///
-    /// 阶段 5 之后，仓库内的主路径是 `config::layer::resolve`（profile → bundle → patch
-    /// → config.toml 合成）。本函数保留原样，给「手上就是一份 TOML、不需要合成」的调用方用。
-    #[allow(dead_code)] // bin 目标里没有调用方；在 lib 目标它是公开 API
+    /// After stage 5, the repo's main path is `config::layer::resolve` (profile → bundle → patch →
+    /// config.toml composition). This function stays as-is for callers that "have one TOML in hand and
+    /// need no composition".
+    #[allow(dead_code)] // No caller in the bin target; in the lib target it is a public API
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| {
-            format!(
-                "找不到配置文件 {}。请复制 config.example.toml 为 config.toml 并填写 API 配置。",
+            crate::tf!(
+                "config file {} not found. Copy config.example.toml to config.toml and fill in your API settings.",
                 path.display()
             )
         })?;
-        let cfg: Config = toml::from_str(&text).with_context(|| format!("配置文件 {} 解析失败", path.display()))?;
+        let cfg: Config = toml::from_str(&text).with_context(|| crate::tf!("failed to parse config file {}", path.display()))?;
         Ok(cfg)
     }
 
-    /// selftest 使用的占位配置（不需要真实 provider）
+    /// Placeholder config for selftest (no real provider needed)
     pub fn dummy() -> Self {
         Self {
             provider: ProviderConfig {
@@ -704,7 +734,7 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// 包一层再解析：TOML 文档不能是裸值，颜色只能作为某个键的值出现。
+    /// Wrap before parsing: a TOML document cannot be a bare value, and a colour can only appear as a value of some key.
     #[derive(Deserialize)]
     struct W {
         c: RgbColor,
@@ -718,7 +748,7 @@ mod tests {
     fn rgb_color_accepts_documented_forms() {
         let a = RgbColor { r: 0x1A, g: 0x2B, b: 0x3C, a: 255 };
         assert_eq!(color("\"#1A2B3C\""), Some(a));
-        assert_eq!(color("\"1a2b3c\""), Some(a), "前导 # 可省，大小写不敏感");
+        assert_eq!(color("\"1a2b3c\""), Some(a), "a leading # is optional, and case does not matter");
         assert_eq!(
             color("\"#1A2B3C80\""),
             Some(RgbColor { r: 0x1A, g: 0x2B, b: 0x3C, a: 0x80 })
@@ -733,17 +763,18 @@ mod tests {
 
     #[test]
     fn rgb_color_rejects_garbage() {
-        for bad in ["\"#12345\"", "\"#GGGGGG\"", "\"红色\"", "[1, 2]", "[]"] {
-            assert!(color(bad).is_none(), "{bad} 不该被接受");
+        for bad in ["\"#12345\"", "\"#GGGGGG\"", "\"red\"", "[1, 2]", "[]"] {
+            assert!(color(bad).is_none(), "{bad} must not be accepted");
         }
     }
 
-    /// 默认 ThemeConfig 必须是**零覆盖**，且尺度默认值等于阶段 2 之前写死在
-    /// `gui/src/theme.rs` 的那组常量。这条测试就是「默认外观逐像素不变」的数据层保证。
+    /// The default ThemeConfig must be a **zero override**, and the metric defaults must equal the
+    /// constants hard-coded in `gui/src/theme.rs` before stage 2. This test is the data-layer
+    /// guarantee that "the default appearance is pixel-for-pixel unchanged".
     #[test]
     fn default_theme_is_zero_override() {
         let t = ThemeConfig::default();
-        assert!(t.mode.is_none(), "默认不指定明暗，交给偏好记录 / 内置默认");
+        assert!(t.mode.is_none(), "the default does not pick light or dark; that is left to the stored preference / built-in default");
 
         let all_none = |p: &PaletteConfig| {
             p.bg.is_none()
@@ -804,15 +835,15 @@ mod tests {
             cjk = 'C:\Windows\Fonts\simkai.ttf'
             "##,
         )
-        .expect("主题段应能解析");
+        .expect("the theme section should parse");
 
         assert_eq!(t.mode.as_deref(), Some("light"));
         assert_eq!(t.metrics.body_size, 18.0);
         assert_eq!(t.metrics.card_radius, 4);
-        assert_eq!(t.metrics.heading_size, 21.0, "没写的尺度仍取默认");
+        assert_eq!(t.metrics.heading_size, 21.0, "metrics that were not written keep their defaults");
         assert_eq!(t.dark.text, Some(RgbColor { r: 0xFF, g: 0, b: 0, a: 255 }));
-        assert!(t.dark.bg.is_none(), "只改了 text，其余 17 项不受影响");
-        assert!(t.light.text.is_none(), "改暗色不该碰到亮色");
+        assert!(t.dark.bg.is_none(), "only text was changed; the other 17 entries are unaffected");
+        assert!(t.light.text.is_none(), "editing dark must not touch light");
         assert_eq!(t.fonts.cjk.as_deref(), Some(r"C:\Windows\Fonts\simkai.ttf"));
         assert!(t.fonts.mono.is_none());
     }
@@ -836,7 +867,7 @@ mod tests {
             text = "#123456"
             "##,
         )
-        .expect("整份配置应能解析");
+        .expect("the whole config should parse");
 
         assert_eq!(c.theme.mode.as_deref(), Some("light"));
         assert_eq!(c.theme.metrics.body_size, 20.0);
@@ -845,8 +876,8 @@ mod tests {
         assert!(c.theme.light.text.is_none());
     }
 
-    /// `--theme` 的文件两种写法都要认：裸主题 / 带 `[theme]` 表。
-    /// （`themes/*.toml` 用的是后者，所以整段能直接粘进 `config.toml`。）
+    /// A `--theme` file must accept both forms: bare theme / with a `[theme]` table.
+    /// (`themes/*.toml` uses the latter, so the whole block can be pasted straight into `config.toml`.)
     #[test]
     fn theme_file_accepts_bare_and_wrapped_shapes() {
         let bare = ThemeConfig::from_toml_text(
@@ -860,7 +891,7 @@ mod tests {
             text = "#00FF00"
             "##,
         )
-        .expect("裸主题应能解析");
+        .expect("a bare theme should parse");
         assert_eq!(bare.mode.as_deref(), Some("dark"));
         assert_eq!(bare.metrics.body_size, 19.0);
         assert_eq!(bare.dark.text, Some(RgbColor { r: 0, g: 0xFF, b: 0, a: 255 }));
@@ -877,23 +908,23 @@ mod tests {
             text = "#00FF00"
             "##,
         )
-        .expect("带 [theme] 表的主题文件应能解析");
+        .expect("a theme file with a [theme] table should parse");
         assert_eq!(wrapped.mode.as_deref(), Some("light"));
         assert_eq!(wrapped.metrics.body_size, 19.0);
         assert_eq!(wrapped.light.text, Some(RgbColor { r: 0, g: 0xFF, b: 0, a: 255 }));
         assert!(wrapped.dark.text.is_none());
     }
 
-    /// 交付出去的示例主题文件必须真的能加载 —— 这条测试正是冲着
-    /// 「示例文件用了 `[theme]` 嵌套、而加载器只认裸主题」那个 bug 来的。
+    /// Shipped example theme files must really be loadable — this test is aimed exactly at the bug of
+    /// "the example file uses `[theme]` nesting while the loader only accepts a bare theme".
     #[test]
     fn shipped_theme_files_load() {
         for f in ["themes/paper.toml", "themes/ink.toml", "themes/high-contrast.toml"] {
-            let t = ThemeConfig::load(Path::new(f)).unwrap_or_else(|e| panic!("{f} 应能加载: {e:#}"));
-            assert!(t.mode.is_some(), "{f} 应声明 mode");
+            let t = ThemeConfig::load(Path::new(f)).unwrap_or_else(|e| panic!("{f} should load: {e:#}"));
+            assert!(t.mode.is_some(), "{f} should declare mode");
         }
 
-        // 纸 / 墨 是内置配色的完整复制，18 个字段应全部覆盖到
+        // paper / ink are complete copies of the built-in palettes, all 18 fields should be covered
         let paper = ThemeConfig::load(Path::new("themes/paper.toml")).unwrap();
         assert!(paper.light.bg.is_some() && paper.light.text.is_some());
         assert!(paper.light.on_reverse.is_some() && paper.light.shadow.is_some());
@@ -902,13 +933,13 @@ mod tests {
         assert!(ink.dark.bg.is_some() && ink.dark.text.is_some());
         assert!(ink.dark.on_reverse.is_some() && ink.dark.shadow.is_some());
 
-        // 高对比两套明暗都定义了（否则另一半会退回内置配色、看着串味）
+        // high-contrast defines both light and dark (otherwise the other half falls back to the built-in palette and looks mixed)
         let hc = ThemeConfig::load(Path::new("themes/high-contrast.toml")).unwrap();
         assert!(hc.light.bg.is_some() && hc.dark.bg.is_some());
         assert_eq!(hc.metrics.body_size, 17.0);
     }
 
-    /// 老配置（完全没写 `[theme]`）必须照常解析 —— 阶段 2 不能打破既有 config.toml。
+    /// An old config (with no `[theme]` at all) must still parse — stage 2 must not break existing config.toml.
     #[test]
     fn config_without_theme_section_still_parses() {        let c: Config = toml::from_str(
             r#"
@@ -918,14 +949,14 @@ mod tests {
             api_key = "k"
             "#,
         )
-        .expect("没有 [theme] 的旧配置必须仍能解析");
+        .expect("an old config without [theme] must still parse");
 
         assert!(c.theme.mode.is_none());
         assert!(c.theme.dark.text.is_none());
         assert_eq!(c.theme.metrics.body_size, 16.0);
     }
 
-    /// `[hook.tool_args_default.<工具名>]` 的嵌套写法要能解析成「工具 → 要补哪些键」。
+    /// The nested form `[hook.tool_args_default.<tool name>]` must parse into "tool → which keys to fill".
     #[test]
     fn hook_section_parses_nested_tool_args_default() {
         let c: Config = toml::from_str(
@@ -942,32 +973,33 @@ mod tests {
             create_dirs = true
             "#,
         )
-        .expect("带 [hook] 的配置应能解析");
+        .expect("a config with [hook] should parse");
 
         let d = &c.hook.tool_args_default;
-        assert_eq!(d.len(), 2, "两个工具各一条");
+        assert_eq!(d.len(), 2, "one entry per tool");
         assert_eq!(d["fs_read_file"]["encoding"].as_str(), Some("utf-8"));
         assert_eq!(d["fs_write_file"]["create_dirs"].as_bool(), Some(true));
     }
 
-    /// `[hook] max_llm_retries`（阶段 6 · 6b 的配置驱动兜底）：不写 = 0 = 不重试。
+    /// `[hook] max_llm_retries` (the config-driven fallback from stage 6 · 6b): unwritten = 0 = no retry.
     #[test]
     fn hook_section_parses_max_llm_retries() {
         let p = "[provider]\nbase_url = \"https://example.com/v1\"\nmodel = \"m\"\napi_key = \"k\"\n";
 
-        let off: Config = toml::from_str(p).expect("不写 [hook] 应能解析");
-        assert_eq!(off.hook.max_llm_retries, 0, "默认 0 = 不重试，与阶段 4 逐字节一致");
+        let off: Config = toml::from_str(p).expect("omitting [hook] should parse");
+        assert_eq!(off.hook.max_llm_retries, 0, "default 0 = no retry, byte-for-byte identical to stage 4");
 
         let on: Config =
-            toml::from_str(&format!("{p}\n[hook]\nmax_llm_retries = 2\n")).expect("应能解析");
+            toml::from_str(&format!("{p}\n[hook]\nmax_llm_retries = 2\n")).expect("should parse");
         assert_eq!(on.hook.max_llm_retries, 2);
     }
 
-    /// `[workplace]` 是正式段名，`[workspace]` 是**旧名**（2026-10-04 统一命名）。
+    /// `[workplace]` is the official section name, `[workspace]` is the **old name** (unified on 2026-10-04).
     ///
-    /// 这条是硬要求：少了 `alias`，已经写好 `[workspace]` 的 config.toml 会被 serde
-    /// **静默忽略**（认不出的段直接跳过，不报错）⇒ 用户以为边界还开着，实际退回了 `full`
-    /// —— 正是「写了却不生效」那一类最难查的问题。所以两个名字都要钉住。
+    /// This is a hard requirement: without the `alias`, a config.toml already written with `[workspace]`
+    /// would be **silently ignored** by serde (unrecognized sections are skipped without error) ⇒ the user
+    /// thinks the boundary is still on while it actually fell back to `full` — exactly the "written but
+    /// not in effect" class of problem. So both names must be pinned.
     #[test]
     fn workplace_section_accepts_the_legacy_name() {
         const BASE: &str = r#"
@@ -977,26 +1009,28 @@ model = "m"
 api_key = "k"
 "#;
         let new: Config = toml::from_str(&format!("{BASE}\n[workplace]\nmode = \"default\"\n"))
-            .expect("[workplace] 应当能解析");
+            .expect("[workplace] should parse");
         let old: Config = toml::from_str(&format!("{BASE}\n[workspace]\nmode = \"default\"\n"))
-            .expect("旧段名 [workspace] 必须仍能解析");
-        assert_eq!(old.workplace, new.workplace, "旧段名读出来的必须与新段名一模一样");
-        assert_eq!(new.workplace.mode, "default", "值要真的读进来，而不是落回默认");
+            .expect("the old section name [workspace] must still parse");
+        assert_eq!(old.workplace, new.workplace, "the old section name must read back exactly like the new one");
+        assert_eq!(new.workplace.mode, "default", "the value must really be read in, not fall back to the default");
 
-        // 两个名字都写（理论上不该发生）：宁可**报错**，也别静默取其中一个 ——
-        // 取错了就是「我明明写了 full，它却还在拦我」这种没法自查的现象。
+        // Both names written (which theoretically should not happen): better to **error** than silently
+        // pick one — picking wrong shows up as the self-diagnosis-proof phenomenon "I clearly wrote full,
+        // yet it still blocks me".
         let both =
             format!("{BASE}\n[workplace]\nmode = \"default\"\n[workspace]\nmode = \"full\"\n");
-        assert!(toml::from_str::<Config>(&both).is_err(), "同一段写两个名字应当报错");
+        assert!(toml::from_str::<Config>(&both).is_err(), "writing both names for the same section should error");
     }
 
-    /// 老配置（完全没写 `[hook]`）必须照常解析，且钩子表为空 ——
-    /// 阶段 4 和阶段 2 一样，不能打破任何一份既有的 config.toml。
-    /// 出厂默认是**受限档**（`default`）—— 2026-10-05 由 `full` 改过来。
+    /// An old config (with no `[hook]` at all) must still parse, and the hook table must be empty —
+    /// stage 4, like stage 2, must not break any existing config.toml.
+    /// The factory default is the **confined tier** (`default`) — changed from `full` on 2026-10-05.
     ///
-    /// 这条钉住的是一个**产品决定**：不写 `[workplace]` 的用户，启动就该是受限的
-    /// （写入与删除只准落在 `workplace/<时间戳>/` 里）。改回 `full` 会**静默**把所有人的
-    /// 写边界打开 —— 那是安全方向上的倒退，必须有测试出声，不能靠 review 记得。
+    /// This pins a **product decision**: a user who writes no `[workplace]` should start confined
+    /// (writes and deletes may only land in `workplace/<timestamp>/`). Reverting to `full` would
+    /// **silently** open everyone's write boundary — a regression in the safety direction, so a test
+    /// must speak up rather than relying on review to remember.
     #[test]
     fn factory_default_is_the_confined_mode() {
         assert_eq!(WorkplaceConfig::default().mode, "default");
@@ -1008,8 +1042,8 @@ model = "m"
 api_key = "k"
 "#,
         )
-        .expect("不写 [workplace] 应能解析");
-        assert_eq!(c.workplace.mode, "default", "不写这一段 = 出厂默认 = 受限档");
+        .expect("omitting [workplace] should parse");
+        assert_eq!(c.workplace.mode, "default", "omitting this section = factory default = restricted tier");
         assert_eq!(c.workplace.root, None);
     }
 
@@ -1023,12 +1057,12 @@ api_key = "k"
             api_key = "k"
             "#,
         )
-        .expect("没有 [hook] 的旧配置必须仍能解析");
+        .expect("an old config without [hook] must still parse");
         assert!(c.hook.tool_args_default.is_empty());
     }
 
-    /// `[loop]` 的默认值：standard + 不裁剪。
-    /// 这条是「不写 `[loop]` ⇒ 行为与阶段 5 逐字节相同」的数据层保证。
+    /// The defaults of `[loop]`: standard + no trimming.
+    /// This is the data-layer guarantee that "no `[loop]` ⇒ behaviour byte-identical to stage 5".
     #[test]
     fn loop_defaults_to_standard_without_trimming() {
         let c: Config = toml::from_str(
@@ -1039,13 +1073,13 @@ api_key = "k"
             api_key = "k"
             "#,
         )
-        .expect("没有 [loop] 的旧配置必须仍能解析");
+        .expect("an old config without [loop] must still parse");
         assert_eq!(c.loop_config.implementor, "standard");
-        assert_eq!(c.loop_config.max_rounds, 0, "默认不裁剪上下文");
+        assert_eq!(c.loop_config.max_rounds, 0, "the context is not trimmed by default");
         assert_eq!(LoopConfig::default().implementor, "standard");
     }
 
-    /// `[loop]` 段两个键都要认 —— 顺带钉住「`impl` 这个 TOML 键名不能被 Rust 关键字那件事带偏」。
+    /// Both keys of the `[loop]` section must be recognized — and, incidentally, pin "the TOML key name `impl` must not be dragged off course by the Rust keyword issue".
     #[test]
     fn loop_section_parses_impl_and_max_rounds() {
         let c: Config = toml::from_str(
@@ -1060,12 +1094,12 @@ api_key = "k"
             max_rounds = 6
             "#,
         )
-        .expect("带 [loop] 的配置应能解析");
+        .expect("a config with [loop] should parse");
         assert_eq!(c.loop_config.implementor, "standard");
         assert_eq!(c.loop_config.max_rounds, 6);
     }
 
-    /// 只写 `max_rounds` 时 `impl` 取默认 —— 与其它各表一样「整表可缺项」。
+    /// With only `max_rounds` written, `impl` takes the default — like the other tables, "a whole table may omit fields".
     #[test]
     fn loop_section_partial_still_parses() {
         let c: Config = toml::from_str(
@@ -1079,15 +1113,16 @@ api_key = "k"
             max_rounds = 3
             "#,
         )
-        .expect("[loop] 只写一个键也应可解析");
+        .expect("[loop] with only one key should still parse");
         assert_eq!(c.loop_config.implementor, "standard");
         assert_eq!(c.loop_config.max_rounds, 3);
     }
 
-    /// `[sandbox]` 的默认值：**开着**，且是「对合法插件零影响」的那一组。
+    /// The defaults of `[sandbox]`: **on**, and exactly the set with "zero impact on legitimate plugins".
     ///
-    /// 这条与其它各段的「默认 = 不生效」是**刻意不同**的：围栏的默认值本身就是行为，
-    /// 所以更要把它钉死 —— 哪天有人顺手改了默认，这条测试应当立刻红。
+    /// This is **deliberately different** from the "default = no effect" of the other sections: the fence's
+    /// default value is itself behaviour, so it must be pinned even harder — should someone casually change
+    /// the default, this test should go red immediately.
     #[test]
     fn sandbox_defaults_are_on_and_conservative() {
         let c: Config = toml::from_str(
@@ -1098,31 +1133,31 @@ api_key = "k"
             api_key = "k"
             "#,
         )
-        .expect("没有 [sandbox] 的旧配置必须仍能解析");
+        .expect("an old config without [sandbox] must still parse");
 
-        assert!(c.sandbox.enabled, "围栏默认开着");
-        assert_eq!(c.sandbox.max_processes, 8, "默认必须放行子进程（0 才是锁死）");
-        assert_eq!(c.sandbox.max_memory_mb, 0, "内存帽默认关（超限是杀进程，不能默认开）");
+        assert!(c.sandbox.enabled, "the fence is on by default");
+        assert_eq!(c.sandbox.max_processes, 8, "the default must allow child processes (0 is what locks it down)");
+        assert_eq!(c.sandbox.max_memory_mb, 0, "the memory cap is off by default (exceeding it kills the process, so it must not default on)");
         assert!(c.sandbox.ui_limits);
 
         let d = SandboxConfig::default();
         assert!(d.enabled && d.max_processes == 8 && d.max_memory_mb == 0 && d.ui_limits);
-        // `+1` 是**平台口径**（`ACTIVE_PROCESS` 含插件自己）。钉住它只加一次，
-        // 而且 0 真的是「一个子进程都不许」，不是「不限」。
-        assert_eq!(d.job_process_limit(), 9, "配置 8 ⇒ Job 里 9 个名额（含插件自己）");
+        // The `+1` is the **platform convention** (`ACTIVE_PROCESS` includes the plugin itself). Pin that it
+        // is added only once, and that 0 really means "not a single child process allowed", not "unlimited".
+        assert_eq!(d.job_process_limit(), 9, "configured 8 => 9 slots in the Job (including the plugin itself)");
         assert_eq!(
             SandboxConfig { max_processes: 0, ..SandboxConfig::default() }.job_process_limit(),
             1,
-            "0 = 只准插件自己 ⇒ 一个子进程都开不了"
+            "0 = only the plugin itself => not one child process can start"
         );
         assert_eq!(
             SandboxConfig { max_processes: u32::MAX, ..SandboxConfig::default() }.job_process_limit(),
             u32::MAX,
-            "极端值不能回绕成 0 —— 在 Job 里 0 是「不限」，意思正好相反"
+            "an extreme value must not wrap to 0 — inside a Job, 0 means \"unlimited\", the exact opposite"
         );
     }
 
-    /// 只写一个键时其余取默认（与其它各表一样「整表可缺项」）。
+    /// With only one key written the rest take defaults (like the other tables, "a whole table may omit fields").
     #[test]
     fn sandbox_section_partial_still_parses() {
         let c: Config = toml::from_str(
@@ -1137,15 +1172,15 @@ api_key = "k"
             max_memory_mb = 512
             "#,
         )
-        .expect("[sandbox] 只写两个键也应可解析");
+        .expect("[sandbox] with only two keys should still parse");
 
         assert_eq!(c.sandbox.max_processes, 4);
         assert_eq!(c.sandbox.max_memory_mb, 512);
-        assert!(c.sandbox.enabled, "没写的键仍取默认");
+        assert!(c.sandbox.enabled, "keys that were not written keep their defaults");
         assert!(c.sandbox.ui_limits);
     }
 
-    /// 关掉围栏这条路必须真的存在（它是唯一的退路）。
+    /// The path to turn the fence off must really exist (it is the only way back).
     #[test]
     fn sandbox_can_be_turned_off() {
         let c: Config = toml::from_str(
@@ -1159,7 +1194,7 @@ api_key = "k"
             enabled = false
             "#,
         )
-        .expect("应能解析");
+        .expect("should parse");
         assert!(!c.sandbox.enabled);
     }
 }

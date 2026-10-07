@@ -1,180 +1,209 @@
 # AOX
 
-一个**自我增长**的 AI 编程代理。它启动时**没有任何工具**，只有一个核心循环和三个元工具。
-当任务需要某种能力（读写文件、跑命令、抓网页……）时，它会**自己编写一个插件并注入**，
-下一轮立刻就能调用。插件会持久化在磁盘上，重启后自动恢复——所以它用着用着会越来越强。
+A **self-growing** AI coding agent. It starts with **no tools at all** — just a core loop and three
+meta-tools. When a task needs some capability (reading and writing files, running commands,
+fetching web pages…), it **writes a plugin itself and injects it**, and can call it on the very next
+turn. Plugins persist on disk and are restored automatically after a restart — so the more you use
+it, the stronger it gets.
 
 ---
 
-## 快速开始
+## Quick start
 
-1. 双击 `aox.exe`（首次运行会在程序目录自动生成 `config.toml`）。
-2. 用记事本打开 `config.toml`，填入你的模型服务信息：
+1. Double-click `aox.exe` (the first run auto-generates `config.toml` in the program directory).
+2. Open `config.toml` in Notepad and fill in your model service:
 
    ```toml
    [provider]
-   base_url = "https://api.deepseek.com/v1"   # 任何 OpenAI 兼容服务都行
+   base_url = "https://api.deepseek.com/v1"   # any OpenAI-compatible service works
    model    = "deepseek-chat"
-   api_key  = "sk-你的key"                    # 或者改用 api_key_env 指向环境变量
+   api_key  = "sk-your-key"                   # or point api_key_env at an environment variable
    ```
 
-3. 再次双击 `aox.exe`，进入交互界面。
-4. 直接说人话，例如：
+3. Double-click `aox.exe` again to enter the interactive interface.
+4. Just talk normally, for example:
 
-   > 读取 config.toml，告诉我里面有哪些配置项
+   > Read config.toml and tell me which configuration options it contains
 
-   它发现没有文件读取能力，会先造一个 `fs` 插件，然后用它完成任务。
+   It discovers it has no file-reading capability, so it first builds an `fs` plugin and then uses
+   it to finish the task.
 
-## 从源码构建
+## Building from source
 
-需要 Rust 1.90+ 与 MSVC 工具链。
+Requires Rust 1.90+ and the MSVC toolchain.
 
 ```bash
-cargo build                      # 只构建 CLI（workspace 默认成员）
-cargo run                        # 运行 CLI
-cargo build -p aox-gui --release # 构建 GUI
-cargo run -p aox-gui             # 运行 GUI
+cargo build                      # build the CLI only (the workspace default member)
+cargo run                        # run the CLI
+cargo build -p aox-gui --release # build the GUI
+cargo run -p aox-gui             # run the GUI
 ```
 
-**Windows + Git Bash 用户注意**：Git Bash 自带的 coreutils `link` 会抢占 PATH 里 MSVC 的
-`link.exe`，报 `link: extra operand '...rcgu.o'`。解决办法是在 `.cargo/config.toml` 里
-显式指定链接器与 `LIB` / `INCLUDE`：
+**Windows + Git Bash users, take note**: Git Bash's bundled coreutils `link` shadows MSVC's
+`link.exe` on `PATH`, reporting `link: extra operand '...rcgu.o'`. The fix is to specify the linker
+and `LIB` / `INCLUDE` explicitly in `.cargo/config.toml`:
 
 ```toml
 [target.x86_64-pc-windows-msvc]
-linker = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\<版本>\\bin\\Hostx64\\x64\\link.exe"
+linker = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\<version>\\bin\\Hostx64\\x64\\link.exe"
 
-# 静态链接 MSVC 运行库（/MT 等价），**发行必加**：
-# 否则 exe 会依赖 VCRUNTIME140.dll，而它不属于 Windows 自带组件
-# （来自 VC++ 2015-2022 Redistributable），干净装机上直接报「找不到 VCRUNTIME140.dll」。
+# Statically link the MSVC runtime (the equivalent of /MT), **mandatory for releases**:
+# otherwise the exe depends on VCRUNTIME140.dll, which is not a Windows built-in component
+# (it comes from the VC++ 2015-2022 Redistributable), and a clean install dies immediately
+# with "VCRUNTIME140.dll not found".
 rustflags = ["-C", "target-feature=+crt-static"]
 
 [env]
-LIB     = { value = "<MSVC>\\lib\\x64;<WinSDK>\\Lib\\<版本>\\um\\x64;<WinSDK>\\Lib\\<版本>\\ucrt\\x64", force = true }
-INCLUDE = { value = "<MSVC>\\include;<WinSDK>\\Include\\<版本>\\um;<WinSDK>\\Include\\<版本>\\ucrt;<WinSDK>\\Include\\<版本>\\shared;<WinSDK>\\Include\\<版本>\\winrt", force = true }
+LIB     = { value = "<MSVC>\\lib\\x64;<WinSDK>\\Lib\\<version>\\um\\x64;<WinSDK>\\Lib\\<version>\\ucrt\\x64", force = true }
+INCLUDE = { value = "<MSVC>\\include;<WinSDK>\\Include\\<version>\\um;<WinSDK>\\Include\\<version>\\ucrt;<WinSDK>\\Include\\<version>\\shared;<WinSDK>\\Include\\<version>\\winrt", force = true }
 ```
 
-这个文件含本机绝对路径（对别人无效），已被 `.gitignore` 排除，**需要自建**。
-用 PowerShell / cmd 或已 `vcvars64` 的终端构建则不需要其中的 `linker` / `LIB` / `INCLUDE`，
-但 **`rustflags` 那行无论用哪个终端都要保留**。
+This file holds machine-specific absolute paths (useless to anyone else) and is excluded by
+`.gitignore`, so **you must create it yourself**. Building from PowerShell / cmd, or from a terminal
+that has already run `vcvars64`, does not need the `linker` / `LIB` / `INCLUDE` entries — but **the
+`rustflags` line must stay no matter which terminal you use**.
 
-漏加 `rustflags` 时构建不会失败，但两个 `build.rs` 会打出显眼的 `cargo:warning` 提醒你产物
-在干净机器上起不来。
+If you leave out `rustflags` the build does not fail, but both `build.rs` scripts print a prominent
+`cargo:warning` telling you the artifact won't start on a clean machine.
 
-## 命令行
+## Command line
 
-| 命令 | 作用 |
+| Command | What it does |
 | --- | --- |
-| `/help` | 显示帮助（列出全部命令） |
-| `/tools` | 查看当前所有可用工具 |
-| `/plugins` | 查看已加载的插件 |
-| `/history` | 查看历史对话列表（`/history show <序号>` 看全文、`/history open <序号>` 接着聊、`/history dir` 看目录、`/history rm <序号>` 删除） |
-| `/new` | 开一段新对话（当前这段已经落盘） |
-| `/runtime` | 查看解释器解析结果；`/runtime install python` 自动装配内置运行时 |
-| `/demo` | 预览终端排版与折叠效果 |
-| `/expand` | 展开上一次被折叠的工具调用过程 |
-| `/quit` | 退出（`/exit` 等价） |
+| `/help` | Show help (lists every command) |
+| `/tools` | View all currently available tools |
+| `/plugins` | View the loaded plugins |
+| `/history` | View the conversation list (`/history show <n>` for the full text, `/history open <n>` to continue it, `/history dir` for the directory, `/history rm <n>` to delete) |
+| `/new` | Start a new conversation (the current one is already on disk) |
+| `/runtime` | View how the interpreters resolved; `/runtime install python` assembles the bundled runtime |
+| `/demo` | Preview terminal layout and folding |
+| `/expand` | Expand the most recently folded tool-call sequence |
+| `/quit` | Exit (`/exit` is equivalent) |
 
-按 `Ctrl+C` 可中断正在进行的任务。
+Press `Ctrl+C` to interrupt a running task.
 
-启动横幅里的项目地址是可点击超链接（OSC 8）。Windows Terminal、VS Code 终端等会自动启用；
-传统 conhost（例如直接双击 exe）不认这个序列，会自动退回纯文本 URL。
-自动探测不灵时可用 `AOX_HYPERLINK=1` 强制开启、`AOX_HYPERLINK=0` 关闭。
+The project URL in the startup banner is a clickable hyperlink (OSC 8). Windows Terminal, the VS
+Code terminal and the like enable it automatically; legacy conhost (for example, double-clicking the
+exe) doesn't recognise the sequence and falls back to a plain-text URL. When auto-detection gets it
+wrong, force it on with `AOX_HYPERLINK=1` or off with `AOX_HYPERLINK=0`.
 
-## 等待动画与过程折叠
+## Waiting animation and process folding
 
-任务进行中，终端只保留**一行**状态（执行工具时会自动切换提示文字）：
-
-```
-⠹ 思考中 3.2s
-⠼ 执行 fs_read 8.7s
-```
-
-如果模型是**思考模式**（`deepseek-flash` / `deepseek-reasoner` 等），等待期间它还会把推理过程
-实时滚动显示在状态行下方——看到它「在想什么」，就知道任务跑到哪一步了：
+While a task runs, the terminal keeps **a single line** of status (the text switches automatically
+when a tool runs):
 
 ```
-⠹ 思考中 3.2s
-  我需要先确认这个目录下有哪些文件，
-  然后判断是否要新建一个插件来读取配置。
+⠹ Thinking 3.2s
+⠼ Running fs_read 8.7s
 ```
 
-这段推理过程是**即时出现、响应结束即消失**的临时回显（滚动窗口保留末尾 4 行），
-不会污染输出，也不会进入折叠区。想关掉流式（例如端点不支持 `stream` 参数），
-在 `config.toml` 的 `[provider]` 里加一行 `stream = false` 即可。
-
-任务完成后，中间的模型思考与工具调用会自动折叠成一行摘要，只显示最终输出：
+If the model is a **thinking model** (`deepseek-flash` / `deepseek-reasoner` and the like), during
+the wait it also scrolls its reasoning live below the status line — seeing *what it's thinking*
+tells you which step the task is at:
 
 ```
-▸ 已折叠 8 步工具调用 · 12.4s · /expand 展开
-
-（这里是模型的最终输出）
+⠹ Thinking 3.2s
+  I first need to see which files are in this directory,
+  then decide whether to build a new plugin to read the config.
 ```
 
-输入 `/expand` 可随时展开最近一次的过程明细（每一步的调用参数与结果）。
+This reasoning is a **momentary echo that appears immediately and vanishes when the response
+ends** (the scrolling window keeps the last 4 lines); it doesn't pollute the output and doesn't
+enter the folded region. To turn streaming off (for example, an endpoint that doesn't support the
+`stream` parameter), add `stream = false` under `[provider]` in `config.toml`.
 
-动画在输出被重定向到文件/管道时自动静默；可用环境变量 `AOX_ANIM=1` 强制开启、`AOX_ANIM=0` 强制关闭。
+Once a task finishes, the intermediate model thinking and tool calls are folded automatically into
+a one-line summary, showing only the final output:
 
-## 图形界面（AOX GUI）
+```
+▸ Folded 8 tool calls · 12.4s · /expand to expand
 
-除了命令行版本，仓库里还有一套**独立的图形界面**：`gui/`（crate 名 `aox-gui`）。
+(the model's final output)
+```
 
-它和 CLI **共用同一套核心**——`src/lib.rs` 把 Agent 主循环、LLM Provider、插件宿主、`Ui`
-抽象层暴露成库，GUI 只是 `aox::ui::Ui` 的另一个实现，没有任何逻辑分叉。CLI 的行为不受影响
-（`cargo build` 仍然只构建 CLI，见 `default-members`）。
+Type `/expand` at any time to expand the details of the most recent run (each step's call arguments
+and result).
+
+The animation goes silent automatically when output is redirected to a file/pipe; force it on with
+the environment variable `AOX_ANIM=1` or off with `AOX_ANIM=0`.
+
+## Graphical interface (AOX GUI)
+
+Besides the command-line version, the repo also carries a **standalone graphical interface**: `gui/`
+(crate name `aox-gui`).
+
+It **shares a single core** with the CLI — `src/lib.rs` exposes the Agent main loop, the LLM
+Provider, the plugin host and the `Ui` abstraction as a library, and the GUI is just another
+implementation of `aox::ui::Ui`, with no logic forking off anywhere. The CLI's behaviour is
+unaffected (`cargo build` still builds only the CLI, see `default-members`).
 
 ```bash
-cargo run -p aox-gui                      # 直接运行（与 CLI 共用 config.toml）
-cargo run -p aox-gui -- --demo            # 演示模式：不连模型，预览界面与事件流
-cargo run -p aox-gui -- --prompt "看看现在有哪些插件"   # 启动后自动发第一条指令
-cargo build -p aox-gui --release          # 产出 target/release/aox-gui.exe
+cargo run -p aox-gui                      # run directly (shares config.toml with the CLI)
+cargo run -p aox-gui -- --demo            # demo mode: no model, previews the interface and event stream
+cargo run -p aox-gui -- --prompt "what plugins are there right now"   # send the first instruction automatically on launch
+cargo build -p aox-gui --release          # produces target/release/aox-gui.exe
 ```
 
-界面结构：
+Interface layout:
 
-| 区域 | 内容 |
+| Area | Contents |
 | --- | --- |
-| 顶栏 | 最左两枚图标：**历史侧边栏开关**、**新建对话**；右上角三枚（自左向右）关于、活动流开关、**明暗切换**。只有任务执行中才在左侧显示一行耗时 |
-| 左侧历史栏 | 默认折叠，点顶栏最左那枚图标展开（见 [对话历史](#对话历史)）。点某一条就**切换到那段对话**接着聊 |
-| 主区 | 对话流：用户气泡、助手 Markdown（标题带细线、**行内代码是带底色的芯片**、**表格有完整外框 + 表头色带 + 行分隔线**、**围栏代码块带语法高亮**）、**自动折叠的过程块**（点击展开工具调用明细） |
-| 活动流 | **不在主窗口里**：点顶栏那枚图标会打开一个独立窗口，初始尺寸与主窗口一致（用系统标题栏，可拖动、缩放、最小化，Win11 自带圆角）。主体是一条**横向时间轴**：横轴是时间，任务自左向右推进，色块宽度 = 真实耗时；工具调用 / 思考 / 授权 / 消息分三行各用一种颜色，同一插件的色块用同一族色分深浅。**点色块（或下方列表里的一行）看详情**。滚轮平移、Ctrl+滚轮缩放 |
-| 底部 | 多行输入（`Enter` 发送、`Shift+Enter` 换行）、发送 / 停止按钮 |
+| Top bar | The two leftmost icons: **history sidebar toggle**, **new conversation**; the top-right three (left to right): About, activity-stream toggle, **light/dark toggle**. The left side shows a running elapsed time only while a task is executing |
+| Left history sidebar | Collapsed by default; click the top bar's leftmost icon to expand it (see [Conversation history](#conversation-history)). Clicking an entry **switches to that conversation** to continue it |
+| Main area | The conversation flow: user bubbles, the assistant's Markdown (headings with a hairline rule, **inline code as a tinted chip**, **tables with a full frame + a header band + row separators**, **fenced code blocks with syntax highlighting**), and **automatically folded process blocks** (click to expand the tool-call details) |
+| Activity stream | **Not in the main window**: clicking that top-bar icon opens a separate window, initially the same size as the main one (with the system title bar — draggable, resizable, minimisable, Win11's own rounded corners). Its body is a **horizontal timeline**: the x axis is time, the task advances left to right, and a block's width is its real elapsed time; tool calls / thinking / authorisation / messages each get a row and a colour, and blocks for the same plugin use one colour family at different shades. **Click a block (or a row in the list below) to see the details**. Wheel to pan, Ctrl+wheel to zoom |
+| Bottom | Multi-line input (`Enter` sends, `Shift+Enter` inserts a newline), send / stop buttons |
 
-其它细节：
+Other details:
 
-- 配色是**「纸与墨」的单色方案**，只有明度、没有色相：亮色是一张发暖的纸（`#F2EFE8`），
-  暗色是暖调的黑（`#141412`）。点顶栏最右的按钮即可切换（亮色显示月牙、暗色显示太阳），
-  原生标题栏的底色与文字色也跟着一起变（DWM 属性）；偏好记在 `.aox-gui-theme`。
-  成功/警告/失败不靠颜色区分，而用明度层次与反白块表达。
-  **唯一的例外是代码块**：语法高亮是低饱和的暖色系（赭红关键字、松绿类型、钢蓝函数、
-  橄榄字符串、梅紫数字、暖灰注释、琥珀元信息），只跟明暗两套、随主题一起切换。
-- 语法高亮覆盖 rust / python / js·ts / c 系 / shell / sql / json·toml·yaml / html·xml，
-  认不出来的语言按「只高亮字符串与数字」处理，不会乱标。识别靠两条通用启发式：
-  **紧跟 `(` 的标识符当函数、PascalCase 当类型**，因此不必为每种语言维护类型表。
-  ``` 的语言提示支持 `rust,ignore` 这类后缀，只取第一段。
-- 原生标题栏上不缀模型名（标题固定是 `AOX`），也不再单独设窗口图标：左上角只剩标题本身，
-  品牌交给初始界面承担，模型名与运行时分发状态都在「关于」窗口里。注意 Windows 的标题栏图标
-  与任务栏图标共用同一枚，不设它之后任务栏上也看不到这个图标。
-- 初始界面是一句问候加三条示例指令，点一下会填进输入框（不会直接发送）。
-- 需要授权的元工具会弹出 Modal，快捷键与 CLI 完全一致：`y` 允许一次、`a` 本会话始终允许、`n` / `Esc` 拒绝。
-- 任务执行中可点右下角的停止按钮中断，对话历史会回滚到任务前状态（与 CLI 的 `Ctrl+C` 等价）；
-  内存里的消息和已落盘的 `history/*.jsonl` 一起回滚，不会留下半截记录。
-- 界面语言跟随系统：自动从 `C:\Windows\Fonts` 挑一个中文字体（等线 / 微软雅黑 / 黑体…），
-  无需手动配置。初始界面那句问候另挑一个**带笔势的展示体**（Gabriola → Ink Free → …），
-  找不到就逐级退回衬线、粗体、正文字体，永远不会变成方块。
-  可用 `AOX_GUI_FONT`、`AOX_GUI_FONT_BOLD`、`AOX_GUI_FONT_SERIF`、`AOX_GUI_FONT_BRAND`、
-  `AOX_GUI_FONT_MONO` 指定字体文件。
-- 鼠标往上翻历史时不会自动被拽回底部；滚回底部附近会自动恢复跟随。
+- The palette is a **"paper and ink" monochrome scheme** — lightness only, no hue: light mode is a
+  sheet of warm paper (`#F2EFE8`), dark mode is a warm black (`#141412`). Click the top bar's
+  rightmost button to switch (light shows a crescent moon, dark shows a sun), and the native title
+  bar's background and text colour follow along (DWM attributes); the preference is remembered in
+  `.aox-gui-theme`. Success/warning/failure are not distinguished by colour but by lightness levels
+  and inverted blocks. **The one exception is code blocks**: syntax highlighting is a low-saturation
+  warm family (ochre-red keywords, pine-green types, steel-blue functions, olive strings, plum
+  numbers, warm-grey comments, amber metadata), only two sets of light and dark, switching with the
+  theme.
+- Syntax highlighting covers rust / python / js·ts / the c family / shell / sql / json·toml·yaml /
+  html·xml; an unrecognised language falls back to "highlight only strings and numbers" rather than
+  mislabelling. Recognition rests on two general heuristics: **an identifier immediately followed by
+  `(` is a function, and PascalCase is a type**, so no per-language type table has to be maintained.
+  A ```` ``` ```` language hint supports suffixes like `rust,ignore`, of which only the first
+  segment is used.
+- The native title bar carries no model name (the title is always `AOX`), and no window icon is set
+  separately either: the top-left shows only the title itself, branding is left to the initial
+  screen, and the model name and runtime distribution state live in the About window. Note that on
+  Windows the title-bar icon and the taskbar icon are the same one, so without setting it the icon
+  is invisible on the taskbar too.
+- The initial screen is a greeting plus three example instructions; clicking one fills it into the
+  input box (it does not send immediately).
+- Meta-tools that need authorisation pop up a modal, with shortcuts identical to the CLI: `y` allow
+  once, `a` always allow this session, `n` / `Esc` deny.
+- While a task is running you can click the stop button in the bottom-right to interrupt it, and the
+  conversation history rolls back to its pre-task state (equivalent to the CLI's `Ctrl+C`); the
+  in-memory messages and the already-written `history/*.jsonl` roll back together, leaving no
+  half-written record.
+- The interface language follows the system: it automatically picks a Chinese font from
+  `C:\Windows\Fonts` (DengXian / Microsoft YaHei / SimHei…), with no manual configuration. The
+  greeting on the initial screen picks a different **flourished display face** (Gabriola → Ink
+  Free → …), falling back step by step to serif, bold and body fonts so it never becomes tofu.
+  Use `AOX_GUI_FONT`, `AOX_GUI_FONT_BOLD`, `AOX_GUI_FONT_SERIF`, `AOX_GUI_FONT_BRAND`,
+  `AOX_GUI_FONT_MONO` to point at font files.
+- Scrolling up through history doesn't get yanked back to the bottom automatically; scrolling back
+  near the bottom resumes following.
 
-仓库根目录的行为与加 GUI 之前**完全一致**；GUI 是独立 crate，删掉 `gui/` 与
-`Cargo.toml` 里的 `[workspace] members` 即可移除。
+The repository root's behaviour is **exactly the same** as before the GUI was added; the GUI is a
+separate crate, and you can remove it by deleting `gui/` and the `[workspace] members` entry in
+`Cargo.toml`.
 
-## 对话历史
+## Conversation history
 
-对话**自动落盘**，命令行和 GUI 走的是同一套实现（`Agent` 里的唯一写入点），
-关掉窗口/终端也不会丢。
+Conversations are **written to disk automatically**, and the command line and the GUI use the same
+implementation (the single write point inside `Agent`), so closing the window/terminal doesn't lose
+them.
 
-存在 `<应用根>/history/`，**每个对话一个文件**：
+They live in `<app root>/history/`, **one file per conversation**:
 
 ```
 history/
@@ -182,223 +211,255 @@ history/
   20261002-160001-e98c.jsonl
 ```
 
-> 两个安装包默认装到不同目录（`%LOCALAPPDATA%\Programs\AOX` 与 `…\AOX GUI`），
-> 因此各自有一份 `history/`。想让它们共用，把其中一个装到另一个的目录即可。
+> The two installers default to different directories by design (`%LOCALAPPDATA%\Programs\AOX` and
+> `…\AOX GUI`), so each has its own `history/`. To share them, just install one into the other's
+> directory.
 
-文件名主干就是这次对话的 id（`年月日-时分秒-4位随机`），也是命令行 `show` / `rm` 认的键。
+The filename stem is the conversation's id (`yyyymmdd-hhmmss-4 random chars`) and is also the key
+the command line's `show` / `rm` recognise.
 
-### 文件格式
+### File format
 
-JSONL——一行一个 JSON 对象，第一行是元信息，之后每行是一条消息：
+JSONL — one JSON object per line, with the first line holding metadata and each line after that a
+message:
 
 ```json
 {"created":1790927628,"id":"20261002-155348-c5d8","kind":"meta","model":"deepseek-chat","root":"D:\\AOX","version":"0.1.0"}
-{"content":"你好，先看看目录","kind":"message","role":"user"}
-{"content":"我先列一下目录。","kind":"message","role":"assistant","tool_calls":[...]}
+{"content":"Hi, take a look at the directory first","kind":"message","role":"user"}
+{"content":"Let me list the directory first.","kind":"message","role":"assistant","tool_calls":[...]}
 {"content":"[FILE] ...","is_error":false,"kind":"message","name":"fs_ls","role":"tool","tool_call_id":"call_1"}
 ```
 
-消息行就是 **OpenAI 请求体里的原始消息对象**，额外只多一个 `is_error` 字段；
-所以这个文件既是给人看的日志，也能直接当请求体重放。系统提示不落盘（每次启动都由代码重组，
-存下来只会是一份随时会过期的副本）。`kind` 用来区分行类型，读回时会被剥掉。
+A message line is the **raw message object from the OpenAI request body**, with only one extra field
+added, `is_error`; so the file is both a human-readable log and directly replayable as a request
+body. The system prompt is not written to disk (it is reassembled from code on every launch, and
+saving it would only store a copy that goes stale). `kind` distinguishes line types and is stripped
+when reading back.
 
-几个刻意的取舍：
+A few deliberate trade-offs:
 
-- **追加写**，不整体重写。中途断电/杀进程最多丢最后一行，前面都还在。
-- **一行坏了不影响整个文件**：读取时跳过解析失败的行，而不是让整个对话打不开。
-- **中断会回滚**：`Ctrl+C` / 停止按钮回滚半截任务时，文件里那半截也一并删掉——
-  否则会留下「有 `tool_calls` 但没有结果」的残缺记录，重放时会被服务端直接拒绝。
+- **Append-only**, never rewritten wholesale. A power cut or a killed process loses at most the last
+  line; everything before it survives.
+- **One bad line doesn't break the whole file**: unparsable lines are skipped on read, rather than
+  making the entire conversation unopenable.
+- **An interruption rolls back**: when `Ctrl+C` / the stop button rolls back a half-finished task,
+  that half is deleted from the file as well — otherwise it would leave a broken record with
+  `tool_calls` but no result, which the server rejects outright on replay.
 
-### 命令行
+### Command line
 
 ```bash
-/history                  # 列表：序号、时间、条数、首条用户输入当标题
-/history show 1           # 看第 1 条的全文（你 / 助手 / 工具调用与结果）
-/history open 1           # 切到第 1 条接着聊（旧对话已落盘，不需要「保存」）
-/history dir              # 打印目录路径
-/history rm 2             # 删掉第 2 条
+/history                  # list: index, time, count, first user input as the title
+/history show 1           # view the full text of entry 1 (you / assistant / tool calls and results)
+/history open 1           # switch to entry 1 and continue it (the old conversation is already on disk, no "save" needed)
+/history dir              # print the directory path
+/history rm 2             # delete entry 2
 ```
 
-列表里本次会话那一条会标 `← 当前`。`show` / `open` / `rm` 也接受 id 或 id 前缀，不必去数序号。
+In the list, the entry for the current session is marked `← current`. `show` / `open` / `rm` also
+accept an id or id prefix, so you don't have to count indices.
 
 ### GUI
 
-左上角两枚图标：**列表**开关左侧边栏，**加号**新开一段对话。
+The top-left two icons: **list** toggles the left sidebar, **plus** starts a new conversation.
 
-- 侧边栏列出全部历史，按**最后一次说话的时间**从新到旧排；右侧一个小圆点标出
-  **眼下正在聊的**那条（它永远置顶——刚切进去的老对话也排得到最上面）。
-- 点任意一条即**切换到那段对话**：界面上那段的正文立刻换上，接着往下聊是接着它的上下文；
-  想另起一段就点加号，原来那段已经完整躺在 `history/` 里了。
-- 两侧面板默认都是收起的，窗口打开就是干净的对话区。
-- 当前对话落盘后侧边栏会自动刷新，一般用不着手动点「刷新」；那个按钮是给
-  「另开了窗口 / 在别处改动了 `history/`」这类情况兜底的。
+- The sidebar lists every conversation, ordered **by the time it was last spoken to**, newest first;
+  a small dot on the right marks **the one you're in right now** (it is always pinned to the top —
+  an old conversation you just switched into also lands at the very top).
+- Clicking any entry **switches to that conversation**: the main body swaps in immediately, and
+  continuing the chat continues its context; to start a fresh one, click the plus — the previous one
+  is already sitting complete in `history/`.
+- Both side panels are collapsed by default, so the window opens to a clean conversation area.
+- After the current conversation is written to disk the sidebar refreshes automatically, so the
+  manual "refresh" button is rarely needed; that button is a fallback for "another window was
+  opened / `history/` was changed elsewhere".
 
-### 保留策略
+### Retention policy
 
-`config.toml` 的 `[history]`：
+`[history]` in `config.toml`:
 
 ```toml
 [history]
-enabled = true   # 关掉后不再写新文件；已有历史仍可查看
-keep = 200       # 只保留最近 N 个对话，0 = 不限制
+enabled = true   # once off, no new files are written; existing history is still viewable
+keep = 200       # keep only the most recent N conversations, 0 = unlimited
 ```
 
-清理是**顺带的**：只在新建对话文件时数一下目录、删掉超出的旧文件，没有后台线程、
-没有定时器、也不会在启动时全盘扫描。
+Cleanup is **incidental**: it only counts the directory and deletes the excess old files when a new
+conversation file is created — no background thread, no timer, and no full scan at startup.
 
-### 卸载
+### Uninstall
 
-`history/` 属于用户数据，**卸载时不会删除**，同 `plugins/`。
+`history/` is user data and **is not deleted on uninstall**, same as `plugins/`.
 
-## 故障排查
+## Troubleshooting
 
-**任务跑到一半停下、模型什么也没输出？**
+**The task stops halfway through and the model outputs nothing?**
 
-先看终端里有没有 `⚠` / `✗` 行——AOX 现在不会再「静默结束」了。若确有异常，按以下顺序排查：
+First check the terminal for a `⚠` / `✗` line — AOX no longer "ends silently". If something really
+is wrong, work through this order:
 
-1. **思考模式（thinking）模型**：`deepseek-flash`、`deepseek-reasoner` 这类模型会返回
-   `reasoning_content`，回传历史时**必须原样带回**，否则每次多步任务的第二次请求都会被
-   API 以 400 拒绝（`reasoning_content ... must be passed back to the API`）。
-   AOX 已自动处理，无需你干预。
-2. **`max_tokens` 太小**：推理 token 也占输出额度，额度耗尽会得到一条**空回复**。
-   建议 `config.toml` 里设为 `8192` 以上。
-3. **抓原始报文**：用 `AOX_DEBUG_LLM=1 aox` 启动，每次请求与响应会追加到
-   `logs/llm.jsonl`，可直接看到 `finish_reason`、`usage`、空回复等细节。
+1. **Thinking-mode models**: models like `deepseek-flash` and `deepseek-reasoner` return
+   `reasoning_content`, which **must be passed back verbatim** when replaying history, otherwise the
+   API rejects the second request of every multi-step task with a 400
+   (`reasoning_content ... must be passed back to the API`). AOX handles this automatically, so you
+   don't need to intervene.
+2. **`max_tokens` too small**: reasoning tokens count against the output budget too, and exhausting
+   it yields an **empty reply**. Set it to `8192` or more in `config.toml`.
+3. **Capture the raw traffic**: launch with `AOX_DEBUG_LLM=1 aox` and every request and response is
+   appended to `logs/llm.jsonl`, so you can see `finish_reason`, `usage`, empty replies and other
+   details directly.
 
-AOX 对「空回复」的处置是：先重试 2 次并提示，仍为空则明确报错说明原因，**不会**把
-一句「我先看看……」的前言当成最终答案。
+AOX's handling of an "empty reply" is: retry twice with a prompt, then, if it's still empty, report
+an explicit error explaining why — it will **not** treat a preamble like "Let me take a look…" as the
+final answer.
 
-**图形界面里「一用插件 / 插件初始化就弹黑色 python 窗口」？**
+**In the GUI, "a black python window pops up whenever a plugin is used / initialised"?**
 
-GUI 版编译为 `windows` 子系统，**自身没有控制台**。如果拉起插件子进程时不加
-`CREATE_NO_WINDOW`，Windows 会为 `python.exe` 新分配一块**带窗口**的控制台 —— 现象就是
-动不动弹出几个黑窗。宿主已修（`src/plugin/mod.rs::hide_console`，覆盖首次启动恢复插件、
-插件崩溃自愈重启、`rustc` 编译三条路径），装上最新构建的 `AOX-GUI-Setup` 即可。
-留了回归检查：
+The GUI build uses the `windows` subsystem and **has no console of its own**. If a plugin
+subprocess is spawned without `CREATE_NO_WINDOW`, Windows allocates a **windowed** console for
+`python.exe` — and the symptom is a handful of black windows flashing up at random. The host has
+been fixed (`src/plugin/mod.rs::hide_console`, covering all three paths: restoring plugins at first
+launch, self-healing restart after a plugin crash, and `rustc` compilation), so installing the
+latest `AOX-GUI-Setup` is enough. A regression check is included:
 
 ```bash
-python tools/check_no_console_window.py --ab                                  # 机制自检，秒级
+python tools/check_no_console_window.py --ab                                  # mechanism self-test, takes seconds
 python tools/check_no_console_window.py --app target/release/aox-gui.exe --cwd .
 ```
 
-注意 `cargo run` 起来的 **debug 版本身就是控制台程序**，看到一个黑窗属于正常现象，
-不是这个 bug。
+Note that a `cargo run` **debug build is itself a console program**, so seeing a black window is
+normal and not this bug.
 
-## 目录说明
+## Directory layout
 
-程序目录（安装目录）下会自动生成：
+The program directory (the install directory) auto-generates:
 
-| 路径 | 说明 |
+| Path | Description |
 | --- | --- |
-| `config.toml` | 你的配置（首次运行自动生成） |
-| `plugins/<名字>/` | 模型自己写的插件，含源码与 `plugin.toml` |
-| `plugins/sdk/` | 宿主提供的插件 SDK 与协议文档，每次启动自动更新 |
-| `history/*.jsonl` | 对话历史，每个对话一个文件（见 [对话历史](#对话历史)） |
-| `RULES.md` | 可选。写在这里的项目规则会被注入系统提示 |
-| `logs/llm.jsonl` | 可选。仅在 `AOX_DEBUG_LLM=1` 启动时记录原始请求/响应，用于排查模型侧问题 |
+| `config.toml` | Your configuration (auto-generated on first run) |
+| `plugins/<name>/` | Plugins the model wrote itself, including source and `plugin.toml` |
+| `plugins/sdk/` | The plugin SDK and protocol docs the host provides, refreshed on every launch |
+| `history/*.jsonl` | Conversation history, one file per conversation (see [Conversation history](#conversation-history)) |
+| `RULES.md` | Optional. Project rules written here are injected into the system prompt |
+| `logs/llm.jsonl` | Optional. Records raw requests/responses only when launched with `AOX_DEBUG_LLM=1`, for diagnosing model-side problems |
 
-插件子进程以**安装目录为工作目录**启动，Python 插件已由宿主强制 UTF-8 输出。
+Plugin subprocesses are started with **the install directory as their working directory**, and
+Python plugins are forced to UTF-8 output by the host.
 
-## 系统要求
+## System requirements
 
-平台：Windows 10 / 11（x64）。
+Platform: Windows 10 / 11 (x64).
 
-宿主本体（`aox.exe` / `aox-gui.exe`）**不需要任何外部运行时**：发行版已静态链接 MSVC 运行库，
-既不要求 VC++ Redistributable（导入表里没有 `VCRUNTIME140.dll`），也不需要 Python / Node / Rust。
+The host itself (`aox.exe` / `aox-gui.exe`) **needs no external runtime**: releases are statically
+linked against the MSVC runtime, so they neither require the VC++ Redistributable (there is no
+`VCRUNTIME140.dll` in the import table) nor Python / Node / Rust.
 
-外部运行时只影响**插件**，而且三种语言的要求不一样：
+External runtimes affect only **plugins**, and the three languages have different requirements:
 
-| 插件语言 | 运行已有插件 | 新建插件（`create_plugin`） |
+| Plugin language | Running an existing plugin | Creating a new plugin (`create_plugin`) |
 | --- | --- | --- |
-| python | 需要能用的 `python`（3.8+） | 同左 |
-| node | 需要能用的 `node` | 同左 |
-| rust | **不需要任何环境** | 需要 `rustc`（编译完就不再需要） |
+| python | needs a working `python` (3.8+) | same as the left |
+| node | needs a working `node` | same as the left |
+| rust | **needs no environment at all** | needs `rustc` (no longer needed once compiled) |
 
-也就是说，`plugins/` 里已有的插件只有 python / node 两类要求解释器在场；rust 插件是编译好的原生 exe，
-宿主直接运行它，没装 Rust 工具链也能用。
+In other words, only the python / node plugins already in `plugins/` require their interpreter to be
+present; a rust plugin is a compiled native exe that the host runs directly, so it works without the
+Rust toolchain installed.
 
-### 解释器从哪来：三档解析
+### Where interpreters come from: three-tier resolution
 
-宿主启动时对每个语言（python / node / rustc）按下面的顺序解析一次，**取第一个命中的**：
+At startup the host resolves each language (python / node / rustc) once, in this order, **taking the
+first hit**:
 
-1. `config.toml` 的 `[runtimes]` 里写了**完整路径** → 直接用它，不做任何替换；
-2. 该字段是**裸命令**（默认值就是 `python` / `node` / `rustc`）且应用目录下存在内置运行时
-   `<应用根>/runtime/<语言>/<可执行文件>` → 用内置的那份；
-3. 仍然没有 → 用裸命令交给 `PATH`。
+1. A **full path** written under `[runtimes]` in `config.toml` → used directly, with no substitution;
+2. The field is a **bare command** (the default is `python` / `node` / `rustc`) and a bundled runtime
+   exists at `<app root>/runtime/<language>/<executable>` → the bundled one is used;
+3. Still nothing → the bare command is handed to `PATH`.
 
-第 2 档是重点：**把运行时放进应用目录就自动生效**，不用改配置，也不会往系统 `PATH`
-或用户环境变量里写任何东西（卸载即消失）。
+Tier 2 is the important one: **drop a runtime into the app directory and it takes effect
+automatically** — no config change, and nothing written to the system `PATH` or user environment
+variables (it disappears on uninstall).
 
-### 装配 Python 运行时
+### Assembling the Python runtime
 
-没有任何解释器时程序照常启动、能对话、能用 `/tools` `/plugins` 等本地命令，
-但 python 插件会加载失败——此时启动横幅会明确提示一行。补上它的方式：
+With no interpreter present the program still starts, can hold a conversation, and can use local
+commands like `/tools` and `/plugins` — but python plugins fail to load, and the startup banner says
+so explicitly. To supply it:
 
 ```
-/runtime                      # 查看三种运行时的状态与来源（含版本号）
-/runtime install python       # 装配 Python 运行时到 <应用根>/runtime/python
-/runtime dir                  # 打印运行时目录
+/runtime                      # view the three runtimes' status and origin (with version numbers)
+/runtime install python       # assemble the Python runtime into <app root>/runtime/python
+/runtime dir                  # print the runtime directory
 ```
 
-`install` 的顺序是：**已存在 → 本地离线包 → 下载**。
+`install`'s order is: **already present → local offline package → download**.
 
-- **离线包**：文件名固定为 `aox-python-runtime.zip`，放在 **exe 同目录**、应用根、
-  `<应用根>/runtime` 或 `%LOCALAPPDATA%\AOX` 下都会被自动发现。用
-  `bash tools/build_installer.sh pack` 可以产出这个包（约 10 MB），适合内网 / 离线分发。
-- **下载**：默认取 CPython 官方嵌入式发行版（约 10 MB），并用内置的官方 SHA-256 校验。
-  可换成自建镜像：
+- **Offline package**: the filename is fixed at `aox-python-runtime.zip`, and it is auto-discovered
+  when placed **next to the exe**, in the app root, in `<app root>/runtime`, or under
+  `%LOCALAPPDATA%\AOX`. `bash tools/build_installer.sh pack` produces this package (about 10 MB),
+  suited to intranets / offline distribution.
+- **Download**: by default it fetches CPython's official embeddable distribution (about 10 MB) and
+  verifies it against a built-in official SHA-256. A self-hosted mirror can be substituted:
 
   ```toml
   [runtimes]
   python_url    = "https://your-mirror.example.com/python-3.13.7-embed-amd64.zip"
-  python_sha256 = "<官方或自建包的 SHA-256>"
+  python_sha256 = "<the official or self-built package's SHA-256>"
   ```
 
-- 装配完成后**立即生效**（内部会重新解析一次）：之后新建的 python 插件直接用它；
-  此前因缺少 python 而加载失败的插件，重启程序即可恢复。
-- 整个过程只用系统已有能力：下载走 `reqwest`，解压走系统 `tar.exe`（Win10 1803+），
-  校验走 `certutil`。宿主**没有为此增加任何第三方依赖**。
-- Node 单文件就超过 80 MB，不适合自动装配。`/runtime install node` 会直接说明这一点，
-  请自行安装并保证 `node` 在 `PATH` 中。
-- 个别插件的**第三方 pip 依赖**要自己装。注意官方「嵌入式发行版」**不含 `pip`**：
-  确实需要 `pip` 时请装完整 Python，并在 `[runtimes] python` 指向它。
+- **It takes effect immediately** after assembly (an internal re-resolution happens): python plugins
+  created afterwards use it directly, and a plugin that previously failed to load for want of python
+  recovers after a restart.
+- The whole process uses only the system's existing capabilities: the download goes through
+  `reqwest`, extraction through the system `tar.exe` (Win10 1803+), and verification through
+  `certutil`. The host **added no third-party dependency for this**.
+- A single Node binary is over 80 MB, so it isn't suited to automatic assembly.
+  `/runtime install node` says so outright; install it yourself and make sure `node` is on `PATH`.
+- A plugin's **third-party pip dependencies** must be installed by you. Note that the official
+  "embeddable distribution" **does not include `pip`**: if you really need `pip`, install the full
+  Python and point `[runtimes] python` at it.
 
-### 发行产物（一次构建全部产出）
+### Release artifacts (one build produces them all)
 
-`installer/*.iss` 只有一份脚本，靠条件编译产出两种变体（不维护第二份脚本）。
-`bash tools/build_installer.sh` **不带参数时一次产出下面全部五种文件**：
+There is only one script per installer in `installer/*.iss`, using conditional compilation to
+produce two variants (no second script is maintained). `bash tools/build_installer.sh` **with no
+arguments produces all five files below in one go**:
 
-| 产物 | 内容 | 体积 |
+| Artifact | Contents | Size |
 | --- | --- | --- |
-| `AOX-Setup-<版本>.exe` | 命令行版，只有宿主 | 约 3 MB |
-| `AOX-GUI-Setup-<版本>.exe` | 图形界面版，只有宿主 | 约 4 MB |
-| `AOX-Setup-<版本>-with-python.exe` | 命令行版 + Python 运行时（离线可用） | 约 11.4 MB |
-| `AOX-GUI-Setup-<版本>-with-python.exe` | 图形界面版 + Python 运行时（离线可用） | 约 12.5 MB |
-| `aox-python-runtime.zip` | 运行时组件包，给主包用户离线装配用 | 约 10.4 MB |
+| `AOX-Setup-<version>.exe` | command-line build, host only | about 3 MB |
+| `AOX-GUI-Setup-<version>.exe` | graphical build, host only | about 4 MB |
+| `AOX-Setup-<version>-with-python.exe` | command-line build + Python runtime (works offline) | about 11.4 MB |
+| `AOX-GUI-Setup-<version>-with-python.exe` | graphical build + Python runtime (works offline) | about 12.5 MB |
+| `aox-python-runtime.zip` | runtime component package, for offline assembly by main-package users | about 10.4 MB |
 
 ```bash
-bash tools/build_installer.sh                    # 默认：上面全部
-bash tools/build_installer.sh all none           # 只要两个主包（最快）
-bash tools/build_installer.sh all with-python    # 只要两个捆绑变体
-bash tools/build_installer.sh cli                # 只做命令行版（两种变体）
-bash tools/build_installer.sh pack               # 只产出运行时组件包
+bash tools/build_installer.sh                    # default: everything above
+bash tools/build_installer.sh all none           # only the two main packages (fastest)
+bash tools/build_installer.sh all with-python    # only the two bundled variants
+bash tools/build_installer.sh cli                # the command-line build only (both variants)
+bash tools/build_installer.sh pack               # only produce the runtime component package
 ```
 
-脚本把版本号以 `--define=AppVersion=…` 传给 ISCC，**不要改成旧式的 `/DAppVersion=…`**：
-ISCC 把 `/` 开头的参数当选项，而 Git Bash（MSYS）在启动原生程序前会把这类参数当 Unix
-路径改写一遍（`/DAppVersion=0.1.0` → `<Git 安装目录>/DAppVersion=0.1.0`），ISCC 认不出它是
-选项，就报 `You may not specify more than one script filename.`。`--define=` 不以 `/` 开头，
-不受这条规则影响；手动编译时同理，见 `installer/*.iss` 头部注释。
+The script passes the version to ISCC as `--define=AppVersion=…`; **do not change it to the old-style
+`/DAppVersion=…`**: ISCC treats arguments beginning with `/` as options, and Git Bash (MSYS) rewrites
+such arguments as Unix paths before launching a native program (`/DAppVersion=0.1.0` →
+`<Git install dir>/DAppVersion=0.1.0`), so ISCC doesn't recognise it as an option and reports
+`You may not specify more than one script filename.` `--define=` doesn't begin with `/` and is
+immune to this rule; the same applies when compiling by hand, see the header comment of
+`installer/*.iss`.
 
-两个 `-with-python` 变体与主包的**差别只在于是否把 `runtime/python` 一并装进应用目录**，
-宿主会自动发现它（三档解析的第 2 档）。
+The two `-with-python` variants differ from the main package **only in whether `runtime/python` is
+installed into the app directory along with it**; the host discovers it automatically (tier 2 of the
+three-tier resolution).
 
-## 卸载
+## Uninstall
 
-通过「设置 → 应用」或开始菜单里的卸载项即可。卸载会删除 `<安装目录>/runtime`
-（按需装配或捆绑进来的运行时，机器相关、可随时重建），但**不会删除 `plugins/` 与 `history/`**——
-前者是模型积累出来的插件，后者是你的对话记录，两者都是用户数据。
-如果你确实不再需要，请手动删除安装目录。
+Use "Settings → Apps" or the uninstall entry in the Start menu. Uninstalling deletes
+`<install dir>/runtime` (the runtime assembled on demand or bundled in — machine-specific and
+rebuildable at any time), but **does not delete `plugins/` or `history/`** — the former is the
+plugins the model accumulated, the latter your conversation records, and both are user data. If you
+really no longer need them, delete the install directory by hand.
 
 ---
 

@@ -1,12 +1,15 @@
-# llm-openai —— 模型端点这一块：走 OpenAI 兼容协议。
+# llm-openai -- the model endpoint block: the OpenAI-compatible protocol.
 #
-# ⚠️ 这里**故意只写 stream**，不写 base_url / model / api_key：
-# 那三项没有出厂值（写死一个端点等于替用户决定往哪儿发请求），必须由用户提供 ——
-# 通常写在 config.toml（最后一层），或写在你自己的 patch 里。
+# ⚠️ This **deliberately writes only `stream`**, not base_url / model / api_key: those three
+# have no factory value (hard-coding an endpoint would be deciding for the user where their
+# requests go) and must be supplied by the user -- normally in config.toml (the last layer),
+# or in a patch of your own.
 #
-# 换成别的协议家族时，这里是「以后要动的地方」（比如某个不认 stream_options 的端点）。
+# When moving to another protocol family, this is "the place that will have to change" (for
+# example, an endpoint that doesn't accept stream_options).
 
 [provider]
-# SSE 流式：思考模型的推理过程因此能实时回显（响应结束即消失）。
-# 某个端点不接受 stream / stream_options 时，在 config.toml 里写 stream = false 即可。
+# SSE streaming: a reasoning model's chain of thought can therefore be echoed in real time (it
+# disappears once the response ends).
+# If an endpoint rejects stream / stream_options, write `stream = false` in config.toml.
 stream = true

@@ -1,11 +1,12 @@
-//! GUI ↔ Agent 桥接层。
+//! GUI ↔ Agent bridge layer.
 //!
-//! 设计要点：**完全复用既有架构**。
-//! - 后台线程跑一个 tokio 运行时，用 `aox::agent::Agent` 原封不动的循环驱动任务；
-//! - `GuiUi` 实现 `aox::ui::Ui` trait，把 `AgentEvent`、状态、流式思考过程转发给 egui 主线程；
-//! - 用户输入、授权决定、中断信号通过 channel 反向传回。
+//! Design point: **fully reuse the existing architecture**.
+//! - A background thread runs a tokio runtime, driving the task with `aox::agent::Agent`'s loop unchanged;
+//! - `GuiUi` implements the `aox::ui::Ui` trait, forwarding `AgentEvent`, status and the streaming
+//!   reasoning process to the egui main thread;
+//! - user input, authorization decisions and abort signals travel back through channels.
 //!
-//! 因此 CLI 与 GUI 共享同一套 Agent / Provider / 插件宿主实现，没有任何逻辑分叉。
+//! As a result the CLI and GUI share one Agent / Provider / plugin-host implementation, with no logic fork.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,186 +24,202 @@ use aox::llm::{LlmProvider, StreamSink};
 use aox::runtime::Runtime;
 use aox::ui::{AgentEvent, AuthDecision, ChoiceReply, Ui};
 
-/// 主线程 → Agent 线程
+/// Main thread → Agent thread
 pub enum ToAgent {
-    /// 一条用户指令 + 这条指令带的附件（本机路径）。
+    /// One user instruction plus the attachments it carries (local paths).
     ///
-    /// 附件只跟着**这一条**消息走（一次性）：后续轮次里模型如果还需要那份文件，
-    /// 顺着消息里的路径引用自己读（`read_file`）—— 把附件的字节留在上下文里，
-    /// 每一轮都要为它付一次 token。
+    /// Attachments only travel with **this one** message (one-shot): if the model needs that file in
+    /// a later turn, it reads it itself (via `read_file`) following the path referenced in the
+    /// message — keeping the attachment bytes in the context would cost tokens for it every turn.
     Input(String, Vec<PathBuf>),
-    /// 切换到某段历史对话（`id` 即文件名主干）。
+    /// Switch to some past conversation (`id` is the file-name stem).
     ///
-    /// 切换是「就地换掉上下文」，所以必须回到 Agent 所在的线程做，
-    /// 不能由主线程自己读了文件再塞过来。
+    /// Switching "replaces the context in place", so it must happen back on the Agent's thread; the
+    /// main thread cannot read the file itself and hand it over.
     Resume(String),
-    /// 开一段新对话。旧对话不需要任何收尾动作 —— 它已经边聊边写进 `history/` 了。
+    /// Start a new conversation. The old one needs no wrap-up — it was written to `history/` as it went.
     NewConversation,
-    /// 本轮产生的活动流记录，追加进同一个对话文件（`kind:"act"` 行）。
+    /// This turn's activity-stream records, appended to the same conversation file (`kind:"act"` lines).
     ///
-    /// 走这条队列而不是让主线程自己开文件：句柄在 Agent 线程手里，而且「新建对话」
-    /// 与「中断回滚」也在那个线程里发生 —— 队列天然保住了写入顺序。
+    /// This goes through the queue rather than letting the main thread open the file itself: the
+    /// handle is in the Agent thread's hands, and "new conversation" and "abort rollback" also happen
+    /// on that thread — the queue naturally preserves write order.
     Act(Vec<Value>),
-    /// 工作区：切档位（输入框左下角那枚按钮，见 `gui/src/workplace_ui.rs`）。
+    /// Workplace: switch tier (the button at the bottom-left of the input box, see `gui/src/workplace_ui.rs`).
     ///
-    /// 与 `Input` 一样必须**回到 Agent 所在线程**才做得了 —— `Workplace` 住在 `Runtime`
-    /// 里，只有这个线程拿得到它；界面不能自己调 `set_mode`，只能把请求发过来。
+    /// Like `Input`, this can only be done **back on the Agent's thread** — `Workplace` lives inside
+    /// `Runtime`, and only this thread can reach it; the UI cannot call `set_mode` itself and can only
+    /// send the request over.
     ///
-    /// 只带「要切成哪一档」：界面不需要主动问现状，因为启动 / 每轮结束 / 每次切档后
-    /// bridge 都会主动推一份 [`FromAgent::Workplace`]。
+    /// It carries only "which tier to switch to": the UI need not ask for the current state, because on
+    /// startup / at the end of every turn / after every tier switch the bridge proactively pushes a
+    /// [`FromAgent::Workplace`].
     Workplace(aox::workplace::Mode),
-    /// 退出：关闭插件子进程并结束驱动线程
+    /// Exit: close the plugin child processes and end the driver thread
     Shutdown,
 }
 
-/// Agent 线程 → 主线程
+/// Agent thread → main thread
 pub enum FromAgent {
-    /// 启动信息（配置 / 模型 / 路径 / 是否可用）
+    /// Startup info (config / model / paths / whether usable)
     Boot(Box<BootInfo>),
-    /// 核心事件流（与 CLI 完全同源）
+    /// The core event stream (fully shared with the CLI)
     Event(AgentEvent),
-    /// 一轮任务开始
+    /// A turn starts
     TurnStart,
-    /// 一轮任务结束（正常）
+    /// A turn ends (normally)
     TurnEnd,
-    /// 一轮任务的 token 账 —— 就是落进对话文件的那一行（排在 `TurnEnd` 之后）
+    /// This turn's token ledger — exactly the line written into the conversation file (sent after `TurnEnd`)
     Usage(Box<UsageRecord>),
-    /// 整段对话的用量账本（切对话 / 新建对话后重发）。
+    /// The usage ledger for the whole conversation (resent after switching / creating a conversation).
     ///
-    /// **必须排在 `Switched` 之后发**：主线程收到 `Switched` 会把账本清空，
-    /// 顺序反了的话，刚接回来的数据会被自己抹掉。
+    /// **Must be sent after `Switched`**: on receiving `Switched` the main thread clears the ledger;
+    /// if the order were reversed, the just-restored data would be wiped by itself.
     UsageLog(Vec<UsageRecord>),
-    /// 一轮任务被中断
+    /// A turn was aborted
     TurnAborted,
-    /// 状态栏文字（思考中 / 执行 xx）
+    /// Status-bar text (thinking / executing xx)
     Status(String),
-    /// 流式思考增量
+    /// Streaming reasoning delta
     Reasoning(String),
-    /// 一次响应的思考流结束（即时消失）
+    /// The reasoning stream of one response is over (it disappears immediately)
     ReasoningEnd,
-    /// 流式正文增量。正文本身走 `Event(AssistantText)`，这条**只为实时 token 计数** ——
-    /// 主线程需要知道「这一瞬间又吐出来多少字」，才能让数字一直在涨。
+    /// Streaming content delta. The content itself goes through `Event(AssistantText)`; this one is
+    /// **only for live token counting** — the main thread needs to know "how many more characters just
+    /// came out this instant" for the number to keep climbing.
     Content(String),
-    /// 请求授权（阻塞等待主线程回填）
+    /// Request authorization (blocks waiting for the main thread to fill in)
     AuthRequest { tool: String, args: String, reply: oneshot::Sender<AuthDecision> },
-    /// 一道「选择题」（`ask_user`）：同样阻塞等主线程回填。
+    /// A "multiple-choice question" (`ask_user`): likewise blocks waiting for the main thread to fill in.
     ///
-    /// 与 `AuthRequest` 分成两条而不是合成一条：它们的**界面形态**与**回答类型**都不同
-    ///（授权是「允许/拒绝」的确认框，选项是「挑一个」的一排按钮），合并只会让两边
-    /// 都要在参数里判断「这次是哪种」，而那正是最容易出错的地方。
+    /// It is a separate variant from `AuthRequest` rather than merged into one: their **UI shapes** and
+    /// **answer types** differ (authorization is an "allow/deny" confirmation box, a choice is a row of
+    /// "pick one" buttons), and merging would force both sides to decide "which kind is this" from the
+    /// parameters — which is exactly where mistakes are most likely.
     ChoiceRequest {
         question: String,
         options: Vec<String>,
         reply: oneshot::Sender<ChoiceReply>,
     },
-    /// 工具 / 插件快照（周期性刷新，用于右侧面板实时展示「自我增长」）
+    /// Tool / plugin snapshot (refreshed periodically, for the right panel to show "self-growth" live)
     Snapshot(Snapshot),
-    /// 插件运行时状态（供「关于」窗口展示）；装配完成后会重发
+    /// Plugin runtime status (for the "About" window); resent once assembly completes
     Runtimes(RuntimeView),
-    /// 本次会话正在写的那个对话文件 id（还没开始对话时为 None）。
+    /// The id of the conversation file being written this session (`None` before a conversation starts).
     ///
-    /// 主线程据此在历史列表里标出「当前」，并在需要时重新扫描目录 ——
-    /// 历史文件本身由主线程直接读盘，不经过这条 channel（见 `aox::history`）。
+    /// The main thread uses it to mark "current" in the history list and to rescan the directory when
+    /// needed — the history files themselves are read from disk by the main thread directly, not
+    /// through this channel (see `aox::history`).
     HistoryCurrent(Option<String>),
-    /// 会话已切换（打开历史对话 / 新建对话）。
+    /// The session was switched (opened a history conversation / created a new one).
     ///
-    /// `opened` 是切换后的对话 id（新建对话时为 `None`）；`error` 非空表示
-    /// 载入失败 —— 此时 Agent 的上下文**没有被动过**，主线程应当什么都不改。
+    /// `opened` is the conversation id after switching (`None` when creating a new one); a non-empty
+    /// `error` means loading failed — in that case the Agent's context **was not touched** and the main
+    /// thread should change nothing.
     ///
-    /// 只带 id 不带消息：载入后的内容由主线程自己读盘重建（见上一条说明）。
+    /// It carries only the id, not the messages: the loaded content is re-read from disk by the main
+    /// thread itself (see the note above).
     Switched { opened: Option<String>, error: Option<String> },
-    /// 工作区现状（档位 + 当前生效的根）。
+    /// The current workplace (tier + the root in effect).
     ///
-    /// 启动、每轮结束、以及任何一次切档之后都会回执一份：界面要它做两件事 ——
-    /// 按钮上显示当前档位名、三选一列表里给当前档位打勾。
-    /// 用结构体而不是一行文本：打勾要靠 `PartialEq` 比档位，解析「选择工作区」这种
-    /// 字符串太脆（文案一改就静默失效），理由与 [`RuntimeView`] 一致。
+    /// Sent as a receipt on startup, at the end of every turn, and after any tier switch: the UI needs
+    /// it for two things — showing the current tier name on the button, and ticking the current tier in
+    /// the three-way list. A struct rather than a line of text: ticking requires comparing tiers with
+    /// `PartialEq`, and parsing a string like "Picked workspace" is too brittle (a copy change silently breaks
+    /// it), for the same reason as [`RuntimeView`].
     Workplace(Box<WorkplaceView>),
-    /// 本轮出现不可恢复错误
+    /// An unrecoverable error occurred this turn
     Fatal(String),
 }
 
-/// 工作区现状（见 [`FromAgent::Workplace`]）。
+/// The current workplace (see [`FromAgent::Workplace`]).
 #[derive(Debug, Clone)]
 pub struct WorkplaceView {
     pub mode: aox::workplace::Mode,
-    /// 当前生效的根。`full` 档、以及 `default` 档**还没开地**时都是 `None`
-    /// —— 后者不是「不受限」，是「这条对话还没开始」，界面别把两者说成一回事。
+    /// The currently effective root. `None` in the `full` tier, and in the `default` tier when the
+    /// **ground has not been broken yet** — the latter is not "unrestricted" but "this conversation has
+    /// not begun"; the UI must not present the two as the same thing.
     pub root: Option<PathBuf>,
 }
 
-/// 把当前工作区现状发给界面。
+/// Send the current workplace state to the UI.
 ///
-/// 一次取锁同时拿档位与根（[`aox::workplace::Workplace::snapshot`]），与 CLI 的
-/// `/workplace` 读的是同一份状态 —— 两个前端不各留一套「现在是什么档」的判断。
+/// One lock acquisition takes both tier and root ([`aox::workplace::Workplace::snapshot`]), reading the
+/// same state as the CLI's `/workplace` — the two frontends do not each keep their own "what tier is it
+/// now" judgment.
 fn sync_workplace(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
     let (mode, root) = rt.workplace.snapshot();
     let _ = tx.send(FromAgent::Workplace(Box::new(WorkplaceView { mode, root })));
 }
 
-/// 处理界面发来的工作区请求（输入框左下角那枚按钮，见 `gui/src/workplace_ui.rs`）。
+/// Handle a workplace request from the UI (the button at the bottom-left of the input box, see `gui/src/workplace_ui.rs`).
 ///
-/// 与 CLI 的 `/workplace` 是**同一条实现**（[`aox::workplace::Workplace::set_mode`]），
-/// 这里只决定「结果写到哪」：切档成功/失败进活动流（用户看得见的反馈），
-/// 随后无论成败都补一份现状回执 —— 按钮上的档位名与三选一列表里的勾立即跟上，
-/// 不用等下一轮结束。
+/// It is the **same implementation** as the CLI's `/workplace` ([`aox::workplace::Workplace::set_mode`]);
+/// here it only decides "where the result goes": a successful/failed switch goes into the activity
+/// stream (feedback the user can see), and afterwards a state receipt is sent regardless of outcome —
+/// so the tier name on the button and the tick in the three-way list catch up immediately, without
+/// waiting for the next turn to end.
 fn set_workplace(ui: &mut GuiUi, rt: &Arc<Runtime>, mode: aox::workplace::Mode) {
-    // 先取名字：`set_mode` 会把 `mode` 收走，而报错文案里要用它。
+    // Take the name first: `set_mode` consumes `mode`, and the error text needs it.
     let label = mode.label();
     match rt.workplace.set_mode(mode, &rt.root) {
         Ok(msg) => ui.emit(AgentEvent::Info(msg)),
-        Err(e) => ui.emit(AgentEvent::Error(format!("切换工作区失败（{label}）: {e:#}"))),
+        Err(e) => ui.emit(AgentEvent::Error(aox::tf!("failed to switch workplace ({}): {}", label, format!("{e:#}")))),
     }
     sync_workplace(&ui.tx, rt);
 }
 
 pub struct BootInfo {
     pub config_path: String,
-    /// 合成这份配置用到的层（低 → 高，后面的覆盖前面的）。
+    /// The layers used to compose this config (low → high, later ones override earlier ones).
     ///
-    /// 只给「关于」窗口显示一行用；完整的来源树走 CLI 的 `--dump-config` ——
-    /// 380px 的小卡片塞不下那张表，塞进去也只是没人看的噪音。
+    /// Only used to show one line in the "About" window; the full source tree goes through the CLI's
+    /// `--dump-config` — that table does not fit in a 380px card, and squeezing it in would just be
+    /// noise nobody reads.
     pub config_layers: Vec<String>,
     pub model: String,
     pub provider_ready: bool,
     pub note: Option<String>,
-    /// 「系统」选项卡要的那几处路径与主机信息（见 [`BootPaths`]）。
+    /// The paths and host info the "System" tab needs (see [`BootPaths`]).
     pub paths: BootPaths,
-    /// 界面侧读历史用的存储实例（只读用途）。
+    /// The storage instance the UI side reads history with (read-only use).
     ///
-    /// 与 agent 线程**同一个后端实现**、指向同一处数据 —— 界面不自己拼路径，
-    /// 也不自己判断落盘格式（见 `aox::store`）。正常启动时就是 `rt.store` 的克隆；
-    /// 配置读不出来时用默认后端兜底，至少让侧边栏里的旧对话还看得见。
+    /// The **same backend implementation** as the agent thread, pointing at the same data — the UI does
+    /// not build paths itself, nor decide the persistence format (see `aox::store`). On a normal start
+    /// it is a clone of `rt.store`; when the config cannot be read, the default backend is a fallback, so
+    /// at least old conversations in the sidebar remain visible.
     pub store: Arc<dyn aox::store::Store>,
 }
 
-/// 「系统」选项卡里那几处路径与主机信息。
+/// The paths and host info in the "System" tab.
 ///
-/// 为什么合成一个结构体而不是给 `BootInfo` 再加七八个 `String` 字段：这些值同生共死
-/// （都来自同一个 `Runtime`），而且**将来还会加**（比如日志目录）。打包之后
-/// `boot()` 的签名不会随着「再加一行显示项」继续变长，三个调用点也只需改一处构造。
+/// Why one struct rather than adding seven or eight more `String` fields to `BootInfo`: these values
+/// live and die together (all come from the same `Runtime`), and **more will be added** (e.g. a log
+/// directory). Bundling them keeps `boot()`'s signature from growing with "one more displayed row", and
+/// the three call sites need change in only one construction.
 #[derive(Debug, Clone, Default)]
 pub struct BootPaths {
-    /// 应用根目录（配置 / 插件 / 历史 / 运行时都挂在它下面）。
+    /// Application root directory (config / plugins / history / runtime all hang off it).
     pub root: String,
-    /// 配置文件（合成链的最后一层）。
+    /// The config file (the last layer of the composition chain).
     pub config: String,
-    /// 插件目录。
+    /// The plugins directory.
     pub plugins: String,
-    /// 历史记录目录（`<root>/history`，由存储后端自己报，界面不拼）。
+    /// The history directory (`<root>/history`, reported by the storage backend itself; the UI doesn't build it).
     pub history: String,
-    /// 内置运行时目录（`<root>/runtime`）—— 没装任何内置运行时时它也在，只是空的。
+    /// The bundled runtime directory (`<root>/runtime`) — it exists even when no bundled runtime is installed, just empty.
     pub runtime: String,
-    /// 主机信息，例如 `windows x86_64 · 16 核 · 31.7 GB 内存`。
+    /// Host info, e.g. `windows x86_64 · 16 cores · 31.7 GB RAM`.
     pub host: String,
 }
 
 impl BootPaths {
-    /// 从几处路径装配一份（主机信息自己去问核心库）。
+    /// Assemble one from several paths (host info asks the core library itself).
     ///
-    /// 三个启动分支都走它 —— 包括「配置读不出来」与「模型没就绪」两个降级分支：
-    /// 那些分支拿不到完整 `Runtime`，但**路径是知道的**，而「配置文件到底在哪」
-    /// 恰恰是那时候最该显示的东西（用户就是来排查它为什么没读起来）。
+    /// All three startup branches go through it — including the two degraded branches "config cannot be
+    /// read" and "model not ready": those branches cannot get a full `Runtime`, but **the paths are
+    /// known**, and "where the config file actually is" is exactly what should be shown then (the user
+    /// came to find out why it did not load).
     pub fn new(
         root: &std::path::Path,
         config: &std::path::Path,
@@ -225,34 +242,36 @@ pub struct Snapshot {
     pub plugins: Vec<String>,
 }
 
-/// 一门插件运行时的状态（「系统」选项卡里的一行）。
+/// The status of one plugin runtime language (a row in the "System" tab).
 ///
-/// 结构化而不是预先拼好的字符串：CLI 要的是一行紧凑文本（`runtimes::one_line`），
-/// 而设置页要的是「语言 / 解析到的命令 / 来源」三列 —— 同一份数据两种排法。
-/// 拼成字符串再拆回来是自找麻烦，而这行文字本来就是给人看的，拆不动。
+/// Structured rather than a pre-joined string: the CLI wants one compact line (`runtimes::one_line`),
+/// while the settings page wants three columns "language / resolved command / origin" — the same data
+/// laid out two ways. Joining into a string and splitting it back is asking for trouble, and this line
+/// is meant for human eyes anyway, so it cannot be split.
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeItem {
     pub lang: String,
-    /// 最终使用的命令（绝对路径或裸命令）
+    /// The command finally used (absolute path or bare command)
     pub command: String,
-    /// 来源：`config.toml 指定` / `应用目录内置` / `PATH` / `未找到`
+    /// Origin: `specified in config.toml` / `bundled in app dir` / `PATH` / `not found`
     pub origin: String,
     pub ok: bool,
 }
 
-/// 运行时状态视图。
+/// The runtime status view.
 ///
-/// 刻意做成结构体而不是几行字符串：界面要据此决定「要不要给安装按钮」，
-/// 靠解析 `✗ python` 这种文本判断太脆（文案一改就静默失效）。
+/// Deliberately a struct rather than a few lines of string: the UI decides "whether to show an install
+/// button" from it, and judging by parsing text like `✗ python` is too brittle (a copy change silently
+/// breaks it).
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeView {
-    /// 每个语言一行（结构化，见 [`RuntimeItem`]）。
+    /// One row per language (structured, see [`RuntimeItem`]).
     pub items: Vec<RuntimeItem>,
-    /// Python 是否缺失——决定设置页是否显示一键安装入口
+    /// Whether Python is missing — decides whether the settings page shows the one-click install entry
     pub python_missing: bool,
 }
 
-/// 跨线程的中断标志。用轮询而不是 Notify，避免「通知早于等待」导致的陈旧许可问题。
+/// A cross-thread abort flag. Polling rather than `Notify`, to avoid the stale-permit problem of "notification before wait".
 pub struct SessionFlags {
     abort: AtomicBool,
 }
@@ -280,7 +299,7 @@ async fn wait_abort(flags: Arc<SessionFlags>) {
     }
 }
 
-/// 把 Provider 的流式思考过程转发给 GUI。
+/// Forward the Provider's streaming reasoning to the GUI.
 struct ChanSink {
     tx: mpsc::UnboundedSender<FromAgent>,
 }
@@ -299,7 +318,7 @@ impl StreamSink for ChanSink {
     }
 }
 
-/// `aox::ui::Ui` 的图形实现。
+/// The graphical implementation of `aox::ui::Ui`.
 pub struct GuiUi {
     tx: mpsc::UnboundedSender<FromAgent>,
     rx: mpsc::UnboundedReceiver<ToAgent>,
@@ -307,18 +326,19 @@ pub struct GuiUi {
 
 #[async_trait]
 impl Ui for GuiUi {
-    /// GUI 的取指令路径是 `next_command`（它还要就地处理「切换会话」），
-    /// 所以这里实际上不会被调到；保留实现只为满足 trait。
+    /// The GUI's instruction path is `next_command` (which also handles "switch session" in place), so
+    /// this is in fact never called; the implementation is kept only to satisfy the trait.
     async fn read_user_input(&mut self) -> Result<Option<String>> {
         loop {
             match self.rx.recv().await {
                 Some(ToAgent::Input(s, files)) => {
-                    // GUI 真正取指令的是 `next_command`（见它的文档），这条 trait 实现只
-                    // 为满足签名而存在。真走到这里就**出声**——静默丢掉附件，等哪天这条路
-                    // 变活了会得到一个「图明明拖了却没发出去」的幽灵 bug。
+                    // The GUI's real instruction path is `next_command` (see its docs); this trait
+                    // implementation exists only to satisfy the signature. If execution really reaches
+                    // here, **speak up** — silently dropping attachments would one day, when this path
+                    // comes alive, yield a ghost bug of "the image was clearly dragged but not sent".
                     if !files.is_empty() {
-                        let _ = self.tx.send(FromAgent::Event(AgentEvent::Warn(format!(
-                            "内部错误：这条路径不支持附件，{} 个附件未随消息发出。",
+                        let _ = self.tx.send(FromAgent::Event(AgentEvent::Warn(aox::tf!(
+                            "internal error: this path does not support attachments; {} attachment(s) were not sent with the message.",
                             files.len()
                         ))));
                     }
@@ -351,11 +371,13 @@ impl Ui for GuiUi {
         rx.await.unwrap_or(AuthDecision::Deny)
     }
 
-    /// `ask_user` 的图形版：把问题与选项发给主线程，画成输入框上方那排按钮，等回填。
+    /// The graphical version of `ask_user`: send the question and options to the main thread, draw them
+    /// as the row of buttons above the input box, and wait to be filled in.
     ///
-    /// 三条失败路径（发不出去 / 主线程没回 / 回执通道断了）一律回 `Cancelled`：
-    /// 那比「默认选第一个」安全得多 —— 前者只是没答，模型会按它自己的话往下走并说明，
-    /// 后者是**替用户做了一个他没做过的选择**，而谁都不会发现。
+    /// All three failure paths (cannot send / main thread did not reply / reply channel broken) return
+    /// `Cancelled`: that is far safer than "default to the first option" — the former merely leaves it
+    /// unanswered and the model proceeds in its own words and explains, whereas the latter **makes a
+    /// choice for the user that they never made**, and nobody would notice.
     async fn choose(&mut self, question: &str, options: &[String]) -> ChoiceReply {
         let (reply, rx) = oneshot::channel();
         let sent = self.tx.send(FromAgent::ChoiceRequest {
@@ -390,10 +412,10 @@ impl Ui for GuiUi {
     }
 }
 
-/// 把运行时状态发给「关于」窗口。
+/// Send the runtime status to the "About" window.
 ///
-/// 传**原始** `config.runtimes`（而不是解析后的快照），否则「来源」会被误判成
-/// 「config.toml 指定」——见 `aox::runtimes::status` 的说明。
+/// Pass the **raw** `config.runtimes` (not a resolved snapshot), otherwise the "origin" would be
+/// misjudged as "specified in config.toml" — see the notes in `aox::runtimes::status`.
 fn send_runtime_status(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
     let st = aox::runtimes::status(&rt.root, &rt.config.runtimes);
     let view = RuntimeView {
@@ -413,10 +435,11 @@ fn send_runtime_status(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
     let _ = tx.send(FromAgent::Runtimes(view));
 }
 
-/// `/runtime` 的 GUI 实现。
+/// The GUI implementation of `/runtime`.
 ///
-/// 解析、装配、文案全部复用 `aox::runtimes`，与 CLI 同源；这里只决定「写到哪」：
-/// 进度与结果都进活动流，这样 10 MB 的下载过程不会让界面看起来卡死。
+/// Parsing, provisioning and copy all reuse `aox::runtimes`, shared with the CLI; here it only decides
+/// "where the output goes": progress and results go into the activity stream, so a 10 MB download does
+/// not make the UI look frozen.
 async fn runtime_command(ui: &mut GuiUi, rt: &Arc<Runtime>, line: &str) {
     let parsed = match aox::runtimes::parse_cmd(line) {
         Ok(c) => c,
@@ -458,7 +481,7 @@ fn boot(
     ready: bool,
     note: Option<String>,
     store: Arc<dyn aox::store::Store>,
-    // 这份配置由哪几层合成（低 → 高）。读不出配置时给空表 —— 不编造不存在的层。
+    // Which layers this config was composed from (low → high). An empty list when the config cannot be read — do not invent layers that don't exist.
     layers: Vec<String>,
     paths: BootPaths,
 ) {
@@ -473,10 +496,11 @@ fn boot(
     })));
 }
 
-/// 三个启动分支都要的那份路径清单。
+/// The path list all three startup branches need.
 ///
-/// 历史目录问存储后端要（`Store::location`）—— 界面不自己拼 `<root>/history`：
-/// 换了后端（这是存储缝存在的意义）之后，拼出来的路径就是假的，而这里会跟着变。
+/// The history directory is asked of the storage backend (`Store::location`) — the UI does not build
+/// `<root>/history` itself: after a backend change (the very point of the storage seam existing), a
+/// built path would be fake, whereas this follows along.
 fn boot_paths(
     root: &std::path::Path,
     config: &std::path::Path,
@@ -486,18 +510,20 @@ fn boot_paths(
     BootPaths::new(root, config, plugins, store.location().to_path_buf())
 }
 
-/// 把「本次会话正在写的对话」告诉主线程。
+/// Tell the main thread "which conversation this session is writing".
 ///
-/// 每轮结束后调一次：id 第一次出现时主线程会把新对话加进侧边栏，
-/// 之后同一 id 的重复通知则让主线程知道「这一条的内容变了，条数该刷新了」。
+/// Called once after each turn: the first time the id appears, the main thread adds the new
+/// conversation to the sidebar; repeated notifications with the same id then tell it "this one's content
+/// changed, the count should refresh".
 fn send_history_current(tx: &mpsc::UnboundedSender<FromAgent>, agent: &Agent) {
     let _ = tx.send(FromAgent::HistoryCurrent(agent.history_id().map(str::to_string)));
 }
 
-/// 启动受挫时（配置读不出来 / 模型没就绪）的「只等退出」循环。
+/// The "only wait for shutdown" loop when startup is thwarted (config unreadable / model not ready).
 ///
-/// 必须回应切换会话的请求：主线程发出请求后会先把列表锁灰、等回执解锁，
-/// 而这几条消息在这个状态下注定做不成事 —— 沉默就等于把侧边栏永久冻住。
+/// It must answer switch-session requests: after sending one the main thread greys out the list and
+/// waits for a receipt to unlock it, while those messages are doomed to do nothing in this state —
+/// silence would freeze the sidebar forever.
 async fn idle_until_shutdown(
     rx: &mut mpsc::UnboundedReceiver<ToAgent>,
     tx: &mpsc::UnboundedSender<FromAgent>,
@@ -508,35 +534,37 @@ async fn idle_until_shutdown(
             ToAgent::Resume(_) | ToAgent::NewConversation => {
                 let _ = tx.send(FromAgent::Switched {
                     opened: None,
-                    error: Some("模型未就绪，暂时无法切换对话".into()),
+                    error: Some(aox::i18n::t("model not ready; cannot switch conversation right now").into()),
                 });
             }
             ToAgent::Input(..) => {
                 let _ = tx.send(FromAgent::Event(AgentEvent::Warn(
-                    "模型未就绪，这条指令没有发出。".into(),
+                    aox::i18n::t("model not ready; this instruction was not sent.").into(),
                 )));
             }
-            // 这一段里没有 log 可写（Agent 根本没起来），如实丢掉
+            // There is no log to write in this stretch (the Agent never started); drop it honestly
             ToAgent::Act(_) => {}
-            // 工作区按钮这时也按不动 —— `Workplace` 住在 `Runtime` 里，而 Runtime 没起来。
-            // 出声回一句，别让按钮看起来「点了没反应」（与上面 Input 那条同一个理由）。
+            // The workplace button is also dead here — `Workplace` lives in `Runtime`, and the Runtime
+            // never started. Say something rather than let the button look "unresponsive when clicked"
+            // (the same reason as the `Input` arm above).
             ToAgent::Workplace(_) => {
                 let _ = tx.send(FromAgent::Event(AgentEvent::Warn(
-                    "模型未就绪，工作区暂时无法切换。".into(),
+                    aox::i18n::t("model not ready; the workplace cannot be switched right now.").into(),
                 )));
             }
         }
     }
 }
 
-/// 取下一个用户指令，期间顺手处理「切换会话」这类控制消息。
+/// Take the next user instruction, handling control messages like "switch session" along the way.
 ///
-/// 这里没有走 `Ui::read_user_input()`：那个方法只能吐回用户文本，而切换会话
-/// 必须**就地**改动 `agent`，只有这个线程拿得到它。通道还是同一条，
-/// 顺序自然也就和用户的操作顺序一致。
+/// This does not go through `Ui::read_user_input()`: that method can only return user text, whereas
+/// switching a session must **modify `agent` in place**, which only this thread can reach. The channel is
+/// still the same one, so the order naturally matches the user's order of operations.
 ///
-/// 返回值带上附件路径：附件要在**Agent 线程**里组进消息（`Message::user_with_files`），
-/// 界面侧不能自己拼 —— 否则「内存里有、历史文件里没有」那种错位就回来了。
+/// The return value carries the attachment paths: attachments must be assembled into the message **on the
+/// Agent thread** (`Message::user_with_files`); the UI side must not build it itself — otherwise the
+/// "in memory but not in the history file" divergence comes right back.
 async fn next_command(
     ui: &mut GuiUi,
     agent: &mut Agent,
@@ -546,40 +574,45 @@ async fn next_command(
         match ui.rx.recv().await {
             Some(ToAgent::Input(s, files)) => return Ok(Some((s, files))),
             Some(ToAgent::Resume(id)) => {
-                // 按 id 让存储缝去开那次对话 —— 界面侧不拼路径（见 `src/store.rs`）。
+                // Let the storage seam open that conversation by id — the UI side does not build paths (see `src/store.rs`).
                 let msg = match agent.resume(&id) {
                     Ok(_) => FromAgent::Switched { opened: Some(id), error: None },
                     Err(e) => FromAgent::Switched { opened: None, error: Some(format!("{e:#}")) },
                 };
                 let _ = tx.send(msg);
-                // 账本紧跟 Switched 发出：主线程收到 Switched 会先把界面上的账清空，
-                // 顺序反了的话刚接回来的数据会被自己抹掉。
+                // The ledger is sent right after Switched: on receiving Switched the main thread first
+                // clears the UI ledger, so a reversed order would wipe the just-restored data by itself.
                 let _ = tx.send(FromAgent::UsageLog(agent.usage_log().to_vec()));
-                // 工作区也要跟着推：每段对话有自己的档位与根（`resume` 已经把存档里的那份
-                // 还原了）。不推的话按钮上会一直挂着**上一段对话**的档位 —— 这就是实机撞出来的
-                // 「打开旧对话，工作区还是上一个」。
+                // The workplace must be pushed along too: each conversation has its own tier and root
+                // (`resume` has already restored the persisted one). Without it the button would keep
+                // showing **the previous conversation's** tier — which is the "open an old conversation,
+                // the workplace is still the last one" that was hit on a real run.
                 sync_workplace(&tx, agent.rt());
             }
             Some(ToAgent::NewConversation) => {
                 agent.new_conversation();
                 let _ = tx.send(FromAgent::Switched { opened: None, error: None });
                 let _ = tx.send(FromAgent::UsageLog(Vec::new()));
-                // 新对话一律回到「默认」档（`new_conversation` 里已经切了），界面必须立刻跟上，
-                // 否则按钮继续显示上一段对话的档位。
+                // A new conversation always returns to the "default" tier (`new_conversation` already
+                // switched it); the UI must catch up immediately, or the button keeps showing the last
+                // conversation's tier.
                 sync_workplace(&tx, agent.rt());
             }
-            // 活动流落盘：就地进行，不进下一轮 —— 顺序与用户的操作完全一致，
-            // 所以「这一轮的时间轴」永远落在这一轮的对话文件里。
+            // Activity-stream persistence: done in place, without entering the next turn — the order is
+            // exactly the user's order of operations, so "this turn's timeline" always lands in this
+            // turn's conversation file.
             Some(ToAgent::Act(acts)) => agent.append_acts(&acts),
-            // 工作区按钮：切档 / 查现状。就地做完 —— `Workplace` 住在 `Runtime` 里，
-            // 而这个线程是唯一拿得到 Agent（进而拿得到它的 `rt`）的地方。
-            // 不进下一轮：切档是纯宿主动作，与模型对话无关。
+            // Workplace button: switch tier / query state. Done in place — `Workplace` lives inside
+            // `Runtime`, and this thread is the only place that can reach the Agent (and through it its
+            // `rt`). It does not enter the next turn: a tier switch is a pure host action, unrelated to
+            // the model conversation.
             Some(ToAgent::Workplace(mode)) => {
                 let rt = agent.rt().clone();
                 set_workplace(ui, &rt, mode);
-                // 切档也要记进**本对话**的存档：工作区是跟着对话走的，切完不记的话
-                // 下次打开这段对话就回到默认那块地了。`persist_workplace` 自己比对过、
-                // 没变就不写，所以失败/无变化时都不会留下垃圾行。
+                // A tier switch must also be recorded in **this conversation's** archive: the workplace
+                // follows the conversation, and without recording it, opening this conversation next time
+                // would fall back to the default ground. `persist_workplace` compares for itself and does
+                // not write when nothing changed, so neither failure nor no-change leaves junk lines.
                 agent.persist_workplace();
             }
             Some(ToAgent::Shutdown) | None => return Ok(None),
@@ -587,7 +620,7 @@ async fn next_command(
     }
 }
 
-/// 在独立线程里启动：建 tokio 运行时 → 装载运行时 → 跑驱动循环。
+/// Start it on a dedicated thread: build the tokio runtime → load the runtime → run the driver loop.
 pub fn spawn(
     tx: mpsc::UnboundedSender<FromAgent>,
     rx: mpsc::UnboundedReceiver<ToAgent>,
@@ -599,7 +632,7 @@ pub fn spawn(
             let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    let _ = tx.send(FromAgent::Fatal(format!("无法创建异步运行时: {e}")));
+                    let _ = tx.send(FromAgent::Fatal(aox::tf!("failed to create async runtime: {}", e)));
                     return;
                 }
             };
@@ -609,7 +642,7 @@ pub fn spawn(
                 }
             });
         })
-        .expect("无法启动 agent 线程")
+        .expect(aox::i18n::t("failed to start the agent thread"))
 }
 
 async fn boot_and_run(
@@ -625,14 +658,14 @@ async fn boot_and_run(
     let config_path = aox::paths::resolve_config_path(&args);
 
     if let Err(e) = aox::plugin::ensure_sdk(&plugins_dir) {
-        let _ = tx.send(FromAgent::Event(AgentEvent::Warn(format!(
-            "插件 SDK 写入失败（{:#}）：插件功能可能不可用",
-            e
+        let _ = tx.send(FromAgent::Event(AgentEvent::Warn(aox::tf!(
+            "failed to write the plugin SDK ({}): plugin features may be unavailable",
+            format!("{e:#}")
         ))));
     }
 
-    // 配置走**分层合成**（阶段 5）：profile → bundle → patch → config.toml。
-    // 与 CLI 是同一条 `aox::config::layer::resolve` —— 两个前端不各留一套合成规则。
+    // Config goes through **layered composition** (stage 5): profile → bundle → patch → config.toml.
+    // The same `aox::config::layer::resolve` as the CLI — the two frontends do not each keep a set of composition rules.
     let resolved = match aox::config::layer::resolve(
         &root,
         &config_path,
@@ -641,8 +674,9 @@ async fn boot_and_run(
     ) {
         Ok(r) => r,
         Err(e) => {
-            // 配置缺失/无效：GUI 照常打开，展示引导信息，输入区会被禁用。
-            // 读历史的后端用默认的（此时还没读到配置），免得侧边栏跟着一起空掉。
+            // Config missing/invalid: the GUI still opens, showing guidance, and the input area is
+            // disabled. The history-reading backend uses the default one (the config is not read yet),
+            // so the sidebar doesn't go empty along with it.
             let store = aox::store::default_store(&root, 0);
             let paths = boot_paths(&root, &config_path, &plugins_dir, &store);
             boot(
@@ -667,52 +701,55 @@ async fn boot_and_run(
     for t in aox::tool::meta::meta_tools() {
         rt.register(t).await?;
     }
-    // 宿主文件工具（工作区边界，见 src/workplace.rs 与 src/tool/hostfs.rs）。
-    // 与 CLI 注册的是同一组、同一份实现；默认 `[workplace] mode = "full"` 时
-    // 它们的行为与普通读写工具无异 —— 边界只在你收紧档位之后才生效。
+    // Host file tools (the workspace boundary, see src/workplace.rs and src/tool/hostfs.rs).
+    // The same group and the same implementation registered as the CLI; with the default
+    // `[workplace] mode = "full"` they behave no differently from ordinary read/write tools — the
+    // boundary takes effect only after you tighten the tier.
     for t in aox::tool::hostfs::host_file_tools() {
         rt.register(t).await?;
     }
-    // 交互工具（`ask_user`）：让模型把「选择题」交给界面，而不是写在正文里
-    // 等用户打字。注册在这里的意义是**让模型在 tools 列表里看得见它**。
+    // Interaction tools (`ask_user`): let the model hand a "multiple-choice question" to the UI, rather
+    // than writing it in the body and waiting for the user to type. Registering them here matters because
+    // it **makes the model see them in the tools list**.
     for t in aox::tool::ask::ask_tools() {
         rt.register(t).await?;
     }
 
     let mut ui = GuiUi { tx: tx.clone(), rx };
 
-    // 运行时状态：一条给「关于」窗口，一条缺失提示进活动流（与 CLI 同一份文案）。
-    // 这样用户在 GUI 里也能立刻知道「本机缺 python、该点哪里装」，而不是等到
-    // 模型建插件失败才发现。
+    // Runtime status: one line to the "About" window, one missing-interpreter hint into the activity
+    // stream (the same copy as the CLI). So the user knows immediately in the GUI that "this machine
+    // lacks python, click here to install", rather than discovering it only when the model fails to
+    // build a plugin.
     send_runtime_status(&tx, &rt);
     if let Some(hint) = aox::runtimes::missing_hint(&rt.root, &rt.config.runtimes) {
         ui.emit(AgentEvent::Warn(hint));
     }
 
-    // 恢复持久化插件（与 CLI 同一路径）。
-    // 成功保持静默——启动时不该往活动流里刷一屏「插件 xxx 已恢复」，
-    // 那会把真正要看的信息挤下去。只有失败才出声。
+    // Restore persisted plugins (the same path as the CLI).
+    // Success stays silent — startup should not flush a screenful of "plugin xxx restored" into the
+    // activity stream, pushing the information you really need out of view. Only failure speaks up.
     for (name, result) in aox::plugin::load_all(&rt).await {
         if let Err(e) = result {
-            ui.emit(AgentEvent::Warn(format!("插件 {name} 加载失败: {e:#}")));
+            ui.emit(AgentEvent::Warn(aox::tf!("plugin {} failed to load: {}", name, format!("{e:#}"))));
         }
     }
-    // 围栏没套上的插件也要出声（与 CLI 共用同一份判定与文案）。
-    // `围栏 ✗` 不是致命错误，但「以为有保护、其实没有」值得用户看一眼。
+    // Plugins without a fence must speak up too (sharing the same judgment and copy as the CLI).
+    // A fence failure is not a fatal error, but "thinking there is protection when there is none" deserves a look.
     let unfenced = aox::sandbox::unfenced(&rt).await;
     if !unfenced.is_empty() {
-        ui.emit(AgentEvent::Warn(format!(
-            "以下插件没套上进程围栏，它们不受进程数 / 内存 / UI 限制：{}",
-            unfenced.join("；")
+        ui.emit(AgentEvent::Warn(aox::tf!(
+            "These plugins are not wrapped in a process fence; they are not subject to the process / memory / UI limits: {}",
+            unfenced.join(aox::i18n::t("; "))
         )));
     }
 
     let llm: Arc<dyn LlmProvider> = match aox::llm::openai::OpenAiProvider::new(&rt.config.provider) {
         Ok(p) => Arc::new(p),
         Err(e) => {
-            ui.emit(AgentEvent::Error(format!("LLM 未就绪: {e:#}")));
+            ui.emit(AgentEvent::Error(aox::tf!("LLM not ready: {}", format!("{e:#}"))));
             ui.emit(AgentEvent::Info(
-                "请在 config.toml 的 [provider] 填写 base_url 与 api_key（或 api_key_env）后重新启动。".into(),
+                aox::i18n::t("Fill in base_url and api_key (or api_key_env) under [provider] in config.toml, then restart.").into(),
             ));
             let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store);
             boot(
@@ -725,25 +762,26 @@ async fn boot_and_run(
                 config_layers.clone(),
                 paths,
             );
-            // 仍是「未就绪」状态，但工作区现状照样发一份：按钮若可见，至少显示的是真档位。
+            // Still in "not ready" state, but send the workplace state anyway: if the button is visible, at least it shows the real tier.
             sync_workplace(&tx, &rt);
             idle_until_shutdown(&mut ui.rx, &tx).await;
             return Ok(());
         }
     };
 
-    // 项目规则文件（RULES.md）现在由 `aox::prompt::build` 统一读取，
-    // 不再是 GUI 与 CLI 各读一遍（见 src/prompt.rs）。
+    // The project rules file (RULES.md) is now read centrally by `aox::prompt::build`, no longer once
+    // each in the GUI and CLI (see src/prompt.rs).
     let mut agent = Agent::new(llm, rt.clone());
     let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store);
     boot(&tx, &config_path, &model, true, None, rt.store.clone(), config_layers, paths);
     send_history_current(&tx, &agent);
-    // 启动就把工作区现状发过去：按钮上「工作区 · <档位>」的初值，以及三选一列表里
-    // 该给哪一项打勾，都靠它。
+    // Send the workplace state right at startup: both the button's initial "Workplace · <tier>" and which
+    // item to tick in the three-way list depend on it.
     sync_workplace(&tx, &rt);
 
-    // 周期性广播插件快照：模型每造出一个新插件，右侧面板立刻可见。
-    // （工具名不再广播——顶栏的工具胶囊已去掉，没有消费方。）
+    // Broadcast plugin snapshots periodically: every new plugin the model creates becomes visible in the
+    // right panel immediately. (Tool names are no longer broadcast — the top-bar tool chips were removed,
+    // so there is no consumer.)
     let snap_tx = tx.clone();
     let snap_rt = rt.clone();
     let snap_task = tokio::spawn(async move {
@@ -761,15 +799,15 @@ async fn boot_and_run(
         }
     });
 
-    // ---- 驱动循环：与 CLI 的 REPL 一一对应
+    // ---- Driver loop: one-to-one with the CLI's REPL
     loop {
         let Some((input, files)) = next_command(&mut ui, &mut agent, &tx).await? else { break };
         let line = input.trim().to_string();
-        // 只有附件、没有文字也是合法的一条消息（拖张图直接发送）
+        // Only attachments with no text is also a legal message (drag an image and send directly)
         if line.is_empty() && files.is_empty() {
             continue;
         }
-        // 本地命令：/runtime 由宿主自己处理，不发给模型（与 CLI 一致）
+        // Local command: /runtime is handled by the host itself, not sent to the model (same as the CLI)
         if aox::runtimes::is_cmd(&line) {
             runtime_command(&mut ui, &rt, &line).await;
             continue;
@@ -798,17 +836,17 @@ async fn boot_and_run(
                 let _ = ui.tx.send(FromAgent::TurnAborted);
             }
         }
-        // 每轮结束后同步一次「当前对话」：第一轮会新建文件（侧边栏出现新条目），
-        // 之后同一 id 的重复通知让侧边栏刷新条数。
+        // Sync "current conversation" once after each turn: the first turn creates the file (a new entry
+        // appears in the sidebar), and repeated notifications with the same id make the sidebar refresh the count.
         send_history_current(&tx, &agent);
-        // 工作区也顺手同步一次：`default` 档的根是**首条消息时**才建的，所以
-        // 「默认」档下按钮背后的目录是到这一轮结束才有值 —— 不重发的话界面会一直显示
-        // 「根：还没定」。
+        // Sync the workplace along the way: the `default` tier's root is created **on the first message**,
+        // so under the "default" tier the directory behind the button has a value only at the end of this
+        // turn — without resending, the UI would keep showing "root: not decided yet".
         sync_workplace(&tx, &rt);
     }
 
     snap_task.abort();
-    // 关闭所有插件子进程（与 CLI 退出路径一致）
+    // Close all plugin child processes (the same as the CLI's exit path)
     let handles: Vec<_> = rt.plugins.lock().await.values().cloned().collect();
     for h in handles {
         h.shutdown().await;

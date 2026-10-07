@@ -1,41 +1,48 @@
 ; ============================================================================
-;  AOX GUI 安装脚本（Inno Setup）
+;  AOX GUI installer script (Inno Setup)
 ;
-;  编译（推荐用构建脚本，它会自动编译两遍产出两种变体）：
+;  Build (the build script is recommended: it compiles twice and produces both
+;  variants):
 ;      bash tools/build_installer.sh
-;  手动编译单个变体：
-;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" installer\aox-gui.iss                            -> 主包
-;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" --define=BUNDLE_PYTHON=1 installer\aox-gui.iss   -> 捆绑变体
+;  Build a single variant by hand:
+;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" installer\aox-gui.iss                            -> main package
+;      "E:\INNO SETUP\Inno Setup 7\ISCC.exe" --define=BUNDLE_PYTHON=1 installer\aox-gui.iss   -> bundled variant
 ;
-;  定义一律写长式 --define=。旧式的 /D名字=值 在 Git Bash 里会被 MSYS 当成 Unix 路径
-;  改写（/DAppVersion=0.1.0 -> <Git 安装目录>/DAppVersion=0.1.0），ISCC 于是把它算成
-;  第二个 script filename，报 “You may not specify more than one script filename.”
-;  产物：
-;      dist\AOX-GUI-Setup-<版本>.exe                 （主包，约 4 MB）
-;      dist\AOX-GUI-Setup-<版本>-with-python.exe     （捆绑变体，约 12.5 MB）
+;  Always write definitions in the long form, --define=. The old-style /Dname=value gets
+;  rewritten by MSYS as a Unix path under Git Bash (/DAppVersion=0.1.0 becomes
+;  <Git install dir>/DAppVersion=0.1.0), and ISCC then counts it as a second script
+;  filename and reports "You may not specify more than one script filename."
+;  Outputs:
+;      dist\AOX-GUI-Setup-<version>.exe                 (main package, ~4 MB)
+;      dist\AOX-GUI-Setup-<version>-with-python.exe     (bundled variant, ~12.5 MB)
 ;
-;  与 aox.iss（命令行版）的关系：两者是各自独立的安装包，AppId、安装目录、
-;  开始菜单项都不共用，可以同时装在一台机器上互不干扰。
+;  Relationship to aox.iss (the CLI edition): the two are independent installers and share
+;  neither the AppId, the install directory nor the Start-menu entry, so both can be installed
+;  on one machine without interfering with each other.
 ;
-;  设计要点（与命令行版保持一致的理由）：
-;    * 采用「当前用户」安装（PrivilegesRequired=lowest），装到
-;      %LOCALAPPDATA%\Programs\AOX GUI —— GUI 与 CLI 共用 aox::paths 的
-;      根目录解析，运行时要在自己的目录下写 config.toml 和 plugins/，
-;      装在 Program Files 会因无写权限而失效。
-;    * 不打包 config.toml（避免把个人 API key 装进去），由程序首次运行自动生成。
-;    * 不打包 plugins/：宿主启动时会自动创建 plugins/sdk。
-;    * 卸载不删除 plugins/，保留模型积累的能力。
-;    * 不写 PATH：GUI 版不需要从终端启动，避免和命令行版的 PATH 项打架。
+;  Design notes (and why they match the CLI edition):
+;    * Installs for the **current user only** (PrivilegesRequired=lowest), into
+;      %LOCALAPPDATA%\Programs\AOX GUI -- the GUI and the CLI share the root-directory
+;      resolution in aox::paths, and at runtime they need to write config.toml and plugins/
+;      inside their own directory, which under Program Files would fail for lack of write
+;      permission.
+;    * config.toml is not packaged (so a personal API key is never baked into the installer);
+;      the program generates one on first run.
+;    * plugins/ is not packaged either: the host creates plugins/sdk on startup.
+;    * Uninstalling does not delete plugins/ -- capability the model accumulated is kept.
+;    * PATH is not written: the GUI edition doesn't need launching from a terminal, and this
+;      avoids fighting with the CLI edition's PATH entry.
 ; ============================================================================
 
 #define AppName        "AOX GUI"
-; 文件名用的短名：AppName 里有空格，直接拿来当文件名会得到
-; 「AOX GUI-Setup-0.1.0.exe」，在 URL、终端和脚本里都要额外转义，所以分开定义。
+; The short name used in file names: AppName has a space in it, and using it directly as a file
+; name gives you "AOX GUI-Setup-0.1.0.exe", which needs escaping in URLs, terminals and
+; scripts alike -- hence the separate definition.
 #define AppSlug        "AOX-GUI"
 
-; 版本号可由命令行覆盖，避免与 Cargo.toml 脱节：
+; The version can be overridden from the command line, so it can't drift from Cargo.toml:
 ;     ISCC --define=AppVersion=1.2.3 installer\aox-gui.iss
-; tools/build_installer.sh 会自动从 Cargo.toml 读取并传入。
+; tools/build_installer.sh reads it from Cargo.toml and passes it in automatically.
 #ifndef AppVersion
   #define AppVersion "0.1.0"
 #endif
@@ -46,10 +53,12 @@
 #define AppExeName     "aox-gui.exe"
 #define ProjectRoot    ".."
 
-; ── 可选变体：把 Python 运行时装进安装包 ──────────────────────────────────
-;      ISCC --define=AppVersion=1.2.3 --define=BUNDLE_PYTHON=1 installer\aox-gui.iss
-;   产出 AOX-GUI-Setup-<版本>-with-python.exe，装完即可用 python 插件（离线可用）。
-;   与命令行版完全同构：主包不捆绑，需要时才装配或用 -with-python 变体。
+; ── optional variant: bundle the Python runtime into the installer ──────────────────────────────────
+;     ISCC --define=AppVersion=1.2.3 --define=BUNDLE_PYTHON=1 installer\aox-gui.iss
+; Produces AOX-GUI-Setup-<version>-with-python.exe; python plugins work straight after install
+; (usable offline).
+; Exactly the same structure as the CLI edition: the main package bundles nothing, and you
+; provision on demand or use the -with-python variant.
 #ifdef BUNDLE_PYTHON
   #define OutputSuffix "-with-python"
 #else
@@ -57,7 +66,7 @@
 #endif
 
 [Setup]
-; 与命令行版的 AppId 必须不同，否则两个包会互相覆盖
+; The AppId must differ from the CLI edition's, or the two packages overwrite each other
 AppId={{7D4E1B92-3A5C-4F8E-9B26-5C1A7E3D82F4}
 AppName={#AppName}
 AppVersion={#AppVersion}
@@ -78,7 +87,8 @@ DisableProgramGroupPage=yes
 DisableDirPage=no
 AllowNoIcons=yes
 
-; 仅当前用户安装：保证安装目录可写，程序能正常生成 config.toml 与插件
+; Current-user install only: guarantees the install directory is writable, so the program can
+; generate config.toml and plugins
 PrivilegesRequired=lowest
 
 OutputDir={#ProjectRoot}\dist
@@ -94,7 +104,7 @@ LicenseFile={#ProjectRoot}\LICENSE
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
-; 防止同一用户重复安装
+; Stop the same user from installing twice
 SetupMutex=AOX_GUI_Setup_Mutex
 
 [Languages]
@@ -115,18 +125,22 @@ Source: "{#ProjectRoot}\config.example.toml";          DestDir: "{app}"; Flags: 
 Source: "{#ProjectRoot}\README.md";                    DestDir: "{app}"; Flags: ignoreversion isreadme
 Source: "{#ProjectRoot}\LICENSE";                      DestDir: "{app}"; Flags: ignoreversion
 #ifdef BUNDLE_PYTHON
-; 捆绑变体：Python 运行时直接装进应用目录，宿主启动时自动发现
-; <应用根>\runtime\python\python.exe（三档解析的第 2 档）。
-; 运行时由 tools/build_installer.sh 的 ensure_runtime 下载并解压到 runtime\python\。
+; Bundled variant: the Python runtime goes straight into the application directory, and the
+; host discovers <app root>\runtime\python\python.exe on startup (tier 2 of the three-tier
+; resolution).
+; The runtime is downloaded and unpacked into runtime\python\ by ensure_runtime in
+; tools/build_installer.sh.
 Source: "{#ProjectRoot}\runtime\python\*"; DestDir: "{app}\runtime\python"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 #endif
 
 [UninstallDelete]
-; 运行时是「机器相关、可随时重新装配」的数据（约 21 MB），卸载时清掉；
-; 而 plugins\ 是模型积累的能力、history\ 是用户的对话记录，两者都是用户数据，必须保留。
-; 这两个目录都不在这里列出，Inno 就不会碰它们。
-; 该目录只在捆绑版或用户主动装配过时才存在。
+; The runtime is "machine-specific, re-provisionable at any time" data (~21 MB), so it is
+; removed on uninstall; whereas plugins\ is capability the model accumulated and history\ is
+; the user's conversation record -- both are user data and must be kept.
+; Neither directory is listed here, so Inno won't touch them.
+; That directory only exists in the bundled build, or once the user has provisioned it
+; themselves.
 Type: filesandordirs; Name: "{app}\runtime"
 
 [Icons]

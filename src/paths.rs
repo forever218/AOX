@@ -1,17 +1,19 @@
-//! 应用根目录 / 可写性 / 插件迁移等与「宿主进程运行位置」相关的公共逻辑。
+//! Shared logic tied to "where the host process runs": the app root directory, writability, plugin
+//! migration, and so on.
 //!
-//! CLI（`src/main.rs`）与 GUI（`gui/`）都需要这套规则：把应用根归一化到同一个位置，
-//! 避免 `cargo run`（exe 在 target/debug）与双击 exe 出现两套 `plugins/` 目录，
-//! 也避免把 `config.toml` 写到不可写的位置导致闪退。
+//! The CLI (`src/main.rs`) and the GUI (`gui/`) both need this rule set: normalise the app root to a
+//! single location, so that `cargo run` (whose exe is under target/debug) and a double-clicked exe
+//! don't end up with two `plugins/` directories, and so that `config.toml` isn't written somewhere
+//! unwritable and crash the app.
 //!
-//! 这里是从 `src/main.rs` 提取的同一套实现，行为完全一致。
+//! This is the same implementation extracted from `src/main.rs`, with identical behaviour.
 
 use std::path::{Path, PathBuf};
 
-/// 解析「应用根目录」。
+/// Resolve the "app root directory".
 ///
-/// 规则：从 exe 所在目录向上找最近的 Cargo.toml；找到就用它所在目录（开发态），
-/// 否则就用 exe 所在目录（分发态）。
+/// The rule: walk up from the exe's directory to the nearest Cargo.toml; if one is found use its
+/// directory (development mode), otherwise use the exe's directory (distribution mode).
 pub fn resolve_app_root(exe_dir: Option<&Path>) -> PathBuf {
     let Some(exe_dir) = exe_dir else {
         return PathBuf::from(".");
@@ -26,7 +28,7 @@ pub fn resolve_app_root(exe_dir: Option<&Path>) -> PathBuf {
     exe_dir.to_path_buf()
 }
 
-/// 当前进程 exe 所在目录（拿不到则为 None）。
+/// The directory containing the current process's exe (None if it can't be obtained).
 pub fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
@@ -47,8 +49,10 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 把旧位置（exe 目录下）的插件迁到规范插件目录，避免历史插件「凭空消失」。
-/// 只补不存在的，不覆盖已有文件；全部迁移成功后清理遗留的构建产物目录。
+/// Migrate plugins from the old location (under the exe directory) into the canonical plugin
+/// directory, so historical plugins don't "vanish into thin air". Only missing ones are added, and
+/// existing files are never overwritten; once everything has migrated successfully the leftover
+/// build-artifact directory is cleaned up.
 pub fn migrate_plugins(from: &Path, to: &Path) {
     if from == to || !from.is_dir() {
         return;
@@ -61,10 +65,10 @@ pub fn migrate_plugins(from: &Path, to: &Path) {
                 continue;
             }
             if e.file_name() == "sdk" {
-                continue; // sdk 由宿主每次启动重写，不迁移
+                continue; // the sdk is rewritten by the host on every launch, so don't migrate it
             }
             if !src.join("plugin.toml").is_file() {
-                continue; // 跳过上次失败留下的空目录
+                continue; // skip the empty directories left behind by a previous failure
             }
             let dst = to.join(e.file_name());
             if dst.exists() {
@@ -81,7 +85,7 @@ pub fn migrate_plugins(from: &Path, to: &Path) {
     }
 }
 
-/// 目录是否可写（用一个探测文件判断）。
+/// Whether a directory is writable (judged with a probe file).
 pub fn is_writable_dir(dir: &Path) -> bool {
     let probe = dir.join(".aox-write-probe");
     match std::fs::write(&probe, b"") {
@@ -93,8 +97,9 @@ pub fn is_writable_dir(dir: &Path) -> bool {
     }
 }
 
-/// 保证应用根可写。AOX 运行时要在根目录下写 config.toml 与 plugins/，
-/// 若被装到 Program Files 这类只读位置，就退回到用户可写的 %LOCALAPPDATA%\AOX。
+/// Guarantee the app root is writable. AOX needs to write `config.toml` and `plugins/` under its
+/// root at runtime; if it has been installed somewhere read-only like Program Files, fall back to
+/// the user-writable `%LOCALAPPDATA%\AOX`.
 pub fn ensure_writable_root(root: PathBuf) -> PathBuf {
     if is_writable_dir(&root) {
         return root;
@@ -110,15 +115,16 @@ pub fn ensure_writable_root(root: PathBuf) -> PathBuf {
     }
 }
 
-/// 只解析「可写的应用根」，不做插件迁移。
+/// Resolve only the "writable app root", without migrating plugins.
 ///
-/// 插件迁移是 `resolve_workplace` 的副作用；只想问「根目录在哪」的调用方（例如
-/// GUI 主线程要先读 `config.toml` 的 `[theme]`）用这个，避免与后台线程重复触发迁移。
+/// Plugin migration is a side effect of `resolve_workplace`; a caller that only wants to ask "where
+/// is the root" (for instance the GUI main thread needs to read `[theme]` from `config.toml` first)
+/// uses this, to avoid triggering migration a second time alongside the background thread.
 pub fn app_root() -> PathBuf {
     ensure_writable_root(resolve_app_root(exe_dir().as_deref()))
 }
 
-/// 一步到位：解析出可写的应用根 + 插件目录（可被 --plugins 覆盖）。
+/// One step to get both: the resolved writable app root + the plugin directory (overridable by --plugins).
 pub fn resolve_workplace() -> (PathBuf, PathBuf) {
     let exe = exe_dir();
     let root = ensure_writable_root(resolve_app_root(exe.as_deref()));
@@ -129,9 +135,11 @@ pub fn resolve_workplace() -> (PathBuf, PathBuf) {
     (root, plugins)
 }
 
-/// 解析配置文件路径：`--config <path>` 优先，否则应用根下的 `config.toml`。
+/// Resolve the config file path: `--config <path>` takes priority, otherwise `config.toml` under the
+/// app root.
 ///
-/// CLI、GUI 主线程、GUI 后台驱动线程读的是同一份 —— 规则收在这里，免得散成三份拷贝。
+/// The CLI, the GUI main thread and the GUI background driver thread all read the same one — the
+/// rule is gathered here rather than scattered across three copies.
 pub fn resolve_config_path(args: &[String]) -> PathBuf {
     match arg_value(args, "--config") {
         Some(p) => PathBuf::from(p),
@@ -139,21 +147,24 @@ pub fn resolve_config_path(args: &[String]) -> PathBuf {
     }
 }
 
-/// 在命令行参数里取 `--flag <value>` 形式的取值。
+/// Fetch a `--flag <value>` style value from the command-line arguments.
 pub fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
 
-/// 解析组合清单路径：`--manifest <path>` 的**显式**覆盖，没给则返回 `None`。
+/// Resolve the composition-manifest path: an **explicit** override via `--manifest <path>`,
+/// returning `None` when it isn't given.
 ///
-/// `None` 不等于「文件不存在」—— 前者的意思是「没指定，去应用根下找默认的 `aox.toml`」，
-/// 后者由 `config::layer` 自己判断（默认位置没有就退化成「只有 config.toml 一层」）。
-/// 但显式指定了却不存在，是**报错**：写了 `--manifest` 却没生效，比没有清单更让人困惑。
+/// `None` does not mean "the file doesn't exist" — the former means "not specified, go look for the
+/// default `aox.toml` under the app root", while the latter is decided by `config::layer` itself (if
+/// there is none at the default location it degrades to "only the config.toml layer"). But
+/// specifying it explicitly and having it not exist is **an error**: writing `--manifest` and having
+/// it not take effect is more confusing than having no manifest at all.
 pub fn resolve_manifest_path(args: &[String]) -> Option<PathBuf> {
     arg_value(args, "--manifest").map(PathBuf::from)
 }
 
-/// 解析 `--profile <名>`：临时换一个 profile，不改 `aox.toml`。
+/// Resolve `--profile <name>`: temporarily switch to another profile without modifying `aox.toml`.
 pub fn resolve_profile(args: &[String]) -> Option<String> {
     arg_value(args, "--profile")
 }

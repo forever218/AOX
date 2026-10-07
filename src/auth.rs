@@ -1,12 +1,15 @@
-//! 授权策略（Policy 缝）。
+//! Authorization policy (the Policy seam).
 //!
-//! 把「这次工具调用该不该放行」从写死的三档判断，抽成可替换的策略对象：
-//! `Runtime` 只持一个 `Arc<dyn Policy>`，不再知道策略是怎么算出来的。
+//! Turns "should this tool call be allowed?" from a hard-coded three-tier check
+//! into a replaceable policy object: `Runtime` only holds an `Arc<dyn Policy>`
+//! and no longer knows how the decision is computed.
 //!
-//! 阶段 3 只做「抽缝 + 原样搬运」：`ConfigPolicy` 就是原来的 `AuthPolicy`，
-//! 三档语义（auto / ask / deny）与 override 优先级（**工具名 > 插件名 > 类别默认**）
-//! 一行没改。将来要加别的策略来源（比如策略文件、插件自带策略），是实现一个新的
-//! `Policy` 而不是改这里。
+//! Phase 3 only "carves the seam + moves the code verbatim": `ConfigPolicy` is
+//! the old `AuthPolicy`, and the three tiers (auto / ask / deny) plus the
+//! override precedence (**tool name > plugin name > category default**) are
+//! unchanged, not a single line. Adding another policy source later (a policy
+//! file, a plugin-provided policy, ...) means implementing a new `Policy`, not
+//! editing this one.
 
 use crate::config::AuthConfig;
 use crate::tool::ToolKind;
@@ -14,11 +17,11 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthLevel {
-    /// 直接放行
+    /// Allow outright.
     Auto,
-    /// 询问用户
+    /// Ask the user.
     Ask,
-    /// 直接拒绝
+    /// Deny outright.
     Deny,
 }
 
@@ -32,34 +35,41 @@ impl AuthLevel {
     }
 }
 
-/// 授权策略：回答「这个工具调用要 auto、ask 还是 deny」。
+/// The authorization policy: answers "should this tool call be auto, ask or deny".
 ///
-/// `Send + Sync`：`Runtime` 被 agent 线程与 GUI 主线程共享，策略对象必须能跨线程持有。
+/// `Send + Sync`: `Runtime` is shared between the agent thread and the GUI main
+/// thread, so a policy object must be holdable across threads.
 pub trait Policy: Send + Sync {
-    /// `caps`：这次调用**申请的能力**。
+    /// `caps`: the **capabilities requested** by this call.
     ///
-    /// 阶段 3 立好了参数位，阶段 4 仍传空切片（那两项配置都不是「能力申请」），
-    /// **阶段 6 · 6b 起真的填上了**：组件在 `[contributes] caps` 里声明要什么能力，
-    /// 宿主把该插件工具的申请原样传进这里 —— 于是「组件申请能力」直接落在同一套
-    /// 授权判定里（原则 P7），没有第二条判定路径。
+    /// Phase 3 reserved the parameter slot and phase 4 still passed an empty
+    /// slice (neither of those two configs is a "capability request"), but
+    /// **phase 6 · 6b actually fills it in**: a component declares the
+    /// capabilities it wants in `[contributes] caps`, and the host passes that
+    /// plugin tool's request straight through here — so "a component requests a
+    /// capability" lands in the very same authorization decision (principle P7),
+    /// with no second decision path.
     fn level_for(&self, kind: &ToolKind, tool_name: &str, caps: &[String]) -> AuthLevel;
 }
 
-/// 由 `config.toml [auth]` 决定的策略：overrides 优先（按工具名，其次按插件名），
-/// 否则按工具类别取默认值。
+/// The policy decided by `config.toml [auth]`: overrides win (by tool name, then
+/// by plugin name), otherwise the tool's category default applies.
 ///
-/// override 的键有两种写法（阶段 4 起）：
-/// - **完整名字**（`shell_exec`）—— 精确命中；
-/// - **尾随 `*` 的前缀**（`fs_*`）—— 命中所有以该前缀开头的名字。
+/// Override keys come in two forms (since phase 4):
+/// - **a full name** (`shell_exec`) — an exact hit;
+/// - **a prefix with a trailing `*`** (`fs_*`) — hits every name starting with
+///   that prefix.
 ///
-/// 通配只看前缀、不认分隔符：`fs*` 会连 `fsx` 一起命中，所以想只圈住一组工具，
-/// 记得把下划线写进去（`fs_*`）。单独一个 `*` 是「兜底一切」。
+/// Wildcards only look at the prefix and don't respect separators: `fs*` will
+/// also hit `fsx`, so if you want to fence off just one group of tools, remember
+/// to include the underscore (`fs_*`). A lone `*` is "catch-all".
 pub struct ConfigPolicy {
     meta: AuthLevel,
     plugin: AuthLevel,
     overrides: HashMap<String, AuthLevel>,
-    /// 带 `*` 的那些 override（存的是去掉 `*` 的前缀），按前缀**从长到短**排好 ——
-    /// 越具体的先命中：`fs_read_*` 必须压过 `fs_*`。
+    /// The overrides carrying a `*` (stored as the prefix with `*` stripped),
+    /// sorted by prefix **longest first** — the more specific one hits first:
+    /// `fs_read_*` must beat `fs_*`.
     wildcards: Vec<(String, AuthLevel)>,
 }
 
@@ -77,8 +87,9 @@ impl ConfigPolicy {
                 }
             }
         }
-        // 排序有两个作用：长前缀优先（更具体的规则赢），以及让判定与 HashMap 的随机
-        // 遍历顺序无关 —— 同一份配置必须每次给出同一个答案。
+        // The sort serves two purposes: longer prefixes win (the more specific
+        // rule), and it makes the decision independent of HashMap's random
+        // iteration order — the same config must yield the same answer every time.
         wildcards.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
         Self {
             meta: AuthLevel::parse(&cfg.meta_tools),
@@ -88,7 +99,7 @@ impl ConfigPolicy {
         }
     }
 
-    /// 查一个名字（工具名或插件名）：**先精确、再通配**。
+    /// Look up a name (tool name or plugin name): **exact first, then wildcard**.
     fn lookup(&self, name: &str) -> Option<AuthLevel> {
         if let Some(l) = self.overrides.get(name) {
             return Some(*l);
@@ -102,37 +113,47 @@ impl ConfigPolicy {
 
 impl Policy for ConfigPolicy {
     fn level_for(&self, kind: &ToolKind, tool_name: &str, caps: &[String]) -> AuthLevel {
-        // ① 工具名（精确 → 通配）
+        // ① Tool name (exact → wildcard)
         if let Some(l) = self.lookup(tool_name) {
             return l;
         }
-        // ② 插件名（精确 → 通配）—— 同样属于「用户明确写下的表态」，压在能力位之上
+        // ② Plugin name (exact → wildcard) — equally a "stance the user wrote
+        //    down explicitly", so it outranks the capability slot
         let plugin_hit = match kind {
             ToolKind::Plugin(plugin_name) => self.lookup(plugin_name),
-            // 元工具与宿主文件工具都没有「插件名」这一层
+            // Neither meta tools nor host file tools have a "plugin name" layer
             ToolKind::Meta | ToolKind::Host => None,
         };
         if let Some(l) = plugin_hit {
             return l;
         }
-        // ③ 能力申请（阶段 6 · 6b 首次填值，原则 P7）：组件在 `[contributes] caps` 里
-        //    声明「我要什么能力」，这类调用**一律问一次** —— 不许静默搭类别默认的便车。
-        //    例：`[auth] plugin_tools = "auto"` 的意思是「常规插件随便跑」，不该顺势变成
-        //    「顺手把写文件的权利也批了」。位置刻意放在 override 之后：用户手写的
-        //    override 是明确表态，比组件的申请更该说话。
+        // ③ Capability request (first filled in phase 6 · 6b, principle P7): a
+        //    component declares "what capability I want" in `[contributes] caps`,
+        //    and such a call is **always asked once** — it must not silently ride
+        //    the category default. E.g. `[auth] plugin_tools = "auto"` means
+        //    "ordinary plugins may run freely", which should not become "and by
+        //    the way the right to write files is granted too". The position is
+        //    deliberate: after the override, because a hand-written override is
+        //    an explicit stance and deserves to speak louder than a component's
+        //    request.
         //
-        //    只对**插件工具**生效：能力申请只可能来自组件，元工具是宿主自己的、
-        //    不替任何人申请。多这一道判断是为了「传了就生效」不会意外波及元工具。
+        //    Only **plugin tools** are affected: a capability request can only
+        //    come from a component, whereas meta tools belong to the host and
+        //    request on nobody's behalf. This extra check exists so that
+        //    "passing it makes it take effect" cannot accidentally reach meta
+        //    tools.
         if matches!(kind, ToolKind::Plugin(_)) && !caps.is_empty() {
             return AuthLevel::Ask;
         }
-        // ④ 都没有才退到类别默认
+        // ④ Only when none of the above hit do we fall back to the category default
         //
-        //    宿主文件工具（`ToolKind::Host`）跟着**插件工具那一档**走：两者都是
-        //    「让别的东西去干一件活」，而不是「改宿主自身」。于是 `plugin_tools = "auto"`
-        //    （默认）下文件工具也是 auto —— 与 `fs_*` 那类插件工具行为一致，模型换用
-        //    哪个工具都一样；想单独收紧就用名字 override（如 `read_file = "ask"`），
-        //    第 ① 步会先命中它。
+        //    Host file tools (`ToolKind::Host`) follow the **same tier as plugin
+        //    tools**: both are "let something else do a job" rather than "modify
+        //    the host itself". So under `plugin_tools = "auto"` (the default) file
+        //    tools are auto too — consistent with plugin tools of the `fs_*` kind,
+        //    so the model behaves the same whichever tool it picks; to tighten one
+        //    specifically, use a name override (e.g. `read_file = "ask"`), which
+        //    step ① will hit first.
         match kind {
             ToolKind::Meta => self.meta,
             ToolKind::Host | ToolKind::Plugin(_) => self.plugin,
@@ -157,23 +178,25 @@ mod tests {
         }
     }
 
-    /// 抽缝是纯重构 —— 这条把原来的优先级钉死：工具名 override > 插件名 override > 类别默认。
+    /// Carving the seam is a pure refactor — this pins down the original
+    /// precedence: tool-name override > plugin-name override > category default.
     #[test]
     fn override_beats_category_defaults() {
         let p = ConfigPolicy::from_config(&cfg());
-        // ① 按工具名 override 最优先，连类别默认都盖掉
+        // ① A tool-name override wins first, beating even the category default
         assert_eq!(p.level_for(&ToolKind::Meta, "create_plugin", &[]), AuthLevel::Auto);
-        // ② 其次按插件名 override
+        // ② Next comes a plugin-name override
         assert_eq!(
             p.level_for(&ToolKind::Plugin("myplugin".into()), "myplugin_fs", &[]),
             AuthLevel::Ask
         );
-        // ③ 没有 override 时退回类别默认
+        // ③ With no override, fall back to the category default
         assert_eq!(p.level_for(&ToolKind::Meta, "list_plugins", &[]), AuthLevel::Ask);
         assert_eq!(p.level_for(&ToolKind::Plugin("other".into()), "other_do", &[]), AuthLevel::Deny);
     }
 
-    /// 工具名 override 不该被插件名 override 抢走 —— 两条查询的顺序不能反。
+    /// A tool-name override must not be stolen by a plugin-name override — the
+    /// two lookups must not be swapped.
     #[test]
     fn tool_name_wins_over_plugin_name() {
         let mut c = cfg();
@@ -183,11 +206,12 @@ mod tests {
         assert_eq!(
             p.level_for(&ToolKind::Plugin("myplugin".into()), "myplugin_fs", &[]),
             AuthLevel::Auto,
-            "同名工具与同名插件同时有 override 时，以工具为准"
+            "when a tool and a plugin share a name and both have an override, the tool wins"
         );
     }
 
-    /// 三档字符串的别名与大小写：改了会让用户写在 config 里的值悄悄变成 ask。
+    /// The aliases and casing of the three tier strings: changing them would
+    /// silently turn a value the user wrote in config into ask.
     #[test]
     fn level_parse_accepts_aliases_case_insensitively() {
         for s in ["auto", "AUTO", " allow ", "always"] {
@@ -209,18 +233,20 @@ mod tests {
         }
     }
 
-    /// 尾随 `*` 的前缀通配：一次挡住「一类工具」。
+    /// The trailing-`*` prefix wildcard: block "a class of tools" in one go.
     #[test]
     fn wildcard_override_matches_by_prefix() {
         let p = ConfigPolicy::from_config(&cfg_with_overrides(&[("fs_*", "deny")]));
         assert_eq!(p.level_for(&ToolKind::Plugin("fs".into()), "fs_read_file", &[]), AuthLevel::Deny);
         assert_eq!(p.level_for(&ToolKind::Plugin("fs".into()), "fs_write_file", &[]), AuthLevel::Deny);
-        // 没被通配圈住的仍走原来的优先级（插件默认 auto）
+        // What the wildcard doesn't catch still follows the original precedence
+        // (plugin default auto)
         assert_eq!(p.level_for(&ToolKind::Plugin("net".into()), "net_fetch", &[]), AuthLevel::Auto);
     }
 
-    /// 三层优先级在通配加入之后**一个字都没变**：
-    /// 精确工具名 > 更长的前缀 > 更短的前缀 > 插件默认。
+    /// The three-level precedence **did not change by a single word** once
+    /// wildcards were added: exact tool name > longer prefix > shorter prefix >
+    /// plugin default.
     #[test]
     fn exact_key_beats_wildcard_and_longer_prefix_wins() {
         let p = ConfigPolicy::from_config(&cfg_with_overrides(&[
@@ -229,13 +255,13 @@ mod tests {
             ("fs_read_file", "ask"),
         ]));
         let kind = ToolKind::Plugin("fs".into());
-        // ① 精确键最优先，连更长的前缀都盖得住
+        // ① An exact key wins first, beating even a longer prefix
         assert_eq!(p.level_for(&kind, "fs_read_file", &[]), AuthLevel::Ask);
-        // ② 没有精确键时，长前缀（更具体）赢
+        // ② With no exact key, the longer (more specific) prefix wins
         assert_eq!(p.level_for(&kind, "fs_read_dir", &[]), AuthLevel::Auto);
-        // ③ 都不匹配才退到短前缀
+        // ③ Only when neither matches do we fall back to the shorter prefix
         assert_eq!(p.level_for(&kind, "fs_write_file", &[]), AuthLevel::Deny);
-        // ④ 插件名同样吃通配 —— `myplugin*` 命中插件名 myplugin
+        // ④ Plugin names take wildcards too — `myplugin*` hits the plugin name myplugin
         let p2 = ConfigPolicy::from_config(&cfg_with_overrides(&[("myplugin*", "deny")]));
         assert_eq!(
             p2.level_for(&ToolKind::Plugin("myplugin".into()), "unrelated", &[]),
@@ -243,7 +269,8 @@ mod tests {
         );
     }
 
-    /// 单独一个 `*` = 兜底一切 —— 既然写得出来，就该按字面意思生效。
+    /// A lone `*` = catch-all — if it can be written, it should take effect
+    /// literally.
     #[test]
     fn bare_star_catches_everything() {
         let p = ConfigPolicy::from_config(&cfg_with_overrides(&[("*", "deny")]));
@@ -254,53 +281,62 @@ mod tests {
         );
     }
 
-    /// 通配是**前缀**匹配，不认分隔符 —— 这条把语义钉死，免得以后有人以为它有路径感知。
+    /// Wildcards are **prefix** matches and don't respect separators — this pins
+    /// the semantics so nobody later thinks they're path-aware.
     #[test]
     fn wildcard_is_a_plain_prefix() {
-        // 没有 `*` 就是精确匹配：键 `fs` 只命中叫 `fs` 的东西，不命中 fs_read_file
+        // Without `*` it's an exact match: the key `fs` only hits things named
+        // `fs`, not fs_read_file
         let p = ConfigPolicy::from_config(&cfg_with_overrides(&[("fs", "deny")]));
         assert_eq!(
             p.level_for(&ToolKind::Plugin("other".into()), "fs_read_file", &[]),
             AuthLevel::Auto
         );
 
-        // 写成 `fs*` 才按前缀命中 —— 连 `fsx_do` 一起命中（这就是「只看前缀」的含义）
+        // Written as `fs*` it matches by prefix — hitting `fsx_do` too (that's
+        // what "prefix only" means)
         let p = ConfigPolicy::from_config(&cfg_with_overrides(&[("fs*", "deny")]));
         assert_eq!(p.level_for(&ToolKind::Plugin("x".into()), "fs_read_file", &[]), AuthLevel::Deny);
         assert_eq!(p.level_for(&ToolKind::Plugin("x".into()), "fsx_do", &[]), AuthLevel::Deny);
     }
 
-    /// 能力申请（阶段 6 · 6b 首次填值）：声明了 caps 的组件，它的工具调用一律走问询。
+    /// Capability request (first filled in phase 6 · 6b): a component that
+    /// declares caps has all its tool calls go through asking.
     #[test]
     fn declared_caps_force_ask_over_plugin_default() {
-        // 插件类别默认是 auto（见 cfg_with_overrides）—— 常规插件不必问
+        // The plugin category default is auto (see cfg_with_overrides) —
+        // ordinary plugins need no ask
         let p = ConfigPolicy::from_config(&cfg_with_overrides(&[]));
         let kind = ToolKind::Plugin("comp".into());
         assert_eq!(p.level_for(&kind, "comp_do", &[]), AuthLevel::Auto);
-        // 但组件一旦申请能力，就必须让人点一次头
+        // But once a component requests a capability, it must get a nod from the user
         assert_eq!(p.level_for(&kind, "comp_do", &["fs_write".to_string()]), AuthLevel::Ask);
     }
 
-    /// 用户手写的 override 压过能力申请 —— 那是明确表态，比组件的申请更该说话。
+    /// A hand-written override beats a capability request — it's an explicit
+    /// stance and deserves to speak louder than a component's request.
     #[test]
     fn explicit_override_beats_declared_caps() {
         let p = ConfigPolicy::from_config(&cfg_with_overrides(&[("comp", "auto"), ("comp_do", "deny")]));
         let kind = ToolKind::Plugin("comp".into());
         let caps = ["fs_write".to_string()];
-        assert_eq!(p.level_for(&kind, "comp_do", &caps), AuthLevel::Deny, "工具名 override 最优先");
-        assert_eq!(p.level_for(&kind, "comp_other", &caps), AuthLevel::Auto, "插件名 override 次之");
+        assert_eq!(p.level_for(&kind, "comp_do", &caps), AuthLevel::Deny, "the tool-name override has top priority");
+        assert_eq!(p.level_for(&kind, "comp_other", &caps), AuthLevel::Auto, "the plugin-name override comes next");
     }
 
-    /// 能力位**只影响插件工具那条路**：元工具是宿主自己的，不替谁申请能力、
-    /// 也不该被误伤（这条钉的是「传了就生效」不会意外波及元工具）。
+    /// The capability slot **only affects the plugin-tool path**: meta tools
+    /// belong to the host, request capabilities on nobody's behalf and must not
+    /// be caught in the crossfire (this pins that "passing it makes it take
+    /// effect" cannot accidentally reach meta tools).
     #[test]
     fn caps_never_apply_to_meta_tools() {
-        // meta_tools = deny：如果 caps 判断漏到这条路上，结果会变成 Ask
+        // meta_tools = deny: if the caps check leaked onto this path, the result
+        // would become Ask
         let p = ConfigPolicy::from_config(&cfg_with_overrides(&[("*", "deny")]));
         assert_eq!(
             p.level_for(&ToolKind::Meta, "list_plugins", &["fs_write".to_string()]),
             AuthLevel::Deny,
-            "兜底 override 命中元工具，能力位不该把它改成 ask"
+            "the fallback override hits a meta-tool; the caps bit must not turn it into ask"
         );
     }
 }

@@ -1,5 +1,6 @@
-//! 自检：不依赖任何 LLM，直接验证「创建插件 → 注册 → 调用 → 卸载」全链路。
-//! 运行方式: aox selftest
+//! Self-test: depends on no LLM and directly verifies the whole chain
+//! "create plugin → register → call → uninstall".
+//! How to run: aox selftest
 
 use std::path::PathBuf;
 
@@ -17,18 +18,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from plugin_sdk import serve
 
 def echo(args):
-    # 附带 cwd 与非 ASCII 内容：用于验证「工作目录=应用根」与「UTF-8 往返」两条修复
+    # Carries cwd and non-ASCII content: verifies the "workdir = app root" and "UTF-8 round-trip" fixes
     return "ECHO: {} | cwd={} | 中文标记OK".format(args.get("text", ""), os.getcwd())
 
 serve("selftest", {
-    "selftest_echo": ("回显输入文本并报告进程工作目录", {"type": "object", "properties": {"text": {"type": "string"}}}, echo),
+    "selftest_echo": ("Echo the input text and report the process working directory", {"type": "object", "properties": {"text": {"type": "string"}}}, echo),
 })
 "#;
 
-/// 围栏验证用插件：它的唯一工作就是**尝试拉起一个子进程**。
+/// The plugin for fence verification: its only job is to **try to spawn a child process**.
 ///
-/// 用「子进程有没有真的跑起来（有没有打印 child-ok）」而不是「有没有抛异常」来判定 ——
-/// 断言要断内容，不要断错误的形状（错误码/措辞会随系统版本变）。
+/// Judgment uses "did the child process really run (did it print child-ok)" rather than
+/// "did it throw" — assert on content, not on the shape of the error (error codes and
+/// wording change with system versions).
 const SPAWN_SOURCE: &str = r#"
 import sys, os, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sdk"))
@@ -44,14 +46,15 @@ def child(args):
         return "SPAWN-BLOCKED: {}: {}".format(type(e).__name__, e)
 
 serve("selftest_spawn", {
-    "selftest_spawn_child": ("尝试拉起一个子进程", {"type": "object", "properties": {}}, child),
+    "selftest_spawn_child": ("Try to spawn a child process", {"type": "object", "properties": {}}, child),
 })
 "#;
 
-/// 只读声明自检插件：两道工具**故意只差第 4 位**。
+/// Read-only declaration self-test plugin: the two tools **deliberately differ only in the 4th position (the `access` argument)**.
 ///
-/// 用一对「只差一个变量」的工具去验，是因为这次改动的全部内容就是那一位 ——
-/// 只声明一边的话，SDK 把 access 发错了（比如发成常量）也照样能过。
+/// The point of testing with a pair of tools that "differ by a single field" is that this
+/// change is *entirely* about that one position — if only one side is declared, the SDK could
+/// still send `access` wrong (e.g. as a constant) and the test would pass anyway.
 const READ_DECL_SOURCE: &str = r#"
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sdk"))
@@ -61,83 +64,89 @@ def probe(args):
     return "PROBE: {}".format(args.get("path", ""))
 
 serve("selftest_read", {
-    "selftest_read_scan": ("只读扫描（声明了 read）",
+    "selftest_read_scan": ("Read-only scan (declares read)",
                            {"type": "object", "properties": {"path": {"type": "string"}}},
                            probe, "read"),
-    "selftest_read_write": ("未声明（应当按可能落盘判）",
+    "selftest_read_write": ("Not declared (treated as may-write)",
                             {"type": "object", "properties": {"path": {"type": "string"}}},
                             probe),
 })
 "#;
 
 pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
-    println!("[selftest] 初始化运行时…");
+    println!("{}", crate::i18n::t("[selftest] initializing runtimes…"));
     plugin::ensure_sdk(&plugins_dir)?;
     let rt = Runtime::new(Config::dummy(), root, plugins_dir)?;
     for t in meta::meta_tools() {
         rt.register(t).await?;
     }
 
-    println!("[selftest] 通过 create_plugin 链路创建自检插件…");
-    let tools = plugin::create_plugin(&rt, "selftest", "python", "自检回显插件", ECHO_SOURCE).await?;
-    println!("[selftest] 已注册工具: {}", tools.join(", "));
+    println!("{}", crate::i18n::t("[selftest] creating the selftest plugin via the create_plugin path…"));
+    let tools = plugin::create_plugin(&rt, "selftest", "python", crate::i18n::t("selftest echo plugin"), ECHO_SOURCE).await?;
+    println!("{}", crate::tf!("[selftest] registered tools: {}", tools.join(", ")));
     if !tools.contains(&"selftest_echo".to_string()) {
-        bail!("selftest_echo 未注册");
+        bail!(crate::i18n::t("selftest_echo is not registered"));
     }
 
-    println!("[selftest] 调用 selftest_echo…");
+    println!("{}", crate::i18n::t("[selftest] calling selftest_echo…"));
     let out = rt.execute("selftest_echo", json!({"text": "hello-agent"})).await;
-    println!("[selftest] 返回: {}", out.content);
+    println!("{}", crate::tf!("[selftest] returned: {}", out.content));
     if out.is_error || !out.content.contains("hello-agent") {
-        bail!("回显结果不符合预期");
+        bail!(crate::i18n::t("echo result does not match expectation"));
     }
-    // 回归 1：非 ASCII 内容必须能无损往返（此前 Windows 默认 GBK 会击穿协议）
+    // Regression 1: non-ASCII content must round-trip losslessly (the Windows default
+    // GBK used to break through the protocol)
     if !out.content.contains("中文标记OK") {
-        bail!("非 ASCII 内容未能正确往返，编码链路仍有问题: {}", out.content);
+        bail!(crate::tf!("non-ASCII content did not round-trip correctly; the encoding pipeline is still broken: {}", out.content));
     }
-    // 回归 2：插件进程的工作目录必须是应用根，而不是插件自身目录
-    //         （此前 cwd=插件目录导致插件内相对路径错乱）
+    // Regression 2: the plugin process's working directory must be the app root, not
+    //             the plugin's own directory (cwd=plugin dir used to scramble relative
+    //             paths inside plugins)
     if out.content.contains(&format!("plugins{}selftest", std::path::MAIN_SEPARATOR)) {
-        bail!("插件工作目录仍是插件自身目录，未指向应用根: {}", out.content);
+        bail!(crate::tf!("the plugin's working directory is still the plugin's own directory, not the app root: {}", out.content));
     }
 
-    println!("[selftest] 通过 remove_plugin 链路卸载插件…");
+    println!("{}", crate::i18n::t("[selftest] removing the plugin via the remove_plugin path…"));
     let removed = plugin::remove_plugin(&rt, "selftest").await?;
-    println!("[selftest] 已注销工具: {}", removed.join(", "));
+    println!("{}", crate::tf!("[selftest] unregistered tools: {}", removed.join(", ")));
 
     let names = rt.tool_names().await;
     if names.iter().any(|n| n == "selftest_echo") {
-        bail!("卸载后工具仍残留");
+        bail!(crate::i18n::t("tools still present after removal"));
     }
 
-    // 回归 3：同名残留目录（上次创建失败的遗骸）应被自动清理并成功重建
-    println!("[selftest] 回归：残留目录重建…");
+    // Regression 3: a same-named leftover directory (the remains of a previous failed
+    // creation) must be cleaned up automatically and rebuilt successfully
+    println!("{}", crate::i18n::t("[selftest] regression: rebuilding a stale directory…"));
     let stale = rt.plugins_dir.join("selftest_stale");
     std::fs::create_dir_all(&stale)?;
     std::fs::write(stale.join("leftover.txt"), "x")?;
-    let t3 = plugin::create_plugin(&rt, "selftest_stale", "python", "残留目录重建测试", ECHO_SOURCE).await?;
+    let t3 = plugin::create_plugin(&rt, "selftest_stale", "python", crate::i18n::t("stale-directory rebuild test"), ECHO_SOURCE).await?;
     if !t3.contains(&"selftest_echo".to_string()) {
-        bail!("残留目录重建后工具未注册");
+        bail!(crate::i18n::t("tool not registered after the stale-directory rebuild"));
     }
     if stale.join("leftover.txt").exists() {
-        bail!("残留文件未被清理");
+        bail!(crate::i18n::t("stale files were not cleaned up"));
     }
     plugin::remove_plugin(&rt, "selftest_stale").await?;
 
-    // 回归 4：目录存在但插件未加载（幽灵插件）也应能被 remove 清掉
-    println!("[selftest] 回归：幽灵插件清理…");
+    // Regression 4: a directory that exists but whose plugin isn't loaded (a ghost
+    // plugin) must also be clearable by remove
+    println!("{}", crate::i18n::t("[selftest] regression: ghost-plugin cleanup…"));
     let orphan = rt.plugins_dir.join("selftest_orphan");
     std::fs::create_dir_all(&orphan)?;
     std::fs::write(orphan.join("plugin.toml"), "name = \"selftest_orphan\"\n")?;
     plugin::remove_plugin(&rt, "selftest_orphan").await?;
     if orphan.exists() {
-        bail!("幽灵插件目录未被清理");
+        bail!(crate::i18n::t("ghost plugin directory was not cleaned up"));
     }
 
-    // 回归 5：思考模式（DeepSeek thinking）消息必须原样回传 reasoning_content。
-    //        此前 Message 丢弃该字段，带 tool_calls 的历史消息再回传时会被 API 以
-    //        400 "reasoning_content must be passed back" 拒绝，表现为「多步任务跑到一半静默中断」。
-    println!("[selftest] 回归：思考模式 reasoning_content 往返…");
+    // Regression 5: in thinking mode (DeepSeek thinking), messages must pass
+    //             reasoning_content back verbatim. Previously Message dropped the field,
+    //             and replaying a historical message with tool_calls got rejected by the
+    //             API with 400 "reasoning_content must be passed back", showing up as "a
+    //             multi-step task silently dying halfway".
+    println!("{}", crate::i18n::t("[selftest] regression: thinking-mode reasoning_content round-trip…"));
     let raw = json!({
         "role": "assistant",
         "content": "我先看看有哪些插件。",
@@ -150,24 +159,27 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
     });
     let msg: crate::message::Message = serde_json::from_value(raw)?;
     if msg.reasoning_content.as_deref() != Some("需要先确认当前可用的能力。") {
-        bail!("assistant 消息的 reasoning_content 未被保留（思考模式下回传会被 API 拒绝）");
+        bail!(crate::i18n::t("the assistant message's reasoning_content was not preserved (echoing it back in thinking mode would be rejected by the API)"));
     }
     let back = serde_json::to_value(&msg)?;
     if back.get("reasoning_content").and_then(|v| v.as_str()) != Some("需要先确认当前可用的能力。") {
-        bail!("回传请求中缺少 reasoning_content: {back}");
+        bail!(crate::tf!("reasoning_content missing from the echoed-back request: {}", back));
     }
     if back.get("tool_calls").is_none() {
-        bail!("回传请求中缺少 tool_calls");
+        bail!(crate::i18n::t("tool_calls missing from the echoed-back request"));
     }
-    // 非思考消息不应凭空带上该字段，避免污染 OpenAI 等严格校验的端点
+    // Non-thinking messages must not carry the field out of nowhere, to avoid polluting
+    // strict endpoints like OpenAI
     let plain = serde_json::to_value(crate::message::Message::user("hi"))?;
     if plain.get("reasoning_content").is_some() {
-        bail!("普通消息不应序列化 reasoning_content: {plain}");
+        bail!(crate::tf!("plain messages must not serialize reasoning_content: {}", plain));
     }
 
-    // 回归 6：SSE 流式解析。思考过程必须能实时推给 sink（否则等待时看不到进度），
-    //        工具调用的分片参数必须能拼回完整 JSON（流式下 arguments 会被拆成多个 chunk）。
-    println!("[selftest] 回归：SSE 流式解析（思考过程 + 工具调用分片）…");
+    // Regression 6: SSE streaming parsing. The reasoning process must be pushed to the
+    //             sink in real time (otherwise no progress is visible while waiting), and
+    //             a tool call's fragmented arguments must reassemble into complete JSON
+    //             (in streaming, arguments get split across several chunks).
+    println!("{}", crate::i18n::t("[selftest] regression: SSE stream parsing (reasoning + tool-call deltas)…"));
     {
         use crate::llm::openai::StreamAcc;
         use crate::llm::StreamSink;
@@ -218,45 +230,46 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
         for c in &chunks {
             acc.feed(&format!("data: {c}"), Some(&cap));
         }
-        acc.feed(": keep-alive", Some(&cap)); // 注释行必须被忽略
+        acc.feed(": keep-alive", Some(&cap)); // Comment lines must be ignored
         acc.feed("data: [DONE]", Some(&cap));
 
         let streamed = cap.reasoning.lock().unwrap().clone();
         if streamed != "先看有哪些插件" {
-            bail!("思考过程未实时推送给 sink: {streamed:?}");
+            bail!(crate::tf!("reasoning was not pushed to the sink in real time: {}", format!("{streamed:?}")));
         }
-        // 正文增量也得推给 sink —— 实时 token 滚动要靠它数输出侧
+        // The content deltas must also be pushed to the sink — real-time token scrolling depends on counting the output side
         let streamed_text = cap.content.lock().unwrap().clone();
         if streamed_text != "好的" {
-            bail!("正文增量未实时推送给 sink: {streamed_text:?}");
+            bail!(crate::tf!("content deltas were not pushed to the sink in real time: {}", format!("{streamed_text:?}")));
         }
         if !acc.is_done() {
-            bail!("未识别 data: [DONE]");
+            bail!(crate::i18n::t("did not recognize data: [DONE]"));
         }
         let reply = acc.into_reply();
         if reply.message.reasoning_content.as_deref() != Some("先看有哪些插件") {
-            bail!("流式累加未保留 reasoning_content（思考模式回传会被 API 拒绝）");
+            bail!(crate::i18n::t("streaming accumulation did not preserve reasoning_content (echoing it back in thinking mode would be rejected by the API)"));
         }
         if reply.message.text() != Some("好的") {
-            bail!("流式正文累加错误: {:?}", reply.message.content);
+            bail!(crate::tf!("streamed content accumulation mismatch: {}", format!("{:?}", reply.message.content)));
         }
         let calls = reply.message.tool_calls.clone().unwrap_or_default();
         if calls.len() != 2 {
-            bail!("流式工具调用数量错误: {}", calls.len());
+            bail!(crate::tf!("streaming tool-call count mismatch: {}", calls.len()));
         }
         if calls[0].function.name != "list_plugins" || calls[0].function.arguments != "{}" {
-            bail!("第 1 个工具调用拼装错误: {:?}", calls[0]);
+            bail!(crate::tf!("tool call #1 assembled incorrectly: {}", format!("{:?}", calls[0])));
         }
         if calls[1].id != "call_b"
             || calls[1].function.name != "fs_read"
             || calls[1].function.arguments != "{\"path\":\"a.txt\"}"
         {
-            bail!("分片参数拼接错误: {:?}", calls[1]);
+            bail!(crate::tf!("delta arguments joined incorrectly: {}", format!("{:?}", calls[1])));
         }
         if reply.finish_reason.as_deref() != Some("tool_calls") {
-            bail!("finish_reason 未捕获: {:?}", reply.finish_reason);
+            bail!(crate::tf!("finish_reason not captured: {}", format!("{:?}", reply.finish_reason)));
         }
-        // usage 要逐项解析到位：这些数字直接决定界面上给用户看什么
+        // usage must be parsed field by field: these numbers directly decide what the
+        // UI shows the user
         let u = &reply.usage;
         if u.prompt != Some(1200)
             || u.completion != Some(300)
@@ -265,95 +278,98 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
             || u.cached != Some(1024)
             || u.cache_miss != Some(176)
         {
-            bail!("usage 未完整捕获: {u:?}");
+            bail!(crate::tf!("usage not captured completely: {}", format!("{u:?}")));
         }
     }
 
-    // 回归 7：进程围栏（Job Object）。**三段对拍** ——
-    //        A 默认额度：插件必须照常干活，子进程也拉得起来（「围栏不该挡插件干活」）；
-    //        B 额度锁 0：必须有围栏拦下（fork bomb 防护还在）；
-    //        C 围栏整个关掉：又拉得起来（对照组 —— 若 C 也失败，那 B 的「被拦下」
-    //          根本不是围栏的功劳，而是这台机器上的 python 自己有别的毛病）。
-    //        只有三段都过，上面两条结论才成立。
-    println!("[selftest] 回归：进程围栏（Job Object）…");
+    // Regression 7: the process fence (Job Object). A **three-way cross-check** —
+    //        A default quota: the plugin must work as usual and be able to spawn a child
+    //          ("the fence must not block the plugin from working");
+    //        B quota locked to 0: the fence must block it (the fork-bomb protection is
+    //          still there);
+    //        C fence fully disabled: it can spawn again (the control group — if C also
+    //          fails, then B's "blocked" isn't the fence's doing at all, but some other
+    //          problem with python on this machine).
+    //        Only when all three pass do the two conclusions above hold.
+    println!("{}", crate::i18n::t("[selftest] regression: process fence (Job Object)…"));
     {
-        let t = plugin::create_plugin(&rt, "selftest_spawn", "python", "围栏验证", SPAWN_SOURCE).await?;
+        let t = plugin::create_plugin(&rt, "selftest_spawn", "python", crate::i18n::t("fence verification"), SPAWN_SOURCE).await?;
         if !t.contains(&"selftest_spawn_child".to_string()) {
-            bail!("围栏验证插件未注册工具");
+            bail!(crate::i18n::t("the fence-verification plugin registered no tools"));
         }
-        // A：默认额度。这一条钉住「默认配置不阻止插件干活」—— 以前默认是 1
-        // （而且那个 1 是**含插件自己**的进程总数），于是任何靠 `subprocess` 的插件
-        // 都是 `WinError 1816 配额不足`，插件等于废了。
+        // A: the default quota. This pins "the default config does not stop plugins from
+        // working" — the default used to be 1 (and that 1 was the total process count
+        // **including the plugin itself**), so any plugin relying on `subprocess` got
+        // `WinError 1816 insufficient quota`, which effectively disabled the plugin.
         let ok = rt.execute("selftest_spawn_child", json!({})).await;
-        println!("[selftest]   默认额度: {}", ok.content);
+        println!("{}", crate::tf!("[selftest]   default quota: {}", ok.content));
         if ok.is_error {
-            bail!("围栏验证插件自身执行失败（围栏不该影响插件自己）: {}", ok.content);
+            bail!(crate::tf!("the fence-verification plugin failed on its own (the fence must not affect the plugin itself): {}", ok.content));
         }
         if !ok.content.contains("child-ok") {
-            bail!(
-                "默认配置（max_processes = {}）下插件拉不起子进程 —— \
-                 默认额度把插件干活挡住了: {}",
+            bail!(crate::tf!(
+                "under the default config (max_processes = {}) the plugin cannot spawn a child — the default quota blocks the plugin from working: {}",
                 rt.config.sandbox.max_processes,
                 ok.content
-            );
+            ));
         }
         plugin::remove_plugin(&rt, "selftest_spawn").await?;
     }
 
     {
-        // B：把子进程额度锁到 0 ⇒ 必须拦下。
+        // B: lock the subprocess quota to 0 ⇒ it must be blocked.
         let mut cfg = Config::dummy();
         cfg.sandbox.max_processes = 0;
         let rt0 = Runtime::new(cfg, rt.root.clone(), rt.plugins_dir.clone())?;
-        plugin::create_plugin(&rt0, "selftest_spawn", "python", "围栏验证（锁死）", SPAWN_SOURCE).await?;
+        plugin::create_plugin(&rt0, "selftest_spawn", "python", crate::i18n::t("fence verification (locked)"), SPAWN_SOURCE).await?;
         let blocked = rt0.execute("selftest_spawn_child", json!({})).await;
-        println!("[selftest]   额度锁 0: {}", blocked.content);
+        println!("{}", crate::tf!("[selftest]   quota locked to 0: {}", blocked.content));
         if blocked.is_error {
-            bail!("额度锁 0 时插件自身执行失败（围栏不该影响插件自己）: {}", blocked.content);
+            bail!(crate::tf!("with the quota locked to 0 the plugin failed on its own (the fence must not affect the plugin itself): {}", blocked.content));
         }
         if blocked.content.contains("child-ok") {
-            bail!("max_processes = 0 没锁住：插件仍然拉起了子进程 —— {}", blocked.content);
+            bail!(crate::tf!("max_processes = 0 did not lock it down: the plugin still spawned a child — {}", blocked.content));
         }
         plugin::remove_plugin(&rt0, "selftest_spawn").await?;
     }
 
     {
-        // C：对照组（围栏整个关掉）。
+        // C: control group (fence fully disabled).
         let mut cfg = Config::dummy();
         cfg.sandbox.enabled = false;
         let rt2 = Runtime::new(cfg, rt.root.clone(), rt.plugins_dir.clone())?;
-        plugin::create_plugin(&rt2, "selftest_spawn", "python", "围栏验证（对照）", SPAWN_SOURCE).await?;
+        plugin::create_plugin(&rt2, "selftest_spawn", "python", crate::i18n::t("fence verification (control)"), SPAWN_SOURCE).await?;
         let open = rt2.execute("selftest_spawn_child", json!({})).await;
-        println!("[selftest]   围栏关闭: {}", open.content);
+        println!("{}", crate::tf!("[selftest]   fence off: {}", open.content));
         if !open.content.contains("child-ok") {
-            bail!(
-                "对照组失败：关掉围栏后插件仍拉不起子进程 ⇒ 挡住它的不是围栏，\
-                 上面那条「额度锁 0 生效」的结论无效 —— {}",
+            bail!(crate::tf!(
+                "control group failed: with the fence off the plugin still cannot spawn a child ⇒ what blocks it is not the fence, invalidating the \"quota locked to 0\" conclusion above — {}",
                 open.content
-            );
+            ));
         }
         plugin::remove_plugin(&rt2, "selftest_spawn").await?;
     }
 
-    // 回归 8：工作区边界（沙箱方案 ③）。同样是 **A/B 对拍** —— 受限档必须拦住越界、
-    //         **而且那个文件真的没被创建**；full 档下同一个调用必须成功。
-    //         只测一边的话，「被拦住了」可能只是因为路径本身有问题（父目录不存在之类），
-    //         那样这条测试是在自欺 —— 与回归 7 同一个理由。
-    //         新语义（2026-10-04）：**读不设限、写删受限** —— 「相对路径被拒」那条已改到
-    //         **写**上，另加「读区外放行 / 删区外拦截」的对拍。
-    println!("[selftest] 回归：工作区边界（文件能力收回宿主）…");
+    // Regression 8: workspace boundary (sandbox approach ③). Likewise an **A/B cross-check** — the restricted tier must block the out-of-bounds write,
+    //         **and the file must genuinely not have been created**; under the `full` tier the same call must succeed.
+    //         Testing only one side, "it got blocked" might just mean the path itself was broken (missing parent dir, etc.),
+    //         which would make this test lie to itself — the same reasoning as Regression 7.
+    //         New semantics (2026-10-04): **reads unrestricted, writes/deletes restricted** — the "relative path rejected" case
+    //         has moved to **writes**, plus a cross-check of "reads outside allowed / deletes outside blocked".
+    println!("{}", crate::i18n::t("[selftest] regression: workspace boundary (file capability returned to the host)…"));
     {
         let ws_root = std::env::temp_dir().join("aox-selftest-ws");
         let outside = std::env::temp_dir().join("aox-selftest-outside.txt");
-        // 「读不设限」那条要读一个**真实存在**的区外文件：读一个不存在的路径也会失败，
-        // 那种失败归因不到边界上。
+        // The "reads unrestricted" case needs to read a **genuinely existing**
+        // out-of-bounds file: reading a non-existent path fails too, and that failure
+        // can't be attributed to the boundary.
         let outside_read = std::env::temp_dir().join("aox-selftest-outside-read.txt");
         let _ = std::fs::remove_dir_all(&ws_root);
         let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_file(&outside_read);
         std::fs::create_dir_all(ws_root.join("inside"))?;
 
-        // ── A：固定工作区 ⇒ 只准里面 ──
+        // ── A: fixed workplace ⇒ only inside is allowed ──
         let mut cfg = Config::dummy();
         cfg.workplace = crate::config::WorkplaceConfig {
             mode: "fixed".into(),
@@ -364,7 +380,7 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
             rt_ws.register(t).await?;
         }
         if rt_ws.workplace.active_root().is_none() {
-            bail!("fixed 档位没有确定工作区根");
+            bail!(crate::i18n::t("the fixed tier has no definite workspace root"));
         }
 
         let inside = ws_root.join("inside").join("ok.txt");
@@ -372,54 +388,58 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
             .execute("write_file", json!({"path": inside.to_string_lossy(), "content": "工作区内的内容"}))
             .await;
         if w.is_error {
-            bail!("工作区内写入被拒了（边界太紧）: {}", w.content);
+            bail!(crate::tf!("a write inside the workspace was rejected (boundary too tight): {}", w.content));
         }
         let r = rt_ws.execute("read_file", json!({"path": inside.to_string_lossy()})).await;
         if r.is_error || !r.content.contains("工作区内的内容") {
-            bail!("工作区内的读写往返失败: {}", r.content);
+            bail!(crate::tf!("the read/write round-trip inside the workspace failed: {}", r.content));
         }
 
         let bad = rt_ws
             .execute("write_file", json!({"path": outside.to_string_lossy(), "content": "x"}))
             .await;
-        println!("[selftest]   受限档越界: {}", bad.content.lines().next().unwrap_or(""));
+        println!("{}", crate::tf!("[selftest]   restricted-tier out-of-bounds: {}", bad.content.lines().next().unwrap_or("")));
         if !bad.is_error {
-            bail!("越界写入没被拦下");
+            bail!(crate::i18n::t("the out-of-bounds write was not intercepted"));
         }
         if outside.exists() {
-            bail!("越界写入被拒了，但文件真的被创建了 —— 这个边界是假的");
+            bail!(crate::i18n::t("the out-of-bounds write was rejected, but the file was really created — this boundary is fake"));
         }
-        for needle in ["权限边界", "不要重试", "转述给用户"] {
+        for needle in [crate::i18n::t("permission boundary"), crate::i18n::t("Do not retry"), crate::i18n::t("relay this to the user")] {
             if !bad.content.contains(needle) {
-                bail!("越界文案缺了「{needle}」这一段（模型会因此反复重试）: {}", bad.content);
+                bail!(crate::tf!("the out-of-bounds message is missing the \"{}\" section (the model would keep retrying): {}", needle, bad.content));
             }
         }
-        // 相对路径必须拒（**只对写/删成立**）：宿主与插件子进程的 cwd 不同，
-        // 同一个相对路径会指到两个文件 —— 那是「写」才有的风险。
+        // A relative path must be refused (**true only for write/delete**): the host and
+        // the plugin subprocess have different cwds, so the same relative path points at
+        // two different files — a risk that only "writing" carries.
         let rel = rt_ws
             .execute("write_file", json!({"path": "config.toml", "content": "x"}))
             .await;
         if !rel.is_error {
-            bail!("受限档位下**写**的相对路径没被拒");
+            bail!(crate::i18n::t("a **write** with a relative path was not rejected under the restricted tier"));
         }
-        // 新语义（2026-10-04）：**读不设限、写删受限**。两条一起对拍 ——
-        // 只测一边的话，「读通过了」也可能只是因为读压根没走判定（那是实现漏了，不是语义对）。
+        // New semantics (2026-10-04): **reads unrestricted, writes/deletes restricted**.
+        // Cross-check both together — testing only one side means "read passed" could just
+        // be because reading never went through the check at all (an implementation leak,
+        // not correct semantics).
         std::fs::write(&outside_read, "区外的内容")?;
         let rd = rt_ws.execute("read_file", json!({"path": outside_read.to_string_lossy()})).await;
         if rd.is_error || !rd.content.contains("区外的内容") {
-            bail!("受限档位下读区外文件失败（读应当不设限）: {}", rd.content);
+            bail!(crate::tf!("reading an outside file failed under the restricted tier (reads should be unrestricted): {}", rd.content));
         }
         let rm = rt_ws.execute("remove", json!({"path": outside_read.to_string_lossy()})).await;
         if !rm.is_error {
-            bail!("受限档位下删区外文件没被拦下");
+            bail!(crate::i18n::t("deleting an outside file was not intercepted under the restricted tier"));
         }
         if !outside_read.exists() {
-            bail!("区外删除被拒了，但文件真的被删了 —— 这个边界是假的");
+            bail!(crate::i18n::t("the outside delete was rejected, but the file was really deleted — this boundary is fake"));
         }
-        println!("[selftest]   读区外放行 / 删区外拦截: 对拍通过");
+        println!("{}", crate::i18n::t("[selftest]   read outside allowed / delete outside blocked: cross-check passed"));
         let _ = std::fs::remove_file(&outside_read);
 
-        // ── B：对照组（full）—— 同一个越界调用必须成功，A 的拦截才归因于工作区 ──
+        // ── B: the control group (full) — the same out-of-bounds call must succeed, so
+        // that A's interception can be attributed to the workplace ──
         let mut cfg_full = Config::dummy();
         cfg_full.workplace = crate::config::WorkplaceConfig { mode: "full".into(), root: None };
         let rt_full = Runtime::new(cfg_full, ws_root.clone(), ws_root.join("plugins"))?;
@@ -427,57 +447,60 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
             rt_full.register(t).await?;
         }
         if rt_full.workplace.active_root().is_some() {
-            bail!("full 档位不该有工作区根");
+            bail!(crate::i18n::t("the full tier must not have a workspace root"));
         }
         let ok = rt_full
             .execute("write_file", json!({"path": outside.to_string_lossy(), "content": "x"}))
             .await;
         if ok.is_error {
-            bail!(
-                "对照组失败：full 档位下同一个路径也写不了 ⇒ 上面「越界被拦」不能归因于工作区 —— {}",
+            bail!(crate::tf!(
+                "control group failed: under the full tier the same path cannot be written either ⇒ the \"out-of-bounds blocked\" above cannot be attributed to the workspace — {}",
                 ok.content
-            );
+            ));
         }
         if !outside.exists() {
-            bail!("对照组报告写入成功，但文件不在");
+            bail!(crate::i18n::t("the control group reported a successful write, but the file is not there"));
         }
         let _ = std::fs::remove_dir_all(&ws_root);
         let _ = std::fs::remove_file(&outside);
     }
 
-    // 插件声明的**工作区意图**（工具声明的第 4 位）一路从 SDK 到注册表。
+    // The plugin-declared **workplace intent** (the 4th position in a tool declaration)
+    // travels all the way from the SDK to the registry.
     //
-    // 这一段补的是别处测不到的**中间那一跳**：解析规则（`plugin::parse_access` 的单测）、
-    // 边界怎么用它（`agent` 的单测）各自都覆盖了，但「插件在 initialize 里写的 access
-    // 最终有没有变成注册表上的意图」只能在这里验 —— 它横跨 Python SDK、协议解析、
-    // ToolDef、PluginTool 四层，任何一层漏了都会静默退回「落盘」。
-    println!("[selftest] 回归：插件声明的 read 意图…");
+    // This section fills in the **middle hop** that can't be tested elsewhere: the parse
+    // rules (`plugin::parse_access`'s unit test) and how the boundary uses it (`agent`'s
+    // unit test) are each covered, but "did the access a plugin wrote in initialize
+    // actually become the intent on the registry" can only be verified here — it spans
+    // four layers: the Python SDK, protocol parsing, ToolDef and PluginTool, and a gap in
+    // any one of them silently falls back to "writes to disk".
+    println!("{}", crate::i18n::t("[selftest] regression: plugin-declared read intent…"));
     {
         let tools =
-            plugin::create_plugin(&rt, "selftest_read", "python", "只读声明自检", READ_DECL_SOURCE)
+            plugin::create_plugin(&rt, "selftest_read", "python", crate::i18n::t("read-only declaration selftest"), READ_DECL_SOURCE)
                 .await?;
         for t in ["selftest_read_scan", "selftest_read_write"] {
             if !tools.contains(&t.to_string()) {
-                bail!("{t} 未注册（已注册: {tools:?}）");
+                bail!(crate::tf!("{} is not registered (registered: {})", t, format!("{tools:?}")));
             }
         }
-        // A：声明了 read ⇒ 注册表上的意图必须是 Read
+        // A: declared read ⇒ the registry intent must be Read
         let a = rt.tool_access("selftest_read_scan").await;
         if a != crate::workplace::Access::Read {
-            bail!(
-                "声明了 \"read\" 的工具在注册表上不是只读（拿到了 {a:?}）—— \
-                 先查 Python SDK 的 `_tool_entry` 有没有把第 4 位发出来"
-            );
+            bail!(crate::tf!(
+                "a tool that declared \"read\" is not read-only in the registry (got {}) — first check whether the Python SDK's `_tool_entry` sends the 4th position",
+                format!("{a:?}")
+            ));
         }
-        // B：没声明 ⇒ 仍是落盘。老插件的行为一个字节都不许变 ——
-        //    这条如果松了，等于悄悄放开了所有已有的写类插件。
+        // B: not declared ⇒ still falls back to "writes to disk". Old plugins' behavior must not change by a single byte —
+        //    if this loosens, it silently opens up all existing write-class plugins.
         let b = rt.tool_access("selftest_read_write").await;
         if b != crate::workplace::Access::Write {
-            bail!("没声明 access 的工具被当成了只读（拿到了 {b:?}）—— 这会静默放松写边界");
+            bail!(crate::tf!("a tool without an access declaration was treated as read-only (got {}) — this silently loosens the write boundary", format!("{b:?}")));
         }
-        println!("[selftest]   声明 read → Read；未声明 → Write: 对拍通过");
+        println!("{}", crate::i18n::t("[selftest]   declared read → Read; undeclared → Write: cross-check passed"));
     }
 
-    println!("[selftest] 全部通过 ✔");
+    println!("{}", crate::i18n::t("[selftest] all checks passed ✔"));
     Ok(())
 }

@@ -1,51 +1,69 @@
-//! 活动流：住在**独立窗口**里（egui 的 viewport），不在主窗口的右侧栏。
+//! Activity stream: lives in its **own window** (an egui viewport), not in the
+//! main window's side panel.
 //!
-//! 为什么要共享状态：eframe 的 `AppCreator` 是 `FnOnce`，每个视口一份 `App` 实例，
-//! 子窗口拿不到主窗口 `App` 的 `&mut self`。所以活动流要用的东西全放在
-//! [`Activity`] 里，用 `Arc<Mutex<_>>` 两边共享 —— 主窗口只管往里写，
-//! 子窗口只管读和渲染。
+//! Why share state: eframe's `AppCreator` is `FnOnce`, and each viewport gets its
+//! own `App` instance, so the child window can't reach the main window's `App`
+//! through a `&mut self`. Everything the activity stream needs therefore lives in
+//! [`Activity`], shared between the two sides via `Arc<Mutex<_>>` — the main
+//! window only writes, the child window only reads and renders.
 //!
-//! 窗口是个**无系统装饰的顶层窗口**（就是「小 AOX」，初始尺寸与主窗口一致）。
-//! 也就是说 Windows 那条自带的白底（深色下是黑底）标题栏 —— 图标、标题、
-//! 最小化 / 最大化 / 关闭 —— 一律不显示，整条顶栏由这里自绘。
+//! The window is a **borderless top-level window** (a "mini AOX", initially the
+//! same size as the main window). That means Windows' built-in title bar — icon,
+//! title, minimize / maximize / close — is gone entirely; this module draws the
+//! whole top bar itself.
 //!
-//! 代价是系统那几样现成的东西也没了，得自己补：
-//! - **拖动**：顶栏按住即发 [`ViewportCommand::StartDrag`]。
-//! - **缩放**：四边四角各埋一条拖拽热区（[`resize_handles`]），按下时把方向交给 winit。
-//! - **最大化**：顶栏多一枚按钮（关掉系统栏后，双击标题栏、Win+↑ 这些也就没了）。
-//! - **边界**：无装饰窗口和桌面之间没有分界线，所以最后描一圈一像素的边。
-//! - **圆角**：不想自绘（透明视口会把系统阴影一起弄丢），而是让 DWM 裁 ——
-//!   见 [`set_round_corners`]。半径与主窗口一致。
+//! The cost is that the system-provided niceties are gone too and must be rebuilt:
+//! - **Drag**: press on the top bar to send [`ViewportCommand::StartDrag`].
+//! - **Resize**: a drag hot-zone is embedded along each edge and corner
+//!   ([`resize_handles`]); on press the direction is handed to winit.
+//! - **Maximize**: an extra button on the top bar (once the system bar is gone,
+//!   double-clicking the title bar, Win+↑, etc. stop working too).
+//! - **Border**: with no decoration there's no seam between the borderless window
+//!   and the desktop, so a 1px outline is drawn around it at the end.
+//! - **Rounded corners**: instead of drawing them ourselves (a transparent
+//!   viewport would also lose the system shadow), we let DWM clip them — see
+//!   [`set_round_corners`]. Radius matches the main window.
 //!
-//! # 主体：一条横向时间轴（甘特图）
+//! # Core: one horizontal timeline (a Gantt chart)
 //!
 //! ```text
 //!  0.0s      2.0s      4.0s      6.0s     8.0s
 //!    │         │         │         │        │
 //!  ①          ②
-//! 输入 ▐███▌        ▐███▌
-//! 模型      ▐█████▌        ▐███████████▌
+//! Input       ▐███▌        ▐███▌
+//! Model       ▐█████▌        ▐███████████▌
 //! filestat_count  ▐██▌
 //! create_plugin        ▐███▌
-//! 系统                ▐▌
+//! System              ▐▌
 //! ```
 //!
-//! - **横轴是时间（秒）**，任务自左向右推进；每一枚色块条就是一段真实耗时。
-//! - 行是固定的两行「输入 / 模型」，之后**每个工具各占一行**，最后按需多一行「系统」。
-//! - 横轴可以随意缩放（Ctrl+滚轮 / 工具栏 ±）、左右平移（拖动 / 滚轮）。
-//! - 纵轴：工具行多到摊不下时**由纵向滚动接管**（Shift+滚轮或最右边的滚动条），
-//!   行高本身也能拉（工具栏「行高 −/＋」），不会为了塞进一屏把行压到看不清。
-//! - 左上的锚点按钮把视图钉在「起点 / 居中 / 最新」；「轮次」可以直接跳到第 N 轮。
-//! - 打开「连接线」后，各条色块按真实执行顺序被一根线首尾相连，线色取自出发色块。
+//! - **The horizontal axis is time (seconds)**; tasks march left to right, and
+//!   each colored block is a stretch of real elapsed time.
+//! - Rows are the two fixed rows "Input / Model", then **one row per tool**, and
+//!   finally an extra "System" row when needed.
+//! - The horizontal axis can be zoomed freely (Ctrl+wheel / toolbar ±) and panned
+//!   left/right (drag / wheel).
+//! - The vertical axis: when there are too many tool rows to fit, **vertical
+//!   scrolling takes over** (Shift+wheel or the scrollbar on the far right); row
+//!   height itself can also be stretched (toolbar "row height −/+") — we don't
+//!   squash rows unreadably just to fit one screen.
+//! - The anchor button at top-left pins the view to "start / center / latest"; the
+//!   "round" field jumps straight to round N.
+//! - With "link lines" on, the blocks are joined head-to-tail in true execution
+//!   order by one line, colored after the block it leaves.
 //!
-//! **空闲不记录**：只有一轮任务执行期间才会往这里写东西。程序闲着的时候，
-//! 时间轴上一个像素都不长。
+//! **Idle means nothing is recorded**: we only ever write here while a round of
+//! work is running. When the program is idle, not a single pixel grows on the
+//! timeline.
 //!
-//! **记录随对话走**：每一轮结束，这一轮新增的色块会被交给 Agent 线程追加进
-//! **这段对话自己的那个 `history/*.jsonl`**（`kind:"act"` 行，见 `aox::history`）。
-//! 于是「打开一段旧对话」能看到它当时的时间轴，「删掉这段对话」时间轴也跟着没了 ——
-//! 不需要任何额外的清理逻辑。也正因为如此，这里**没有「清空」按钮**：清界面不清文件，
-//! 下次打开它又长回来，那才是真的说不清。
+//! **Records travel with the conversation**: at the end of each round, the new
+//! blocks are handed to the Agent thread to append to **that conversation's own
+//! `history/*.jsonl`** (`kind:"act"` rows, see `aox::history`). So "open an old
+//! conversation" shows its timeline as it was then, and "delete that conversation"
+//! takes the timeline with it — no extra cleanup logic needed. For the same
+//! reason there is **no "clear" button** here: clearing the UI but not the file
+//! would just let it grow back next time you open it, which is the truly
+//! confusing case.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -62,21 +80,22 @@ use serde::{Deserialize, Serialize};
 use crate::app::default_window_size;
 use crate::theme::{self, P};
 
-// ────────────────────────────── 类别 ──────────────────────────────
+// ────────────────────────────── Category ──────────────────────────────
 
-/// 记录类别。带 `Serialize` 是为了落盘（见 [`Activity::export_acts`]）：
-/// 存进对话文件的那一份用 `snake_case` 的名字（`input` / `tool` …），
-/// 而不是 Rust 里的枚举名 —— 文件是给人看也给别的工具看的。
+/// Recording category. `Serialize` is here for persistence (see
+/// [`Activity::export_acts`]): the copy written to the conversation file uses
+/// `snake_case` names (`input` / `tool` …) rather than the Rust enum names —
+/// the file is meant for humans and other tools to read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActKind {
-    /// 用户下达的指令：一轮任务的起点
+    /// User-issued instruction: the start of one round of work
     Input,
-    /// 模型侧的活动（思考 + 产出）
+    /// Activity on the model side (thinking + output)
     Model,
-    /// 一次工具调用（调用 → 执行 → 返回是同一段）
+    /// One tool call (call → execute → return is a single segment)
     Tool,
-    /// 授权请求 / 结果
+    /// Authorization request / result
     Auth,
     Info,
     Warn,
@@ -84,21 +103,22 @@ pub enum ActKind {
 }
 
 impl ActKind {
-    /// 徽标上的名字
+    /// Name shown on the badge
     pub fn label(self) -> &'static str {
         match self {
-            ActKind::Input => "输入",
-            ActKind::Model => "模型",
-            ActKind::Tool => "工具",
-            ActKind::Auth => "授权",
-            ActKind::Info => "信息",
-            ActKind::Warn => "警告",
-            ActKind::Error => "错误",
+            ActKind::Input => aox::i18n::t("Input"),
+            ActKind::Model => aox::i18n::t("Model"),
+            ActKind::Tool => aox::i18n::t("Tool"),
+            ActKind::Auth => aox::i18n::t("Auth"),
+            ActKind::Info => aox::i18n::t("Info"),
+            ActKind::Warn => aox::i18n::t("Warning"),
+            ActKind::Error => aox::i18n::t("Error"),
         }
     }
 
-    /// 色块基色。低饱和暖色系，与代码高亮同一套语言：
-    /// 输入是灰、模型是紫、工具是橙，其余（授权/提示/异常）落在暖黄与砖红上。
+    /// Base color of the block. A low-saturation warm palette, the same language
+    /// as code highlighting: input is gray, model is purple, tools are orange, the
+    /// rest (auth / notice / error) sit in warm yellow and brick red.
     fn color(self) -> Color32 {
         match theme::mode() {
             theme::Mode::Light => match self {
@@ -122,7 +142,7 @@ impl ActKind {
         }
     }
 
-    /// 工具调用失败 / 错误事件的砖红（覆盖类别色）
+    /// Brick red for failed tool calls / error events (overrides the category color)
     fn failed_color() -> Color32 {
         match theme::mode() {
             theme::Mode::Light => Color32::from_rgb(0xA3, 0x4A, 0x2A),
@@ -130,18 +150,18 @@ impl ActKind {
         }
     }
 
-    /// 正文用等宽（参数、结果、错误都是代码或数据）
+    /// Body uses monospace (parameters, results, errors are all code or data)
     fn mono(self) -> bool {
         matches!(self, ActKind::Tool | ActKind::Auth | ActKind::Error)
     }
 
-    /// 落在「系统」行
+    /// Lands on the "System" row
     fn is_sys(self) -> bool {
         matches!(self, ActKind::Auth | ActKind::Info | ActKind::Warn | ActKind::Error)
     }
 }
 
-/// 时间轴的行。前两行固定，工具各占一行（按首次出现的顺序），「系统」按需出现。
+/// Rows of the timeline. The first two rows are fixed, each tool gets its own row (in first-seen order), and "System" appears as needed.
 #[derive(Clone, PartialEq, Eq)]
 enum Row {
     Input,
@@ -153,21 +173,22 @@ enum Row {
 impl Row {
     fn label(&self) -> &str {
         match self {
-            Row::Input => "输入",
-            Row::Model => "模型",
+            Row::Input => aox::i18n::t("Input"),
+            Row::Model => aox::i18n::t("Model"),
             Row::Tool(t) => t,
-            Row::Sys => "系统",
+            Row::Sys => aox::i18n::t("System"),
         }
     }
 
-    /// 行名的字体：工具名是标识符，用等宽；其余用正文字体
+    /// Font for the row name: tool names are identifiers, so monospace; the rest use the body font
     fn dim(&self) -> bool {
         matches!(self, Row::Input | Row::Sys)
     }
 }
 
-/// 由当前记录推出行表。工具行的顺序 = 首次出现顺序，所以中途冒出新工具时，
-/// 已有行不会重排（眼睛不会被跳来跳去的行带跑）。
+/// Derive the row list from the current records. Tool rows follow first-seen
+/// order, so when a new tool appears mid-stream the existing rows don't
+/// reshuffle (the eye won't be thrown off by rows jumping around).
 fn rows_of(acts: &VecDeque<Act>) -> Vec<Row> {
     let mut rows = vec![Row::Input, Row::Model];
     for a in acts {
@@ -194,38 +215,41 @@ fn row_of(rows: &[Row], a: &Act) -> usize {
     }
 }
 
-// ────────────────────────────── 数据 ──────────────────────────────
+// ────────────────────────────── Data ──────────────────────────────
 
-/// 活动流里的一条记录 = 时间轴上的一枚色块。
+/// One record in the activity stream = one colored block on the timeline.
 ///
-/// 带 serde 是因为它要**落盘**（存进对话文件，见 [`Activity::export_acts`]）：
-/// 关掉程序再打开那段对话，时间轴要能原样长回来。落盘的是「相对那次会话开始时
-/// 刻的秒数」，装回来时会整批平移（见 [`Activity::load_acts`]）。
+/// serde is here because it must **persist** (written to the conversation file,
+/// see [`Activity::export_acts`]): after closing and reopening that conversation,
+/// the timeline should grow back exactly as it was. What's persisted is "seconds
+/// relative to the start of that session"; on load it's shifted as a batch (see
+/// [`Activity::load_acts`]).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Act {
     kind: ActKind,
-    /// 属于第几轮（用户第 N 次下达指令）
+    /// Which round this belongs to (the user's Nth issued instruction)
     round: u32,
-    /// 插件名（工具调用有）。同一插件的工具用同一族色的不同深浅。
+    /// Plugin name (present for tool calls). Tools of the same plugin share one color family
+    /// at different shades.
     plugin: String,
-    /// 起始时刻（秒，应用启动以来的绝对时间）
+    /// Start time (seconds, absolute time since the app launched)
     at: f32,
-    /// 结束时刻。`None` = 还在进行中，色块随时间实时变长。
+    /// End time. `None` = still in progress, the bar grows in real time.
     end: Option<f32>,
     failed: bool,
     title: String,
     body: String,
-    /// 稳定序号：色块点击、详情面板都靠它
+    /// Stable sequence number: used by block clicks and the detail panel
     seq: u64,
 }
 
 impl Act {
-    /// 这一条在轴上的时长；仍在进行中就算到「现在」
+    /// Duration of this entry on the axis; if still running, count up to "now"
     fn dur(&self, now: f32) -> f32 {
         (self.end.unwrap_or(now) - self.at).max(0.0)
     }
 
-    /// 结束时刻；进行中的用 `now` 顶上
+    /// End time; for in-progress entries fall back to `now`
     fn end_t(&self, now: f32) -> f32 {
         self.end.unwrap_or(now).max(self.at)
     }
@@ -235,25 +259,25 @@ impl Act {
     }
 }
 
-/// 最多留多少条。超了从头丢：活动流是「近期过程」，不是日志归档。
+/// How many entries to keep at most. Overflow drops from the front: the stream is "recent activity", not a log archive.
 const ACT_LIMIT: usize = 600;
-/// 模型那一段的正文最多留这么多字节（只看尾部，前面截掉）
+/// The model segment's body keeps at most this many bytes (only the tail; the front is dropped)
 const NOTE_CAP: usize = 4000;
-/// 装回存档时，让最后一条结束在「现在」之前多久（秒）。留一点空，新一轮
-/// 才不会紧贴着旧记录长出来。
+/// When reloading a save, how long before "now" the last entry should end (seconds). Leave
+/// a little gap so the new round doesn't grow right on top of the old records.
 const START_GAP: f32 = 0.4;
 
-/// 视图锚点：决定左边缘对齐到哪一刻
+/// View anchor: decides which moment the left edge aligns to
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 enum Anchor {
-    /// 起点固定在左侧
+    /// Start pinned to the left
     Start,
-    /// 「当前」固定在正中
+    /// "Current" pinned to the center
     Center,
-    /// 「当前」贴在最右侧（跟着任务走）
+    /// "Current" hugs the right edge (follows the task)
     #[default]
     Latest,
-    /// 用户自己拖到的地方
+    /// Wherever the user dragged to
     Free,
 }
 
@@ -261,59 +285,59 @@ enum Anchor {
 pub struct Activity {
     acts: VecDeque<Act>,
     next_seq: u64,
-    /// 「已落盘」水位：`seq` 不大于它的记录已经在对话文件里了（见 `export_acts`）。
+    /// The "flushed" watermark: records whose `seq` is no greater than this are already in the conversation file (see `export_acts`).
     flushed: u64,
-    /// 时间原点：第一条记录的时刻。横轴上的 0.0s 就是它。
+    /// Time origin: the moment of the first record. 0.0s on the axis is this.
     t_zero: Option<f32>,
-    /// 当前是第几轮
+    /// Current round number
     round: u32,
     open_input: Option<u64>,
     open_model: Option<u64>,
     open_tool: Option<u64>,
-    /// 用户点选的色块
+    /// The block the user selected
     selected: Option<u64>,
 
     status: String,
     busy: bool,
     started: Option<Instant>,
-    /// 主窗口的时间基准（秒），用来给「进行中」的色块算实时长度
+    /// The main window's time base (seconds), used to compute real-time length for "in-progress" blocks
     now: f32,
 
     open: bool,
     pinned: bool,
     applied_top: bool,
     theme_mode: Option<theme::Mode>,
-    /// 尺寸与位置是否已经摆过一次（见 `sync` 里那段注释）
+    /// Whether size and position have been set once (see the note in `sync`)
     placed: bool,
-    /// 圆角是否已经交代过系统（同样是「一扇窗口只做一次」的事）
+    /// Whether rounded corners have been handed to the system (also a "do once per window" thing)
     corners: bool,
-    /// 呼吸圆点用的相位
+    /// Phase for the breathing dot
     spin: f32,
 
-    // ── 时间轴视图 ──
+    // ── Timeline view ──
     anchor: Anchor,
-    /// 每秒多少像素。`None` = 还没手动调过，用默认（一屏 60 秒）
+    /// Pixels per second. `None` = not manually tuned yet, use the default (60s per screen)
     scale: Option<f32>,
-    /// `Anchor::Free` 时左边缘的时刻（相对 `t_zero`，秒）
+    /// When `Anchor::Free`, the moment at the left edge (relative to `t_zero`, seconds)
     t0: f32,
-    /// 是否画连接线
+    /// Whether to draw link lines
     link: bool,
-    /// 行高：`None` = 按可用高度自动铺满（工具行多到摊不下时由纵向滚动接管）
+    /// Row height: `None` = auto-fill by available height (when too many tool rows to fit, vertical scroll takes over)
     row_h: Option<f32>,
-    /// 待执行的行高倍率（工具栏不知道怎么算「铺满」，和 `pending_zoom` 同理）
+    /// Pending row-height multiplier (the toolbar can't compute "fill", same as `pending_zoom`)
     pending_row: Option<f32>,
-    /// 「按轮次查看」的输入框
+    /// Input box for "view by round"
     round_input: String,
-    /// 待执行的跳转（工具栏排队，等时间轴拿到绘图宽度后再执行）
+    /// Pending jump (queued by the toolbar, executed once the timeline knows its draw width)
     goto: Option<u32>,
-    /// 待执行的缩放倍率（同上：工具栏不知道绘图宽度）
+    /// Pending zoom factor (same as above: the toolbar doesn't know the draw width)
     pending_zoom: Option<f32>,
-    /// 待执行的「整段铺满」
+    /// Pending "fit the whole span"
     fit_all: bool,
 }
 
 impl Activity {
-    /// 时间原点（相对时间 = 绝对时间 - t_zero）
+    /// Time origin (relative time = absolute time - t_zero)
     fn tz(&self) -> f32 {
         self.t_zero.unwrap_or(0.0)
     }
@@ -327,7 +351,7 @@ impl Activity {
         self.acts.iter_mut().rev().find(|a| a.seq == seq)
     }
 
-    /// 记一条。返回它的序号。
+    /// Record one entry. Returns its sequence number.
     fn push(&mut self, mut a: Act) -> u64 {
         let seq = self.next_seq();
         a.seq = seq;
@@ -341,7 +365,7 @@ impl Activity {
         seq
     }
 
-    /// 收掉某一条（只补结束时刻，不改别的）
+    /// Close one entry (only fills in its end time, changes nothing else)
     fn end_act(&mut self, seq: u64, at: f32) {
         if let Some(a) = self.find(seq) {
             if a.end.is_none() {
@@ -362,7 +386,7 @@ impl Activity {
         }
     }
 
-    /// 收掉所有还开着的段
+    /// Close all still-open segments
     fn close_open(&mut self, at: f32) {
         self.close_input(at);
         self.close_model(at);
@@ -371,10 +395,11 @@ impl Activity {
         }
     }
 
-    // ── 写入（主窗口调用） ──
+    // ── Writing (called by main window) ──
 
-    /// 一轮开始：用户下达指令。「输入」这一段 = 从发出到模型真正开口，
-    /// 也就是「等模型的时间」。
+    /// A round begins: the user issues an instruction. The "Input" segment = from
+    /// sending to when the model actually starts speaking — i.e. the "wait for the
+    /// model" time.
     pub fn round_begin(&mut self, text: &str, at: f32) {
         self.close_open(at);
         self.round += 1;
@@ -385,17 +410,17 @@ impl Activity {
             at,
             end: None,
             failed: false,
-            title: "用户指令".to_owned(),
+            title: aox::i18n::t("User instruction").to_owned(),
             body: text.to_owned(),
             seq: 0,
         });
         self.open_input = Some(seq);
     }
 
-    /// 模型开始产出（第一段思考 / 正文）。也负责把「输入」那一段收掉。
+    /// The model starts producing (first thinking / body). Also closes the "Input" segment.
     pub fn model_begin(&mut self, at: f32) {
         self.close_input(at);
-        // 工具在跑的时候不可能是模型在说话（工具是串行的）
+        // The model can't be speaking while a tool runs (tools are serial)
         if self.open_tool.is_some() || self.open_model.is_some() {
             return;
         }
@@ -406,29 +431,29 @@ impl Activity {
             at,
             end: None,
             failed: false,
-            title: "模型产出".to_owned(),
+            title: aox::i18n::t("Model output").to_owned(),
             body: String::new(),
             seq: 0,
         });
         self.open_model = Some(seq);
     }
 
-    /// 模型正在流式吐出的思考文本（只进详情面板，不影响时间轴）
+    /// The model is streaming out thinking text (only goes to the detail panel, doesn't affect the timeline)
     pub fn model_push(&mut self, chunk: &str) {
         let Some(seq) = self.open_model else { return };
         let Some(a) = self.find(seq) else { return };
         a.body.push_str(chunk);
         if a.body.len() > NOTE_CAP {
-            // 截在字符边界上：按字节切会把一个汉字劈成两半，`[..]` 直接 panic
+            // Cut on a character boundary: slicing by bytes would split a CJK char in half and `[..]` would panic
             let mut cut = a.body.len() - NOTE_CAP;
             while cut < a.body.len() && !a.body.is_char_boundary(cut) {
                 cut += 1;
             }
-            a.body = format!("…（前文省略）{}", &a.body[cut..]);
+            a.body = aox::tf!("…(earlier text trimmed){}", &a.body[cut..]);
         }
     }
 
-    /// 一次工具调用开始。「模型」那一段到此收尾。
+    /// One tool call starts. This also closes the "Model" segment.
     pub fn tool_begin(&mut self, tool: &str, plugin: Option<&str>, args: &str, at: f32) {
         self.close_input(at);
         self.close_model(at);
@@ -449,7 +474,7 @@ impl Activity {
         self.open_tool = Some(seq);
     }
 
-    /// 工具调用期间追加一句（如「超时上限 30s」）
+    /// Append a line during a tool call (e.g. "timeout limit 30s")
     pub fn tool_note(&mut self, note: &str) {
         let Some(seq) = self.open_tool else { return };
         if let Some(a) = self.find(seq) {
@@ -461,7 +486,7 @@ impl Activity {
         }
     }
 
-    /// 工具调用收尾：补上耗时、结果与成败
+    /// Tool call wraps up: fill in the duration, result, and success/failure
     pub fn tool_end(&mut self, is_error: bool, preview: &str, at: f32) {
         let Some(seq) = self.open_tool.take() else { return };
         if let Some(a) = self.find(seq) {
@@ -471,15 +496,16 @@ impl Activity {
                 if a.body.trim().is_empty() {
                     a.body = preview.to_owned();
                 } else {
-                    a.body.push_str("\n\n── 结果 ──\n");
+                    a.body.push_str(aox::i18n::t("\n\n── Result ──\n"));
                     a.body.push_str(preview);
                 }
             }
         }
     }
 
-    /// 系统事件（信息 / 警告 / 错误 / 授权）—— 瞬时的一条，落在「系统」行。
-    /// **只在一轮任务执行期间记**：程序闲着时不往时间轴上写任何东西。
+    /// System event (info / warning / error / auth) — a transient entry, lands on the "System" row.
+    /// **Only recorded while a round of work is running**: when the program is idle nothing is
+    /// written to the timeline.
     pub fn note(&mut self, kind: ActKind, title: &str, body: &str, at: f32) {
         self.push(Act {
             kind,
@@ -494,12 +520,12 @@ impl Activity {
         });
     }
 
-    /// 一轮结束：把还开着的段全收掉
+    /// A round ends: close all still-open segments
     pub fn end_round(&mut self, at: f32) {
         self.close_open(at);
     }
 
-    /// 每帧同步：时间基准 + 现在在干什么
+    /// Per-frame sync: time base + what's happening right now
     pub fn tick(&mut self, now: f32, status: &str, busy: bool) {
         if busy && !self.busy {
             self.started = Some(Instant::now());
@@ -512,11 +538,12 @@ impl Activity {
         self.status = status.to_owned();
     }
 
-    /// 把时间轴清空（换对话时用）。
+    /// Clear the timeline (used when switching conversations).
     ///
-    /// **刻意不对外提供「清空」按钮**：活动流是这段对话记录的一部分，
-    /// 删它只能通过删那段对话来做 —— 否则界面上清掉了、文件里还留着，
-    /// 下次打开这段对话它又长回来，那才叫不可理解。
+    /// **Deliberately no "Clear" button is exposed**: the activity stream is part of this
+    /// conversation's record, so it can only be removed by deleting that conversation — otherwise
+    /// the UI clears it but the file still holds it, and reopening the conversation grows it back,
+    /// which would be genuinely incomprehensible.
     pub fn reset(&mut self) {
         self.acts.clear();
         self.open_input = None;
@@ -537,10 +564,12 @@ impl Activity {
         self.round_input.clear();
     }
 
-    /// 取走还没落盘的那些记录（序列化成 JSON），并把水位推到最新。
+    /// Take the records that haven't been persisted yet (serialized to JSON) and advance the
+    /// watermark to the latest.
     ///
-    /// **按轮调用**：中途半截的段（还开着的色块）落下去就成了「没有结束时刻」的
-    /// 残记录，中途回滚时也没法把它收回来。等一轮结束、所有段都闭上了再一次性给。
+    /// **Call per round**: if we flushed a half-finished segment (a block still open), it would
+    /// land as a "no end time" stub that can't be recovered on a mid-way rollback. So we hand it
+    /// all over only after a round ends and every segment is closed.
     pub fn export_acts(&mut self) -> Vec<serde_json::Value> {
         let mut out = Vec::new();
         for a in &self.acts {
@@ -556,11 +585,14 @@ impl Activity {
         out
     }
 
-    /// 把一段存档对话的活动流装回来（切到那段对话时调）。
+    /// Load a saved conversation's activity stream back (called when switching to that
+    /// conversation).
     ///
-    /// `now` = **本次启动**以来的秒数。存档里的时刻是上一次启动的坐标系，直接装进来
-    /// 会和现在的 `now` 差出一大截，新长出来的色块要么跑到视野外、要么把旧记录挤没。
-    /// 所以整批平移：让最后一条结束在 `now` 稍前一点，接着聊时新一轮自然从右边继续。
+    /// `now` = seconds since **this launch**. The save's timestamps come from the last launch's
+    /// coordinate system; loading them directly would be far off from the current `now`, so the
+    /// new blocks would either fly off-screen or shove the old records out. So we shift the whole
+    /// batch: end the last entry slightly before `now`, and the next round naturally continues
+    /// from the right.
     pub fn load_acts(&mut self, rows: &[serde_json::Value], now: f32) {
         self.reset();
         let acts: Vec<Act> = rows
@@ -581,14 +613,14 @@ impl Activity {
             a.end = a.end.map(|e| e + shift);
             round = round.max(a.round);
             top_seq = top_seq.max(a.seq);
-            // 直接塞进队列（不走 `push`）：序号是存档里带的，重编会让
-            // 「水位」和文件的对应关系错位。
+            // Push straight into the queue (not via `push`): the sequence numbers come from the
+            // save, and renumbering would desync the watermark from the file.
             self.acts.push_back(a);
         }
         self.round = round;
         self.next_seq = top_seq;
         self.flushed = top_seq;
-        // 坐标原点跟着这一批走：轴上的 0.0s = 存档里最早的那一刻
+        // The origin follows this batch: 0.0s on the axis = the earliest moment in the save
         self.t_zero = Some(earliest + shift);
         self.anchor = Anchor::Latest;
         if self.acts.len() > ACT_LIMIT {
@@ -601,22 +633,23 @@ impl Activity {
         self.open
     }
 
-    /// 「这扇窗口已经没了」。所有**一扇窗口只做一次**的初始化都要在这里作废，
-    /// 下次再开才会重做 —— 现在有两样：摆尺寸位置（`placed`）、
-    /// 交代系统画圆角（`corners`，圆角是挂在 HWND 上的，窗口没了就一起没了）。
+    /// "This window is gone". Every **do-once-per-window** initialization must be invalidated
+    /// here, so it gets redone next time the window opens — currently two things: placing the
+    /// size and position (`placed`), and telling the system to draw rounded corners (`corners`,
+    /// since the rounding is attached to the HWND and vanishes with the window).
     fn forget_placement(&mut self) {
         self.placed = false;
         self.corners = false;
     }
 
-    /// 直接把窗口打开（演示模式预览用；正常路径走 [`toggle`]）。
+    /// Open the window directly (used for the demo-mode preview; the normal path goes through [`toggle`]).
     pub fn force_open(&mut self) {
         self.open = true;
         self.spin = 0.0;
         self.forget_placement();
     }
 
-    /// 当前被选中的那条；没选就取最新一条
+    /// The currently selected one; if none selected, take the latest
     fn focused(&self) -> Option<&Act> {
         match self.selected {
             Some(seq) => {
@@ -626,7 +659,7 @@ impl Activity {
         }
     }
 
-    /// 全部记录的时间范围（相对秒）
+    /// The time range covered by all records (relative seconds)
     fn span(&self) -> (f32, f32) {
         let tz = self.tz();
         let mut lo = f32::MAX;
@@ -642,7 +675,7 @@ impl Activity {
         }
     }
 
-    /// 把视图对准第 `r` 轮
+    /// Aim the view at round `r`
     fn fit_round(&mut self, r: u32, plot_w: f32) {
         let tz = self.tz();
         let now = self.now;
@@ -668,7 +701,7 @@ impl Activity {
         }
     }
 
-    /// 让 `[lo, hi]` 这段铺满绘图区
+    /// Make the `[lo, hi]` span fill the plot area
     fn fit_range(&mut self, lo: f32, hi: f32, plot_w: f32) {
         let span = (hi - lo).clamp(0.2, 1.0e7);
         self.anchor = Anchor::Free;
@@ -683,8 +716,8 @@ pub fn new_shared() -> Shared {
     Arc::new(Mutex::new(Activity::default()))
 }
 
-/// 取锁。上一次 panic 会把锁毒死，这里直接 recovering —— 一个窗口崩了不该
-/// 让整个程序的活动流一起死。
+/// Take the lock. A previous panic poisons it; recover directly here — one window crashing should not
+/// take the whole program's activity stream down with it.
 pub fn lock(a: &Shared) -> MutexGuard<'_, Activity> {
     a.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -693,21 +726,21 @@ fn act_id() -> ViewportId {
     ViewportId::from_hash_of("aox-activity")
 }
 
-/// 窗口标题。两处在用：建视口时上报，以及事后按标题把 HWND 找回来设圆角
-/// （见 [`set_round_corners`]），所以必须只有一份。
-const WINDOW_TITLE: &str = "AOX 活动流";
+/// The window title. Used in two places: reported when building the viewport, and later used to find the HWND back by title to set rounded corners
+/// (see [`set_round_corners`]), so there must be exactly one copy.
+const WINDOW_TITLE: &str = "AOX Activity Stream";
 
-// ─────────────────────────── 窗口的开关 ───────────────────────────
+// ─────────────────────────── Window open/close ───────────────────────────
 
 const MIN_W: f32 = 860.0;
 const MIN_H: f32 = 520.0;
 
-/// 打开活动流窗口（幂等）。
+/// Open the activity-stream window (idempotent).
 ///
-/// 刻意**不做成开关**：设置页里那枚按钮写的是「打开活动流」，而**写着「打开」却会
-/// 关掉窗口**是最容易让人以为程序坏了的一种交互。窗口自带关闭按钮（右上角那枚 ×）、
-/// 也支持系统级的 Alt+F4，要关它有正经的路。已经开着时是空操作 ——
-/// egui 的子视口由每帧的 `sync` 声明，窗口会被带到前面来。
+/// Deliberately **not a toggle**: the button in the settings page says "Open activity stream", and a control **labelled "Open" that actually
+/// closes the window** is one of the most program-is-broken-feeling interactions. The window has its own close button (the × at top-right)
+/// and supports system-level Alt+F4, so there is a proper way to close it. When already open it is a no-op —
+/// egui's child viewports are declared by `sync` every frame, and the window gets brought to the front.
 pub fn open(ctx: &egui::Context, a: &Shared) {
     let mut st = lock(a);
     if st.open {
@@ -715,35 +748,36 @@ pub fn open(ctx: &egui::Context, a: &Shared) {
     }
     st.open = true;
     st.spin = 0.0;
-    st.forget_placement(); // 重新开一个窗口要重新摆位
+    st.forget_placement(); // reopening a window means placing it afresh
     drop(st);
     ctx.request_repaint();
 }
 
-/// 主窗口每帧调一次。
+/// Called once per frame by the main window.
 ///
-/// egui 的视口是「声明式」的：**这一轮没有声明的子视口会被直接丢掉**。
-/// 所以哪怕窗口正被最小化、没人碰它，也必须每帧重新声明一次。
+/// egui's viewports are "declarative": **a child viewport not declared this round is simply dropped**.
+/// So even while the window is minimized and untouched, it must be re-declared every frame.
 pub fn sync(ctx: &egui::Context, a: &Shared) {
     let mut st = lock(a);
     if !st.open {
         return;
     }
-    // 尺寸与位置**只在第一次声明时给**。
+    // Size and position are given **only on the first declaration**.
     //
-    // eframe 每帧都会拿新 builder 去 `patch` 旧 builder，凡是有变化的字段就下发成
-    // 命令（位置 → `OuterPosition`、尺寸 → `InnerSize`），个别字段甚至直接重建窗口。
-    // 所以「每帧都报一遍位置」等于每帧把窗口拽回原处 —— 表现为拖不动、缩放不生效、
-    // 置顶也丢。第二次起只报标题和 resizable 这类**恒定不变**的字段。
+    // Every frame eframe `patch`es the old builder with a new one, dispatching any changed field as a
+    // command (position → `OuterPosition`, size → `InnerSize`), and some fields even rebuild the window outright.
+    // So "reporting the position every frame" equals yanking the window back every frame — showing up as it not moving when dragged, resizing not working,
+    // and always-on-top being lost. From the second time on, report only **never-changing** fields like title and resizable.
     let fresh = !st.placed;
     st.placed = true;
 
     let mut b = ViewportBuilder::default()
-        .with_title(WINDOW_TITLE)
+        .with_title(aox::i18n::t(WINDOW_TITLE))
         .with_resizable(true)
-        // **不要系统装饰**：留着它就是顶上多一条 Windows 自带的标题栏
-        // （图标 + 标题 + 最小化/最大化/关闭），而我们顶栏里那套按钮是自绘的，
-        // 于是变成两条栏叠着。关掉之后拖动 / 缩放 / 最大化全部由 `window()` 自己接管。
+        // **No system decorations**: keeping them would just add a Windows-supplied title bar on top
+        // (icon + title + minimize/maximize/close), while our top bar's buttons are self-drawn,
+        // leaving two bars stacked. After turning it off, drag / resize / maximize are all taken over
+        // by `window()` itself.
         .with_decorations(false);
 
     if fresh {
@@ -762,21 +796,21 @@ pub fn sync(ctx: &egui::Context, a: &Shared) {
     ctx.show_viewport_deferred(act_id(), b, move |ctx, _| window(ctx, &a2));
 }
 
-/// 初始尺寸 = **主窗口的默认尺寸**（同一个公式，见 `app::default_window_size`）。
+/// Initial size = **the main window's default size** (the same formula, see `app::default_window_size`).
 ///
-/// `default_window_size` 要减掉「装饰占掉的那点厚度」（标题栏 + 边框），
-/// 算出来的才是**内容区**的尺寸。而活动流窗口自己已经没有装饰了，
-/// 它的 `outer - inner` 恒等于 0 —— 拿它算会凭空多出 46 点高度。
-/// 所以这里必须去问**主窗口**要装饰厚度，两边的内容区才对得上。
+/// `default_window_size` subtracts "the thickness decoration takes up" (title bar + border),
+/// and what it computes is the **content area** size. The activity-stream window itself has no decoration,
+/// so its `outer - inner` is always 0 — computing with it would add 46 points of height out of nowhere.
+/// So here we must ask the **main window** for the decoration thickness, for the two content areas to line up.
 fn initial_size(ctx: &egui::Context) -> Vec2 {
     let (mon, chrome) = ctx.input(|i| {
-        // 所有视口的信息都在 `raw.viewports` 里（eframe 每帧把整张表灌进来）
+        // All viewports' info is in `raw.viewports` (eframe fills the whole table in every frame)
         let root = i.raw.viewports.get(&ViewportId::ROOT);
         let mon = i.viewport().monitor_size.or_else(|| root.and_then(|v| v.monitor_size));
         let chrome = root
             .and_then(|v| Some(v.outer_rect?.size() - v.inner_rect?.size()))
             .filter(|c| c.x > 0.0 && c.y > 0.0)
-            // 取不到（首帧、或平台不给）就用一个保守的估计值
+            // If unavailable (first frame, or the platform doesn't provide it), use a conservative estimate
             .unwrap_or(Vec2::new(18.0, 46.0));
         (mon, chrome)
     });
@@ -786,12 +820,12 @@ fn initial_size(ctx: &egui::Context) -> Vec2 {
     default_window_size(mon, chrome)
 }
 
-/// 初始位置：与主窗口**同一个显示器居中**。窗口和主窗口一样大时，往旁边摆必然
-/// 摆不下，不如直接盖在中间、让用户自己挪。
+/// Initial position: centered on **the same monitor** as the main window. When the window is as large as the main one, placing it beside is bound
+/// to not fit, so it is better to lay it straight over the middle and let the user move it.
 ///
-/// 注意 `monitor_size` 给的是**尺寸**，egui 不暴露显示器的原点，所以只能按
-/// 「显示器左上角 = 屏幕原点」来算 —— 主显示器上这是对的，副显示器上会退化成
-/// 「摆到主显示器中间」，但至少不会被推到屏幕外面去。
+/// Note `monitor_size` gives a **size**; egui does not expose the monitor origin, so we can only compute by
+/// "monitor top-left = screen origin" — correct on the primary monitor, degrading on a secondary one to
+/// "placed at the middle of the primary monitor", but at least it is not pushed off-screen.
 fn initial_pos(ctx: &egui::Context, size: Vec2) -> Pos2 {
     let mon_size = ctx.input(|i| i.viewport().monitor_size).unwrap_or(Vec2::new(1920.0, 1080.0));
     let mon = Rect::from_min_size(Pos2::ZERO, mon_size);
@@ -802,56 +836,56 @@ fn initial_pos(ctx: &egui::Context, size: Vec2) -> Pos2 {
     )
 }
 
-// ═══════════════════════════ 布局刻度 ═══════════════════════════
+// ═══════════════════════════ Layout metrics ═══════════════════════════
 
 const HEADER_H: f32 = 52.0;
-/// 左侧行名那一栏的宽度（工具名可以很长，这一栏要留够，放不下再省略号）
+/// Width of the row-name gutter on the left (tool names can be long; leave enough, elide when it doesn't fit)
 const GUTTER: f32 = 182.0;
-/// 顶部时间刻度带
+/// Top time-scale band
 const AXIS_H: f32 = 32.0;
-/// 轮次刻度带
+/// Round-scale band
 const ROUND_H: f32 = 24.0;
-/// 行间距
+/// Row spacing
 const LANE_GAP: f32 = 8.0;
-/// 右侧给竖向滚动条留的宽度（轴与行必须按同一个宽度对齐）
+/// Width reserved on the right for the vertical scrollbar (the axis and rows must align to the same width)
 const RSV: f32 = 14.0;
-/// 最短的一枚色块（瞬时事件的宽度下限，保证点得中）
+/// The shortest bar (minimum width for instantaneous events, so they stay clickable)
 const MIN_BAR_W: f32 = 6.0;
-/// 缩放区间：像素 / 秒
+/// Zoom range: pixels / second
 const MIN_SCALE: f32 = 0.15;
 const MAX_SCALE: f32 = 320.0;
-/// 默认视野：一屏 60 秒
+/// Default view: 60 seconds per screen
 const DEFAULT_SPAN: f32 = 60.0;
-/// 一行最矮多少像素。**这是纵向滚动的分界线**：工具行多到摊不下时不再继续把行
-/// 压扁（压到十几个像素时行名和色块都没法看了），而是让内容溢出、交给滚动条。
+/// The shortest a row may be, in pixels. **This is the vertical-scrolling boundary**: when there are too many tool rows to spread out, do not keep
+/// squashing rows (past a dozen pixels both row names and bars become unreadable); let the content overflow and hand it to the scrollbar.
 const LANE_MIN: f32 = 28.0;
-/// 自动铺满时一行最高多少像素（行少时行就高一点，点起来也容易）
+/// The tallest a row may be when auto-spreading (fewer rows means taller rows, which are also easier to click)
 const LANE_MAX: f32 = 48.0;
-/// 手动拉伸时的上下限（比自动档宽，撑到 100 像素看单行细节是合理需求）
+/// Limits for manual stretching (wider than the auto range; stretching to 100 pixels to see one row's detail is a reasonable need)
 const LANE_MIN_USER: f32 = 16.0;
 const LANE_MAX_USER: f32 = 104.0;
 
-/// 边框缩放的抓取厚度（四边）。无装饰窗口没有原生边框，这几像素得自己留，
-/// 太窄不好抓、太宽又会把顶栏两端的拖动区吃掉。
+/// Grab thickness for border resizing (the four edges). An undecorated window has no native border, so these pixels must be reserved by us:
+/// too narrow is hard to grab, too wide eats into the top bar's drag zone at both ends.
 const RESIZE_BORDER: f32 = 5.0;
-/// 四角抓取区的边长。角上要能斜着拖，所以比边厚一截。
+/// Side length of the four corner grab zones. Corners must support diagonal dragging, so they are thicker than the edges.
 ///
-/// 上限由顶栏的按钮决定：关闭按钮左缘离右边 10 + 32 = 42 点，
-/// 上缘在 `HEADER_H/2 - BH/2 = 12` 点处，所以 12 点见方的角区碰不到它。
+/// The upper bound is set by the top-bar buttons: the close button's left edge sits 10 + 32 = 42 points from the right,
+/// and its top edge is at `HEADER_H/2 - BH/2 = 12` points, so a 12-point square corner zone cannot reach it.
 const RESIZE_CORNER: f32 = 12.0;
 
-// ─────────────────────────── 子窗口的内容 ───────────────────────────
+// ─────────────────────────── The child window's content ───────────────────────────
 
 fn window(ctx: &egui::Context, shared: &Shared) {
     let mut st = lock(shared);
 
-    // 系统级的关闭（Alt+F4、任务栏右键关闭）也要把开关拨回去，
-    // 否则主窗口下一帧还会重新声明这个视口，窗口关不掉。
+    // System-level close (Alt+F4, taskbar right-click close) must flip the switch back too,
+    // otherwise the main window re-declares this viewport next frame and the window cannot be closed.
     if ctx.input(|i| i.viewport().close_requested()) {
         st.open = false;
         st.forget_placement();
     }
-    // 置顶状态变化时才下发命令，别每帧都发。
+    // Dispatch the command only when the pinned state changes, not every frame.
     if st.pinned != st.applied_top {
         st.applied_top = st.pinned;
         ctx.send_viewport_cmd(ViewportCommand::WindowLevel(if st.pinned {
@@ -860,28 +894,28 @@ fn window(ctx: &egui::Context, shared: &Shared) {
             WindowLevel::Normal
         }));
     }
-    // 原生主题要**每个视口各发一次**：`SetTheme` 是按视口下发的。
+    // The native theme must be sent **once per viewport**: `SetTheme` is dispatched per viewport.
     if st.theme_mode != Some(theme::mode()) {
         st.theme_mode = Some(theme::mode());
         theme::sync_native_theme(ctx);
     }
 
-    // 圆角同理，也是「一扇窗口只做一次」的事。放在这里而不是建视口时做：
-    // 那会儿 HWND 还没被 winit 创建出来，按标题根本找不到它。
+    // Rounded corners are the same — a "do once per window" thing. It is done here rather than when building the viewport:
+    // at that point the HWND has not been created by winit yet, so it cannot be found by title at all.
     if !st.corners {
         st.corners = true;
-        set_round_corners(WINDOW_TITLE);
+        set_round_corners(aox::i18n::t(WINDOW_TITLE));
     }
 
     let frame = Frame::NONE.fill(P::panel());
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-        // 子视口与主视口共用一个 `egui::Context`，控件 Id **不会**自动带上视口信息。
+        // Child and main viewports share one `egui::Context`, so widget Ids are **not** automatically prefixed with viewport info.
         ui.push_id("aox-activity-window", |ui| {
             body(ui, ctx, &mut st);
         });
     });
 
-    // 忙的时候自己驱动重绘：子视口的 repaint 请求是独立的。
+    // While busy, drive repaints ourselves: the child viewport's repaint requests are independent.
     if st.busy {
         st.spin = (st.spin + 0.016) % 1000.0;
         ctx.request_repaint_after(Duration::from_millis(16));
@@ -889,31 +923,31 @@ fn window(ctx: &egui::Context, shared: &Shared) {
 }
 
 fn body(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
-    // 整个窗口的矩形。**必须在往 ui 里放东西之前取**：`max_rect()` 会随着
-    // 逐个 allocate 一路收缩，到函数末尾就只剩底下一条缝了。
+    // The whole window's rect. **Must be taken before putting anything into the ui**: `max_rect()` shrinks
+    // with each allocate, and by the end of the function only a sliver at the bottom would be left.
     let full = ui.max_rect();
 
     header(ui, ctx, st);
 
     Frame::NONE.inner_margin(Margin { left: 18, right: 18, top: 12, bottom: 14 }).show(ui, |ui| {
-        // 这一块里的纵向间距一律自己加，免得 egui 的 item_spacing 把高度算歪
+        // All vertical spacing inside this block is added by us, so egui's item_spacing doesn't skew the height
         ui.spacing_mut().item_spacing.y = 0.0;
 
         toolbar(ui, st);
         ui.add_space(14.0);
 
-        // 行表要先知道：时间轴要多高取决于有几行工具。
-        // 行少的时候时间轴就矮一点，把空间让给下面的详情；行多就有个上限，
-        // 不会把详情面板挤没 —— 多出来的行交给纵向滚动（见 `timeline`）。
+        // The row list must be known first: how tall the timeline is depends on how many tool rows there are.
+        // With few rows the timeline is shorter, ceding space to the detail panel below; with many rows there is a cap,
+        // so the detail panel is not squeezed out — the surplus rows go to vertical scrolling (see `timeline`).
         let rows = rows_of(&st.acts);
         let n = rows.len() as f32;
         let natural = AXIS_H + ROUND_H + n * LANE_MAX + (n - 1.0).max(0.0) * LANE_GAP;
         let rest = ui.available_height();
         let chart_h = natural.min(rest - 170.0).max(170.0);
-        // 详情面板**吃掉剩下的全部高度**，不再封顶。
-        // 封顶（原来 clamp 到 420）会让它在窗口下半截留出一片空白 —— 时间轴明明
-        // 可以更高、详情明明可以更宽，却被一个写死的上限挡住。它内部本来就是
-        // 可滚动的，给多高都不会撑破。
+        // The detail panel **takes all the remaining height**, no longer capped.
+        // Capping it (it used to clamp to 420) leaves a blank strip in the window's lower half — when the timeline clearly
+        // could be taller and the detail clearly could be wider, a hard-coded cap blocks them. It is internally
+        // scrollable anyway, so no height will break it.
         let detail_h = (rest - chart_h - 14.0).max(132.0);
 
         timeline(ui, ctx, st, &rows, chart_h);
@@ -921,30 +955,30 @@ fn body(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
         detail(ui, st, detail_h);
     });
 
-    // 最后再叠两样「窗口级」的东西：边框拖拽热区（要压过顶栏的拖动区，所以必须
-    // 最后声明）和最外圈那道 1px 的边。
+    // Finally overlay two "window-level" things: the border drag hot-zones (which must beat the top bar's drag zone, so they must be
+    // declared last) and the 1px outline on the outermost ring.
     resize_handles(ui, ctx, full);
     outline(ui, full);
 }
 
-/// 无装饰窗口**没有原生边框缩放**了，这里自己补回来。
+/// An undecorated window **has no native border resizing**; we add it back here.
 ///
-/// 做法和 egui 内置的 `Resize` 容器一样：四边四角各埋一块用 `Sense::drag` 的
-/// 透明热区，按下时只发一条 [`ViewportCommand::BeginResize`]，之后整个拖拽过程
-/// 由系统接管（不是我们每帧去改窗口尺寸 —— 那样既卡又会和系统打架）。
+/// The approach is the same as egui's built-in `Resize` container: bury one transparent hot-zone using `Sense::drag`
+/// along each of the four edges and four corners; on press it sends a single [`ViewportCommand::BeginResize`], and from then on the whole drag
+/// is taken over by the system (not us changing the window size every frame — that would both stutter and fight the system).
 ///
-/// 顺序很关键：这些热区在 `body` 的**最后**声明，而 egui 的命中测试是
-/// 「同层里后声明的在上面」，所以窗口最外圈那几像素会判给缩放、而不是顶栏拖动。
-/// 重叠只发生在顶栏的边缘，按钮（关闭等）离边还有十来像素，不会被抢。
+/// Order matters: these hot-zones are declared **last** in `body`, and egui's hit testing is
+/// "later-declared wins within a layer", so the outermost few pixels go to resizing rather than top-bar dragging.
+/// Overlap happens only at the top bar's edge; the buttons (close etc.) are still a dozen pixels from the edge and are not stolen.
 fn resize_handles(ui: &mut Ui, ctx: &egui::Context, full: Rect) {
-    // 最大化的窗口不该能再拖边（Windows 自己也这样），顺手也避免了
-    // 「拖着拖着从最大化状态里掉出来」的怪相。
+    // A maximized window should not be edge-draggable (Windows itself works this way), which also avoids
+    // the oddity of "dragging along and falling out of the maximized state".
     if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
         return;
     }
 
     let zones = resize_zones(full);
-    // 光标要在**悬停**时就变（不等按下），否则用户根本不知道这儿能拖
+    // The cursor must change on **hover** (without waiting for press), otherwise the user has no idea this is draggable
     let hover = ctx.input(|i| i.pointer.hover_pos());
     if let Some(p) = hover {
         if let Some((_, _, d)) = zones.iter().find(|(_, r, _)| r.contains(p)) {
@@ -963,8 +997,9 @@ fn resize_handles(ui: &mut Ui, ctx: &egui::Context, full: Rect) {
     }
 }
 
-/// 八块热区的几何。四边只取**去掉四角**的那一段，四角另给一块方形的
-/// —— 否则角上会同时命中两块，方向就没法确定。
+/// Geometry of the eight hot-zones. The four edges take only the segment **with the corners removed**,
+/// and each corner gets its own square zone — otherwise a corner would hit two zones at once and the
+/// direction couldn't be determined.
 fn resize_zones(full: Rect) -> [(&'static str, Rect, ResizeDirection); 8] {
     let (l, r, t, b) = (full.left(), full.right(), full.top(), full.bottom());
     let d = RESIZE_BORDER;
@@ -995,11 +1030,11 @@ fn resize_cursor(d: ResizeDirection) -> CursorIcon {
     }
 }
 
-/// 无装饰窗口和桌面之间没有任何分界线，浅色主题下几乎看不出窗口到哪儿为止。
-/// 描一圈一像素的边把它框出来（比顶栏那条分隔线重一点，才压得住底色）。
+/// There is no dividing line between an undecorated window and the desktop; in a light theme you can barely tell where the window ends.
+/// Draw a 1px outline to frame it (a touch heavier than the top bar's divider, so it holds against the background).
 ///
-/// 圆角要跟着系统的来：窗口最后是被 DWM 按圆角裁掉的，这里若还画直角，
-/// 四角那几像素的边框会被裁掉、剩下一个方方正正的断口。
+/// The corners must follow the system's: the window is ultimately clipped to rounded corners by DWM, and drawing square corners here would
+/// leave the corner few pixels of border clipped, producing a square break in the corner.
 fn outline(ui: &Ui, full: Rect) {
     ui.painter().rect_stroke(
         full.shrink(0.5),
@@ -1009,29 +1044,33 @@ fn outline(ui: &Ui, full: Rect) {
     );
 }
 
-// ───────────────────── 系统圆角（Windows 11） ─────────────────────
+// ───────────────────── System rounded corners (Windows 11) ─────────────────────
 
-/// DWM 的标准圆角半径，与主窗口一致。单位是 egui 点，会随缩放一起变大。
+/// DWM's standard corner radius, matching the main window. The unit is egui points, which grow with scaling.
 const CORNER_RADIUS: u8 = 8;
 
-/// 让系统给这扇窗口画上圆角。
+/// Let the system draw rounded corners on this window.
 ///
-/// **为什么不自绘**（视口开 `with_transparent` + 自己画一个圆角矩形）：
-/// 圆角是画得出来，但边界以外必须真的透明，于是**系统阴影一起丢掉** ——
-/// 窗口会像一张贴纸糊在桌面上，而且透明窗口在拖拽缩放时容易闪。
+/// **Why not draw them ourselves** (viewport with `with_transparent` + draw a rounded rect ourselves):
+/// the corners can be drawn, but everything outside the border must be truly transparent, so the
+/// **system shadow is lost with them** — the window becomes a sticker slapped on the desktop, and
+/// transparent windows tend to flicker when dragged or resized.
 ///
-/// 而 winit 的无装饰窗口并不是 `WS_POPUP`：它靠 `WM_NCCALCSIZE` 把非客户区
-/// 压成 0，`WS_BORDER` / `WS_SYSMENU` 都还留着 —— 在系统眼里这仍是一扇
-/// **普通的重叠窗口**，所以走 DWM 那条路既能拿到抗锯齿的圆角，又原样保留阴影，
-/// 半径还天然和主窗口一致（这正是我们刚把系统标题栏去掉时丢掉的那样东西）。
+/// Yet winit's undecorated window is not `WS_POPUP`: it uses `WM_NCCALCSIZE` to squash the non-client
+/// area to 0 while keeping `WS_BORDER` / `WS_SYSMENU` — so in the system's eyes this is still an
+/// **ordinary overlapping window**, and going through DWM gets us antialiased corners while keeping the
+/// shadow intact, with a radius that naturally matches the main window (exactly the thing we lost when
+/// we removed the system title bar).
 ///
-/// winit 其实自带这个开关（`WindowAttributesExtWindows::with_corner_preference`），
-/// 但 egui 的 `ViewportBuilder` 没有透传的口子，子视口更是连 hook 都没有
-/// （`ViewportBuilder` 只有 `has_shadow`、`taskbar` 这类，且 eframe 也没全用）。
-/// 所以这里直接喊一次系统 API：三个函数、十来行声明，不值得为它引入 windows-sys。
+/// winit actually ships this switch (`WindowAttributesExtWindows::with_corner_preference`),
+/// but egui's `ViewportBuilder` has no passthrough for it, and child viewports don't even have a hook
+/// (`ViewportBuilder` only has `has_shadow`, `taskbar`, etc., and eframe doesn't use them all either).
+/// So here we just call the system API once: three functions, a dozen-ish lines of declarations;
+/// not worth pulling in windows-sys for this.
 ///
-/// 只需要在建好窗口之后叫**一次** —— 圆角是挂在 HWND 上的状态，不是每帧的事。
-/// 窗口一重建（关掉再开）圆角就没了，所以调用方用 [`Activity::corners`] 记着。
+/// It only needs to be called **once** after the window is built — rounded corners are a state hung on
+/// the HWND, not a per-frame thing. The moment the window is rebuilt (closed and reopened) the corners
+/// vanish, so the caller tracks it via [`Activity::corners`].
 #[cfg(windows)]
 fn set_round_corners(title: &str) {
     use std::ffi::c_void;
@@ -1045,22 +1084,22 @@ fn set_round_corners(title: &str) {
         fn GetWindowThreadProcessId(h: *mut c_void, pid: *mut u32) -> u32;
     }
 
-    /// 枚举时用的上下文。回调只能是不捕获环境的普通 fn，所以东西得从 `param` 递进去。
+    /// The context used during enumeration. The callback can only be a plain fn that captures no environment, so things must be passed in via `param`.
     struct Probe<'a> {
         title: &'a str,
         pid: u32,
         hwnd: *mut c_void,
     }
 
-    /// 是不是「本进程开的那扇标题对得上的窗口」。
+    /// Whether it is "a window opened by this process with a matching title".
     ///
-    /// SAFETY: `h` 是 `EnumWindows` 递过来的句柄，在本次调用期间有效。
+    /// SAFETY: `h` is a handle passed by `EnumWindows` and is valid for the duration of this call.
     unsafe fn mine(h: *mut c_void, title: &str, pid: u32) -> bool {
         if unsafe { IsWindowVisible(h) } == 0 {
             return false;
         }
-        // 光看标题不够：用户完全可以同时开着两个 AOX 实例（比如装了两个包），
-        // 那样可能摸到别人的窗口上去改圆角。
+        // Looking at the title alone is not enough: a user may well have two AOX instances open at once (e.g. two installs),
+        // and then we could reach another's window and change its corners.
         let mut owner = 0u32;
         unsafe { GetWindowThreadProcessId(h, &mut owner) };
         if owner != pid {
@@ -1079,11 +1118,11 @@ fn set_round_corners(title: &str) {
     }
 
     extern "system" fn probe(h: *mut c_void, param: isize) -> i32 {
-        // SAFETY: `param` 就是下面那个 `Probe` 的地址，生命周期覆盖整个 `EnumWindows`
+        // SAFETY: `param` is the address of the `Probe` below, with a lifetime covering the whole `EnumWindows`
         let p = unsafe { &mut *(param as *mut Probe) };
         if p.hwnd.is_null() && unsafe { mine(h, p.title, p.pid) } {
             p.hwnd = h;
-            return 0; // 找到就停，别再枚举下去
+            return 0; // stop once found, don't keep enumerating
         }
         1
     }
@@ -1091,10 +1130,10 @@ fn set_round_corners(title: &str) {
     let mut ctx = Probe { title, pid: std::process::id(), hwnd: std::ptr::null_mut() };
     unsafe { EnumWindows(probe, &mut ctx as *mut Probe as isize) };
     if ctx.hwnd.is_null() {
-        return; // 还没建出来（或平台不给），下次开窗口再试
+        return; // not built yet (or the platform doesn't provide it); try again next time the window opens
     }
-    // DWM 调用统一走 `theme`：同一个符号在整个 crate 里只声明一次。
-    // 失败（Win10 不认识这个属性）也无所谓 —— 那就维持方角，本来的样子。
+    // DWM calls all go through `theme`: each symbol is declared only once in the whole crate.
+    // Failure (Win10 does not know this attribute) is fine — corners simply stay square, as they were.
     theme::dwm_set_attribute(
         ctx.hwnd as isize,
         theme::DWMWA_CORNER_PREFERENCE,
@@ -1106,17 +1145,17 @@ fn set_round_corners(title: &str) {
 #[cfg(not(windows))]
 fn set_round_corners(_title: &str) {}
 
-// ───────────────────────────── 顶栏 ─────────────────────────────
+// ───────────────────────────── Top bar ─────────────────────────────
 
 fn header(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), HEADER_H), Sense::click_and_drag());
-    // 必须在按下鼠标的**那一帧**发 StartDrag，晚一帧窗口就跟不动了。
+    // StartDrag must be sent on the **very frame** the mouse is pressed; a frame late and the window won't follow.
     if resp.drag_started() {
         ctx.send_viewport_cmd(ViewportCommand::StartDrag);
     }
 
-    // 左：呼吸点 + 标题 + 现状
+    // Left: breathing dot + title + current state
     let pulse = ((st.spin * 2.0) as i32) % 2 == 0;
     ui.painter().circle_filled(
         Pos2::new(rect.left() + 22.0, rect.center().y),
@@ -1134,18 +1173,18 @@ fn header(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
     ui.painter().text(
         Pos2::new(rect.left() + 40.0, rect.center().y),
         Align2::LEFT_CENTER,
-        "活动流",
+        aox::i18n::t("Activity Stream"),
         theme::bold_font(18.0),
         P::text(),
     );
 
-    let status = if st.status.is_empty() { "就绪" } else { &st.status };
+    let status = if st.status.is_empty() { aox::i18n::t("Ready") } else { &st.status };
     let info = if st.busy {
         format!("{status} · {:.1}s", st.started.map_or(0.0, |s| s.elapsed().as_secs_f32()))
     } else if st.round == 0 {
-        "空闲 · 不记录任何内容".to_string()
+        aox::i18n::t("Idle · nothing is recorded").to_string()
     } else {
-        format!("空闲 · 共 {} 轮 · {} 条记录", st.round, st.acts.len())
+        aox::tf!("Idle · {} rounds · {} records", st.round, st.acts.len())
     };
     ui.painter().text(
         Pos2::new(rect.left() + 108.0, rect.center().y),
@@ -1155,13 +1194,13 @@ fn header(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
         P::text_faint(),
     );
 
-    // 右侧自右向左排：关闭 / 最大化 / 最小化 / 固定，落到屏幕上就是 Windows
-    // 那套「固定 · 最小化 · 最大化 · 关闭」。因为系统标题栏已经不要了，
-    // 这几枚自绘按钮就是窗口唯一的出口。
+    // Laid out right-to-left: close / maximize / minimize / pin, which lands on screen as Windows'
+    // usual "pin · minimize · maximize · close". Since the system title bar is gone,
+    // these self-drawn buttons are the window's only way out.
     //
-    // 这里**不再有「清空」**：活动流已经随这段对话落进了同一个文件，删它只能
-    // 通过删那段对话去做 —— 界面上一按就清空，文件里却还留着，下次打开这段
-    // 对话它又长回来了，那才是真的说不清。
+    // There is **no "clear" here any more**: the activity stream is already persisted into the same file with this conversation, so removing it can only
+    // be done by deleting that conversation — clearing on a click in the UI while the file still holds it, and reopening this
+    // conversation grows it back, is the truly incomprehensible case.
     const BW: f32 = 32.0;
     const BH: f32 = 28.0;
     const GAP: f32 = 2.0;
@@ -1174,7 +1213,7 @@ fn header(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
     x -= BW + GAP;
-    // 最大化状态得主动去问 —— 这台窗口现在是自己管的，没人替我们记着它是不是最大了
+    // The maximized state must be asked for actively — this window is self-managed now, and nobody remembers whether it is maximized for us
     let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
     if win_button(ui, btn(x), "max", Glyph::Max { on: maxed }) {
         ctx.send_viewport_cmd(ViewportCommand::Maximized(!maxed));
@@ -1188,7 +1227,7 @@ fn header(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
         st.pinned = !st.pinned;
     }
 
-    // 标题栏与内容之间的一道细线
+    // A thin line between the title bar and the content
     let line = Rect::from_min_max(
         Pos2::new(rect.left(), rect.bottom() - 1.0),
         Pos2::new(rect.right(), rect.bottom()),
@@ -1200,7 +1239,7 @@ fn header(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
 enum Glyph {
     Close,
     Min,
-    /// 最大化 / 还原。`on` = 当前已经是最大化（于是画成「还原」那个双框）
+    /// Maximize / restore. `on` = currently maximized (so it is drawn as the "restore" double frame)
     Max { on: bool },
     Pin { on: bool },
 }
@@ -1210,8 +1249,8 @@ fn win_button(ui: &mut Ui, r: Rect, id: &str, glyph: Glyph) -> bool {
     if resp.hovered() {
         ui.painter().rect_filled(r, CornerRadius::same(7), P::surface_hi());
     }
-    // 「已固定」是个**持续状态**，得一直看得见：不悬停时也给它最深的前景色，
-    // 否则一枚灰图钉躺在灰底上，用户根本分不出自己到底钉没钉上。
+    // "Pinned" is a **persistent state** and must stay visible: give it the deepest foreground colour even when not hovered,
+    // otherwise a grey pushpin on a grey background leaves the user unable to tell whether it is pinned.
     let pinned = matches!(glyph, Glyph::Pin { on: true });
     let fg = if resp.hovered() || pinned { P::ink() } else { P::text_dim() };
     let p = ui.painter();
@@ -1227,7 +1266,7 @@ fn win_button(ui: &mut Ui, r: Rect, id: &str, glyph: Glyph) -> bool {
             p.line_segment([c + Vec2::new(-5.0, 2.4), c + Vec2::new(5.0, 2.4)], stroke);
         }
         Glyph::Max { on: false } => {
-            // 一个方框 —— 就是 Windows 的最大化
+            // A single box — exactly Windows' maximize
             p.rect_stroke(
                 Rect::from_center_size(c, Vec2::splat(9.6)),
                 CornerRadius::ZERO,
@@ -1236,7 +1275,7 @@ fn win_button(ui: &mut Ui, r: Rect, id: &str, glyph: Glyph) -> bool {
             );
         }
         Glyph::Max { on: true } => {
-            // 「还原」：后面那个框被前面的挡住半截，所以只描它的上边与右边
+            // "Restore": the rear frame is half-hidden by the front one, so only its top and right edges are stroked
             let (b0, b1) = (c + Vec2::new(-2.4, -5.0), c + Vec2::new(5.0, 1.6));
             p.line_segment([b0, Pos2::new(b1.x, b0.y)], stroke);
             p.line_segment([Pos2::new(b1.x, b0.y), b1], stroke);
@@ -1248,31 +1287,31 @@ fn win_button(ui: &mut Ui, r: Rect, id: &str, glyph: Glyph) -> bool {
             );
         }
         Glyph::Pin { on } => {
-            // 一枚图钉：扁平的帽 + 一根收成尖的针。
+            // A pushpin: a flat head + a needle tapering to a point.
             //
-            // 固定与不固定**共用同一个形状**，只差一个 90° 的朝向 ——
-            // 不固定时横躺着（针尖朝左下），固定时立起来（针尖朝下）。
-            // 这样两态之间不是「换了张图」，而是同一枚钉子躺下与站起，
-            // 用户不用重新认识一个图标就知道状态变了。
+            // Pinned and unpinned **share the same shape**, differing only by a 90° orientation —
+            // unpinned it lies down (tip toward lower-left), pinned it stands up (tip pointing down).
+            // So the two states aren't "a different picture" but the same pin lying down vs standing up,
+            // and the user knows the state changed without having to re-learn an icon.
             //
-            // 全部实心填色，不再用描边：细线条在这块深底上是真的看不清。
+            // Fully filled, no stroking: thin lines are genuinely invisible on this dark background.
             let rot = |v: Vec2| if on { v } else { Vec2::new(-v.y, v.x) };
-            // 矩形转过 90° 之后长宽对调，所以尺寸得单独换一次
+            // After a 90° rotation a rect's length and width swap, so the dimensions need a separate swap
             let swap = |v: Vec2| if on { v } else { Vec2::new(v.y, v.x) };
 
-            // 帽
+            // Head
             p.rect_filled(
                 Rect::from_center_size(c + rot(Vec2::new(0.0, -4.2)), swap(Vec2::new(10.0, 2.6))),
                 CornerRadius::same(1),
                 fg,
             );
-            // 针杆
+            // Needle shaft
             p.rect_filled(
                 Rect::from_center_size(c + rot(Vec2::new(0.0, -1.0)), swap(Vec2::new(3.2, 3.8))),
                 CornerRadius::ZERO,
                 fg,
             );
-            // 针尖
+            // Needle tip
             p.add(egui::Shape::convex_polygon(
                 vec![
                     c + rot(Vec2::new(0.0, 4.8)),
@@ -1287,28 +1326,28 @@ fn win_button(ui: &mut Ui, r: Rect, id: &str, glyph: Glyph) -> bool {
     resp.clicked()
 }
 
-// ───────────────────────────── 工具栏 ─────────────────────────────
+// ───────────────────────────── Toolbar ─────────────────────────────
 
-/// 一排视图工具：左半是「看哪一段」，右半是「怎么看」。
+/// A row of view tools: the left half is "which stretch to look at", the right half is "how to view it".
 fn toolbar(ui: &mut Ui, st: &mut Activity) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
 
-        // ── 锚点：把某一刻钉在屏幕的某个位置 ──
-        if pill(ui, "起点", st.anchor == Anchor::Start)
-            .on_hover_text("把第一轮的开始钉在最左边")
+        // ── Anchors: pin a moment to some position on screen ──
+        if pill(ui, aox::i18n::t("Start"), st.anchor == Anchor::Start)
+            .on_hover_text(aox::i18n::t("Pin the start of the first round to the left edge"))
             .clicked()
         {
             st.anchor = Anchor::Start;
         }
-        if pill(ui, "居中", st.anchor == Anchor::Center)
-            .on_hover_text("让「当前时刻」停在正中，两边都看得见")
+        if pill(ui, aox::i18n::t("Center"), st.anchor == Anchor::Center)
+            .on_hover_text(aox::i18n::t("Keep the current moment centered, visible on both sides"))
             .clicked()
         {
             st.anchor = Anchor::Center;
         }
-        if pill(ui, "最新", st.anchor == Anchor::Latest)
-            .on_hover_text("贴着最新的进度走")
+        if pill(ui, aox::i18n::t("Latest"), st.anchor == Anchor::Latest)
+            .on_hover_text(aox::i18n::t("Follow the latest progress"))
             .clicked()
         {
             st.anchor = Anchor::Latest;
@@ -1316,8 +1355,8 @@ fn toolbar(ui: &mut Ui, st: &mut Activity) {
 
         vsep(ui);
 
-        // ── 按轮次查看 ──
-        ui.label(RichText::new("轮次").color(P::text_faint()).size(13.5));
+        // ── View by round ──
+        ui.label(RichText::new(aox::i18n::t("Round")).color(P::text_faint()).size(13.5));
         let edit = ui.add(
             TextEdit::singleline(&mut st.round_input)
                 .id(egui::Id::new("aox-act-round-input"))
@@ -1328,7 +1367,7 @@ fn toolbar(ui: &mut Ui, st: &mut Activity) {
         let entered = edit.lost_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter))
             && !st.round_input.trim().is_empty();
-        if pill(ui, "定位", false).clicked() || entered {
+        if pill(ui, aox::i18n::t("Go"), false).clicked() || entered {
             if let Ok(r) = st.round_input.trim().parse::<u32>() {
                 if r >= 1 && r <= st.round {
                     st.goto = Some(r);
@@ -1336,49 +1375,49 @@ fn toolbar(ui: &mut Ui, st: &mut Activity) {
             }
         }
         ui.label(
-            RichText::new(format!("共 {} 轮", st.round)).color(P::text_faint()).size(13.5),
+            RichText::new(aox::tf!("{} rounds", st.round)).color(P::text_faint()).size(13.5),
         );
 
-        // ── 右半：行高 + 横向缩放 + 连接线 ──
+        // ── Right half: row height + horizontal zoom + link lines ──
         //
-        // `right_to_left` 里**先加的在最右边**，所以下面这段的书写顺序与屏幕上
-        // 从左到右的顺序相反：最终看到的是
-        //     连接线  适应 │ 缩放 − ＋ │ 行高 − ＋
+        // In `right_to_left`, **whatever is added first is rightmost**, so the writing order below is the reverse of
+        // the on-screen left-to-right order: what you finally see is
+        //     Link lines  Fit │ Zoom − + │ Row height − +
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
 
-            // 行高：工具一多，行会被摊薄到看不清 —— 这两枚把每行撑开/压回，
-            // 超出可视区的部分由 Shift+滚轮（或最右边的滚动条）上下翻。
-            if pill(ui, "＋", false)
-                .on_hover_text("行高 ＋：把每一行撑高。超出可视区后用 Shift+滚轮 上下翻")
+            // Row height: with many tools, rows get thinned until unreadable — these two stretch/shrink
+            // each row, and anything past the viewport is scrolled with Shift+wheel (or the rightmost scrollbar).
+            if pill(ui, "+", false)
+                .on_hover_text(aox::i18n::t("Row height +: stretch each row; when it overflows, scroll with Shift+wheel"))
                 .clicked()
             {
                 st.pending_row = Some(1.25);
             }
-            if pill(ui, "－", false).on_hover_text("行高 －：把每一行压矮，一屏看更多行").clicked()
+            if pill(ui, "−", false).on_hover_text(aox::i18n::t("Row height −: squeeze each row to fit more on screen")).clicked()
             {
                 st.pending_row = Some(1.0 / 1.25);
             }
-            ui.label(RichText::new("行高").color(P::text_faint()).size(13.5));
+            ui.label(RichText::new(aox::i18n::t("Row height")).color(P::text_faint()).size(13.5));
             vsep(ui);
 
-            if pill(ui, "＋", false).on_hover_text("放大（横轴）").clicked() {
+            if pill(ui, "+", false).on_hover_text(aox::i18n::t("Zoom in (horizontal axis)")).clicked() {
                 st.pending_zoom = Some(1.35);
             }
-            if pill(ui, "－", false).on_hover_text("缩小（横轴）").clicked() {
+            if pill(ui, "−", false).on_hover_text(aox::i18n::t("Zoom out (horizontal axis)")).clicked() {
                 st.pending_zoom = Some(1.0 / 1.35);
             }
-            ui.label(RichText::new("缩放").color(P::text_faint()).size(13.5));
+            ui.label(RichText::new(aox::i18n::t("Zoom")).color(P::text_faint()).size(13.5));
             vsep(ui);
 
-            if pill(ui, "适应", false)
-                .on_hover_text("整段铺满窗口，并把行高交回自动")
+            if pill(ui, aox::i18n::t("Fit"), false)
+                .on_hover_text(aox::i18n::t("Fill the window with the whole span and hand row height back to auto"))
                 .clicked()
             {
                 st.fit_all = true;
             }
-            if pill(ui, "连接线", st.link)
-                .on_hover_text("按真实执行顺序把各条色块首尾相连，线色取自出发的那一条")
+            if pill(ui, aox::i18n::t("Link lines"), st.link)
+                .on_hover_text(aox::i18n::t("Join the blocks head-to-tail in true execution order; each line takes the color of the block it leaves"))
                 .clicked()
             {
                 st.link = !st.link;
@@ -1387,7 +1426,7 @@ fn toolbar(ui: &mut Ui, st: &mut Activity) {
     });
 }
 
-/// 工具栏里的细竖分隔
+/// A thin vertical separator in the toolbar
 fn vsep(ui: &mut Ui) {
     ui.add_space(6.0);
     let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, 20.0), Sense::hover());
@@ -1395,7 +1434,7 @@ fn vsep(ui: &mut Ui) {
     ui.add_space(6.0);
 }
 
-/// 胶囊按钮。`on` = 当前选中的那个（反白）。
+/// A pill button. `on` = the currently selected one (reversed).
 fn pill(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
     let font = FontId::proportional(14.0);
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER);
@@ -1433,14 +1472,14 @@ fn pill(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
     resp
 }
 
-// ═══════════════════════════ 时间轴 ═══════════════════════════
+// ═══════════════════════════ Timeline ═══════════════════════════
 
-/// 把时间映射到像素：横轴 = 时间，任务自左向右推进。
+/// Map time to pixels: the horizontal axis is time, and tasks advance left to right.
 #[derive(Clone, Copy)]
 struct View {
-    /// 左边缘的时刻（相对 `t_zero`，秒）
+    /// The moment at the left edge (seconds, relative to `t_zero`)
     t0: f32,
-    /// 每秒多少像素
+    /// Pixels per second
     scale: f32,
 }
 
@@ -1454,14 +1493,14 @@ impl View {
             let mut hi = f32::MIN;
             for a in &st.acts {
                 lo = lo.min(a.at - tz);
-                // 进行中的段按「现在」算尾端，否则按真实结束时刻
+                // In-progress segments take "now" as their tail; otherwise use the real end time
                 hi = hi.max(a.end_t(st.now) - tz);
             }
             (lo, hi)
         };
         let scale = st.scale.unwrap_or_else(|| (plot_w / DEFAULT_SPAN).clamp(MIN_SCALE, MAX_SCALE));
         let vis = plot_w / scale;
-        // 视野之外至少留一点点余量，免得首尾的色块贴着边
+        // Leave at least a little margin beyond the view, so bars at either end don't hug the edge
         let pad = (vis * 0.015).clamp(0.05, 2.0);
         let t0 = match st.anchor {
             Anchor::Start => t_min,
@@ -1497,51 +1536,51 @@ fn timeline(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity, rows: &[Row], a
         let w = ui.available_width();
         let (band, band_resp) = ui.allocate_exact_size(Vec2::new(w, AXIS_H), Sense::hover());
         let (rband, _) = ui.allocate_exact_size(Vec2::new(w, ROUND_H), Sense::hover());
-        // 手势不止一种，又没有可点的控件来承载提示，就挂在刻度带上：
-        // 这里是「时间轴」这个对象本身，鼠标划过它时提示最贴切。
+        // There is more than one gesture and no clickable widget to carry the hint, so it hangs off the scale band:
+        // this is the "timeline" object itself, and the hint is most apt when the mouse passes over it.
         band_resp.on_hover_text(
-            "滚轮：左右平移 · Ctrl+滚轮：缩放横轴 · Shift+滚轮：上下翻行\n\
-             拖动：平移 · 点击色块：看这一步的详情",
+            "Wheel: pan left/right · Ctrl+wheel: zoom the horizontal axis · Shift+wheel: scroll rows\n\
+             Drag: pan · Click a block: see this step's details",
         );
 
-        // 绘图区的左边界与宽度：轴、行名、色块全按它对齐
+        // The plot area's left edge and width: axis, row names and bars all align to it
         let plot_left = band.left() + GUTTER;
         let plot_w = (band.right() - RSV - plot_left).max(60.0);
         let area_h = (avail_h - AXIS_H - ROUND_H).max(60.0);
-        // 顶栏那两条带子不是「绘图区」：它们只借绘图区的横坐标，
-        // 所以必须自己造一个左边界对齐的矩形 —— 直接把整条 band 传进
-        // `View::x` 会让刻度和色块错开整整一个行名栏的宽度。
+        // The two top bands are not the "plot area": they only borrow the plot's x coordinate,
+        // so a rect with an aligned left edge must be built for them — passing the whole band into
+        // `View::x` would offset the ticks from the bars by a whole gutter width.
         let axis = Rect::from_min_size(Pos2::new(plot_left, band.top()), Vec2::new(plot_w, AXIS_H));
         let ruler =
             Rect::from_min_size(Pos2::new(plot_left, rband.top()), Vec2::new(plot_w, ROUND_H));
-        // 行的可视区（也是平移/缩放的响应区）。ScrollArea 的视口正好落在这里。
+        // The rows' visible area (also the pan/zoom response area). The ScrollArea's viewport lands exactly here.
         let lane_rect =
             Rect::from_min_size(Pos2::new(band.left(), rband.bottom()), Vec2::new(w - RSV, area_h));
 
-        // 行高先算：默认「把这块高度摊平」，但**不摊到挤扁** —— 工具行一多，
-        // `LANE_MIN` 就兜住下限，多出来的部分交给纵向滚动。用户手动拉过就用他的值。
+        // Compute row height first: by default "spread this height evenly", but **not down to squashed** — as tool rows grow,
+        // `LANE_MIN` holds the floor and the surplus goes to vertical scrolling. If the user has dragged it, use their value.
         let n = rows.len().max(1) as f32;
         let fit = ((area_h - LANE_GAP * (n - 1.0)) / n).clamp(LANE_MIN, LANE_MAX);
 
-        // ── 先处理跳转与交互，再按最终视图绘制 ──
+        // ── Handle jumps and interaction first, then draw by the final view ──
         if let Some(r) = st.goto.take() {
             st.fit_round(r, plot_w);
         }
         if st.fit_all {
             st.fit_all = false;
-            // 「适应」= 横竖都回到自动：横轴整段铺满、行高交回按高度摊平
+            // "Fit" = both axes back to auto: the horizontal axis fills the whole span, and row height returns to spreading by height
             st.row_h = None;
             let (lo, hi) = st.span();
             let pad = ((hi - lo) * 0.04).max(0.2);
             st.fit_range(lo - pad, hi + pad, plot_w);
-            // 整段铺满时把左端钉死，任务继续推进也不会把视野带走
+            // When fitting the whole span, pin the left end so the view isn't carried away as the task advances
             st.anchor = Anchor::Start;
         }
         if let Some(f) = st.pending_zoom.take() {
             st.zoom_by(f, plot_w);
         }
         if let Some(k) = st.pending_row.take() {
-            // 第一次拉伸时以「自动档的当前值」为基准，手感才连续
+            // On the first stretch, base it on the "auto" current value, so the feel stays continuous
             st.row_h = Some((st.row_h.unwrap_or(fit) * k).clamp(LANE_MIN_USER, LANE_MAX_USER));
         }
 
@@ -1549,7 +1588,7 @@ fn timeline(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity, rows: &[Row], a
         input(ui, ctx, st, lane_rect, plot_left, plot_w, v0);
         let v = View::compute(st, plot_w);
 
-        // ── 时间刻度带 ──
+        // ── Time scale band ──
         let base_y = band.bottom() - 1.0;
         {
             let p = ui.painter();
@@ -1582,20 +1621,20 @@ fn timeline(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity, rows: &[Row], a
             p.text(
                 Pos2::new(plot_left - 12.0, base_y - 15.0),
                 Align2::RIGHT_CENTER,
-                "秒",
+                aox::i18n::t("s"),
                 FontId::proportional(12.5),
                 P::text_faint(),
             );
             p.text(
                 Pos2::new(plot_left - 12.0, rband.center().y),
                 Align2::RIGHT_CENTER,
-                "轮次",
+                aox::i18n::t("Round"),
                 FontId::proportional(12.5),
                 P::text_faint(),
             );
         }
 
-        // ── 轮次刻度带 ──
+        // ── Round scale band ──
         {
             let p = ui.painter();
             let tz = st.tz();
@@ -1610,7 +1649,7 @@ fn timeline(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity, rows: &[Row], a
                 let r =
                     Rect::from_min_size(Pos2::new(x + 3.0, rband.top() + 2.0), Vec2::new(tw, 19.0));
                 if r.right() < last_right + 4.0 {
-                    continue; // 挤在一起就不画，免得叠成一团
+                    continue; // skip drawing when they crowd together, so they don't pile up
                 }
                 last_right = r.right();
                 p.rect_filled(r, CornerRadius::same(6), P::surface());
@@ -1624,15 +1663,15 @@ fn timeline(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity, rows: &[Row], a
             }
         }
 
-        // ── 行 ──
-        // 行高可以是「自动摊平」，也可以是用户手拉的值；两者都可能超出可视区，
-        // 超出就由下面这个滚动区负责上下翻。
+        // ── Rows ──
+        // Row height can be "auto-spread" or a value the user dragged; either may exceed the visible area,
+        // and when it does, the scroll area below handles paging up and down.
         let lane_h = st.row_h.unwrap_or(fit);
         let content_h = n * lane_h + (n - 1.0) * LANE_GAP;
         let overflows = content_h > area_h + 0.5;
 
-        // 滚轮默认是「横向平移」（见 `input`），所以纵向滚动挂在 Shift 上：
-        // 按住 Shift 才把滚轮喂给滚动区，否则交给时间轴。
+        // The wheel pans horizontally by default (see `input`), so vertical scrolling hangs off Shift:
+        // only while Shift is held is the wheel fed to the scroll area, otherwise it goes to the timeline.
         let shift_down = ctx.input(|i| i.modifiers.shift);
         ScrollArea::vertical()
             .id_salt("aox-act-lanes")
@@ -1653,14 +1692,14 @@ fn timeline(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity, rows: &[Row], a
                 lanes(ui, st, rows, plot, lane_h, v);
             });
 
-        // 行被折叠到视野之外时，右下角给一句话 —— 只有滚动条这一个细窄的线索，
-        // 很容易让人以为「工具就这么多」。
+        // When rows are folded out of view, give a line at the bottom-right — a scrollbar alone is too thin a clue,
+        // and it is easy to think "that's all the tools there are".
         if overflows {
             let below = ((content_h - area_h) / (lane_h + LANE_GAP)).ceil() as i32;
             ui.painter().text(
                 Pos2::new(band.right() - RSV - 6.0, lane_rect.bottom() - 4.0),
                 Align2::RIGHT_BOTTOM,
-                format!("还有 {below} 行 · Shift+滚轮 上下翻"),
+                aox::tf!("{} more rows · scroll with Shift+wheel", below),
                 FontId::proportional(12.0),
                 P::text_faint(),
             );
@@ -1669,7 +1708,7 @@ fn timeline(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity, rows: &[Row], a
 }
 
 impl Activity {
-    /// 以视图中心为锚缩放（工具栏的 ± 用它）。
+    /// Zoom anchored at the view's centre (the toolbar's ± uses it).
     fn zoom_by(&mut self, factor: f32, plot_w: f32) {
         let v = View::compute(self, plot_w);
         let ns = (v.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
@@ -1681,10 +1720,10 @@ impl Activity {
     }
 }
 
-/// 平移 / 缩放 / 点选。全部落在时间轴的行区里才生效。
+/// Pan / zoom / click-select. All only take effect when landing in the timeline's row area.
 ///
-/// 响应的声明顺序很重要：这个平移区在这儿先声明（在滚动区**之前**），
-/// 色块在滚动区里后声明 —— 于是点在色块上时色块赢、点在空白处时这里赢。
+/// The response declaration order matters: this pan area is declared here first (before the scroll area),
+/// and the bars are declared later inside the scroll area — so clicking a bar lets the bar win, clicking blank space lets this win.
 fn input(
     ui: &mut Ui,
     ctx: &egui::Context,
@@ -1697,7 +1736,7 @@ fn input(
     let plot = Rect::from_min_size(Pos2::new(plot_left, lane.top()), Vec2::new(plot_w, lane.height()));
     let resp = ui.interact(lane, ui.id().with("aox-act-pan"), Sense::click_and_drag());
 
-    // 拖动 = 平移（抓手感：往右拖 = 看到更早）
+    // Drag = pan (grab feel: drag right = see earlier)
     if resp.dragged() {
         let dx = resp.drag_delta().x;
         if dx != 0.0 {
@@ -1705,7 +1744,7 @@ fn input(
             st.t0 = v0.t0 - dx / v0.scale;
         }
     }
-    // 点空白处 = 取消选中（点在色块上时这次点击被色块拿走了，这里不会触发）
+    // Clicking blank space = deselect (when clicking a bar the click is taken by the bar, so this doesn't fire)
     if resp.clicked() {
         st.selected = None;
     }
@@ -1724,7 +1763,7 @@ fn input(
     }
 
     if (zoom - 1.0).abs() > 1e-4 {
-        // Ctrl+滚轮：以光标处那一秒为锚缩放，指哪儿放哪儿
+        // Ctrl+wheel: zoom anchored at the second under the cursor — whatever you point at stays put
         let t_anchor = v0.t_at(plot, p.x);
         let ns = (v0.scale * zoom).clamp(MIN_SCALE, MAX_SCALE);
         let keep = st.anchor == Anchor::Free;
@@ -1733,8 +1772,8 @@ fn input(
             st.t0 = t_anchor - (p.x - plot_left) / ns;
         }
     } else if scroll != Vec2::ZERO && !shift {
-        // 滚轮：横向平移，一次滚动约走视野的 18%。
-        // Shift 按住时这里让路 —— 那颗滚轮被滚动区拿去翻行了（见 `timeline`）。
+        // Wheel: pan horizontally, one scroll moves about 18% of the view.
+        // While Shift is held this yields — the wheel is taken by the scroll area to page rows (see `timeline`).
         let vis = plot_w / v0.scale;
         let d = (scroll.x + scroll.y) / 50.0;
         st.anchor = Anchor::Free;
@@ -1742,7 +1781,7 @@ fn input(
     }
 }
 
-// ── 行、色块、连接线 ──
+// ── Rows, bars, link lines ──
 
 fn lanes(ui: &mut Ui, st: &mut Activity, rows: &[Row], plot: Rect, lane_h: f32, v: View) {
     let now = st.now;
@@ -1753,10 +1792,11 @@ fn lanes(ui: &mut Ui, st: &mut Activity, rows: &[Row], plot: Rect, lane_h: f32, 
         return;
     }
     let step = lane_h + LANE_GAP;
-    // 绘图区专用画笔：所有色块/连接线都被裁在绘图区内，不会糊到右侧留白上
+    // Painter dedicated to the plot area: all bars/link lines are clipped to the plot area, so they don't
+    // smear onto the right-side whitespace
     let p = ui.painter_at(plot);
 
-    // ── 行：基线 + 行名 ──
+    // ── Rows: baseline + row name ──
     for (i, row) in rows.iter().enumerate() {
         let y = plot.top() + i as f32 * step;
         if y > clip.bottom() || y + lane_h < clip.top() {
@@ -1766,7 +1806,7 @@ fn lanes(ui: &mut Ui, st: &mut Activity, rows: &[Row], plot: Rect, lane_h: f32, 
             [Pos2::new(plot.left(), y + lane_h), Pos2::new(plot.right(), y + lane_h)],
             Stroke::new(1.0, P::border()),
         );
-        // 行名画在左侧栏里，用外层画笔（它不在绘图区的裁剪范围内）
+        // The row name is drawn in the left gutter with the outer painter (which is not clipped to the plot area)
         let name = row.label();
         let font =
             if row.dim() { FontId::proportional(13.5) } else { theme::mono_font(13.5) };
@@ -1779,7 +1819,7 @@ fn lanes(ui: &mut Ui, st: &mut Activity, rows: &[Row], plot: Rect, lane_h: f32, 
         );
     }
 
-    // ── 轮次分隔（虚线）：一眼看出第几轮从哪一刻开始 ──
+    // ── Round separators (dashed): see at a glance when each round starts ──
     for a in st.acts.iter().filter(|a| a.kind == ActKind::Input) {
         let x = v.x(plot, a.at - tz);
         if x < plot.left() - 2.0 || x > plot.right() {
@@ -1794,7 +1834,7 @@ fn lanes(ui: &mut Ui, st: &mut Activity, rows: &[Row], plot: Rect, lane_h: f32, 
         }
     }
 
-    // ── 几何：先算一遍，连接线要复用 ──
+    // ── Geometry: computed once, reused by the link lines ──
     let shades = shades_of(st);
     struct Bar {
         row: usize,
@@ -1819,7 +1859,7 @@ fn lanes(ui: &mut Ui, st: &mut Activity, rows: &[Row], plot: Rect, lane_h: f32, 
         Rect::from_min_max(Pos2::new(l, y), Pos2::new(r, y + lane_h))
     };
 
-    // ── 连接线：按真实执行顺序首尾相连，线色取自出发的那一条 ──
+    // ── Link lines: joined head-to-tail in true execution order, coloured after the one it leaves ──
     if st.link {
         for w in bars.windows(2) {
             let (a, b) = (&w[0], &w[1]);
@@ -1851,7 +1891,7 @@ fn lanes(ui: &mut Ui, st: &mut Activity, rows: &[Row], plot: Rect, lane_h: f32, 
         }
     }
 
-    // ── 色块 ──
+    // ── Bars ──
     let mut hit: Option<u64> = None;
     for (i, a) in st.acts.iter().enumerate() {
         let Some(b) = bars.get(i) else { continue };
@@ -1860,7 +1900,7 @@ fn lanes(ui: &mut Ui, st: &mut Activity, rows: &[Row], plot: Rect, lane_h: f32, 
             continue;
         }
         p.rect_filled(r, CornerRadius::same(4), b.fill);
-        // 还在跑的：描一圈 + 右端一个亮点，一眼看出「没结束」
+        // Still running: stroke a ring + a bright dot at the right end, so "not finished" is obvious at a glance
         if a.open() {
             p.rect_stroke(
                 r,
@@ -1890,13 +1930,13 @@ fn lanes(ui: &mut Ui, st: &mut Activity, rows: &[Row], plot: Rect, lane_h: f32, 
                 egui::StrokeKind::Inside,
             );
             let dur = a.dur(now);
-            resp.on_hover_text(format!(
-                "{}\n{} · {} → {}（{:.2}s）",
+            resp.on_hover_text(aox::tf!(
+                "{}\n{} · {} → {} ({}s)",
                 a.title,
                 a.kind.label(),
                 fmt_at(a.at - tz, 0.5),
                 fmt_at(a.at - tz + dur, 0.5),
-                dur
+                format!("{:.2}", dur)
             ));
         }
         if clicked {
@@ -1907,7 +1947,7 @@ fn lanes(ui: &mut Ui, st: &mut Activity, rows: &[Row], plot: Rect, lane_h: f32, 
         st.selected = Some(seq);
     }
 
-    // ── 「现在」：只有任务在跑的时候才有意义 ──
+    // ── "Now": only meaningful while a task is running ──
     if st.busy {
         let x = v.x(plot, st.now - tz);
         if x >= plot.left() && x <= plot.right() {
@@ -1918,19 +1958,19 @@ fn lanes(ui: &mut Ui, st: &mut Activity, rows: &[Row], plot: Rect, lane_h: f32, 
         }
     }
 
-    // ── 空状态：讲清楚「为什么什么都没有」 ──
+    // ── Empty state: explain "why there is nothing here" ──
     if st.acts.is_empty() {
         ui.painter_at(visible).text(
             visible.center(),
             Align2::CENTER_CENTER,
-            "空闲时不记录任何内容 · 下达指令后，这里会按时间铺开模型与每一步工具调用",
+            aox::i18n::t("Nothing is recorded while idle · after you send a command, the model and every tool call are laid out here by time"),
             FontId::proportional(14.5),
             P::text_faint(),
         );
     }
 }
 
-/// 插件 → 色阶序号：同一插件的工具用同一族色的不同深浅
+/// Plugin → shade index: tools of the same plugin use different shades of one colour family
 fn shades_of(st: &Activity) -> Vec<(String, usize)> {
     let mut v: Vec<(String, usize)> = Vec::new();
     for a in &st.acts {
@@ -1954,7 +1994,7 @@ fn fill_of(a: &Act, shades: &[(String, usize)]) -> Color32 {
     }
 }
 
-/// 让明度按序号分层：同一插件的工具调用用同一族色，深浅不同
+/// Layer lightness by index: tool calls of the same plugin use one colour family at different shades
 fn shade(base: Color32, idx: usize) -> Color32 {
     const STEPS: [f32; 5] = [0.0, 0.22, 0.40, -0.18, 0.56];
     let k = STEPS[idx % STEPS.len()];
@@ -1965,7 +2005,7 @@ fn shade(base: Color32, idx: usize) -> Color32 {
     }
 }
 
-/// 刻度间隔取 1/2/5×10ⁿ 里最接近的那个，保证刻度线不至于挤成一团
+/// Take the closest tick interval among 1/2/5×10ⁿ, so ticks don't crowd together
 fn nice_step(rough: f32) -> f32 {
     const STEPS: [f32; 20] = [
         0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0,
@@ -1974,7 +2014,7 @@ fn nice_step(rough: f32) -> f32 {
     STEPS.iter().copied().find(|s| *s >= rough).unwrap_or(7200.0)
 }
 
-/// 时刻的文字表示。小数位随刻度粗细走，免得 0.01s 的刻度上写着「0.0s」。
+/// Text representation of a moment. Decimal places follow the tick granularity, so a 0.01s tick doesn't show "0.0s".
 fn fmt_at(t: f32, step: f32) -> String {
     let t = t.max(0.0);
     if t < 60.0 {
@@ -1998,7 +2038,7 @@ fn text_w(ui: &Ui, font: &FontId, s: &str) -> f32 {
     ui.fonts_mut(|f| f.layout_job(job).size().x)
 }
 
-/// 单行文本按**像素**收口：放不下就省略号截断（行名、工具名都可能很长）
+/// Clamp single-line text by **pixels**: elide with an ellipsis when it doesn't fit (row names and tool names can be long)
 fn elide(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<Galley> {
     let mut job = egui::text::LayoutJob::single_section(
         text.to_owned(),
@@ -2007,14 +2047,14 @@ fn elide(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<G
     job.wrap = egui::text::TextWrapping {
         max_width: max_w.max(20.0),
         max_rows: 1,
-        // 中文没有词边界，不开这个的话「整段放不下」时会直接不截
+        // CJK has no word boundaries; without this, "the whole thing doesn't fit" would simply not elide
         break_anywhere: true,
         overflow_character: Some('…'),
     };
     ui.painter().layout_job(job)
 }
 
-// ══════════════════════ 下方：选中项的详情 ══════════════════════
+// ══════════════════════ Below: details of the selected item ══════════════════════
 
 fn detail(ui: &mut Ui, st: &mut Activity, h: f32) {
     let inner_h = (h - 34.0).max(80.0);
@@ -2033,17 +2073,17 @@ fn detail(ui: &mut Ui, st: &mut Activity, h: f32) {
 
             let Some(a) = st.focused() else {
                 ui.add_space(4.0);
-                ui.label(RichText::new("还没有选中任何过程").color(P::text_dim()).size(15.0));
+                ui.label(RichText::new(aox::i18n::t("No step selected yet")).color(P::text_dim()).size(15.0));
                 ui.add_space(7.0);
                 ui.label(
-                    RichText::new("程序空闲时不记录任何内容；下达指令后，这里会按时间铺开每一步。")
+                    RichText::new(aox::i18n::t("Nothing is recorded while the app is idle; after you send a command, every step is laid out here by time."))
                         .color(P::text_faint())
                         .size(14.0),
                 );
                 return;
             };
 
-            // ── 头部：类别徽标 + 轮次 + 标题 ──
+            // ── Header: category badge + round + title ──
             let (head, _) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::hover());
             {
                 let p = ui.painter();
@@ -2058,7 +2098,7 @@ fn detail(ui: &mut Ui, st: &mut Activity, h: f32) {
                 p.text(br.center(), Align2::CENTER_CENTER, text.label(), font, P::bg());
 
                 let mut x = br.right() + 12.0;
-                let meta = format!("第 {} 轮", a.round);
+                let meta = aox::tf!("Round {}", a.round);
                 p.text(
                     Pos2::new(x, head.center().y),
                     Align2::LEFT_CENTER,
@@ -2068,7 +2108,7 @@ fn detail(ui: &mut Ui, st: &mut Activity, h: f32) {
                 );
                 x += text_w(ui, &FontId::proportional(13.5), &meta) + 14.0;
 
-                // 标题：等宽的标识符用等宽字体
+                // Title: monospaced identifiers use the monospace font
                 let font = if a.kind.mono() {
                     theme::mono_font(15.5)
                 } else {
@@ -2078,10 +2118,10 @@ fn detail(ui: &mut Ui, st: &mut Activity, h: f32) {
                 let g = elide(ui, &a.title, font, P::text(), room);
                 p.galley(Pos2::new(x, head.center().y - g.size().y * 0.5), g, P::text());
 
-                // 右端：时刻与耗时
+                // Right end: time and duration
                 let dur = a.dur(st.now);
                 let when = if a.open() {
-                    format!("{} 开始 · 进行中 {dur:.2}s", fmt_at(a.at - st.tz(), 0.5))
+                    aox::tf!("{} started · running {}s", fmt_at(a.at - st.tz(), 0.5), format!("{:.2}", dur))
                 } else {
                     format!(
                         "{} → {} · {dur:.2}s",
@@ -2105,11 +2145,11 @@ fn detail(ui: &mut Ui, st: &mut Activity, h: f32) {
             ui.painter().hline(rule.x_range(), rule.center().y, Stroke::new(1.0, P::border()));
             ui.add_space(10.0);
 
-            // ── 正文 ──
+            // ── Body ──
             let body = a.body.trim().to_owned();
             let avail = (inner_h - 46.0).max(40.0);
             if body.is_empty() {
-                ui.label(RichText::new("（没有更多信息）").color(P::text_faint()).size(14.5));
+                ui.label(RichText::new(aox::i18n::t("(no more information)")).color(P::text_faint()).size(14.5));
                 return;
             }
             let font = if a.kind.mono() {
@@ -2152,51 +2192,51 @@ fn detail(ui: &mut Ui, st: &mut Activity, h: f32) {
         });
 }
 
-// ─────────────────────────── 测试 ───────────────────────────
+// ─────────────────────────── Tests ───────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 导出 → 装回 → 接着聊。这条链路上有三个容易错的地方，一起钉住：
-    /// 同一条记录被导出两次（水位没推进）、装回来的被当成新记录又写一遍
-    /// （水位没对齐存档）、以及新一轮没有接在存档后面。
+    /// Export → load back → keep chatting. Three easy-to-get-wrong spots on this chain, pinned together:
+    /// the same record exported twice (the watermark not advancing), a loaded record treated as new and written again
+    /// (the watermark not aligned to the save), and a new round not continuing after the save.
     #[test]
     fn acts_round_trip_and_flush_once() {
         let mut a = Activity::default();
-        a.round_begin("看看目录", 0.0); // 输入
-        a.model_begin(0.5); // 模型
-        a.tool_begin("fs_ls", Some("fs"), "{}", 1.7); // 工具
-        a.tool_end(false, "3 项", 2.0);
+        a.round_begin("list the directory", 0.0); // input
+        a.model_begin(0.5); // model
+        a.tool_begin("fs_ls", Some("fs"), "{}", 1.7); // tool
+        a.tool_end(false, "3 items", 2.0);
         a.end_round(2.4);
-        a.note(ActKind::Info, "信息", "x", 2.4); // 系统
+        a.note(ActKind::Info, "Info", "x", 2.4); // system
 
         let first = a.export_acts();
-        assert_eq!(first.len(), 4, "输入 / 模型 / 工具 / 系统 各一条");
-        assert!(a.export_acts().is_empty(), "同样的记录不该被导出两次");
+        assert_eq!(first.len(), 4, "one each of input / model / tool / system");
+        assert!(a.export_acts().is_empty(), "the same records must not be exported twice");
 
-        // 第二轮：只多导出第二轮的那一条
-        a.round_begin("再写个文件", 3.0);
+        // Second round: only that round's one record is newly exported
+        a.round_begin("write another file", 3.0);
         a.end_round(3.4);
         assert_eq!(a.export_acts().len(), 1);
 
-        // 装回来
+        // Load it back
         let mut b = Activity::default();
         b.load_acts(&first, 100.0);
         assert_eq!(b.acts.len(), 4);
         assert_eq!(b.round, 1);
         assert_eq!(b.next_seq, 4);
-        assert_eq!(b.flushed, 4, "装回来的记录本来就在文件里，水位要跟着对齐");
-        assert!(b.export_acts().is_empty(), "装回来的不该被当成新记录再写一遍");
-        // 整批平移到「刚才」：最后一条结束在 now 之前一点点
+        assert_eq!(b.flushed, 4, "loaded records were already in the file; the watermark must line up");
+        assert!(b.export_acts().is_empty(), "loaded records must not be rewritten as new");
+        // Shift the whole batch to "just now": the last entry ends slightly before now
         let last = b.acts.back().unwrap();
         assert!(last.end_t(100.0) < 100.0 && last.end_t(100.0) > 90.0);
-        // 接着聊：轮次接着数、新一轮从右边长出来
-        b.round_begin("继续", 100.0);
+        // Keep chatting: the round count continues and the new round grows in from the right
+        b.round_begin("continue", 100.0);
         assert_eq!(b.round, 2);
     }
 
-    /// 存档里的坏行、或别的版本写出来的未知类别，都不该毁掉整条时间轴。
+    /// Bad lines in a save, or an unknown category written by another version, must not wreck the whole timeline.
     #[test]
     fn load_acts_skips_bad_rows() {
         let mut a = Activity::default();

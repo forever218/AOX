@@ -1,64 +1,76 @@
-# AOX 组合清单（阶段 5）
+# AOX composition manifest (stage 5)
 #
-# 复制本文件为 aox.toml、放到应用根下（与 config.toml 同目录）即生效。
-# **没有这个文件时，配置就只有 config.toml 一层** —— 与加入本功能之前完全一致。
+# Copy this file to aox.toml and drop it into the application root (the same directory as
+# config.toml) and it takes effect.
+# **With no such file, the configuration is just the single config.toml layer** -- exactly as
+# it was before this feature existed.
 #
-# ── 这份文件管什么 ────────────────────────────────────────────────────────
+# ── what this file governs ────────────────────────────────────────────────────────
 #
-# 它只回答一个问题：**这份配置由哪几层、按什么顺序合出来**。值本身不写在这里。
+# It answers one question only: **which layers this configuration is merged from, and in what
+# order**. Values themselves are not written here.
 #
-#     配置层（低 → 高，后面的覆盖前面的）：
+#     Configuration layers (low → high, later ones override earlier ones):
 #
-#       1..n      bundle          出厂选择：一组可命名、可替换的能力包（见 bundles/）
-#       n+1..m    patch           你自己的定制层，按下面的顺序依次叠加
-#       最后一层   config.toml     ⚠️ 永远最强，且不由本文件控制
+#       1..n      bundle          the factory choice: a set of nameable, replaceable
+#                                 capability packs (see bundles/)
+#       n+1..m    patch           your own customization layers, stacked in the order below
+#       last      config.toml     ⚠️ always strongest, and not governed by this file
 #
-# 合成规则：**两张表就深合（只动你写了的那几个键），其余（标量 / 数组）整体替换。**
+# Merge rule: **two tables are deep-merged (only the keys you wrote change); everything else
+# (scalars / arrays) is replaced wholesale.**
 #
-# ── 想看点具体的 ──────────────────────────────────────────────────────────
+# ── want to see something concrete ────────────────────────────────────────────────
 #
-#     aox --dump-config        打印层清单 + 合成后的每个值，标出它来自哪一层
-#     aox --profile strict     临时换一个 profile（不改本文件）
-#     aox --manifest <路径>     临时换一个清单文件
+#     aox --dump-config        print the layer list plus every merged value, marked with the
+#                              layer it came from
+#     aox --profile strict     switch profile temporarily (without editing this file)
+#     aox --manifest <path>    switch manifest file temporarily
 #
-# 启动之后在命令行输入 /config，可以看「这几层各写了几个值」的短版面。
+# Once running, type /config at the command line for a short view of "how many values each of
+# these layers wrote".
 
 profile = "default"
 
 [profiles.default]
-# 出厂选择。`core` 是聚合名，它自己不带任何值，展开成五个叶子 bundle：
+# The factory choice. `core` is an aggregator name: it carries no values of its own and expands
+# into five leaf bundles:
 #     llm-openai + tools + store-jsonl + loop-standard + prompt-core
-# 内容都在 bundles/*.toml 里，是纯文本，可以直接读。
+# The contents live in bundles/*.toml as plain text you can read directly.
 #
-# **想改出厂选择就别改 core** —— 在这里换列表，或者叠一层 patch。
+# **To change the factory choice, don't edit core** -- swap the list here, or stack a patch.
 bundles = ["core"]
-# 你自己的定制层，按顺序叠加（后面的覆盖前面的）。想用就取消注释。
-# 路径**相对应用根**，也可以写绝对路径。文件不存在会在启动时报错，不会静默跳过。
+# Your own customization layers, stacked in order (later ones override earlier ones).
+# Uncomment to use. Paths are **relative to the application root**; absolute paths work too.
+# A missing file is an error at startup, never a silent skip.
 patches = []
 
 [profiles.strict]
-# 第二个例子：在出厂选择之上再叠一个「更保守」的 bundle ——
-# 它自己只改 3 个键（元工具禁掉、插件工具降成询问、工具超时收紧到 30 秒）。
-# 试试：aox --profile strict --dump-config
+# A second example: stack one more, more conservative bundle on top of the factory choice --
+# it changes just 3 keys of its own (meta tools blocked, plugin tools downgraded to ask, tool
+# timeout tightened to 30 seconds).
+# Try it: aox --profile strict --dump-config
 bundles = ["core", "strict"]
 patches = []
 
-# ── 「表深合、其余整体替换」到底是什么意思 ──────────────────────────────
+# ── what "tables deep-merge, everything else replaces" actually means ──────────────────
 #
-# ① 表是深合的。出厂选择里有 agent.tool_timeout_secs = 60 与
-#    agent.max_result_chars = 20000；你在自己的 patch 里只写：
+# ① Tables deep-merge. The factory choice has agent.tool_timeout_secs = 60 and
+#    agent.max_result_chars = 20000; you write only this in your own patch:
 #
 #        [agent]
 #        tool_timeout_secs = 5
 #
-#    结果是超时变 5、max_result_chars 仍是 20000 —— **不是**整张 agent 表被换掉。
+#    The result is a timeout of 5 with max_result_chars still 20000 -- **not** the whole agent
+#    table being swapped out.
 #
-# ② 数组是整体替换的。比如 bundles/prompt-core.toml 里 order = []，
-#    你在 patch 里写 order = ["env"]，结果就是 ["env"]。
+# ② Arrays are replaced wholesale. For example bundles/prompt-core.toml has order = [];
+#    writing order = ["env"] in a patch gives you ["env"].
 #
-#    **没有「往数组里追加一项」的语义**（那要另造一套语法）。想在 [prompt] order
-#    里同时列出好几段，就在同一个地方把它们全写出来。
+#    **There is no "append one item to the array" semantics** (that would need a syntax of its
+#    own). To list several segments in [prompt] order, write all of them in the same place.
 #
-# ③ 认不出的 bundle 名、找不到的 patch 文件、bundle 成环、这里没有那个 profile：
-#    一律**启动即报错**。静默跳过的后果是「我明明写了这一层，怎么没生效」，
-#    而这类问题最难查。
+# ③ An unrecognized bundle name, a missing patch file, a cycle among bundles, or a profile that
+#    isn't here: all of them **error out at startup**. A silent skip ends in "I definitely
+#    wrote that layer, so why isn't it taking effect", and that is the hardest kind of problem
+#    to track down.

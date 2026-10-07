@@ -8,11 +8,12 @@ use super::{ChatReply, LlmProvider, StreamSink, Usage};
 use crate::config::ProviderConfig;
 use crate::message::{FunctionCall, Message, ToolCall};
 
-/// 单次流式响应写入日志的原始内容上限（防止长会话把内存吃满）
+/// Cap on the raw content of one streaming response written to the log (prevents
+/// long sessions from filling memory)
 const MAX_RAW: usize = 60_000;
 
-/// OpenAI 兼容协议（/chat/completions + tool_calls）。
-/// 一份实现可接 DeepSeek / Kimi / OpenAI / vLLM / Ollama 等。
+/// The OpenAI-compatible protocol (/chat/completions + tool_calls).
+/// One implementation can plug into DeepSeek / Kimi / OpenAI / vLLM / Ollama, etc.
 pub struct OpenAiProvider {
     client: reqwest::Client,
     url: String,
@@ -20,8 +21,9 @@ pub struct OpenAiProvider {
     model: String,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
-    /// 是否以 SSE 流式方式请求。开启后思考过程可实时回显；
-    /// 若某个端点不接受 stream/stream_options，可在 config.toml 里设为 false 回退。
+    /// Whether to request via SSE streaming. When on, the reasoning process can be
+    /// echoed live; if an endpoint doesn't accept stream/stream_options, set this
+    /// to false in config.toml to fall back.
     stream: bool,
 }
 
@@ -57,30 +59,31 @@ impl OpenAiProvider {
         }
         if stream {
             body["stream"] = json!(true);
-            // 让服务端在最后一个 chunk 里带上 usage（推理 token 统计依赖它）
+            // Have the server include usage in the last chunk (reasoning-token
+            // accounting depends on it)
             body["stream_options"] = json!({ "include_usage": true });
         }
         body
     }
 
-    /// 非流式请求：等完整响应一次性返回。
+    /// Non-streaming request: wait for the full response and return it in one go.
     async fn chat_blocking(&self, body: &Value) -> Result<ChatReply> {
         let resp = self.client.post(&self.url).bearer_auth(&self.api_key).json(body).send().await?;
         let status = resp.status();
         let text = resp.text().await?;
         debug_dump(body, &text);
         if !status.is_success() {
-            bail!("LLM 请求失败 HTTP {status}: {}", api_error(&text));
+            bail!(crate::tf!("LLM request failed HTTP {}: {}", status, api_error(&text)));
         }
         let v: Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow!("LLM 返回不是合法 JSON: {e}; body={}", truncate(&text, 500)))?;
+            .map_err(|e| anyhow!(crate::tf!("LLM returned invalid JSON: {}; body={}", format!("{e}"), truncate(&text, 500))))?;
         let choice = v.pointer("/choices/0").cloned().unwrap_or(Value::Null);
         let raw = choice.get("message").cloned().unwrap_or(Value::Null);
         if raw.is_null() {
-            bail!("LLM 返回缺少 choices[0].message: {}", truncate(&text, 500));
+            bail!(crate::tf!("LLM response lacks choices[0].message: {}", truncate(&text, 500)));
         }
         let message: Message = serde_json::from_value(raw)
-            .map_err(|e| anyhow!("assistant 消息解析失败: {e}; raw={}", truncate(&text, 500)))?;
+            .map_err(|e| anyhow!(crate::tf!("failed to parse the assistant message: {}; raw={}", format!("{e}"), truncate(&text, 500))))?;
         Ok(ChatReply {
             message,
             finish_reason: choice.get("finish_reason").and_then(|f| f.as_str()).map(str::to_string),
@@ -88,7 +91,8 @@ impl OpenAiProvider {
         })
     }
 
-    /// 流式请求：逐块解析 SSE，一边累加完整消息，一边把思考过程推给 UI。
+    /// Streaming request: parse SSE chunk by chunk, accumulating the full message
+    /// while pushing the reasoning process to the UI.
     async fn chat_stream(
         &self,
         body: &Value,
@@ -99,12 +103,13 @@ impl OpenAiProvider {
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             debug_dump(body, &text);
-            bail!("LLM 请求失败 HTTP {status}: {}", api_error(&text));
+            bail!(crate::tf!("LLM request failed HTTP {}: {}", status, api_error(&text)));
         }
 
         let mut acc = StreamAcc::default();
         let mut raw = String::new();
-        // 网络分块与 SSE 行边界不对齐，必须自己缓冲到换行才算一行
+        // Network chunks don't align with SSE line boundaries, so buffer to a
+        // newline before treating it as a line
         let mut buf = String::new();
         while let Some(chunk) = resp.chunk().await? {
             buf.push_str(&String::from_utf8_lossy(&chunk));
@@ -118,7 +123,8 @@ impl OpenAiProvider {
                 break;
             }
         }
-        // 个别服务端最后一个 data 行没有换行收尾，单独处理残留
+        // A few servers end the last data line without a trailing newline;
+        // handle the leftover separately
         if !acc.is_done() && !buf.trim().is_empty() {
             let line = buf.trim_end().to_string();
             push_raw(&mut raw, &line);
@@ -143,7 +149,7 @@ impl LlmProvider for OpenAiProvider {
         } else {
             self.chat_blocking(&body).await
         };
-        // 成功或失败都要通知 UI：撤掉临时展示的思考过程，避免它赖在屏幕上
+        // Notify the UI whether we succeed or fail: tear down the temporarily shown reasoning process so it doesn't stick on screen
         if let Some(s) = sink {
             s.on_finish();
         }
@@ -151,7 +157,7 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
-/// 一个工具调用的累加分片
+/// An accumulating fragment of one tool call
 #[derive(Default)]
 struct ToolCallAcc {
     id: String,
@@ -159,28 +165,31 @@ struct ToolCallAcc {
     arguments: String,
 }
 
-/// 流式响应的增量累加器：把一串 SSE data chunk 拼成完整的 assistant 消息。
+/// The incremental accumulator for a streaming response: assembles a series of
+/// SSE data chunks into a complete assistant message.
 ///
-/// 独立成结构体便于离线回归测试（selftest 直接用合成 chunk 喂它）。
+/// Kept as its own struct for easy offline regression testing (selftest feeds it
+/// synthetic chunks directly).
 #[derive(Default)]
 pub struct StreamAcc {
     content: String,
     reasoning: String,
-    /// 按 index 归并：同一工具调用的 name / arguments 会被拆到多个 chunk 里
+    /// Merged by index: one tool call's name / arguments are split across several chunks
     tool_calls: BTreeMap<u64, ToolCallAcc>,
     finish_reason: Option<String>,
-    /// 端点给的用量。开了 `stream_options.include_usage` 之后，最后一帧会带上来。
+    /// The usage the endpoint provides. With `stream_options.include_usage` on,
+    /// the last frame carries it.
     usage: Usage,
     done: bool,
 }
 
 impl StreamAcc {
-    /// 是否已收到 `data: [DONE]`
+    /// Whether `data: [DONE]` has been received
     pub fn is_done(&self) -> bool {
         self.done
     }
 
-    /// 处理一行 SSE 原始文本（形如 `data: {...}`）；非协议行会被安静忽略。
+    /// Process one raw SSE line (of the form `data: {...}`); non-protocol lines are silently ignored.
     pub fn feed(&mut self, line: &str, sink: Option<&(dyn StreamSink + Send + Sync)>) {
         let Some(payload) = line.trim().strip_prefix("data:") else {
             return;
@@ -194,26 +203,27 @@ impl StreamAcc {
             return;
         }
         let Ok(v) = serde_json::from_str::<Value>(payload) else {
-            return; // 心跳/注释/非法行，一律跳过
+            return; // Heartbeats/comments/invalid lines are all skipped
         };
         self.apply(&v, sink);
     }
 
     fn apply(&mut self, v: &Value, sink: Option<&(dyn StreamSink + Send + Sync)>) {
-        // 用量：多数端点在最后一帧单独发一个只有 usage 的 chunk。
-        // 只在真的带了数字时才覆盖 —— 否则会把先前那一份清成空。
+        // Usage: most endpoints send a usage-only chunk as the final frame.
+        // Only overwrite when it really carries numbers — otherwise it would wipe
+        // the earlier copy to empty.
         let u = Usage::parse(v);
         if !u.is_empty() {
             self.usage = u;
         }
-        // 纯 usage 的收尾 chunk 没有 choices，直接返回
+        // A pure-usage closing chunk has no choices; return right away
         let Some(choice) = v.pointer("/choices/0") else { return };
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
             self.finish_reason = Some(fr.to_string());
         }
         let Some(delta) = choice.get("delta") else { return };
 
-        // 思考过程：DeepSeek 用 reasoning_content，少数实现叫 reasoning
+        // Reasoning process: DeepSeek uses reasoning_content, a few implementations call it reasoning
         if let Some(r) = delta
             .get("reasoning_content")
             .or_else(|| delta.get("reasoning"))
@@ -230,7 +240,8 @@ impl StreamAcc {
         if let Some(c) = delta.get("content").and_then(Value::as_str) {
             if !c.is_empty() {
                 self.content.push_str(c);
-                // 正文增量也推给 UI：实时 token 滚动要把输出侧（推理 + 正文）一起数
+                // Push the content delta to the UI too: live token scrolling must
+                // count the output side (reasoning + content) together
                 if let Some(s) = sink {
                     s.on_content(c);
                 }
@@ -260,7 +271,7 @@ impl StreamAcc {
         }
     }
 
-    /// 收尾：拼出 assistant 消息与协议元信息。
+    /// Finalize: assemble the assistant message and protocol metadata.
     pub fn into_reply(self) -> ChatReply {
         let content = if self.content.is_empty() { None } else { Some(self.content) };
         let tool_calls: Vec<ToolCall> = self
@@ -268,7 +279,7 @@ impl StreamAcc {
             .into_iter()
             .enumerate()
             .map(|(i, (_, a))| ToolCall {
-                // 少数端点在流式分片里省略 id，这里补一个稳定可用的占位
+                // A few endpoints omit id in the streaming fragment; fill in a stable placeholder here
                 id: if a.id.is_empty() { format!("call_{i}") } else { a.id },
                 kind: "function".into(),
                 function: FunctionCall {
@@ -292,13 +303,14 @@ fn push_raw(raw: &mut String, line: &str) {
     }
 }
 
-/// 从错误响应体里抽出可读信息：优先取 `error.message`，否则退回原始片段。
+/// Extract readable information from an error response body: prefer
+/// `error.message`, otherwise fall back to the raw fragment.
 fn api_error(body: &str) -> String {
     if let Ok(v) = serde_json::from_str::<Value>(body) {
         if let Some(m) = v.pointer("/error/message").and_then(|m| m.as_str()) {
             let hint = if m.contains("reasoning_content") {
-                "\n  提示: 该模型为思考模式（thinking），必须把上一条 assistant 消息的 \
-                 reasoning_content 原样回传。若仍报此错，请把日志中的原始响应发我。"
+                crate::i18n::t("\n  Hint: this model is a thinking model; the previous assistant message's \
+                 reasoning_content must be sent back verbatim. If it still errors, send me the raw response from the log.")
             } else {
                 ""
             };
@@ -308,7 +320,7 @@ fn api_error(body: &str) -> String {
     truncate(body, 500)
 }
 
-/// AOX_DEBUG_LLM=1 时把请求/响应原始 JSON 追加到 <cwd>/logs/llm.jsonl，便于事后定位。
+/// With AOX_DEBUG_LLM=1, append the raw request/response JSON to <cwd>/logs/llm.jsonl for later diagnosis.
 fn debug_dump(request: &Value, response: &str) {
     if std::env::var("AOX_DEBUG_LLM").map(|v| v == "0").unwrap_or(true) {
         return;
@@ -341,7 +353,7 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// 掐中间而不是掐尾：流式日志里最有诊断价值的是尾部（finish_reason / usage / [DONE]）。
+/// Clip the middle rather than the tail: in a streaming log the most diagnostically valuable part is the tail (finish_reason / usage / [DONE]).
 fn head_tail(s: &str, n: usize) -> String {
     let total = s.chars().count();
     if total <= n {
@@ -351,5 +363,5 @@ fn head_tail(s: &str, n: usize) -> String {
     let tail = n - head;
     let h: String = s.chars().take(head).collect();
     let t: String = s.chars().skip(total - tail).collect();
-    format!("{h}\n…[中间省略 {} 字符]…\n{t}", total - n)
+    crate::tf!("{}\n…[{} chars omitted in the middle]…\n{}", h, total - n, t)
 }

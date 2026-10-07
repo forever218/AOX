@@ -1,17 +1,20 @@
-# 高对比 · high-contrast
+# High contrast
 #
-# 与「纸 / 墨」气质相反的一套：纯黑白、明确边框、更锐的圆角、字大一号，
-# 给弱视、强光下使用，或者单纯想要更硬朗的界面时用。
+# A set deliberately opposite in character to "paper / ink": pure black and white, explicit
+# borders, sharper corners, type one size up -- for low vision, for use under strong light, or
+# simply when you want a harder-edged interface.
 #
 #   aox-gui --theme themes/high-contrast.toml
 #
-# 两套明暗**都**定义了，所以不管当前处于纸还是墨，看到的都是高对比外观
-# （半吊子主题文件只定义一套的话，另一半会退回内置配色，看着会串味）。
+# Both light and dark are defined, so whether you are currently on paper or ink you get the
+# high-contrast look (a half-done theme file that defines only one of them falls back to the
+# built-in palette on the other half, and the result tastes of both).
 #
-# 本文件就是一份 `[theme]` 段，可以**整段粘进 config.toml**。
+# This file **is** a `[theme]` section and can be **pasted wholesale into config.toml**.
 #
-# 注意明暗：下面 mode 的优先级**低于**你手动点过的那次切换
-# （记录在 <应用根>/.aox-gui-theme）；想让 mode 生效，先删掉那个文件。
+# Note on light/dark: the `mode` below has **lower** priority than a switch you made by hand
+# (which is recorded in <app root>/.aox-gui-theme); to make `mode` take effect, delete that
+# file first.
 
 [theme]
 mode = "dark"

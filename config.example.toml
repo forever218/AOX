@@ -1,94 +1,113 @@
-# AOX — 自我增长的 AI 编程代理
-# 复制本文件为 config.toml 并填写你的配置
+# AOX — a self-growing AI coding agent
+# Copy this file to config.toml and fill in your configuration
 #
-# ⚠️ 这份文件是**配置层的最后一层**（阶段 5）。它上面还可以叠「出厂 bundle」与你自己
-#    在 aox.toml 里列出的 patch 文件，优先级是：**bundle < patch < 本文件**。
-#    换句话说，**这里写的值一定赢** —— 现有配置不用为「分层」做任何迁移。
-#    想看合成结果：aox --dump-config（启动后也可以输入 /config 看层清单）。
-#    想自定义分层：把 aox.example.toml 复制成 aox.toml。
+# ⚠️ This file is the **last configuration layer** (stage 5). On top of it you can still stack
+#    the factory bundles and the patch files you list in aox.toml; the priority is
+#    **bundle < patch < this file**.
+#    In other words, **what you write here always wins** -- an existing configuration needs no
+#    migration for "layering" at all.
+#    To see the merged result: aox --dump-config (once running you can also type /config for
+#    the layer list).
+#    To customize the layering: copy aox.example.toml to aox.toml.
 
 [provider]
-# OpenAI 兼容协议端点（DeepSeek / Kimi / OpenAI / vLLM / Ollama 均可）
+# OpenAI-compatible endpoint (DeepSeek / Kimi / OpenAI / vLLM / Ollama all work)
 base_url = "https://api.deepseek.com"
 model = "deepseek-chat"
-# 二选一：直接写 key，或指定环境变量名
+# Pick one: write the key directly, or name an environment variable
 api_key = "sk-..."
 # api_key_env = "DEEPSEEK_API_KEY"
-# 单次回复的最大输出 token。
-# ⚠️ 思考模式模型的「推理 token」也计入此额度，给太小会导致正文为空、
-#    表现成「任务莫名中断」。
-#    DeepSeek 服务端上限为 384K（393216），填超了会被直接 400 拒绝。
+# Maximum output tokens for a single reply.
+# ⚠️ A reasoning model's "reasoning tokens" count against this budget too, so a value that is
+#    too small yields an empty body text, which shows up as "the task broke off for no reason".
+#    DeepSeek caps it at 384K (393216) server-side; exceeding that gets a flat 400.
 max_tokens = 300000
 temperature = 0.3
-# 是否以 SSE 流式方式请求（默认 true）。
-# 开启后，思考模式模型的推理过程会在等待时实时滚动显示（响应结束即消失）。
-# 若某个端点不接受 stream / stream_options 参数，设为 false 回退为等完整响应。
+# Whether to request as an SSE stream (default true).
+# With this on, a reasoning model's chain of thought scrolls live while you wait (and
+# disappears once the response ends).
+# If an endpoint doesn't accept the stream / stream_options parameters, set false to fall back
+# to waiting for the complete response.
 stream = true
 
 [auth]
-# 元工具（create_plugin / remove_plugin 等改变系统自身的操作）：ask | auto | deny
+# Meta tools (create_plugin / remove_plugin and other operations that change the system
+# itself): ask | auto | deny
 meta_tools = "ask"
-# 模型自己造出来的插件工具：ask | auto | deny
+# Tools from plugins the model built for itself: ask | auto | deny
 plugin_tools = "auto"
-# 按工具名或插件名单独覆盖：
-#   * 写完整名字 = 精确命中，例如 shell_exec
-#   * 结尾带 `*` = 前缀通配，用来一次挡住「一类工具」
-#     注意通配只看前缀、不认分隔符：`fs*` 连 fsx 也一起命中，想圈住一组工具就写 `fs_*`；
-#     单独一个 `*` 是兜底一切。通配是阶段 4 加的，旧配置一个字都不用改。
-#   * ⚠️ 带 `*` 的键名**必须加引号**：TOML 的裸键只允许字母、数字与 `_` `-`，
-#     写成 `fs_* = "deny"` 会直接解析失败 —— 要用 `"fs_*" = "deny"`。
+# Overriding by individual tool name or plugin name:
+#   * a complete name = an exact match, e.g. shell_exec
+#   * a trailing `*` = a prefix wildcard, to block "a class of tools" in one go
+#     Note the wildcard looks only at the prefix and knows nothing about separators: `fs*`
+#     hits fsx too, so write `fs_*` when you mean one group of tools; a lone `*` is a
+#     catch-everything fallback. Wildcards arrived in stage 4; old configs need no change.
+#   * ⚠️ a key containing `*` **must be quoted**: TOML bare keys allow only letters, digits,
+#     `_` and `-`, so `fs_* = "deny"` fails to parse outright -- write `"fs_*" = "deny"`.
 # [auth.overrides]
 # shell_exec = "ask"
 # "fs_*"     = "deny"
 
 [agent]
-# 项目规则文件，存在则注入系统提示
+# Project rules file; injected into the system prompt if present
 rules_file = "RULES.md"
-# 单次工具调用超时（秒）
+# Timeout for a single tool call (seconds)
 tool_timeout_secs = 120
-# 送回模型的工具结果最大字符数（超出截断）
+# Maximum number of characters of a tool result sent back to the model (truncated past this)
 max_result_chars = 20000
 
 [prompt]
-# 系统提示词由若干「段」拼成，这里是它们在你这台机器上的覆盖方式。
-#   内置段：core（身份与核心事实）/ protocol（插件协议与内置规则）
-#   自动生成：env（运行环境：宿主真实路径 + 本机解释器状况）/ rules（RULES.md 项目规则）
-# 想看当前实际拼装结果：命令行输入 /prompt
+# The system prompt is assembled from several "segments"; this is how you override them on
+# your own machine.
+#   Built in:  core (identity and core facts) / protocol (the plugin protocol and built-in
+#              rules)
+#   Generated: env (the runtime environment: the host's real paths + this machine's
+#              interpreter situation) / rules (RULES.md project rules)
+# To see what is actually assembled right now: type /prompt at the command line
 #
-# 注意：本段全空 = 完全按内置顺序，与内置提示词**逐字节一致**。
-# 一改动就会让服务端的 prompt cache 失效一次（前缀变了），这是正常代价。
+# Note: this section entirely empty = entirely the built-in order, **byte for byte identical**
+# to the built-in prompt.
+# Any change invalidates the server-side prompt cache once (the prefix changed); that is a
+# normal price to pay.
 
-# 显式顺序：列出的段按此顺序排到最前，未列出的保持默认序跟在其后。
-# 所以「只把运行环境挪到最前」只需写一行，不必把四段全列一遍。
+# Explicit order: the listed segments are moved to the front in this order, and unlisted ones
+# keep their default order after them.
+# So "just move the runtime environment to the front" is a single line, not all four segments.
 # order = ["env"]
 
-# 禁用段。例如暂时不打算用插件，可整段去掉协议说明。
+# Segments to disable. For instance, if you don't plan to use plugins for now, drop the whole
+# protocol section.
 # disable = ["protocol"]
 
-# 追加自定义段；若 id 与内置段同名（core / protocol），则**整段替换**内置段。
+# Append custom segments; if the id matches a built-in one (core / protocol), it **replaces
+# that built-in segment wholesale**.
 # [[prompt.segment]]
 # id = "style"
-# title = "团队风格"
+# title = "Team style"
 # order = 50
 # body = """
-# 回答一律用中文，先给结论再给理由。
+# Always answer in English: the conclusion first, then the reasons.
 # """
 
-# ── 循环钩子（阶段 4 新增）───────────────────────────────────────────────
+# ── loop hooks (added in stage 4) ────────────────────────────────────────────────
 #
-# 钩子让宿主在「模型请求前 / 回复后 / 工具调用前后 / 请求出错时」插一脚，
-# 用来微调系统行为，而不必改主循环。
+# Hooks let the host stick a foot in "before the model request / after the reply / around a
+# tool call / when a request errors", to nudge system behaviour without touching the main loop.
 #
-# 下面整块都是注释的：不写 = 一个钩子都不注册，行为与内置循环**完全一致**。
-# 想看当前生效了哪些钩子，命令行输入 /hook（钩子在启动时定型，改完要重启）。
+# Everything below is commented out: writing nothing = not a single hook registered, and the
+# behaviour is **exactly** the built-in loop.
+# To see which hooks are in force right now, type /hook at the command line (hooks are fixed
+# at startup, so a change needs a restart).
 #
-# 本期只开放一项能力 —— 给指定工具**补默认参数**：
-#   * 只在模型没给那个键时补；模型显式传的值一律不动
-#     （覆盖模型的显式意图，会造出「模型说 A、工具收到 B」这种最难查的问题）。
-#   * 值可以是字符串 / 数字 / 布尔 / 数组，写法与 TOML 一致。
+# This release opens exactly one capability -- supplying **default arguments** to a given tool:
+#   * only filled in when the model didn't pass that key; a value the model passed explicitly
+#     is never touched (overriding the model's explicit intent produces "the model said A and
+#     the tool received B", the hardest kind of problem to find).
+#   * values may be strings / numbers / booleans / arrays, written the way TOML writes them.
 #
-# 注意：「禁止某类工具」**不在这里** —— 那是授权问题，写在 [auth.overrides]，
-# 用 fs_* 这样的通配键；本节只管「放行之后，参数要不要动」。
+# Note: "ban a class of tools" is **not here** -- that is an authorization matter, written in
+# [auth.overrides] with a wildcard key like fs_*; this section only governs "once allowed,
+# should the arguments be changed".
 #
 # [hook.tool_args_default.fs_read_file]
 # encoding = "utf-8"
@@ -96,177 +115,215 @@ max_result_chars = 20000
 # [hook.tool_args_default.myplugin_write]
 # create_dirs = true
 #
-# 另一项能力（阶段 6 · 6b 新增）—— 请求出错时让宿主**自己**重试几次：
+# A second capability (stage 6 · 6b) -- have the host **itself** retry a few times when a
+# request errors:
 #
 # [hook]
 # max_llm_retries = 2
 #
-#   —— 模型请求本身失败（网络抖动、上游 5xx 之类）时，宿主自动重试，最多这么多次。
-#      计数是**每轮**的，不会在一段长对话里越攒越多。0（默认）= 不重试，错误原样抛出，
-#      与阶段 4 逐字节一致。
-#      组件（插件 plugin.toml 的 [contributes] hooks）也能提出重试，那条路优先；
-#      这一项是「一个组件都不写也能重试」的兜底。
-#
-# 钩子的**另一个来源**是插件（阶段 6 · 6b 新增）：插件的 plugin.toml 里写
-#   [contributes]
-#   hooks = ["before_tool", "on_error"]
-# 宿主就会把这个子进程挂成一个钩子（10 秒超时，出问题按「放行」降级处理，
-# 失败次数在 /hook 里看得到）。示例见 tools/samples/contributing_component/。
+#   —— when the model request itself fails (a network hiccup, an upstream 5xx, and so on), the
+#      host retries automatically, up to this many times. The count is **per turn**, so it
+#      doesn't accumulate over a long conversation. 0 (the default) = no retries, the error is
+#      thrown as-is, byte for byte identical to stage 4.
+#      Components (the [contributes] hooks of a plugin's plugin.toml) can also request retries,
+#      and that path takes precedence; this one is the fallback that works when no component
+#      asks at all.
 
-# ── 主循环（阶段 6 · 6a 新增）─────────────────────────────────────────────
+# ── the main loop (stage 6 · 6a) ──────────────────────────────────────────────────
 #
-# 这一段决定**用哪个循环骨架**跑完一整轮（问模型 → 执行工具 → 回填结果）。
-# [hook] 只能在循环内部插五个点，骨架本身是固定的；[loop] 换的是骨架本身。
+# This section decides **which loop skeleton** runs a whole turn (ask the model -> run tools ->
+# fill results back in). [hook] can only plug into five points inside the loop; the skeleton
+# itself is fixed. [loop] swaps the skeleton.
 #
-# 同样整块注释掉：不写 = standard + 不裁剪上下文，行为与以前**逐字节相同**。
-# 想看当前生效了什么，命令行输入 /loop（启动时定型，改完要重启）。
+# Also commented out entirely: writing nothing means standard + no context pruning, behaviour
+# **byte for byte identical** to before.
+# To see what is in force right now, type /loop at the command line (fixed at startup, so a
+# change needs a restart).
 #
 # [loop]
 # impl = "standard"
 #
-#   —— 本期只认 standard（内置的那一套）。写别的名字**启动即报错退出**，
-#      不会静默退回 —— 与 [store] backend 同一个道理。
+#   —— this release recognizes only standard (the built-in one). Any other name **errors out
+#      at startup** rather than falling back quietly -- the same reasoning as [store] backend.
 #
 # max_rounds = 6
 #
-#   —— 上下文最多保留多少个「用户轮次」，0（默认）= 不限制。
-#      一轮以一条 user 消息为界；裁剪只从**最老的整轮**开始丢，且永远保留系统提示那一条。
-#      所以裁完的上下文本身就是一个合法请求体 —— 不会留下「tool 结果还在、
-#      它的 assistant 已经被丢掉」这种请求会被端点直接拒绝的半截消息。
-#      裁剪会**同时**改内存与对话文件（回滚是对称的），重启读回来不会残缺。
-#      ⚠️ 它是「上限」不是「目标」：轮数没超过它时，一条都不裁。
+#   —— how many "user turns" the context keeps at most; 0 (the default) = unlimited.
+#      A turn is bounded by one user message; pruning always drops from the **oldest whole
+#      turn**, and the system-prompt message is never dropped.
+#      So a pruned context is still a legal request body -- it can't leave behind a half-message
+#      like "the tool result is still here but its assistant was dropped", which the endpoint
+#      would reject outright.
+#      Pruning changes **both** memory and the conversation file (rollback is symmetric), so
+#      reading it back after a restart isn't truncated.
+#      ⚠️ It is a "cap", not a "target": while the turn count is below it, nothing is pruned.
 
-# ── 插件进程围栏（Job Object）─────────────────────────────────────────────
+# ── plugin process fence (Job Object) ─────────────────────────────────────────────
 #
-# 每个插件子进程放进一个独立的 Windows Job Object，管三件事：它能开几个进程、
-# 能用多少内存、能不能碰宿主的窗口/剪贴板/桌面。
+# Every plugin subprocess goes into its own Windows Job Object, which governs three things:
+# how many processes it may open, how much memory it may use, and whether it may touch the
+# host's windows / clipboard / desktop.
 #
-# 命令行输入 /sandbox 看当前生效的限制。命令行 /plugins 里每个插件后面那枚
-# 「围栏 ✓ / ✗」就是这个 —— ✗ 表示它没进 Job（沙箱关了，或外层 Job 不允许嵌套）。
+# Type /sandbox at the command line to see the limits currently in force. The "fence ✓ / ✗"
+# marker after each plugin in /plugins is exactly this -- ✗ means it didn't enter a Job (the
+# sandbox is off, or the outer Job doesn't allow nesting).
 #
-# ⚠️ 它**管不了文件与网络**：Job Object 没有这个能力。所以它是「围栏」不是「沙箱」——
-#    /sandbox 的输出里会把这句话再原样写一遍，免得有人以为它已经挡住了删文件。
+# ⚠️ It **cannot govern files or the network**: a Job Object has no such ability. Which is why
+#    it is a "fence" and not a "sandbox" -- /sandbox's output repeats that sentence verbatim,
+#    so nobody walks away thinking file deletion is already blocked.
 #
-# 下面这份**不是示例、就是当前生效的默认值**（这一段是默认开的）。
+# What follows is **not an example; it is the default currently in force** (this section is on
+# by default).
 
 [sandbox]
-# 总开关。false = 不建 Job、不加 CREATE_SUSPENDED，与加围栏之前逐字节一致。
+# Master switch. false = no Job created, no CREATE_SUSPENDED added; byte for byte identical to
+# before the fence existed.
 enabled = true
 
-# 每个插件**最多能再开几个子进程**（不含插件自己）。
-#   0 = 一个都不许（唯一能把这条路锁死的档：需要 fork 的插件会报 WinError 1816）
-#   8 = 默认。够「插件 → shell → 工具」这类真实用法，同时仍是个小额度 ——
-#       一个插件的整个进程组最多 9 个，而 fork bomb 靠并发翻倍，这里封顶就起不来。
-# 想放开就写个大数（比如 1000），**别写 0** —— 这里的 0 是「一个都不许」，
-# 与下面 max_memory_mb = 0（不限）方向相反：问「允许几个」时 0 就是 0 个。
-# 额度是**每个插件一份**（一个插件一个 Job），不是全局预算 —— 否则一个插件
-# 把额度吃光，别的插件连启动都启动不起来。
+# How many more child processes each plugin may open (the plugin itself excluded).
+#   0 = none at all (the only setting that truly locks this path down: plugins that need to
+#      fork will report WinError 1816)
+#   8 = the default. Enough for real usage like "plugin -> shell -> tool", while still a small
+#      allowance -- one plugin's whole process group is at most 9, and a fork bomb grows by
+#      doubling, so a cap here stops it from getting off the ground.
+# To open it up, write a large number (1000, say); **don't write 0** -- 0 here means "none at
+# all", the opposite direction from max_memory_mb = 0 (unlimited) below: asked "how many are
+# allowed", 0 means zero.
+# The allowance is **per plugin** (one Job per plugin), not a global budget -- otherwise one
+# plugin could eat the whole allowance and the rest couldn't even start.
 max_processes = 8
 
-# 内存上限（MB）。0 = 不限，这也是默认值。
-# ⚠️ 为什么默认关：超限是**整个进程被内核结束**，不是一次分配失败 —— 偏紧的帽子
-#    会把「合法但吃内存」的插件直接打死，而且从插件侧看不到任何原因，
-#    表现只是「插件老是莫名其妙被重启」，极难查。想开就明确地开。
+# Memory ceiling (MB). 0 = unlimited, which is also the default.
+# ⚠️ Why it is off by default: exceeding the limit **kills the whole process in the kernel**,
+#    it isn't one failed allocation -- a cap that is too tight will kill outright a plugin that
+#    is legitimate but memory-hungry, and nothing is visible from the plugin's side; it just
+#    looks like "the plugin keeps getting restarted for no reason", which is very hard to
+#    diagnose. Turn it on deliberately if you want it.
 max_memory_mb = 0
 
-# 禁止插件使用宿主进程的 USER 对象（窗口 / 剪贴板 / 桌面 / 全局原子）。
-# 插件不需要这些 —— 它与宿主的全部通信都走 stdin/stdout 管道。
+# Forbid the plugin from using the host process's USER objects (windows / clipboard / desktop /
+# global atoms). Plugins don't need any of these -- all their communication with the host goes
+# through stdin/stdout pipes.
 ui_limits = true
 
 [workplace]
-# 模型能碰哪些文件（「把文件能力收回宿主」）。注意它与上面的 [sandbox] 是**两件事**：
-#   [sandbox]   管「插件子进程怎么跑」（能不能开子进程 / 吃多少内存 / 碰不碰宿主窗口）
-#   [workplace] 管「这次能往哪里写、能删哪里」
-# 段名 2026-10-04 从 [workspace] 改成 [workplace]（**旧名仍然认**，老配置不会失效）。
+# Which files the model may touch ("take file capability back from the model"). Note that this
+# is **a separate matter** from [sandbox] above:
+#   [sandbox]   governs "how plugin subprocesses run" (may they open children / how much memory
+#               may they use / may they touch the host's windows)
+#   [workplace] governs "where this session may write, and what it may delete"
+# The section was renamed from [workspace] to [workplace] on 2026-10-04 (**the old name still
+# works**, so older configs don't break).
 #
-# "default" = **默认**：每段新对话在 <应用根>/workplace/<时间戳>/ 开一块新地，
-#             写入与删除只准落在里面（读取不受限）。
-# "full"    = 不受限。要它必须**显式写出来** —— 2026-10-05 起出厂默认改成了 "default"
-#             （用户要「每次启动默认受限」），所以「不写这一段」现在等于受限档。
-# "fixed"   = 固定一块地，配合下面的 root 指定目录。
-# 填一个不认识的名字会在**启动时直接报错**，不会静默退回默认档。
+# "default" = **the default**: each new conversation opens a fresh plot at
+#             <app root>/workplace/<timestamp>/, and writes and deletes may land only inside it
+#             (reading is unrestricted).
+# "full"    = unrestricted. You must **write it explicitly** -- as of 2026-10-05 the factory
+#             default became "default" (the user wanted "restricted by default on every
+#             start"), so "leaving this section out" now means the restricted tier.
+# "fixed"   = one fixed plot; give the directory with `root` below.
+# An unrecognized name **errors out at startup** rather than quietly falling back to default.
 #
-# ⚠️ 只挡「写」和「删」：**读文件不受工作区限制** —— read_file / list_dir 可以读
-#    设备上的任何文件（读一遍不改设备，正是为了「想翻一份别处的资料」不用提权）。
+# ⚠️ Only "write" and "delete" are blocked: **reading files is not limited by the workplace** --
+#     read_file / list_dir can read anything on the device (reading doesn't change the device,
+#     and the point is that "looking something up elsewhere" shouldn't need elevation).
 #
-# 生效范围：宿主内置的文件工具（read_file / write_file / list_dir / remove），
-# 以及插件工具**声明出来的路径参数**（宿主按参数名扫，是张粗网）。那张粗网一律按
-# 「写」判 —— 宿主看不出插件拿这个路径是去读还是去写，于是 fs 类插件在受限档下
-# 连读区外也会被拒（宿主内置的 read_file 不会）。
-# ⚠️ 它**管不了一个不守规矩的插件自己 open() 文件** —— 那要 OS 级隔离（AppContainer）。
-# 运行期改档位不用改这里：命令行用 /workplace（旧名 /workspace 也认），GUI 用输入框左下角的「工作区」。
+# Scope: the host's built-in file tools (read_file / write_file / list_dir / remove), and the
+# **declared path arguments** of plugin tools (the host scans by argument name -- a coarse
+# net). That coarse net always judges as "write" -- the host can't tell whether a plugin takes
+# that path to read or to write, so fs-family plugins are refused even for out-of-area reads in
+# the restricted tier (the host's own read_file is not).
+# ⚠️ It **cannot stop a misbehaving plugin from open()-ing a file itself** -- that needs OS-level
+# isolation (AppContainer).
+# You don't have to change this to switch tiers at runtime: use /workplace at the command line
+# (the old /workspace name works too), or the "workplace" button at the input box's bottom-left
+# in the GUI.
 mode = "default"
 
-# mode = "fixed" 时的固定工作区目录。相对路径相对**应用根**解释。
+# The fixed workplace directory when mode = "fixed". Relative paths are resolved against the
+# **application root**.
 # root = "sandbox-work"
 
 [history]
-# 对话历史自动落盘。目录固定在 <应用根>/history，每个对话一个 .jsonl 文件，
-# 命令行与 GUI 共用同一套写法（各自的应用根各存一份）。
-# 命令行用 /history 查看，GUI 用顶栏最左侧图标开侧边栏。
+# Conversation history is written to disk automatically. The directory is fixed at
+# <app root>/history, one .jsonl file per conversation; the CLI and the GUI share the same
+# layout (each keeps its own copy under its own application root).
+# Use /history in the CLI; in the GUI use the leftmost icon to open the sidebar.
 #
-# 关掉后不再写新文件（已存在的历史仍然可读、可查看）。
+# With this off, no new file is written (existing history stays readable and viewable).
 enabled = true
-# 保留多少个最近对话，超出的按时间从旧到新删除。0 = 不限制。
-# 只在每次新建对话文件时顺带清理，不会在后台扫描或定时删除。
+# How many recent conversations to keep; older ones beyond that are deleted oldest-first.
+# 0 = unlimited.
+# Cleanup only happens alongside creating a new conversation file -- nothing scans in the
+# background or deletes on a timer.
 keep = 200
 
 [store]
-# 对话历史的**存储后端**。
+# The **storage backend** for conversation history.
 #
-# 这是「存储缝」的配置入口：调用方一律按对话 id 说话，不关心历史落在哪儿、
-# 以什么格式落。当前只有 "jsonl"（每个对话一个文件），也是默认值。
+# This is the configuration entry point of the "storage seam": callers speak purely in terms of
+# a conversation id and care neither where history lands nor in what format. Right now only
+# "jsonl" (one file per conversation) exists, and it is the default.
 #
-# 将来会有别的后端（比如把所有对话收进一个 sqlite 库）—— 那时"换后端"就是
-# 改这一行，而不是改代码。填一个不认识的名字会在**启动时直接报错**，
-# 不会静默退回 jsonl（否则你写了 sqlite，却还在往 jsonl 里写，最难查）。
+# There will be other backends one day (all conversations in one sqlite database, say) -- then
+# "swap the backend" is one line here, not a code change. An unrecognized name **errors out at
+# startup** rather than quietly falling back to jsonl (otherwise you'd write sqlite and still
+# be writing into jsonl, which is the hardest kind of problem to find).
 backend = "jsonl"
 
 [runtimes]
-# 插件运行时命令（python 插件 / node 插件 / rust 插件编译器）。
+# Plugin runtime commands (the python plugin / node plugin / rust plugin compiler).
 #
-# 值有两种写法，语义不同：
-#   * 裸命令（下面这种）→ 宿主按「应用目录内置运行时 → PATH」的顺序查找。
-#     内置运行时指 <应用根>/runtime/python/python.exe；把运行时解压到那里就自动生效，
-#     无需改这一行。用 /runtime install python 可自动装配（约 10 MB）。
-#   * 完整路径（如 'C:\Python313\python.exe'）→ 直接采用，绝不被内置运行时顶替。
-#     路径里有反斜杠时建议用 TOML 字面量字符串（单引号），免得 \n 之类被当转义。
+# Values may be written two ways, with different meanings:
+#   * a bare command (as below) -> the host searches "runtime bundled in the app directory,
+#     then PATH", in that order. The bundled runtime means <app root>/runtime/python/python.exe;
+#     unpacking a runtime there takes effect with no change to this line. Use
+#     `/runtime install python` to provision it automatically (~10 MB).
+#   * a full path (e.g. 'C:\Python313\python.exe') -> taken as-is, never displaced by the
+#     bundled runtime. With backslashes in the path, prefer a TOML literal string (single
+#     quotes) so things like \n aren't read as escapes.
 python = "python"
 node = "node"
 rustc = "rustc"
 
-# 可选：覆盖 Python 运行时的下载源。留空用 CPython 官方嵌入式发行版。
-# 需要内网 / 加速时指向自建镜像；`bash tools/build_installer.sh pack` 产出的
-# dist/aox-python-runtime.zip 上传到自己的 CDN 即可。
+# Optional: override the download source for the Python runtime. Leave empty to use CPython's
+# official embedded distribution.
+# Point it at your own mirror for an intranet or for speed; upload the
+# dist/aox-python-runtime.zip produced by `bash tools/build_installer.sh pack` to your own CDN.
 # python_url = "https://your-mirror.example.com/python-3.13.7-embed-amd64.zip"
 
-# 可选：期望的 SHA-256。
-#   * 留空时：默认官方源套用内置的官方校验值；自定义源则不校验。
-#   * 自己托管时必须填（否则不会校验），可用 `certutil -hashfile <包> SHA256` 取。
+# Optional: the expected SHA-256.
+#   * left empty: the built-in official checksum is applied to the default official source; a
+#     custom source is not verified.
+#   * must be filled in when self-hosting (otherwise nothing is verified); get it with
+#     `certutil -hashfile <package> SHA256`.
 # python_sha256 = "f6cca216a359be84797cabb54149ce5e062afb16cc7567eb7fc51cacb2d86b65"
 
 [theme]
-# ── 界面外观（只对 GUI 生效）──────────────────────────────────────────────
+# ── interface appearance (GUI only) ───────────────────────────────────────────────
 #
-# 全部留空 / 注释掉时，外观与出厂状态**逐像素相同** —— 这一节纯粹是「想改才改」。
-# 改完**重启 GUI**即生效，不需要重新编译。
+# Left entirely empty / commented out, the appearance is **pixel for pixel** the factory state
+# -- this section exists purely for "change it if you want to".
+# Changes take effect after **restarting the GUI**; no recompilation needed.
 #
-# 想整体换一套外观，用命令行参数更省事：
+# To swap the whole look in one go, the command-line flag is simpler:
 #     aox-gui --theme themes\high-contrast.toml
-# --theme 指定的文件会**整份取代**本节（不是逐字段叠加）；
-# 例子见 themes/ 下的 paper.toml、ink.toml、high-contrast.toml。
+# A file given via --theme **replaces this section wholesale** (it is not merged field by
+# field); see themes/paper.toml, themes/ink.toml and themes/high-contrast.toml for examples.
 
-# 初始明暗："light"（纸）/ "dark"（墨）。
+# Initial light/dark: "light" (paper) / "dark" (ink).
 #
-# ⚠ 这一项优先级**最低**：只要你手动点过一次明暗切换，就以那次为准
-#   （记录在 <应用根>/.aox-gui-theme）。想让这里生效，先删掉那个文件。
+# ⚠️ This one has the **lowest** priority: as soon as you switch light/dark by hand once, that
+#    wins (recorded in <app root>/.aox-gui-theme). To make this line take effect, delete that
+#    file first.
 # mode = "dark"
 
-# ── 配色：逐字段覆盖 ────────────────────────────────────────────────────
-# 只写想改的字段，没写的继承内置。颜色写法："#RRGGBB" / "#RRGGBBAA" / "#RGB"，
-# 或数组 [r, g, b] / [r, g, b, a]（alpha 是不透明度，FF = 完全不透明）。
+# ── colours: override field by field ──────────────────────────────────────────────
+# Write only the fields you want to change; anything unwritten inherits from the built-in.
+# Colours may be written as "#RRGGBB" / "#RRGGBBAA" / "#RGB", or as an array
+# [r, g, b] / [r, g, b, a] (alpha is opacity, FF = fully opaque).
 #
-# 可用的 18 个字段（含义见 themes/ink.toml 里的完整样板）：
+# The 18 available fields (for their meanings see the full template in themes/ink.toml):
 #   bg  panel  surface  surface_hi  border  border_strong
 #   text  text_dim  text_faint  ink  ink_soft  user_bg
 #   code_bg  code_chip  quote_bar  reverse_bg  on_reverse  shadow
@@ -279,26 +336,28 @@ rustc = "rustc"
 # text = "#EAE7DF"
 # ink = "#ECE9E1"
 
-# ── 字号与尺度 ──────────────────────────────────────────────────────────
-# 括号里是出厂值，只写想改的那几项即可。
+# ── font sizes and metrics ────────────────────────────────────────────────────────
+# The factory value is in brackets; write only the ones you want to change.
 # [theme.metrics]
-# body_size = 16.0                # 正文基准字号
-# heading_size = 21.0             # 标题
-# button_size = 15.0              # 按钮文字
-# small_size = 13.0               # 小字
-# mono_size = 14.5                # 等宽（代码块）
-# card_radius = 14                # 卡片圆角
-# item_spacing = [10.0, 10.0]     # 控件间距 [水平, 垂直]
-# button_padding = [14.0, 9.0]    # 按钮内边距 [水平, 垂直]
-# interact_height = 30.0          # 交互控件最小高度
-# indent = 22.0                   # 缩进
+# body_size = 16.0                # baseline body text
+# heading_size = 21.0             # headings
+# button_size = 15.0              # button text
+# small_size = 13.0               # small text
+# mono_size = 14.5                # monospace (code blocks)
+# card_radius = 14                # card corner radius
+# item_spacing = [10.0, 10.0]     # widget spacing [horizontal, vertical]
+# button_padding = [14.0, 9.0]    # button padding [horizontal, vertical]
+# interact_height = 30.0          # minimum height of an interactive widget
+# indent = 22.0                   # indentation
 
-# ── 字体 ────────────────────────────────────────────────────────────────
-# 留空则按「环境变量 AOX_GUI_FONT* → 系统字体候选表」自动查找，一般不用改。
-# 路径里有反斜杠时用单引号字面量，免得 \n 之类被当转义。
+# ── fonts ─────────────────────────────────────────────────────────────────────────
+# Left empty, fonts are looked up automatically via "the AOX_GUI_FONT* environment variables ->
+# a system font candidate list"; you normally don't need to change this.
+# With backslashes in the path, use single-quoted literals so things like \n aren't read as
+# escapes.
 # [theme.fonts]
-# cjk   = 'C:\Windows\Fonts\Deng.ttf'          # 正文 / 中文
-# bold  = 'C:\Windows\Fonts\Dengb.ttf'         # 粗体
-# serif = 'C:\Windows\Fonts\georgia.ttf'       # 衬线（次级标题）
-# brand = 'C:\Windows\Fonts\Gabriola.ttf'      # 品牌字（首屏大招呼）
-# mono  = 'C:\Windows\Fonts\CascadiaMono.ttf'  # 等宽（代码块）
+# cjk   = 'C:\Windows\Fonts\Deng.ttf'          # body text / CJK
+# bold  = 'C:\Windows\Fonts\Dengb.ttf'         # bold
+# serif = 'C:\Windows\Fonts\georgia.ttf'       # serif (secondary headings)
+# brand = 'C:\Windows\Fonts\Gabriola.ttf'      # brand face (the empty-state wordmark)
+# mono  = 'C:\Windows\Fonts\CascadiaMono.ttf'  # monospace (code blocks)

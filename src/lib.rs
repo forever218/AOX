@@ -1,12 +1,15 @@
-//! AOX 核心库。
+//! The AOX core library.
 //!
-//! 这个 crate 同时提供两种产物：
-//! - **lib `aox`**（本文件）：把 Agent 主循环、LLM Provider、插件宿主、运行时与
-//!   `Ui` 抽象层暴露出来，供 `gui/`（`aox-gui`）等其它前端复用。
-//! - **bin `aox`**（`src/main.rs`）：原有的命令行版本，行为与加入 GUI 之前完全一致。
+//! This crate ships two artifacts:
+//! - **lib `aox`** (this file): exposes the agent loop, the LLM provider, the plugin host,
+//!   the runtimes and the `Ui` abstraction, so other front ends — `gui/` (`aox-gui`) among
+//!   them — can reuse them.
+//! - **bin `aox`** (`src/main.rs`): the original command-line build. Its behaviour is
+//!   identical to what it was before the GUI existed.
 //!
-//! 两个 crate root 各自编译同一批模块；CLI 不引用本 lib，因此它的行为不受影响。
-//! 凡是「前端无关」的能力都应只依赖这里的公开接口，而不要复制实现。
+//! Both crate roots compile the same set of modules, and the CLI does not reference this
+//! lib, so its behaviour is unaffected. Everything that is *not* front-end specific belongs
+//! behind the public API here — never copy an implementation into a front end.
 
 pub mod agent;
 pub mod agent_loop;
@@ -15,6 +18,7 @@ pub mod auth;
 pub mod config;
 pub mod history;
 pub mod hook;
+pub mod i18n;
 pub mod image;
 pub mod llm;
 pub mod message;

@@ -13,20 +13,21 @@ use crate::runtime::Runtime;
 use crate::tool::{ToolKind, ToolOutput};
 use crate::ui::{AgentEvent, AuthDecision, Ui};
 
-/// 一轮任务的用量累加器。
+/// Per-turn usage accumulator.
 ///
-/// 它是 `Agent` 的字段而不是某个函数的局部变量，原因有两条：
+/// It is a field of `Agent` rather than a local variable of some function, for two reasons:
 ///
-/// ① **已经花掉的 token 是收不回来的**：`AgentLoop::run` 可能中途 `bail!`（模型连续返回
-///    空回复等），账留在 `Agent` 手上，出错时 `run_turn` 照样能如实报给用户，
-///    而不是因为一个 `Err` 就把账丢了。
-/// ② 循环已经搬到 `AgentLoop` 里去（阶段 6 的 6a），「谁在跑循环」与「账记在谁身上」
-///    必须解耦 —— 循环通过 [`Agent::accrue_call`] 记一笔，由 [`Agent::finish_turn`] 收口。
+/// ① **Tokens already spent cannot be recovered**: `AgentLoop::run` may `bail!` mid-way
+///    (e.g. the model returns empty replies repeatedly), yet the tally stays with `Agent`,
+///    so `run_turn` can still report it honestly on error instead of losing the books over one `Err`.
+/// ② The loop has been moved into `AgentLoop` (stage 6, 6a), so "who runs the loop" and
+///    "whose books the tally lands on" must be decoupled — the loop records an entry via
+///    [`Agent::accrue_call`], and [`Agent::finish_turn`] closes the books.
 #[derive(Default)]
 struct TurnAcc {
     calls: u32,
     total: Usage,
-    /// 最后一次请求的输入规模 = 当前上下文占用
+    /// Size of the last request's input = current context footprint.
     last_prompt: Option<u64>,
 }
 
@@ -34,44 +35,44 @@ pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     rt: Arc<Runtime>,
     messages: Vec<Message>,
-    /// 本次对话的落盘器（存储缝的**写入端**）。
+    /// The persister for this conversation (the **write end** of the storage seam).
     ///
-    /// 惰性创建：只有真正产生了用户消息才建文件，所以「启动 → /help → 退出」
-    /// 这种会话不会在 history/ 里留下一堆空文件。
+    /// Created lazily: a file is only made once a real user message exists, so a session like
+    /// "launch → /help → quit" never leaves a pile of empty files in history/.
     ///
-    /// 具体落到哪个文件、叫什么名字，这里一概不管 —— 那是 `self.rt.store` 的
-    /// 实现细节（见 `src/store.rs`）。本类型只按 **id** 与它对话。
+    /// Which file it lands in and what it is named is none of this type's business — that is an
+    /// implementation detail of `self.rt.store` (see `src/store.rs`). This type only talks to it by **id**.
     log: Option<Box<dyn crate::store::Session>>,
-    /// 落盘过程中的错误只报一次，避免每轮都刷同一句警告。
+    /// Persist errors are reported only once, so we don't repeat the same warning every turn.
     log_error_reported: bool,
-    /// 本次对话到目前的累计用量（切对话 / 新建对话时从文件接回或归零）
+    /// Cumulative usage for this conversation so far (reloaded from file or reset on switch/new conversation).
     session_usage: Usage,
     session_calls: u32,
-    /// 当前对话**逐轮**的用量记录，与对话文件里的 `kind:"usage"` 行一一对应。
+    /// Per-turn usage records for this conversation, one line per `kind:"usage"` row in the conversation file.
     ///
-    /// 内存里留一份，是为了让界面立刻能答「这段对话一共花了多少、哪一轮最贵」，
-    /// 而不必每帧读盘；文件那边才是权威 —— 重启后从这里接回来。
+    /// We keep a copy in memory so the UI can instantly answer "how much this whole conversation cost, which turn was the priciest",
+    /// without re-reading disk every frame; the file is the source of truth — after a restart we pick back up from there.
     usage_log: Vec<UsageRecord>,
-    /// **本对话已经落盘过**的工作区记录（档位 + 根 + 本对话自建地）；`None` = 还没写过。
+    /// The workplace record this conversation has **already persisted** (tier + root + this conversation's own dir); `None` = not written yet.
     ///
-    /// 有了它才能「只在真的变了的时候补一条」：每轮无脑追加会让文件里堆满重复行，
-    /// 而读的时候是取最后一条 —— 那种文件后来者根本看不出哪几行才算数。
-    /// 新建对话 / 打开旧对话时重置，对齐那一刻文件里的实际情况。
+    /// This is what lets us "append a line only when something actually changed": blindly appending every turn would pile duplicate rows into the file,
+    /// yet readers only take the last one — such a file gives no clue which lines actually count.
+    /// Reset on new conversation / opening an old one, to match the file's state at that moment.
     workplace_logged: Option<crate::workplace::Record>,
-    /// 本轮的用量累加器（由 `AgentLoop` 通过 [`Agent::accrue_call`] 驱动）。
+    /// This turn's usage accumulator (driven by `AgentLoop` via [`Agent::accrue_call`]).
     ///
-    /// 放在 `Agent` 里而不是循环的局部变量里：循环是可替换的，账不行 ——
-    /// 换一个实现也得记在同一本账上（见 [`TurnAcc`] 的注释）。
+    /// Lives on `Agent`, not as a loop-local variable: the loop is swappable, the books are not —
+    /// a different implementation must still record onto the same books (see [`TurnAcc`]'s docs).
     turn: TurnAcc,
 }
 
 impl Agent {
-    /// 组装一个 Agent。
+    /// Assemble an Agent.
     ///
-    /// 系统提示词由 [`crate::prompt::build`] 从「段」拼出来：内置段、运行环境、
-    /// 项目规则文件、以及用户在 `config.toml [prompt]` 里的增删改，全都在那里合成。
-    /// 这里**不再读 `RULES.md`** —— 那份「取规则文件」的逻辑原先在 CLI（`src/main.rs`）
-    /// 与 GUI（`gui/src/bridge.rs`）各写了一遍，现在归到 `prompt` 一处。
+    /// The system prompt is composed from "segments" by [`crate::prompt::build`]: built-in segments, the runtime environment,
+    /// the project rules file, and whatever the user added/removed/edited under `config.toml [prompt]` — all synthesized there.
+    /// This type **no longer reads `RULES.md`** — that "fetch the rules file" logic used to be in the CLI (`src/main.rs`)
+    /// and the GUI (`gui/src/bridge.rs`) separately; now it lives in one place, `prompt`.
     pub fn new(llm: Arc<dyn LlmProvider>, rt: Arc<Runtime>) -> Self {
         let sys = crate::prompt::build(&rt);
         Self {
@@ -88,19 +89,19 @@ impl Agent {
         }
     }
 
-    /// 本次对话的历史 id（还没开始对话时为 None）。
-    /// id 由存储后端在新建时定下（jsonl 后端就是文件名主干），这里只是转述。
+    /// This conversation's history id (None before a conversation has started).
+    /// The id is fixed by the storage backend when created (for the jsonl backend it's the filename stem); this just relays it.
     pub fn history_id(&self) -> Option<&str> {
         self.log.as_ref().map(|l| l.id())
     }
 
-    /// 把当前工作区状态记进**本对话的存档**（只在真的变了的时候写）。
+    /// Persist the current workplace state into **this conversation's archive** (only writing when it actually changed).
     ///
-    /// 调用点三处：每轮开头一次（首条消息把刚建好的那块地记下来）、CLI 的 `/workplace`
-    /// 切档后、GUI 的工作区按钮切档后。
+    /// Called from three sites: once at the start of every turn (the first message records the just-created dir), after a CLI `/workplace`
+    /// tier switch, and after a GUI workplace-button tier switch.
     ///
-    /// **没有对话文件时直接返回** —— 那种情况等 `ensure_log` 建好文件、下一轮的
-    /// 这一步再记，不会丢。
+    /// **Returns immediately when there is no conversation file** — in that case we wait for `ensure_log` to create the file, and the next turn's
+    /// step records it; nothing is lost.
     pub fn persist_workplace(&mut self) {
         let Some(log) = self.log.as_mut() else { return };
         let cur = self.rt.workplace.persisted();
@@ -111,7 +112,7 @@ impl Agent {
         self.workplace_logged = Some(cur);
     }
 
-    /// 确保本次对话已有落盘文件。失败只警告一次，不打断对话。
+    /// Ensure the current conversation already has an on-disk file. On failure we warn only once and don't interrupt the conversation.
     fn ensure_log(&mut self, ui: &mut dyn Ui) {
         if self.log.is_some() {
             return;
@@ -124,24 +125,25 @@ impl Agent {
             Ok(log) => self.log = Some(log),
             Err(e) if !self.log_error_reported => {
                 self.log_error_reported = true;
-                ui.emit(AgentEvent::Warn(format!(
-                    "对话历史无法写入 {}（{e:#}）：本次对话不会被保存",
-                    self.rt.store.location().display()
+                ui.emit(AgentEvent::Warn(crate::tf!(
+                    "conversation history cannot be written to {} ({}): this conversation will not be saved",
+                    self.rt.store.location().display(),
+                    format!("{e:#}")
                 )));
             }
             Err(_) => {}
         }
     }
 
-    /// 把一条用户输入（+ 附件路径）变成消息。
+    /// Turn one user input (+ attachment paths) into a message.
     ///
-    /// 附件在这里、也**只在这里**成型：读盘、base64、组装 parts 全交给
-    /// [`Message::user_with_files`]。GUI 与 CLI 都只把路径递过来，谁也不自己拼 ——
-    /// 否则「内存里有、历史文件里没有」那种错位会从另一个入口回来。
+    /// Attachments take shape here, and **only here**: reading disk, base64, assembling parts are all delegated to
+    /// [`Message::user_with_files`]. Both GUI and CLI only hand over paths; neither assembles them itself —
+    /// otherwise the "in memory but not in the history file" divergence would reappear from the other entry point.
     ///
-    /// 附件出问题（读不到 / 超限 / 目录）时**不吞也不中断**：能挂的照挂，挂不上的
-    /// 把那句理由拼在正文末尾。这样「附件少了一个」是**对话里看得见**的一件事 ——
-    /// 只闪一个界面提示的话，模型与后翻历史的用户都不知道当时少了东西。
+    /// When an attachment misbehaves (unreadable / oversized / wrong dir) we **neither swallow nor interrupt** it: what can attach does, and what can't
+    /// has its reason appended to the end of the body. This way "an attachment went missing" is **visible in the conversation** —
+    /// a mere UI flash would leave both the model and a user scrolling back through history unaware that something was dropped.
     fn user_message(&self, input: &str, files: &[PathBuf]) -> Message {
         if files.is_empty() {
             return Message::user(input);
@@ -150,22 +152,25 @@ impl Agent {
         let text = if problems.is_empty() {
             input.to_string()
         } else {
-            format!(
-                "{input}\n\n（宿主提示）以下附件没能附上：\n{}",
+            crate::tf!(
+                "{}\n\n{} the following attachments could not be attached:\n{}",
+                input,
+                crate::history::HOST_PREFIX,
                 problems.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")
             )
         };
         match Message::user_with_files(&text, &items) {
             Ok(m) => m,
-            Err(e) => Message::user(format!("{text}\n\n（宿主提示）附件没能附上：{e}")),
+            Err(e) => Message::user(crate::tf!("{}\n\n{} an attachment could not be attached: {}", text, crate::history::HOST_PREFIX, e)),
         }
     }
 
-    /// 推入一条消息，并同步落盘。
+    /// Push a message and persist it in sync.
     ///
-    /// **所有**对 `messages` 的写入都必须走这里 —— 落盘与内存只要有一处不同步，
-    /// 历史文件就不再是这段对话的忠实记录。这条约束连 `AgentLoop` 也不例外：
-    /// 它是 `pub` 的，而 `messages` 只给只读视图（见下面的受控原语一节）。
+    /// **All** writes to `messages` must go through here — if the on-disk copy and memory ever
+    /// diverge, the history file is no longer a faithful record of the conversation. This
+    /// constraint applies to `AgentLoop` too: it is `pub`, yet `messages` is only exposed as a
+    /// read-only view (see the controlled-primitives section below).
     pub fn push_message(&mut self, msg: Message, is_error: Option<bool>) {
         if let Some(log) = self.log.as_mut() {
             log.append(&msg, is_error);
@@ -173,29 +178,31 @@ impl Agent {
         self.messages.push(msg);
     }
 
-    /// 当前对话历史长度（用于中断时回滚）
+    /// Current conversation history length (used for rollback on interrupt).
     pub fn messages_len(&self) -> usize {
         self.messages.len()
     }
 
-    /// 当前对话逐轮的用量记录（供界面显示「每轮各花了多少」）
+    /// Per-turn usage records for the current conversation (so the UI can show "how much each turn cost").
     pub fn usage_log(&self) -> &[UsageRecord] {
         &self.usage_log
     }
 
-    /// 追加上一批**活动流**记录（界面侧产生，写进同一份对话文件）。
+    /// Append a batch of **activity-stream** records (produced by the UI side, written into the same conversation file).
     ///
-    /// 为什么由这里写、而不是界面自己去开文件：文件句柄只有这个线程握着，
-    /// 而且「新建对话」「中断回滚」也发生在这里 —— 多一个写入方就要多一套
-    /// 跨线程的互斥与顺序保证，而这些本来靠线程内的一条队列就白拿了。
+    /// Why this writes rather than the UI opening a file itself: the file handle is held only by
+    /// this thread, and "new conversation" / "interrupt rollback" also happen here — a second
+    /// writer would mean another set of cross-thread mutex and ordering guarantees, which we
+    /// already get for free from a single in-thread queue.
     ///
-    /// `log` 为 `None` 时直接丢弃。正常情况下不会发生：活动流只在「一轮任务」
-    /// 期间产生，而那一轮一开始就会 `ensure_log`。唯一的例外是配置里关掉了
-    /// 历史（`[history] enabled = false`）—— 那本来就不该落盘。
+    /// Discarded outright when `log` is `None`. Normally this won't happen: the activity stream is
+    /// only produced during a "task turn", and that turn calls `ensure_log` up front. The only
+    /// exception is when history is disabled in config (`[history] enabled = false`) — which
+    /// shouldn't be persisted anyway.
     ///
-    /// `allow(dead_code)`：`src/main.rs` 与 `src/lib.rs` 各自编译同一批模块
-    /// （见 lib.rs 开头），而 CLI 那一份根本没有活动流，所以它眼里的这个方法是
-    /// 死的。GUI 那一份在用。
+    /// `allow(dead_code)`: `src/main.rs` and `src/lib.rs` each compile the same set of modules
+    /// (see the top of lib.rs), but the CLI build has no activity stream at all, so in its eyes
+    /// this method is dead code. The GUI build uses it.
     #[allow(dead_code)]
     pub fn append_acts(&mut self, acts: &[Value]) {
         let Some(log) = self.log.as_mut() else { return };
@@ -204,25 +211,25 @@ impl Agent {
         }
     }
 
-    /// 切换到一段已存档的对话（按 **id**）：读回消息载入上下文，并把落盘器接回那次对话。
+    /// Switch to an archived conversation (by **id**): load its messages back into context and reconnect the persister to that conversation.
     ///
-    /// 返回载入的消息条数（不含系统提示）。载入失败时上下文**保持原样** ——
-    /// 半途清空再报错，用户会既丢了眼前的对话、又没拿到想要的那段。
+    /// Returns the number of messages loaded (excluding the system prompt). On load failure the context is **left as-is** —
+    /// clearing it halfway then erroring would make the user lose the conversation in front of them and still not get the one they wanted.
     ///
-    /// 载入的是全部历史。这让「接着上次聊」是真的接着聊，代价是对话越长
-    /// 上下文越大；想开新话题就按「+」，那是另一条路径。
+    /// The full history is loaded. This makes "continue where we left off" a real continuation, at the cost of a larger context
+    /// the longer the conversation; to start a new topic press "+", which is a different path.
     pub fn resume(&mut self, id: &str) -> Result<usize> {
         let items = self.rt.store.load(id)?;
         let log = self.rt.store.open(id)?;
-        // 只保留系统提示（第 0 条），其余全部换成存档里的消息。
-        // 系统提示不入档是有意的（每轮都在变），所以它只能由这里保住。
+        // Keep only the system prompt (entry 0); replace everything else with the archived messages.
+        // Deliberately leaving the system prompt out of the archive (it changes every turn), so only here can it be preserved.
         self.messages.truncate(1);
         self.messages.extend(items.iter().map(|i| i.msg.clone()));
         self.log = Some(log);
         self.log_error_reported = false;
-        // 用量账本从存储层接回来。不接的话，重启一次或切一次对话，
-        // 之前那几轮的 token 就凭空消失了 —— 而「这段对话一共花了多少」
-        // 恰恰是最该跨会话保留的数字。
+        // Pick the usage ledger back up from the storage layer. Without this, a restart or a conversation switch would
+        // make the previous turns' tokens vanish into thin air — yet "how much this conversation cost in total"
+        // is precisely the number that most deserves to survive across sessions.
         self.usage_log = self.rt.store.load_usage(id);
         self.session_usage = Usage::default();
         self.session_calls = 0;
@@ -230,12 +237,14 @@ impl Agent {
             self.session_usage.accrue(&r.usage);
             self.session_calls += r.calls;
         }
-        // 工作区跟着**对话**走，不是跟着进程走：把这段对话存档里的那条还回来，
-        // 并把「已落盘」对齐到它。于是重开这段对话会落在**它自己**那块地里，
-        // 而不是「当前这块」—— 原先正是后者，于是同一个对话每次进去工作区都不一样。
+        // The workplace follows the **conversation**, not the process: restore the record from this
+        // conversation's archive and align "already persisted" to it. So reopening this conversation
+        // lands in **its own** dir, not "the current one" — the latter was the old behavior, which
+        // made the same conversation land in a different workplace every time you entered it.
         //
-        // 旧对话文件没有这条记录（那时还没这个功能）：什么都不动，等它下一次落盘时
-        // 由 `persist_workplace` 把当前状态记上，从此这段对话也就有了自己的地。
+        // Old conversation files lack this record (the feature didn't exist yet): leave everything
+        // as-is; the next time it persists, `persist_workplace` records the current state, and from
+        // then on this conversation has its own dir.
         self.workplace_logged = match self.rt.store.load_workplace(id) {
             Some(rec) => {
                 self.rt.workplace.restore(&rec);
@@ -246,11 +255,11 @@ impl Agent {
         Ok(items.len())
     }
 
-    /// 开始一段新对话。
+    /// Start a new conversation.
     ///
-    /// 旧对话**不需要任何「保存」动作**：它是边聊边追加的，此刻已经完整地
-    /// 躺在 `history/` 里了。这里只把落盘器置空 —— 下一轮会惰性新建一个文件，
-    /// 于是「上一段对话」自然就归入历史。
+    /// The old conversation needs **no "save" action** at all: it was appended as you talked, so it already sits complete
+    /// in `history/`. Here we only null out the persister — the next turn lazily creates a new file,
+    /// and so the previous conversation naturally falls into history.
     pub fn new_conversation(&mut self) {
         self.messages.truncate(1);
         self.log = None;
@@ -258,19 +267,19 @@ impl Agent {
         self.session_usage = Usage::default();
         self.session_calls = 0;
         self.usage_log.clear();
-        // 工作区也跟着翻页：**一律回到「默认」档**（用户 2026-10-04 定的语义）——
-        // 上一段对话里临时切过的档不继承；下一轮的首条消息会在 `workplace/` 下开一块新地。
-        // 不清的话，「+」之后模型还写在上一次对话挑的那块地里，那就不是「新对话」了。
+        // The workplace turns the page too: **always back to the "default" tier** (semantics set by the user on 2026-10-04) —
+        // the tier temporarily switched to in the last conversation is not inherited; the next turn's first message opens a fresh dir under `workplace/`.
+        // Without clearing it, after "+" the model would still write into the dir picked in the last conversation, which is no longer a new conversation.
         self.rt.workplace.reset_for_new_conversation();
-        // 新对话的文件还没建，落盘记录等首条消息时由 `persist_workplace` 补上；
-        // 这里先清掉「已落盘」，免得拿上一段对话的记录去比对、把首条消息那次写漏。
+        // The new conversation's file isn't created yet; the persisted record is filled in by `persist_workplace` on the first message;
+        // here we clear "already persisted" first, so we don't compare against the last conversation's record and miss writing that first message.
         self.workplace_logged = None;
     }
 
-    /// 中断当前任务后回滚对话历史，避免遗留「有 tool_calls 但无结果」的半截消息。
+    /// After interrupting the current task, roll back the conversation history to avoid leaving half messages "with tool_calls but no result".
     ///
-    /// 落盘文件同步回滚：内存里丢掉了什么，文件里也必须跟着丢掉，
-    /// 否则会留下一段无法作为请求体回放的残记录。
+    /// The on-disk file rolls back in sync: whatever is dropped from memory must also be dropped from the file,
+    /// otherwise we'd leave a broken record that can't be replayed as a request body.
     pub fn truncate_messages(&mut self, len: usize) {
         self.messages.truncate(len);
         if let Some(log) = self.log.as_mut() {
@@ -278,15 +287,15 @@ impl Agent {
         }
     }
 
-    /// 丢掉正文里最老的一段：保留系统提示，以及 `messages[cut..]`（`cut` 起的都留下）。
+    /// Drop the oldest chunk of the body: keep the system prompt, plus `messages[cut..]` (everything from `cut` onward).
     ///
-    /// ⚠️ **与 `truncate_messages` 方向相反**，所以名字刻意区分开：
-    /// `Vec::truncate(n)` 的语义是「**留前** n 条」，中断回滚要的正是这个（回到任务前）；
-    /// 而 `[loop] max_rounds` 要的是「**留后**几轮」。两者混用的后果是**静默**裁错方向 ——
-    /// 表现为「本轮刚说的话没了、最老的上下文还在」，且内存与文件倒是「一致地错」，
-    /// 所以单看落盘内容并不容易发现。这条注释就是为此存在的。
+    /// ⚠️ **Goes the opposite direction from `truncate_messages`**, hence the deliberately distinct name:
+    /// `Vec::truncate(n)` means "**keep the first** n" — which is exactly what interrupt-rollback wants (back to before the task);
+    /// but `[loop] max_rounds` wants "**keep the last** few turns". Mixing the two silently truncates the wrong way —
+    /// manifesting as "this turn's just-said words are gone, the oldest context remains", and memory and file are "consistently wrong",
+    /// so looking at the persisted content alone won't easily reveal it. This comment exists precisely for that.
     ///
-    /// 落盘同样对称：内存丢了什么，文件里也跟着丢（走 `Session::rewrite`）。
+    /// The persisted file is symmetric too: whatever is dropped from memory is dropped from the file (via `Session::rewrite`).
     pub fn drop_oldest(&mut self, cut: usize) {
         if cut <= 1 || cut >= self.messages.len() {
             return;
@@ -297,60 +306,60 @@ impl Agent {
         }
     }
 
-    /// 处理一轮用户输入：循环「问模型 → 执行工具 → 回填结果」直到模型不再调用工具。
+    /// Handle one round of user input: loop "ask the model → run the tool → fill back the result" until the model stops calling tools.
     ///
-    /// **循环本身不在这里** —— 它由 `Runtime.loop_impl`（循环缝，见 `src/agent_loop.rs`）
-    /// 提供；本方法只负责「开一轮、开账、把账收口」这三件事。换一个 `[loop] impl`
-    /// 就是换一套执行模型，而记账与收尾仍然走同一条路。
+    /// **The loop itself is not here** — it's provided by `Runtime.loop_impl` (the loop seam, see `src/agent_loop.rs`)
+    /// this method only does three things: "open a turn, open the books, close the books". Swapping in a different `[loop] impl`
+    /// means a different execution model, yet accounting and wrap-up still go through the same path.
     ///
-    /// `files` 是这一条消息带的附件（本机路径）。**只附在这一条上**（一次性）：
-    /// 后续轮次模型要用就顺着消息里的路径引用自己读 —— 附件的字节留在上下文里，
-    /// 每一轮都要为它再付一次 token。
+    /// `files` are the attachments on this one message (local paths). They are attached **to this message only** (one-shot):
+    /// in later turns the model refers back to them via the paths recorded in the message and reads them itself — the attachment bytes stay in context,
+    /// so every turn pays token cost for them again.
     pub async fn run_turn(&mut self, ui: &mut dyn Ui, input: &str, files: &[PathBuf]) -> Result<()> {
-        // 工作区：`default` 档位在**首条消息**时开一块新地（`started` 保证一段对话只开一次）。
+        // Workplace: the `default` tier opens a fresh dir on the **first message** (`started` guarantees one dir per conversation).
         //
-        // 放在整轮最前面（早于 `push_message` 与循环），是为了让**本轮任何工具调用之前**
-        // 根就已经定好。否则第一条消息里模型要写文件时会被判成「工作区还没建立」而拒掉，
-        // 用户会觉得莫名其妙 —— 那是实现顺序造成的假故障，不是权限边界。
+        // Placed at the very front of the turn (before `push_message` and the loop) so the root is
+        // fixed **before any tool call this turn**. Otherwise, when the model wants to write a file in
+        // the first message it would be rejected as "workplace not yet established", which would baffle
+        // the user — a fake failure caused by implementation order, not by a permission boundary.
         match self.rt.workplace.ensure_started(&self.rt.root) {
-            Ok(Some(dir)) => ui.emit(AgentEvent::Info(format!(
-                // 措辞按新语义（读不设限、写删受限）：说「只会读写文件」会让用户以为
-                // 连读也被关住了，于是白白去提权 —— 那是 2026-10-04 改语义时漏掉的一句。
-                "本对话的工作区：{}\n  写入与删除都被限制在这个目录里（读取不受限，设备上任何文件都能读）。\
-                 要放宽：`/workplace`，或输入框左下角的「工作区」。",
+            Ok(Some(dir)) => ui.emit(AgentEvent::Info(crate::tf!(
+                // Wording follows the new semantics (reads unrestricted, writes/deletes restricted): saying "can only read and write files"
+                // would make the user think reads are locked down too, prompting a needless privilege escalation — a sentence missed when the semantics changed on 2026-10-04.
+                "this conversation's workspace: {}\n  writes and deletes are restricted to this directory (reads are unrestricted — any file on the device can be read). To loosen it: `/workplace`, or the \"workspace\" control at the bottom-left of the input box.",
                 dir.display()
             ))),
             Ok(None) => {}
-            // 建目录都失败了（权限 / 磁盘），照实说但不打断对话：此后文件写入会被边界拒绝。
-            Err(e) => ui.emit(AgentEvent::Warn(format!("创建工作区失败：{e:#}"))),
+            // Directory creation itself failed (permissions / disk); report it honestly but don't interrupt the conversation: from now on file writes will be rejected by the boundary.
+            Err(e) => ui.emit(AgentEvent::Warn(crate::tf!("failed to create the workspace: {}", format!("{e:#}")))),
         }
         self.ensure_log(ui);
-        // 首条消息这一趟把「本对话在哪块地干活」记进存档（`ensure_started` 刚定下根，
-        // 所以这条记录里带的是那块地的真实路径）。之后只在切档时才再写。
+        // On this first message, record "which dir this conversation works in" into the archive (`ensure_started` just fixed the root,
+        // so this record carries that dir's real path). After that we only write again when the tier switches.
         self.persist_workplace();
         self.push_message(self.user_message(input, files), None);
-        // 包住整轮：UI 借此显示等待动画，并在结束时把中间过程折叠成一行
+        // Wrap the whole turn: the UI shows a waiting animation and collapses the intermediate steps into one line at the end.
         ui.turn_start().await;
         self.begin_turn();
-        // 先把 `Arc` 取出来：`run` 要 `&mut self`，不能再从 `self` 上借 `loop_impl`。
+        // Take the `Arc` out first: `run` needs `&mut self`, so we can't borrow `loop_impl` from `self` anymore.
         let lp = self.rt.loop_impl.clone();
         let result = lp.run(self, ui).await;
         ui.turn_end().await;
-        // 用量排在动画停掉之后再报（见 `Ui::turn_usage` 的注释）。
-        // 出错也报：token 是真花出去了，不能因为任务失败就装作没花。
+        // Report usage after the waiting animation stops (see `Ui::turn_usage`'s docs).
+        // Report it even on error: the tokens were genuinely spent; we can't pretend they weren't just because the task failed.
         if let Some(rec) = self.finish_turn() {
             ui.turn_usage(&rec).await;
         }
         result
     }
 
-    // ───────── 给 `AgentLoop` 的受控原语（见 `src/agent_loop.rs` 的模块文档）─────────
+    // ───────── Controlled primitives for `AgentLoop` (see `src/agent_loop.rs`'s module docs)─────────
     //
-    // 循环搬到 `AgentLoop` 之后成了 `Agent` 的**同层协作者**，所以下面这组方法必须可见。
-    // 但写入口仍然只有 `push_message` 一个：循环拿不到裸 `Vec<Message>`，
-    // 也就造不出「内存里有、历史文件里没有」的错位 —— 那条线没有因为抽缝而放松。
+    // After the loop moved into `AgentLoop` it became a **peer collaborator** of `Agent`, so the following methods must be visible.
+    // But the write entry is still only `push_message`: the loop can't get the bare `Vec<Message>`,
+    // so it can't create the "in memory but not in the history file" divergence — that line wasn't loosened by extracting the seam.
 
-    /// 运行时（工具表 / 插件表 / 配置 / 钩子链都挂在它上面）。
+    /// The runtime (the tool table / plugin table / config / hook chain all hang off it).
     pub fn rt(&self) -> &Arc<Runtime> {
         &self.rt
     }
@@ -360,17 +369,17 @@ impl Agent {
         &self.llm
     }
 
-    /// 当前上下文的只读视图（含下标 0 的系统提示）。**只读** —— 要改走 `push_message`。
+    /// Read-only view of the current context (includes the system prompt at index 0). **Read-only** — to mutate, use `push_message`.
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
 
-    /// 开一轮新的账。`run_turn` 在把控制权交给循环之前调用。
+    /// Open a new set of books for the turn. Called by `run_turn` before handing control to the loop.
     pub fn begin_turn(&mut self) {
         self.turn = TurnAcc::default();
     }
 
-    /// 记一笔 LLM 调用（次数 + 各项 token）。端点不给 usage 时 `accrue` 会安静跳过。
+    /// Record one LLM call (count + each token kind). When the endpoint gives no usage, `accrue` silently skips.
     pub fn accrue_call(&mut self, usage: &Usage) {
         self.turn.calls += 1;
         self.turn.total.accrue(usage);
@@ -379,12 +388,12 @@ impl Agent {
         }
     }
 
-    /// 收口本轮：把账并入会话累计、记进 `usage_log`、落进对话文件。
+    /// Close out the turn: fold the books into the session totals, record into `usage_log`, and persist into the conversation file.
     ///
-    /// 一次调用都没发生（循环一开始就失败）时返回 `None` —— 空账不值得记一行。
+    /// Returns `None` when not a single call happened (the loop failed at the start) — an empty ledger isn't worth a line.
     ///
-    /// 落盘的与交给界面的是**同一个对象** —— 界面显示的账与文件里存的账因此不可能
-    /// 对不上（这类「界面上一个数、文件里另一个数」的坑不值得踩第二次）。
+    /// What we persist and what we hand to the UI is **the same object** — so the ledger the UI shows and the one stored in the file can never
+    /// disagree (a pit like "one number on the UI, another in the file" isn't worth stepping in twice).
     pub fn finish_turn(&mut self) -> Option<UsageRecord> {
         if self.turn.calls == 0 {
             return None;
@@ -407,35 +416,34 @@ impl Agent {
         Some(rec)
     }
 
-    /// 授权 → 执行一次工具调用。属于给 `AgentLoop` 的受控原语：它把「问策略、问用户、
-    /// 记白名单、执行并兜超时」这一整套收在一个入口里，循环不需要、也不应该自己拼。
+    /// Authorize → run one tool call. A controlled primitive for `AgentLoop`: it bundles the whole "ask policy, ask user, record allowlist, execute and catch timeouts" into a single entry point, so the loop needn't — and shouldn't — assemble it itself.
     pub async fn authorize_and_execute(&mut self, ui: &mut dyn Ui, name: &str, args: Value) -> ToolOutput {
         let kind = self.rt.tool_kind(name).await.unwrap_or(ToolKind::Meta);
-        // ── 工作区边界：**早于授权**判定 ──
+        // ── Workplace boundary: judged **before authorization** ──
         //
-        // 放在授权之前有两个理由：
-        // ① 越界调用不必先弹一次授权框、再告诉用户「其实那个位置根本碰不到」；
-        // ② 这里拿得到 `Ui`，能给用户发一条 `Warn`（工具自己的 `call` 拿不到 Ui，
-        //    所以工具内那层只能把契约塞回给模型 —— 两层是纵深，不是重复）。
+        // Two reasons for placing it before authorization:
+        // ① An out-of-bounds call needn't pop an auth dialog first, then tell the user "that location is actually unreachable";
+        // ② Here we have `Ui` and can emit a `Warn` to the user (the tool's own `call` can't get Ui,
+        //    so the tool's inner layer can only stuff the contract back to the model — two layers are defense in depth, not duplication).
         //
-        // 这次调用算「读」还是「落盘」**由工具自己说**（`Tool::access`：宿主文件工具按
-        // 名字判，插件工具按插件声明的 access 判，没声明就是落盘）。
+        // Whether this call counts as "read" or "persist" is **said by the tool itself** (`Tool::access`: host file tools judge by
+        // name, plugin tools judge by the access the plugin declared; undeclared means persist).
         //
-        // `full` 档位在 `workplace_reject` 里**整个短路**：不扫参数、不 `canonicalize`。
-        // 早先这里是「照样调 `check`，反正它返回 `Ok`」—— 而调用方只取 `.err()`，
-        // 于是 `normalize` 的结果被丢掉，65~224 µs 的系统调用白花；这条路径又是
-        // **每次工具调用**都要走的。
-        // ⚠️ 2026-10-05 起配置默认是受限档（`default`），所以这条短路只对**显式**选了
-        // 完全访问的用户生效 —— 别再用「大多数用户走这条」给短路当理由。
+        // The `full` tier is **short-circuited entirely** inside `workplace_reject`: no param scan, no `canonicalize`.
+        // Earlier this called `check` anyway ("it just returns `Ok`") — but the caller only takes `.err()`,
+        // so the `normalize` result was thrown away, wasting 65~224 µs of syscalls; and this path is taken on
+        // **every tool call**.
+        // ⚠️ Since 2026-10-05 the config default is the restricted tier (`default`), so this short-circuit only applies to users
+        // who **explicitly** chose full access — don't justify the short-circuit with "most users go through here" anymore.
         let access = self.rt.tool_access(name).await;
         if let Some(reject) = self.workplace_reject(&kind, access, &args) {
             ui.emit(AgentEvent::Warn(reject.user_text()));
             return ToolOutput::err(reject_text(&kind, &reject));
         }
-        // 能力位（阶段 6 · 6b 起真的填上）：插件在 `[contributes] caps` 里声明要什么能力，
-        // 这里原样转给策略 —— 声明了能力的插件，它的工具调用一律走 `Ask`
-        // （见 `auth::Policy::level_for`）。元工具、以及没声明能力的插件拿到的都是空切片，
-        // 判定与阶段 4 逐条一致。
+        // Capability bits (actually filled in since stage 6 · 6b): a plugin declares what capability it wants under `[contributes] caps`,
+        // relayed here verbatim to policy — a plugin that declared a capability has all its tool calls go through `Ask`
+        // (see `auth::Policy::level_for`). Meta tools, and plugins that declared no capability, get an empty slice,
+        // the judgment matches stage 4 line by line.
         let caps = self.rt.caps_for(&kind).await;
         let level = self.rt.auth.level_for(&kind, name, &caps);
         let allowed = match level {
@@ -457,15 +465,14 @@ impl Agent {
             }
         };
         if allowed {
-            // `ask_user`：唯一一道**需要用户当场作答**的工具，在这里分流。
+            // `ask_user`: the only tool that **needs the user to answer on the spot**; branch it off here.
             //
-            // 三条理由，每条都是硬的：
-            // ① `Tool::call(args, rt)` 拿不到 `Ui`，而「问用户」非它不可 —— 授权那条路
-            //    也是因此才走 Agent（同一段注释在 `tool::ask` 的模块文档里）。
-            // ② 排在授权**之后**：先问「能不能用这个工具」，再问「选哪个」，
-            //    两个弹层不会同时出现。
-            // ③ 排在 `ToolRunning` **之前**：那道事件会带一个「超时上限 Ns」的注记，
-            //    而这道工具等的是**人** —— 想三分钟是完全正常的，给他看倒计时只会催他乱点。
+            // Three reasons, each hard:
+            // ① `Tool::call(args, rt)` can't get `Ui`, and "ask the user" is impossible without it — the
+            //    authorization path therefore also goes through Agent (same comment in `tool::ask`'s module docs).
+            // ② Placed **after** authorization: first "may I use this tool", then "which one" — the two dialogs never appear at once.
+            // ③ Placed **before** `ToolRunning`: that event carries a "timeout cap Ns" note, but this tool waits
+            //    for a **human** — taking three minutes is perfectly normal, and showing a countdown would just rush them into misclicks.
             if name == crate::tool::ask::ASK_TOOL {
                 return crate::tool::ask::interact(args, ui).await;
             }
@@ -475,50 +482,50 @@ impl Agent {
             });
             self.rt.execute(name, args).await
         } else {
-            // 「被配置挡住」与「用户当场拒绝」是两件事，给模型的措辞也必须不同：
-            // 前者是宿主写死的规则（`[auth]` 里的 deny，阶段 4 起支持 `fs_*` 通配），
-            // 后者才是人。以前两者共用同一句话，模型会去「说服用户」，方向从一开始就错了。
+            // "Blocked by config" and "the user refused on the spot" are two different things, and the wording to the model must differ:
+            // the former is a host-hardcoded rule (`[auth]`'s deny, which since stage 4 supports `fs_*` wildcards),
+            // the latter is a human. They used to share one sentence, so the model would try to "convince the user" — wrong direction from the start.
             match level {
-                AuthLevel::Deny => ToolOutput::err(format!(
-                    "工具 {name} 被宿主策略禁止（config.toml 的 [auth]）。\
-                     不要再尝试调用它，改用其它工具或换一条实现路径。"
+                AuthLevel::Deny => ToolOutput::err(crate::tf!(
+                    "tool {} is forbidden by host policy (config.toml's [auth]). Do not try to call it again; use another tool or a different implementation path.",
+                    name
                 )),
                 _ => ToolOutput::err(
-                    "用户拒绝了这次工具调用。请改用其他方式完成任务，或向用户说明原因。",
+                    crate::i18n::t("The user refused this tool call. Find another way to finish the task, or explain the reason to the user."),
                 ),
             }
         }
     }
 
-    /// 判定一次工具调用是否触到工作区边界。`None` = 放行。
+    /// Decide whether one tool call touches the workplace boundary. `None` = allowed.
     ///
-    /// 按工具类别分三条路，精度不同，都是刻意的：
+    /// Three paths by tool kind, of differing precision — all deliberate:
     ///
-    /// - `ToolKind::Meta`（`create_plugin` / `list_plugins` / `remove_plugin`）：
-    ///   不声明路径参数，直接放行。
+    /// - `ToolKind::Meta` (`create_plugin` / `list_plugins` / `remove_plugin`): declares no path parameter, so allow outright.
     ///
-    /// - `ToolKind::Host`（宿主文件工具）：schema 是我们自己定义的，直接读 `path` 参数。
-    ///   读（`read_file` / `list_dir` / `attach_file`）不受工作区限制 ⇒ 这条路恒等于
-    ///   放行；只有写（`write_file`）与删（`remove`）才真正过边界。`list_dir` 允许
-    ///   **不传** `path`（那时指的是工作区根，位置由宿主自己给），所以缺参不是错误、
-    ///   不放行的是「模型指定的位置」。
+    /// - `ToolKind::Host` (host file tools): the schema is our own, so read the `path` parameter directly.
+    ///   Reads (`read_file` / `list_dir` / `attach_file`) are not subject to the workplace restriction ⇒ this path is
+    ///   always allow; only writes (`write_file`) and deletes (`remove`) actually pass the boundary. `list_dir` may be
+    ///   called **without** `path` (then it means the workplace root, position supplied by the host), so a missing arg
+    ///   is not an error — what's not allowed is "a location the model specified".
     ///
-    /// - `ToolKind::Plugin`：插件是黑盒，宿主只能按参数名与值形态扫一遍「像路径」的
-    ///   字符串（见 `workplace::scan_paths`）。这些参数按**插件声明的** access 判
-    ///   （[`crate::tool::Tool::access`]）：声明了 `"read"` 的按读判（读不设限 ⇒
-    ///   一律放行），没声明的仍按「落盘」—— 宿主看不出它的意图，而「少挡一次写」的
-    ///   代价远大于「多挡一次读」，保守方向就是把每个像路径的参数都当成潜在的写。
-    ///   同时它**宁漏勿误伤**：漏判只是少一层粗网，误判会直接拒掉一次合法调用。
+    /// - `ToolKind::Plugin`: the plugin is a black box; the host can only scan for path-like strings by parameter
+    ///   name and value shape (see `workplace::scan_paths`). These parameters are judged by the **plugin-declared**
+    ///   access ([`crate::tool::Tool::access`]): ones declaring `"read"` are judged as reads (reads unrestricted ⇒
+    ///   always allow), undeclared ones are still judged as "persist" — the host can't see its intent, and "missing one
+    ///   write-block" costs far less than "blocking one read too many", so the conservative direction is to treat every
+    ///   path-like parameter as a potential write. It also **prefers false negatives over false positives**: a miss only
+    ///   thins one coarse net, a misjudgment would reject a legitimate call outright.
     ///
-    /// 三条路用的是**同一套** `Workplace` 判定，所以不存在「两套规则」。
+    /// All three paths use the **same** `Workplace` judgment, so there is no "two sets of rules".
     fn workplace_reject(
         &self,
         kind: &ToolKind,
         access: crate::workplace::Access,
         args: &Value,
     ) -> Option<crate::workplace::Reject> {
-        // `full` 档：**一切放行**。放在 `match` 之前，是为了连
-        // `scan_paths` 那张粗网都不跑 —— 见调用点那一段注释。
+        // The `full` tier: **allow everything**. Placed before the `match` so we don't even run
+        // the coarse net of `scan_paths` — see the comment at the call site.
         if self.rt.workplace.is_unrestricted() {
             return None;
         }
@@ -530,10 +537,10 @@ impl Agent {
             }
             ToolKind::Plugin(_) => {
                 for (_key, raw) in crate::workplace::scan_paths(args) {
-                    // 走 `check_access` 而不是 `check`：粗网本身不预设读或写，
-                    // 由调用方给的 `access` 说了算。传 `Read` 时它恒为 `Ok`，
-                    // 于是「只读工具可以碰工作区外的路径」这件事**自动**成立，
-                    // 与 `read_file` / `list_dir` 用的是同一条判定。
+                    // Use `check_access` rather than `check`: the coarse net itself presumes neither read nor write,
+                    // it's decided by the `access` the caller passed. Passing `Read` makes it always `Ok`,
+                    // so "read-only tools may touch out-of-workplace paths" holds **automatically**,
+                    // using the same judgment as `read_file` / `list_dir`.
                     if let Err(r) = self.rt.workplace.check_access(&raw, access) {
                         return Some(r);
                     }
@@ -544,35 +551,28 @@ impl Agent {
     }
 }
 
-/// 一次越界该给模型看的完整文本。
+/// The full text to show the model for one out-of-bounds event.
 ///
-/// `kind` 决定要不要附上插件那条**出路**（[`PLUGIN_READ_HINT`]）：只有插件工具需要，
-/// 宿主文件工具不该看到它 —— 那段话会把模型的注意力引到一条对它并不存在的路上
-///（宿主工具没有「声明只读」这回事，它的档位写死在宿主手里）。
+/// `kind` decides whether to append the plugin's **escape hatch** ([`PLUGIN_READ_HINT`]): only plugin
+/// tools need it; host file tools shouldn't see it — that text would steer the model's attention toward a
+/// path that doesn't exist for them (host tools have no notion of "declaring read-only"; their tier is hardcoded in the host's hands).
 fn reject_text(kind: &ToolKind, reject: &crate::workplace::Reject) -> String {
     match kind {
-        ToolKind::Plugin(_) => format!("{}\n\n{PLUGIN_READ_HINT}", reject.model_text()),
+        ToolKind::Plugin(_) => format!("{}\n\n{}", reject.model_text(), crate::i18n::t(PLUGIN_READ_HINT)),
         _ => reject.model_text(),
     }
 }
 
-/// 插件工具的路径参数撞上边界时，多附给模型的那一段。
+/// The extra passage shown to the model when a plugin tool's path parameter hits the boundary.
 ///
-/// 只加在 `ToolKind::Plugin` 那一种情形。存在的理由：粗网按写入拦下一个**只读**工具
-/// 是**误伤**，而模型此刻手里只有那份通用报错（「不要重试、要提权就找用户」）——
-/// 于是它要么放弃，要么去请求提权。而这件事根本不需要动边界：**插件补一行声明就行**。
-/// 不给它这条路，一次误伤就会换来一次不必要的权限放宽。
+/// Added only in the `ToolKind::Plugin` case. Why it exists: the coarse net blocking a **read-only** tool as a write is a
+/// **false positive**, yet the model only has the generic error at hand ("don't retry, ask the user for escalation") —
+/// so it either gives up or goes asking for privilege escalation. But this doesn't need to touch the boundary at all: **the plugin just adds one declaration line**.
+/// Without this path, one false positive would trade for one needless privilege widening.
 ///
-/// 措辞上要**明确压过**通用报错里的「不要重试」：那一条是给「真的想越界写」准备的，
-/// 这里是另一回事（工具本来就只读），不说清的话模型会照着前一句放弃。
-const PLUGIN_READ_HINT: &str = "【如果这道工具只读，上面那句「不要重试」不适用】\n\
-     如果这道插件工具本来就只是**读**（扫描 / 统计 / 列目录 / 解析文件这类），\
-     那么拦住你的不是权限，而是插件没声明自己是只读的。\n\
-     请让插件在工具声明里补上第 4 位 `\"read\"`，重建插件后即可照常访问工作区外的路径。\
-     Python SDK 的写法是把三元组写成四元组：\n  \
-     \"<工具名>\": (\"<说明>\", <JSON Schema>, <handler>, \"read\")\n\
-     宿主随后就按「读」判 —— 与 read_file / list_dir 同一档，**不需要向用户提权**。\
-     反过来，会写文件 / 删东西的工具**不要**加这一位。";
+/// The wording must **clearly override** the generic error's "don't retry": that line is for "really wants to write out of bounds",
+/// this is a different matter (the tool is read-only to begin with); if unstated the model would give up following the previous line.
+const PLUGIN_READ_HINT: &str = "[If this tool is read-only, the \"do not retry\" line above does not apply]\nIf this plugin tool is only meant to **read** (scanning / counting / listing directories / parsing files), then what blocked you is not a permission, but the plugin not declaring itself read-only.\nAsk the plugin to add `\"read\"` as the 4th position of its tool declaration; after rebuilding the plugin it can access paths outside the workspace as usual. In the Python SDK you write the triple as a 4-tuple:\n  \"<tool name>\": (\"<description>\", <JSON Schema>, <handler>, \"read\")\nThe host then judges it as a **read** — the same tier as read_file / list_dir — and **no privilege escalation from the user is needed**.Conversely, tools that write files / delete things must **not** add this position.";
 
 #[cfg(test)]
 mod tests {
@@ -580,10 +580,10 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
 
-    /// 一道**假**插件工具：类别报 Plugin，`access` 由测试给。
+    /// A **fake** plugin tool: reports kind Plugin, `access` is supplied by the test.
     ///
-    /// 用它而不是真起一个插件子进程：这条测试要钉的是「边界怎么用声明的 access」，
-    /// 与「插件进程怎么跑起来」无关 —— 后者另有真插件的自检（`selftest`）。
+    /// We use it instead of spawning a real plugin subprocess: this test pins down "how the boundary uses the declared access",
+    /// which has nothing to do with "how the plugin process starts" — the latter has its own real-plugin self-test (`selftest`).
     struct FakeTool {
         name: String,
         access: crate::workplace::Access,
@@ -595,7 +595,7 @@ mod tests {
             &self.name
         }
         fn kind(&self) -> ToolKind {
-            // 插件名随便给：`workplace_reject` 只看「是不是插件」，不看是哪一个。
+            // The plugin name is arbitrary: `workplace_reject` only looks at "is it a plugin", not which one.
             ToolKind::Plugin("fake".into())
         }
         fn description(&self) -> &str {
@@ -612,7 +612,7 @@ mod tests {
         }
     }
 
-    /// 一个工作区固定在 `ws` 的 Agent，并注册一道叫 `tool`、意图为 `access` 的工具。
+    /// An Agent with its workplace fixed at `ws`, and a registered tool named `tool` with intent `access`.
     async fn agent_with(ws: &Path, tool: &str, access: crate::workplace::Access) -> Agent {
         let mut cfg = crate::config::Config::dummy();
         cfg.workplace = crate::config::WorkplaceConfig {
@@ -620,10 +620,10 @@ mod tests {
             root: Some(ws.to_string_lossy().into_owned()),
         };
         let rt =
-            Runtime::new(cfg, ws.to_path_buf(), ws.join("plugins")).expect("运行时应当能建起来");
+            Runtime::new(cfg, ws.to_path_buf(), ws.join("plugins")).expect("the runtime should build");
         rt.register(Arc::new(FakeTool { name: tool.to_string(), access }))
             .await
-            .expect("注册假工具应当成功");
+            .expect("registering the fake tool should succeed");
         let llm: Arc<dyn LlmProvider> =
             Arc::new(crate::llm::UnavailableProvider { reason: "test".into() });
         Agent::new(llm, rt)
@@ -636,65 +636,66 @@ mod tests {
         d
     }
 
-    /// **A/B 对拍**：同一道工具、同一个工作区**外**的路径，只差一个声明。
+    /// **A/B comparison**: the same tool, the same out-of-workplace path, differing only by one declaration.
     ///
-    /// 为什么必须两边都断言：只测「声明了 read 就放行」，把整个判定删掉（恒放行）也能过；
-    /// 只测「没声明就拦」，把 access 硬编码成 `Write`、无视声明也能过。
-    /// 两条一起，才证明「这一档**确实由声明决定**」—— 而这正是本次改动的全部内容。
+    /// Why we must assert both sides: testing only "declared read → allowed" would also pass if we deleted the whole judgment (always allow);
+    /// testing only "undeclared → blocked" would also pass if we hardcoded `access` to `Write` and ignored the declaration.
+    /// Only both together prove "this tier is **genuinely decided by the declaration**" — which is the entire content of this change.
     #[tokio::test]
     async fn plugin_read_declaration_controls_the_workplace_gate() {
         use crate::workplace::Access;
         let ws = tmp("access");
-        // 工作区**外面**的一个路径。不必真实存在：判定只做路径比较，不碰磁盘。
+        // A path **outside** the workplace. Need not really exist: the judgment only compares paths, doesn't touch disk.
         let outside = ws.parent().unwrap().join("aox-agent-outside").join("x.bin");
         let args = json!({ "path": outside.to_string_lossy(), "limit": 10 });
         let kind = ToolKind::Plugin("fake".into());
 
-        // ① 声明了只读 ⇒ 放行（与 read_file / list_dir 同一档）
+        // ① Declared read-only ⇒ allow (same tier as read_file / list_dir)
         let a_read = agent_with(&ws, "fake_scan", Access::Read).await;
         let access = a_read.rt().tool_access("fake_scan").await;
-        assert_eq!(access, Access::Read, "`tool_access` 要把工具声明的意图透出来");
+        assert_eq!(access, Access::Read, "`tool_access` must surface the intent declared by the tool");
         assert!(
             a_read.workplace_reject(&kind, access, &args).is_none(),
-            "只读工具访问工作区外的路径必须放行 —— 这就是「插件的读也放开」那条需求"
+            "a read-only tool accessing a path outside the workspace must be allowed — this is that \"plugin reads are opened up too\" requirement"
         );
 
-        // ② 没声明（= 落盘）⇒ 同一个路径被拦
+        // ② Undeclared (= persist) ⇒ the same path is blocked
         let a_write = agent_with(&ws, "fake_scan", Access::Write).await;
         let access = a_write.rt().tool_access("fake_scan").await;
-        assert_eq!(access, Access::Write, "没声明就是落盘，这是默认档");
+        assert_eq!(access, Access::Write, "undeclared means it writes to disk; that is the default tier");
         let rej = a_write
             .workplace_reject(&kind, access, &args)
-            .expect("没声明只读的插件工具，带区外路径必须被拦下");
-        assert!(rej.model_text().contains("权限边界"), "{}", rej.model_text());
+            .expect("a plugin tool that does not declare read-only must be intercepted with an outside path");
+        assert!(rej.model_text().contains("permission boundary"), "{}", rej.model_text());
 
-        // 宿主文件工具那条路没被这次改动影响：同一个区外路径仍然被拦（写档）
+        // The host file-tool path wasn't affected by this change: the same out-of-workplace path is still blocked (writing tier)
         let host_write = a_write
             .workplace_reject(&ToolKind::Host, Access::Write, &args)
-            .expect("宿主写工具的区外路径必须被拦");
-        assert!(host_write.model_text().contains("权限边界"));
-        // 而读档照旧放行 —— 与 2026-10-04 定的「读不设限」一致
+            .expect("a host write tool with an outside path must be intercepted");
+        assert!(host_write.model_text().contains("permission boundary"));
+        // And the read tier is still allowed — consistent with the "reads unrestricted" rule set on 2026-10-04
         assert!(a_write.workplace_reject(&ToolKind::Host, Access::Read, &args).is_none());
 
         let _ = std::fs::remove_dir_all(&ws);
     }
 
-    /// 越界文本里那条**插件专用出路**：插件要看得见，宿主文件工具不该看见。
+    /// The **plugin-only escape hatch** in the out-of-bounds text: plugins must see it, host file tools must not.
     ///
-    /// 两边都断言的道理与上一条相同：只断言「插件有」，把提示无条件加到所有工具上也能过
-    /// —— 而那会让宿主文件工具收到一份指向**不存在机制**的建议（宿主工具没有「声明只读」
-    /// 这回事，它的档位写死在宿主手里），把模型的注意力引到岔路上。
+    /// The reasoning for asserting both is the same as the previous test: asserting only "plugins have it"
+    /// would also pass if the hint were unconditionally added to all tools — which would make host file tools
+    /// receive advice pointing at a **nonexistent mechanism** (host tools have no "declare read-only" notion;
+    /// their tier is hardcoded in the host's hands), steering the model onto a wrong track.
     #[test]
     fn the_read_hint_is_attached_only_to_plugin_rejects() {
         let rej = crate::workplace::Reject::NotStarted;
         let base = rej.model_text();
 
         let plugin = reject_text(&ToolKind::Plugin("x".into()), &rej);
-        assert!(plugin.starts_with(&base), "通用部分要原样在前：{plugin}");
-        assert!(plugin.contains(PLUGIN_READ_HINT), "插件那条出路必须附上");
-        assert!(plugin.contains("\"read\""), "要写清补的是哪个字面量：{plugin}");
+        assert!(plugin.starts_with(&base), "the generic part must come first unchanged: {plugin}");
+        assert!(plugin.contains(PLUGIN_READ_HINT), "the plugin's escape hatch must be attached");
+        assert!(plugin.contains("\"read\""), "it must spell out which literal to add: {plugin}");
 
         let host = reject_text(&ToolKind::Host, &rej);
-        assert_eq!(host, base, "宿主工具不该收到那段插件专用的出路");
+        assert_eq!(host, base, "host tools must not receive that plugin-only escape hatch");
     }
 }

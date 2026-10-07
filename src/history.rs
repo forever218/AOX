@@ -1,11 +1,13 @@
-//! 对话历史的**数据模型与文案**。
+//! The conversation history's **data model and wording**.
 //!
-//! 这里只剩「一条记录长什么样」与「怎么显示给人看」：`Meta` / `UsageRecord` /
-//! `Summary` / `Loaded` 四个结构，加上 `/history` 的子命令解析与纯文本渲染。
+//! What remains here is only "what a record looks like" and "how to show it to a human": the four
+//! structs `Meta` / `UsageRecord` / `Summary` / `Loaded`, plus `/history` subcommand parsing and
+//! plain-text rendering.
 //!
-//! **落盘与读取搬去了 [`crate::store`]**（阶段 3 抽出的存储缝，实现在 `store::jsonl`）。
-//! 分成两边的意义：换存储后端不牵连文案，改措辞也不碰 I/O；调用方按 **id** 说话，
-//! 不再自己拼历史文件路径。
+//! **Persisting and reading moved to [`crate::store`]** (the storage seam extracted in stage 3,
+//! implemented in `store::jsonl`). Splitting the two means: swapping the storage backend doesn't
+//! drag the wording along, and changing the wording doesn't touch I/O; callers speak in terms of
+//! **id** rather than assembling history file paths themselves.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,29 +19,32 @@ use serde_json::{json, Value};
 use crate::llm::Usage;
 use crate::message::Message;
 
-/// 列表里默认返回多少个对话。
+/// How many conversations the list returns by default.
 ///
-/// CLI（`/history`）与后端解析「序号」都用它 —— 序号是按这个列表的第几位算的，
-/// 两处一旦不同，`/history rm 2` 删掉的就不是用户看到的那一条。
+/// Both the CLI (`/history`) and the backend's "index" parsing use it — an index is counted by this
+/// list's position, and the moment the two disagree, `/history rm 2` deletes something other than
+/// the entry the user saw.
 pub const DEFAULT_LIST_LIMIT: usize = 60;
 
-/// 宿主注入的提示语前缀。这类「用户消息」不是真人说的，不该拿来当标题。
+/// The prefix of a prompt the host injected. Such "user messages" weren't said by a real person and
+/// must not be used as a title.
 ///
-/// 后端读标题时要判它，CLI 渲染全文时也要判它 —— 同一个判据，只写一遍。
-pub(crate) const HOST_PREFIX: &str = "（宿主提示）";
+/// The backend tests for it when reading a title, and the CLI tests for it when rendering the full
+/// text — one test, written once.
+pub const HOST_PREFIX: &str = "(host hint)";
 
-/// 当前 Unix 秒。
+/// The current Unix seconds.
 pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-// ─────────────────────────── 记录 ───────────────────────────
+// ─────────────────────────── Records ───────────────────────────
 
-/// 对话文件的头部记录（jsonl 的第一行）。
+/// The conversation file's header record (the first line of the jsonl).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub id: String,
-    /// Unix 秒，便于程序比较
+    /// Unix seconds, convenient for programmatic comparison
     #[serde(default)]
     pub created: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,29 +55,31 @@ pub struct Meta {
     pub version: Option<String>,
 }
 
-/// 一轮任务的 token 账（对应 jsonl 里的一行 `kind:"usage"`）。
+/// One turn's token account (corresponding to a `kind:"usage"` line in the jsonl).
 ///
-/// **逐轮各存一条**，而不是在文件末尾只留一个总数：那样只能回答「这段对话花了多少」，
-/// 回答不了「哪一轮最贵」。而最贵的那一轮往往正是出问题的那一轮 —— 定位要靠它。
+/// **One entry per turn**, rather than a single grand total at the end of the file: a total can only
+/// answer "how much did this conversation cost", not "which turn was the most expensive". And the
+/// most expensive turn is usually exactly the one that went wrong — diagnosis depends on it.
 ///
-/// 各项都是「有值才写」：端点少报一项，文件里就少一个键，读回来自然是 `None`，
-/// 不用拿 0 去冒充「没有消耗」。
+/// Every field is written "only if it has a value": if the endpoint under-reports, the file has one
+/// fewer key, and reading it back naturally yields `None` — no need to pass off a 0 as "no spend".
 #[derive(Debug, Clone, Default)]
 pub struct UsageRecord {
-    /// 第几轮（从 1 起）
+    /// Which turn (1-based)
     pub round: u32,
-    /// 写入时刻（unix 秒）
+    /// When it was written (unix seconds)
     pub at: u64,
-    /// 本轮模型被调用了几次
+    /// How many times the model was called this turn
     pub calls: u32,
-    /// 本轮各项用量
+    /// This turn's per-field usage
     pub usage: Usage,
-    /// 最后一次请求的输入规模 = 当前上下文占用
+    /// The input size of the last request = the current context occupancy
     pub last_prompt: Option<u64>,
-    /// 截至本轮的**对话累计** token。冗余存一份，省得读出来还要自己累加，
-    /// 也让「这段对话一共花了多少」在文件里一眼可见。
+    /// The **conversation total** tokens up to this turn. Stored redundantly so that reading it back
+    /// doesn't require summing by hand, and so "how much this conversation cost in total" is visible
+    /// at a glance in the file.
     pub session_total: Option<u64>,
-    /// 截至本轮的对话累计调用次数
+    /// The conversation's cumulative call count up to this turn
     pub session_calls: u32,
 }
 
@@ -121,54 +128,56 @@ impl UsageRecord {
         }
     }
 
-    /// 这一行是否一个数字都没带（端点压根不返回 usage 时就是空的）
+    /// Whether this line carries not a single number (it is empty when the endpoint doesn't return
+    /// usage at all)
     pub fn is_empty(&self) -> bool {
         self.usage.is_empty()
     }
 }
 
-/// 列表里的一项。
+/// One entry in the list.
 #[derive(Debug, Clone)]
 pub struct Summary {
-    /// 文件名主干（时间戳 + 盐），也是 `/history show` 与 GUI 用的标识。
-    /// 调存储层时一律用它，**不要**用 `path` 拼别的路径。
+    /// The filename stem (timestamp + salt), also the identifier used by `/history show` and the GUI.
+    /// Always use it when calling the storage layer, **never** assemble another path from `path`.
     pub id: String,
-    /// 落盘位置。展示用（`/history dir`、界面上的路径提示）。
+    /// Where it lives on disk. For display (`/history dir`, the path hint in the UI).
     pub path: std::path::PathBuf,
-    /// 首条用户消息（截断）；拿不到就用占位文案
+    /// The first user message (truncated); a placeholder if it can't be obtained
     pub title: String,
-    /// 消息条数（不含 meta）
+    /// The message count (excluding meta)
     pub messages: usize,
-    /// 「最后一次对话时间」的显示串（「10-02 15:39」）。与列表排序用的是同一个
-    /// 时间 —— 排序键和显示的时间一旦不是同一个，列表看着就像排错了。
+    /// The display string for "the time it was last spoken to" ("10-02 15:39"). It uses the same
+    /// time as the list sorting — the moment the sort key and the displayed time aren't the same one,
+    /// the list looks mis-sorted.
     pub time: String,
 }
 
-/// 一条读出来的消息。
+/// One message read back out.
 #[derive(Debug, Clone)]
 pub struct Loaded {
     pub msg: Message,
     pub is_error: Option<bool>,
 }
 
-// ─────────────────────────── 命令（CLI / GUI 共用） ───────────────────────────
+// ─────────────────────────── Commands (shared by CLI / GUI) ───────────────────────────
 
-/// `/history` 子命令。
+/// A `/history` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
-    /// 列出历史对话
+    /// List the historical conversations
     List,
-    /// 打印某个对话全文
+    /// Print one conversation in full
     Show(String),
-    /// 切换到某个对话（读回上下文，之后的发言继续写进同一个文件）
+    /// Switch to a conversation (read its context back, and subsequent turns keep writing to the same file)
     Open(String),
-    /// 打印历史目录
+    /// Print the history directory
     Dir,
-    /// 删除某个对话
+    /// Delete a conversation
     Remove(String),
 }
 
-/// 这一行是不是 `/history` 命令。
+/// Whether this line is a `/history` command.
 pub fn is_cmd(line: &str) -> bool {
     line == "/history" || line.starts_with("/history ")
 }
@@ -181,76 +190,76 @@ pub fn parse_cmd(line: &str) -> Result<Cmd> {
         Some("dir") => Ok(Cmd::Dir),
         Some("show") => match parts.next() {
             Some(id) => Ok(Cmd::Show(id.to_string())),
-            None => bail!("用法: /history show <序号|文件名>"),
+            None => bail!(crate::i18n::t("Usage: /history show <number|file name>")),
         },
         Some("open") | Some("use") => match parts.next() {
             Some(id) => Ok(Cmd::Open(id.to_string())),
-            None => bail!("用法: /history open <序号|文件名>"),
+            None => bail!(crate::i18n::t("Usage: /history open <number|file name>")),
         },
         Some("rm") | Some("remove") => match parts.next() {
             Some(id) => Ok(Cmd::Remove(id.to_string())),
-            None => bail!("用法: /history rm <序号|文件名>"),
+            None => bail!(crate::i18n::t("Usage: /history rm <number|file name>")),
         },
         Some(other) => bail!(
-            "未知的 /history 子命令: {other}\n\
-             用法: /history [list] | /history show <序号|文件名> | \
-             /history open <序号|文件名> | /history rm <序号|文件名> | /history dir"
+            crate::tf!("Unknown /history subcommand: {}\nUsage: /history [list] | /history show <number|file name> | /history open <number|file name> | /history rm <number|file name> | /history dir", other)
         ),
     }
 }
 
-// ─────────────────────────── 文案 ───────────────────────────
+// ─────────────────────────── Text rendering ───────────────────────────
 
-/// `/history` 的纯文本实现（CLI 直接打印）。
+/// The plain-text implementation of `/history` (which the CLI prints directly).
 ///
-/// 只负责排版：数据由调用方从存储层取好传进来 —— 这样「换后端」与「改措辞」
-/// 互不牵连，也免得这个函数自己还要去读盘。
+/// It handles layout only: the data is fetched from the storage layer by the caller and passed in —
+/// that way "swapping the backend" and "changing the wording" don't entangle, and this function
+/// doesn't have to read the disk itself.
 pub fn list_text(items: &[Summary], location: &Path, current: Option<&str>) -> String {
     if items.is_empty() {
-        return format!("（还没有历史记录）\n  目录: {}", location.display());
+        return crate::tf!("(no history yet)\n  Directory: {}", location.display());
     }
-    let mut s = format!("历史记录（{} 个对话，最近聊过的在前）  {}", items.len(), location.display());
+    let mut s = crate::tf!("History ({} conversations, most recently active first)  {}", items.len(), location.display());
     for (i, it) in items.iter().enumerate() {
-        let cur = if Some(it.id.as_str()) == current { "  ← 当前" } else { "" };
-        s.push_str(&format!(
-            "\n  {:>2}. {}  {:>4} 条  {}{}",
-            i + 1,
+        let cur = if Some(it.id.as_str()) == current { crate::i18n::t("  ← current") } else { "" };
+        s.push_str(&crate::tf!(
+            "\n  {}. {}  {} messages  {}{}",
+            format!("{:>2}", i + 1),
             it.time,
-            it.messages,
+            format!("{:>4}", it.messages),
             it.title,
             cur
         ));
     }
     s.push_str(
-        "\n  用法: /history show <序号> 看全文 | /history open <序号> 接着聊 | \
-         /history rm <序号> | /history dir",
+        crate::i18n::t("\n  Usage: /history show <n> to read in full | /history open <n> to continue | /history rm <n> | /history dir"),
     );
     s
 }
 
-/// 把一个对话渲染成纯文本（CLI 的 `/history show`）。
+/// Render one conversation as plain text (the CLI's `/history show`).
 pub fn transcript_text(items: &[Loaded]) -> String {
     use crate::ui::style;
     if items.is_empty() {
-        return "（空对话）".into();
+        return crate::i18n::t("(empty conversation)").into();
     }
     let mut s = String::new();
     for it in items {
         let m = &it.msg;
         match m.role.as_str() {
             "user" => {
-                // 用 `flat_text`：用户消息可能带附件，那时 `content` 是 parts 数组
-                //（正文 + 图片块），直接 `as_deref` 会一个字都显示不出来。
+                // Use `flat_text`: a user message may carry attachments, in which case `content` is a
+                // parts array (body text + image blocks), and a direct `as_deref` would show not one
+                // character.
                 let text = m.flat_text();
                 let text = text.trim();
                 if text.starts_with(HOST_PREFIX) {
-                    s.push_str(&format!("\n{} {}\n", style::dim("宿主:"), style::dim(text)));
+                    s.push_str(&format!("\n{} {}\n", style::dim(crate::i18n::t("host:")), style::dim(text)));
                 } else {
-                    s.push_str(&format!("\n{} {}\n", style::bold("你:"), text));
+                    s.push_str(&format!("\n{} {}\n", style::bold(crate::i18n::t("you:")), text));
                 }
-                // 附件在 `.jsonl` 里只有一条路径引用（见 `attach` 模块），所以翻历史时
-                // 必须显式列出来 —— 否则一段带图对话回看起来与纯文字对话毫无区别，
-                // 而「当时到底发了什么」正是回看历史要回答的那个问题。
+                // An attachment is only a path reference in the `.jsonl` (see the `attach` module),
+                // so when reviewing history it must be listed explicitly — otherwise a conversation
+                // with images looks no different from a plain-text one, and "what exactly was sent
+                // at the time" is precisely the question reviewing history is meant to answer.
                 let files = m
                     .content
                     .as_ref()
@@ -259,14 +268,14 @@ pub fn transcript_text(items: &[Loaded]) -> String {
                 if !files.is_empty() {
                     s.push_str(&format!(
                         "  {} {}\n",
-                        style::dim("附件:"),
-                        style::dim(&files.join("、"))
+                        style::dim(crate::i18n::t("attachments:")),
+                        style::dim(&files.join(crate::i18n::t(", ")))
                     ));
                 }
             }
             "assistant" => {
                 if let Some(t) = m.text() {
-                    s.push_str(&format!("\n{} {}\n", style::bold("助手:"), t));
+                    s.push_str(&format!("\n{} {}\n", style::bold(crate::i18n::t("assistant:")), t));
                 }
                 for c in m.tool_calls.as_deref().unwrap_or(&[]) {
                     s.push_str(&format!(
@@ -282,8 +291,9 @@ pub fn transcript_text(items: &[Loaded]) -> String {
                     if it.is_error == Some(true) { "✗" } else { "✓" },
                     m.name.as_deref().unwrap_or("tool"),
                 );
-                // 工具结果可能很长（写入前已被 max_result_chars 收过一道），
-                // 展示时再收一道，翻历史才不用在一条结果里滚屏。
+                // A tool result can be long (already trimmed by max_result_chars before writing), and
+                // it is trimmed once more for display, so reviewing history doesn't mean scrolling
+                // through a single result.
                 let body = m.flat_text().replace('\n', " ⏎ ");
                 s.push_str(&format!("  {} {} {}\n", mark, name, style::dim(&clamp_chars(body.trim(), 300))));
             }
@@ -301,20 +311,20 @@ fn clamp_chars(s: &str, n: usize) -> String {
     }
 }
 
-// ─────────────────────────── 测试 ───────────────────────────
+// ─────────────────────────── Tests ───────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 序号列表与解析出来的条数用的是同一个上限 —— 两处一旦不同，
-    /// `/history rm 2` 删掉的就不是用户看到的那一条。
+    /// The index list and the parsed count use the same limit — the moment the two disagree,
+    /// `/history rm 2` deletes something other than the entry the user saw.
     #[test]
     fn list_limit_is_the_shared_one() {
         assert!(DEFAULT_LIST_LIMIT > 0);
     }
 
-    /// 用量记录：有值才写、缺项读回是 None（不是 0）。
+    /// Usage record: write only what has a value, and a missing field reads back as None (not 0).
     #[test]
     fn usage_record_round_trips_sparse_fields() {
         let rec = UsageRecord {
@@ -330,14 +340,14 @@ mod tests {
         assert_eq!(back.round, 2);
         assert_eq!(back.usage.prompt, Some(10));
         assert_eq!(back.usage.total, Some(30));
-        assert_eq!(back.usage.completion, None, "没报就是没有，不许变成 0");
+        assert_eq!(back.usage.completion, None, "not reported means absent; it must not become 0");
         assert_eq!(back.last_prompt, None);
         assert_eq!(back.session_total, Some(60));
         assert_eq!(back.session_calls, 3);
         assert!(!back.is_empty());
     }
 
-    /// 子命令解析：别名、缺参报错、未知子命令报错。
+    /// Subcommand parsing: aliases, a missing argument erroring, an unknown subcommand erroring.
     #[test]
     fn parse_cmd_handles_aliases_and_errors() {
         assert_eq!(parse_cmd("/history").unwrap(), Cmd::List);
@@ -350,15 +360,16 @@ mod tests {
         assert!(parse_cmd("/history nope").is_err());
     }
 
-    /// 标题用的前缀判据不能在渲染全文时失效：宿主提示要显示成「宿主:」。
+    /// The prefix test used for titles must not fail when rendering the full text: a host prompt has
+    /// to be shown as "host:".
     #[test]
     fn transcript_marks_host_prompts() {
         let items = vec![
-            Loaded { msg: Message::user("（宿主提示）你上一条回复是空的。"), is_error: None },
-            Loaded { msg: Message::user("帮我看看"), is_error: None },
+            Loaded { msg: Message::user("(host hint) your previous reply was empty."), is_error: None },
+            Loaded { msg: Message::user("take a look for me"), is_error: None },
         ];
         let text = transcript_text(&items);
-        assert!(text.contains("宿主:"), "宿主提示要单独标出来");
-        assert!(text.contains("你:"), "真人消息用「你:」");
+        assert!(text.contains("host:"), "a host prompt must be marked out");
+        assert!(text.contains("you:"), "a real user message uses 'you:'");
     }
 }

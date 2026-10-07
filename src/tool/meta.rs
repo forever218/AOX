@@ -1,4 +1,5 @@
-//! 元工具：系统「自我增长」的入口。初始注册表里只有这三个工具。
+//! Meta-tools: the entry point to the system's "self-growth". The initial registry holds only these
+//! three tools.
 
 use std::sync::Arc;
 
@@ -26,17 +27,17 @@ impl Tool for CreatePluginTool {
         ToolKind::Meta
     }
     fn description(&self) -> &str {
-        "编写并注入一个新工具插件（自我增长）。插件是独立子进程，通过 stdio 行 JSON 协议通信（协议见系统提示与 plugins/sdk/PROTOCOL.md）。创建成功后其声明的工具立即可调用，并持久化到 plugins/ 目录。若同名插件上次创建失败留下残留目录，会自动清理后重建，直接复用原插件名即可。"
+        crate::i18n::t("Write and inject a new tool plugin (self-growth). A plugin is a standalone subprocess that talks over the stdio line-JSON protocol (see the system prompt and plugins/sdk/PROTOCOL.md). Once created, the tools it declares are immediately callable and persisted under plugins/. If a previous creation of the same name failed and left a directory behind, it is cleaned up and rebuilt — just reuse the original plugin name.")
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "插件名，小写字母/数字/下划线，1-40 字符"},
+                "name": {"type": "string", "description": crate::i18n::t("plugin name: lowercase letters / digits / underscore, 1-40 chars")},
                 "language": {"type": "string", "enum": ["python", "node", "rust"],
-                             "description": "插件语言。推荐 python（启动快、json 内置）；rust 仅可用 std 单文件编译"},
-                "description": {"type": "string", "description": "一句话说明这个插件提供什么能力"},
-                "source": {"type": "string", "description": "完整插件源码"}
+                             "description": crate::i18n::t("plugin language. python is recommended (fast startup, built-in json); rust is limited to a single-file build using std")},
+                "description": {"type": "string", "description": crate::i18n::t("one sentence describing what capability this plugin provides")},
+                "source": {"type": "string", "description": crate::i18n::t("full plugin source code")}
             },
             "required": ["name", "language", "description", "source"]
         })
@@ -44,22 +45,23 @@ impl Tool for CreatePluginTool {
 
     async fn call(&self, args: Value, rt: &Arc<Runtime>) -> ToolOutput {
         let Some(name) = args.get("name").and_then(|v| v.as_str()) else {
-            return ToolOutput::err("缺少参数 name");
+            return ToolOutput::err(crate::i18n::t("missing argument name"));
         };
         let Some(language) = args.get("language").and_then(|v| v.as_str()) else {
-            return ToolOutput::err("缺少参数 language");
+            return ToolOutput::err(crate::i18n::t("missing argument language"));
         };
         let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
         let Some(source) = args.get("source").and_then(|v| v.as_str()) else {
-            return ToolOutput::err("缺少参数 source");
+            return ToolOutput::err(crate::i18n::t("missing argument source"));
         };
         match plugin::create_plugin(rt, name, language, description, source).await {
-            Ok(tools) => ToolOutput::ok(format!(
-                "插件 {name} 创建成功，已注册 {} 个工具: {}。现在可以直接调用它们。",
+            Ok(tools) => ToolOutput::ok(crate::tf!(
+                "plugin {} created; registered {} tool(s): {}. You can call them right away.",
+                name,
                 tools.len(),
                 tools.join(", ")
             )),
-            Err(e) => ToolOutput::err(format!("插件创建失败: {e:#}")),
+            Err(e) => ToolOutput::err(crate::tf!("failed to create plugin: {}", format!("{e:#}"))),
         }
     }
 }
@@ -77,7 +79,7 @@ impl Tool for ListPluginsTool {
         ToolKind::Meta
     }
     fn description(&self) -> &str {
-        "列出当前已加载的所有插件及其提供的工具。创建新插件前应先调用本工具检查是否已有可复用的能力。"
+        crate::i18n::t("List every currently loaded plugin and the tools it provides. Before creating a new plugin, call this tool first to check whether a reusable capability already exists.")
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {}})
@@ -87,16 +89,16 @@ impl Tool for ListPluginsTool {
         let plugins = rt.plugins.lock().await;
         if plugins.is_empty() {
             return ToolOutput::ok(
-                "当前没有任何已加载的插件。如任务需要工具能力，请用 create_plugin 创建。".to_string(),
+                crate::i18n::t("No plugins are loaded right now. If the task needs tool capabilities, create one with create_plugin.").to_string(),
             );
         }
-        let mut lines = vec![format!("已加载 {} 个插件:", plugins.len())];
+        let mut lines = vec![crate::tf!("{} plugin(s) loaded:", plugins.len())];
         let mut items: Vec<_> = plugins.values().collect();
         items.sort_by(|a, b| a.name.cmp(&b.name));
         for p in items {
             lines.push(format!("- {} [{}]: {}", p.name, p.language, p.description));
             for t in &p.tool_defs {
-                lines.push(format!("    工具 {}: {}", t.name, t.description));
+                lines.push(crate::tf!("    tool {}: {}", t.name, t.description));
             }
         }
         ToolOutput::ok(lines.join("\n"))
@@ -116,13 +118,13 @@ impl Tool for RemovePluginTool {
         ToolKind::Meta
     }
     fn description(&self) -> &str {
-        "卸载并删除一个插件：停止其进程、注销其工具、删除 plugins/ 下对应目录（即使插件未被加载，也会清理其残留目录）。用于重建坏掉的插件或清理不再需要的能力。"
+        crate::i18n::t("Unload and delete a plugin: stop its process, unregister its tools, and delete its directory under plugins/ (even if the plugin is not loaded, its leftover directory is cleaned up). Use it to rebuild a broken plugin or clear capabilities you no longer need.")
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "要删除的插件名"}
+                "name": {"type": "string", "description": crate::i18n::t("name of the plugin to delete")}
             },
             "required": ["name"]
         })
@@ -130,14 +132,15 @@ impl Tool for RemovePluginTool {
 
     async fn call(&self, args: Value, rt: &Arc<Runtime>) -> ToolOutput {
         let Some(name) = args.get("name").and_then(|v| v.as_str()) else {
-            return ToolOutput::err("缺少参数 name");
+            return ToolOutput::err(crate::i18n::t("missing argument name"));
         };
         match plugin::remove_plugin(rt, name).await {
-            Ok(tools) => ToolOutput::ok(format!(
-                "插件 {name} 已删除，注销工具: {}",
-                if tools.is_empty() { "（无）".to_string() } else { tools.join(", ") }
+            Ok(tools) => ToolOutput::ok(crate::tf!(
+                "plugin {} deleted; unregistered tools: {}",
+                name,
+                if tools.is_empty() { crate::i18n::t("(none)").to_string() } else { tools.join(", ") }
             )),
-            Err(e) => ToolOutput::err(format!("删除插件失败: {e:#}")),
+            Err(e) => ToolOutput::err(crate::tf!("failed to delete plugin: {}", format!("{e:#}"))),
         }
     }
 }
