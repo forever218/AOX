@@ -165,8 +165,9 @@ max_result_chars = 20000
 # host's windows / clipboard / desktop.
 #
 # Type /sandbox at the command line to see the limits currently in force. The "fence ✓ / ✗"
-# marker after each plugin in /plugins is exactly this -- ✗ means it didn't enter a Job (the
-# sandbox is off, or the outer Job doesn't allow nesting).
+# marker shown next to a plugin in /plugins is exactly this -- ✗ means that process didn't enter
+# a Job (the sandbox is off, or the outer Job doesn't allow nesting). A **dormant** plugin shows
+# no marker at all, because it has no process to fence (see [plugins] further down).
 #
 # ⚠️ It **cannot govern files or the network**: a Job Object has no such ability. Which is why
 #    it is a "fence" and not a "sandbox" -- /sandbox's output repeats that sentence verbatim,
@@ -205,6 +206,54 @@ max_memory_mb = 0
 # global atoms). Plugins don't need any of these -- all their communication with the host goes
 # through stdin/stdout pipes.
 ui_limits = true
+
+# ── plugin lazy loading ───────────────────────────────────────────────────────────
+#
+# A plugin is an interpreter process. Without this section every plugin under plugins/ was
+# started at boot and stayed resident for as long as the program ran -- a shelf of idle
+# python.exe processes (10-15 MB each) that nobody was calling.
+#
+# A plugin slot now has two states:
+#
+#   dormant   no process. Metadata only (a few hundred bytes). **Its tools are still registered
+#             and still callable** -- the model sees them exactly as before, and the first call
+#             starts the process (tens of milliseconds).
+#   active    the child process + its Job fence.
+#
+# Startup reads `plugin.toml` plus `plugins/<name>/plugin.cache.json` (the last known tool list,
+# written by the host) and starts nothing. The background reaper closes a process once it has
+# been idle for `idle_timeout_secs`, so the plugin table returns to 0 processes by itself.
+#
+# The one thing to know: the tool list comes from a cache, so a plugin whose source was edited
+# since its last run may briefly advertise a stale tool table. It self-heals -- every real start
+# re-reads the tools, re-registers anything that changed, and rewrites the cache -- so the worst
+# case is one wasted call. To force a rebuild by hand, delete that plugin's plugin.cache.json.
+#
+# Type /plugins at the command line to see each slot's state.
+
+[plugins]
+# Master switch. false = every plugin is started at boot and stays resident until exit, exactly
+# like before this feature existed (the escape hatch; nothing else in this section applies).
+lazy = true
+
+# How many seconds a plugin process may sit unused before it is closed. 0 = never close one.
+# Why a grace period rather than "close it the moment the call returns": a task usually calls the
+# same plugin several times in a row, and re-starting an interpreter costs tens of milliseconds.
+# A minute is invisible to the user but leaves nothing behind by the time you look at the task
+# manager.
+idle_timeout_secs = 60
+
+# Upper bound on **simultaneously live** plugin processes. 0 = unlimited (the default).
+# Over the cap, the longest-idle process is closed first to make room. Leave it at 0 unless memory
+# is genuinely tight: a turn that alternates between a hook component and a tool plugin could
+# otherwise be forced to start a process on every single round.
+max_resident = 0
+
+# Plugin names that **always stay resident**, even when idle.
+# For components that fire on every turn ([contributes] hooks in plugin.toml): they count as "in
+# use" at the start of every request, so under lazy loading they would be started, closed and
+# started again each round. List them here and they are started at boot like they used to be.
+# eager = ["my_component"]
 
 [workplace]
 # Which files the model may touch ("take file capability back from the model"). Note that this

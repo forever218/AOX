@@ -365,16 +365,24 @@ fn last_error_text() -> String {
 /// Returns empty when the sandbox **itself is off** — that's an explicit config
 /// choice (`enabled = false`), which shouldn't spam the startup banner; `/sandbox`
 /// will explain it clearly.
+///
+/// **Only slots with a live process are considered.** A dormant plugin has no Job because it has no
+/// process, which under lazy loading is the *ordinary* state and not a problem worth raising — the
+/// check is about a process that exists and is not fenced, which is the thing that would mislead.
 pub async fn unfenced(rt: &crate::runtime::Runtime) -> Vec<String> {
     if !rt.sandbox.enabled() {
         return Vec::new();
     }
-    let plugins = rt.plugins.lock().await;
-    let mut out: Vec<String> = plugins
-        .values()
-        .filter(|h| !h.fence.lock().map(|f| f.active).unwrap_or(true))
-        .map(|h| format!("{} · {}", h.name, h.fence_status()))
-        .collect();
+    // Snapshot the slots, then drop the lock: `stat` takes each slot's own lock and may await.
+    let handles: Vec<std::sync::Arc<crate::plugin::PluginHandle>> =
+        rt.plugins.lock().await.values().cloned().collect();
+    let mut out: Vec<String> = Vec::new();
+    for h in handles {
+        let st = h.stat().await;
+        if st.running && !st.fence_active {
+            out.push(format!("{} · {}", h.name, st.fence_text));
+        }
+    }
     out.sort();
     out
 }

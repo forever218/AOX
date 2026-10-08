@@ -510,6 +510,35 @@ fn boot_paths(
     BootPaths::new(root, config, plugins, store.location().to_path_buf())
 }
 
+/// Restore persisted plugins and report everything about them the user needs to know.
+///
+/// Split out of `boot_and_run` for two reasons. Both startup branches need it — the normal one and
+/// the "model not configured" one, where the plugin panel should still show what is on disk — and it
+/// is the **one startup step that can block**: a plugin whose metadata cache is cold or stale has to
+/// be started to ask it its own tool list, and a broken one makes that wait out `INIT_TIMEOUT` (20 s)
+/// per plugin. Callers therefore run it **after** the session has been handed to the UI via `boot`,
+/// never before: the history sidebar lives off the store that `boot` carries, so anything scheduled
+/// ahead of `boot` silently blanks it for as long as it blocks.
+async fn restore_plugins(ui: &mut GuiUi, rt: &Arc<Runtime>) {
+    // Success stays silent — startup should not flush a screenful of "plugin xxx restored" into the
+    // activity stream, pushing the information you really need out of view. Only failure speaks up.
+    for (name, result) in aox::plugin::load_all(rt).await {
+        if let Err(e) = result {
+            ui.emit(AgentEvent::Warn(aox::tf!("plugin {} failed to load: {}", name, format!("{e:#}"))));
+        }
+    }
+    // Plugins without a fence must speak up too (sharing the same judgment and copy as the CLI).
+    // A fence failure is not a fatal error, but "thinking there is protection when there is none"
+    // deserves a look.
+    let unfenced = aox::sandbox::unfenced(rt).await;
+    if !unfenced.is_empty() {
+        ui.emit(AgentEvent::Warn(aox::tf!(
+            "These plugins are not wrapped in a process fence; they are not subject to the process / memory / UI limits: {}",
+            unfenced.join(aox::i18n::t("; "))
+        )));
+    }
+}
+
 /// Tell the main thread "which conversation this session is writing".
 ///
 /// Called once after each turn: the first time the id appears, the main thread adds the new
@@ -726,24 +755,6 @@ async fn boot_and_run(
         ui.emit(AgentEvent::Warn(hint));
     }
 
-    // Restore persisted plugins (the same path as the CLI).
-    // Success stays silent — startup should not flush a screenful of "plugin xxx restored" into the
-    // activity stream, pushing the information you really need out of view. Only failure speaks up.
-    for (name, result) in aox::plugin::load_all(&rt).await {
-        if let Err(e) = result {
-            ui.emit(AgentEvent::Warn(aox::tf!("plugin {} failed to load: {}", name, format!("{e:#}"))));
-        }
-    }
-    // Plugins without a fence must speak up too (sharing the same judgment and copy as the CLI).
-    // A fence failure is not a fatal error, but "thinking there is protection when there is none" deserves a look.
-    let unfenced = aox::sandbox::unfenced(&rt).await;
-    if !unfenced.is_empty() {
-        ui.emit(AgentEvent::Warn(aox::tf!(
-            "These plugins are not wrapped in a process fence; they are not subject to the process / memory / UI limits: {}",
-            unfenced.join(aox::i18n::t("; "))
-        )));
-    }
-
     let llm: Arc<dyn LlmProvider> = match aox::llm::openai::OpenAiProvider::new(&rt.config.provider) {
         Ok(p) => Arc::new(p),
         Err(e) => {
@@ -762,6 +773,8 @@ async fn boot_and_run(
                 config_layers.clone(),
                 paths,
             );
+            // Even in the "not ready" state, fill the plugin panel with what is on disk.
+            restore_plugins(&mut ui, &rt).await;
             // Still in "not ready" state, but send the workplace state anyway: if the button is visible, at least it shows the real tier.
             sync_workplace(&tx, &rt);
             idle_until_shutdown(&mut ui.rx, &tx).await;
@@ -773,8 +786,15 @@ async fn boot_and_run(
     // each in the GUI and CLI (see src/prompt.rs).
     let mut agent = Agent::new(llm, rt.clone());
     let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store);
+    // Hand the session to the UI **before** touching plugins. The history sidebar reads off the store
+    // that `boot` carries, so restoring plugins first used to blank it for the whole wait — up to
+    // `INIT_TIMEOUT` (20 s) per cold-or-broken plugin. This order is the point of the fix.
     boot(&tx, &config_path, &model, true, None, rt.store.clone(), config_layers, paths);
     send_history_current(&tx, &agent);
+    // Now restore persisted plugins (the same path as the CLI). It is the one startup step that can
+    // block, so it runs here — after the UI already has the session — and finishes before the driver
+    // loop below, so the very first turn still sees every plugin tool.
+    restore_plugins(&mut ui, &rt).await;
     // Send the workplace state right at startup: both the button's initial "Workplace · <tier>" and which
     // item to tick in the three-way list depend on it.
     sync_workplace(&tx, &rt);
@@ -846,10 +866,11 @@ async fn boot_and_run(
     }
 
     snap_task.abort();
-    // Close all plugin child processes (the same as the CLI's exit path)
+    // Close all plugin child processes (the same as the CLI's exit path). Under lazy loading most
+    // slots are dormant and `stop` is a no-op for them.
     let handles: Vec<_> = rt.plugins.lock().await.values().cloned().collect();
     for h in handles {
-        h.shutdown().await;
+        h.stop().await;
     }
     Ok(())
 }

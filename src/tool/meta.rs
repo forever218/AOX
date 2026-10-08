@@ -97,7 +97,7 @@ impl Tool for ListPluginsTool {
         items.sort_by(|a, b| a.name.cmp(&b.name));
         for p in items {
             lines.push(format!("- {} [{}]: {}", p.name, p.language, p.description));
-            for t in &p.tool_defs {
+            for t in p.tools() {
                 lines.push(crate::tf!("    tool {}: {}", t.name, t.description));
             }
         }

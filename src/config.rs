@@ -36,6 +36,14 @@ pub struct Config {
     /// The `[sandbox]` section of `config.toml` (the plugin child-process fence, see `src/sandbox.rs`).
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// The `[plugins]` section of `config.toml` (lazy loading of plugin subprocesses, see
+    /// `src/plugin/mod.rs`).
+    ///
+    /// It governs a third thing, again distinct from both of the above: `[sandbox]` limits how a
+    /// plugin process runs, `[workplace]` limits which files may be touched, and **this one limits
+    /// how long a plugin process exists at all**.
+    #[serde(default)]
+    pub plugins: PluginsConfig,
     /// The `[workplace]` section of `config.toml` (the model's file boundary, see `src/workplace.rs`).
     ///
     /// Two layers apart from `[sandbox]`: this one governs "which files may be touched", not
@@ -401,6 +409,72 @@ impl Default for SandboxConfig {
     }
 }
 
+/// **Lazy loading of plugin subprocesses** (`config.toml`'s `[plugins]`, see `src/plugin/mod.rs`).
+///
+/// # What problem it solves
+///
+/// A plugin is one interpreter process. Under the old behaviour **every** plugin under `plugins/`
+/// was started at boot and stayed resident for as long as the program lived — a shelf of idle
+/// `python.exe` processes (roughly 10-15 MB each) that nobody was calling, which is exactly the
+/// "checked the task manager and found a row of mysterious processes" complaint.
+///
+/// # How
+///
+/// A plugin slot has only two states: **dormant** (no process; only metadata in memory, a few
+/// hundred bytes) and **active** (child process + Job fence). Startup reads the manifest plus
+/// `plugins/<name>/plugin.cache.json` and registers the plugin's tools, hooks and prompt segments
+/// **without starting anything**; the process is started by the first real use (`tools/call` or a
+/// hook), and the reaper takes it away again once it has been idle past `idle_timeout_secs`.
+///
+/// Dormant is not "disabled": the plugin's tools are still in the model's tool list and still
+/// callable — they just cost a process start (tens of milliseconds) the first time.
+///
+/// ⚠️ The one thing worth knowing: the tool list comes from a cache, so a plugin whose source was
+/// edited since its last run may briefly advertise a stale tool table. It self-heals — every real
+/// start re-reads the tools, re-registers them if they differ, and rewrites the cache — so the
+/// worst case is one wasted call. To force a rebuild by hand, delete that plugin's
+/// `plugin.cache.json`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PluginsConfig {
+    /// Master switch. `true` (default) = metadata-only at boot, start on demand, reap when idle.
+    ///
+    /// `false` restores the previous behaviour **item by item**: every plugin is started at boot
+    /// and stays resident until the program exits. This is the escape hatch, the same idea as
+    /// `[sandbox] enabled = false` — anything that turns out to misbehave under lazy loading can be
+    /// taken back to the old model without downgrading the program.
+    pub lazy: bool,
+    /// How many seconds a plugin process may sit unused before it is shut down.
+    ///
+    /// `0` = never reap (processes persist once started, i.e. lazy *start* but no lazy *stop*).
+    ///
+    /// Why there is a threshold at all rather than "close it the moment the call returns": every
+    /// start costs a process spawn (tens of milliseconds for `python.exe`), and a task usually calls
+    /// the same plugin several times in a row. A minute of grace is invisible to the user while
+    /// still leaving the machine clean by the time they look at the task manager.
+    pub idle_timeout_secs: u64,
+    /// Upper bound on **simultaneously live** plugin processes. `0` (default) = unlimited.
+    ///
+    /// Over the cap, the longest-idle process is closed first to make room. Leave it at 0 unless
+    /// memory is genuinely tight: a turn that alternates between a hook component and a tool plugin
+    /// can otherwise be forced to start a process on every single round, which is slower than just
+    /// keeping both alive for the idle window.
+    pub max_resident: usize,
+    /// Plugin names that **always stay resident** even when idle.
+    ///
+    /// For components that fire on every turn (`[contributes] hooks`): they count as "in use" at the
+    /// start of every request, so under lazy loading they would be started, reaped and started again
+    /// on each round. Put those names here and they are started at boot like before — the right
+    /// shape for "always on, always cheap".
+    pub eager: Vec<String>,
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self { lazy: true, idle_timeout_secs: 60, max_resident: 0, eager: Vec::new() }
+    }
+}
+
 /// The workspace boundary (the config surface of sandbox option ③ "take the file capability back to
 /// the host", see `src/workplace.rs`).
 ///
@@ -724,6 +798,7 @@ impl Config {
             hook: HookConfig::default(),
             loop_config: LoopConfig::default(),
             sandbox: SandboxConfig::default(),
+            plugins: PluginsConfig::default(),
             workplace: WorkplaceConfig::default(),
             theme: ThemeConfig::default(),
         }
@@ -1155,6 +1230,45 @@ api_key = "k"
             u32::MAX,
             "an extreme value must not wrap to 0 — inside a Job, 0 means \"unlimited\", the exact opposite"
         );
+    }
+
+    /// `[plugins]` defaults: lazy on, 60s idle, uncapped resident count, no eager list — and an old
+    /// config that has never heard of the section has to parse into exactly that. This is the
+    /// "written but not in effect" guard: if the default ever silently flipped back to eager, the
+    /// symptom would be a shelf of idle processes, not an error message.
+    #[test]
+    fn plugins_default_to_lazy_loading() {
+        let c: Config = toml::from_str(
+            r#"
+            [provider]
+            base_url = "https://example.com/v1"
+            model = "m"
+            api_key = "k"
+            "#,
+        )
+        .expect("an old config without [plugins] must still parse");
+        assert!(c.plugins.lazy, "lazy loading is the default (starting every plugin at boot is the thing being fixed)");
+        assert_eq!(c.plugins.idle_timeout_secs, 60);
+        assert_eq!(c.plugins.max_resident, 0, "0 = no cap on simultaneously live processes");
+        assert!(c.plugins.eager.is_empty());
+
+        // A partial table keeps the code default for every key it omits, the same as [sandbox]/[auth].
+        let c2: Config = toml::from_str(
+            r#"
+            [provider]
+            base_url = "https://example.com/v1"
+            model = "m"
+            api_key = "k"
+
+            [plugins]
+            idle_timeout_secs = 0
+            eager = ["comp"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c2.plugins.idle_timeout_secs, 0, "0 = never reap");
+        assert_eq!(c2.plugins.eager, vec!["comp"]);
+        assert!(c2.plugins.lazy, "a key the section does not mention keeps its default");
     }
 
     /// With only one key written the rest take defaults (like the other tables, "a whole table may omit fields").

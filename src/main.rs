@@ -344,7 +344,31 @@ async fn main() -> Result<()> {
     }
 
     let mut ui = CliUi::new();
-    // Restore persisted plugins. Silent on success (keeping the startup banner clean),
+
+    // Print the banner **before** restoring plugins. Restore is the one startup step that can
+    // block — up to `INIT_TIMEOUT` (20 s) per cold-or-broken plugin — and it stays silent on
+    // success, so running it first would leave the terminal blank for that whole wait. The REPL
+    // below does not open until after restore, so nothing is skipped by moving this up.
+    println!("\n{}", ui::style::logo());
+    println!(
+        "  {} {}",
+        ui::style::dim(crate::i18n::t("Model")),
+        ui::style::bold(&rt.config.provider.model)
+    );
+    ui.emit(AgentEvent::Info(crate::tf!(
+        "Config {}   plugins dir {}",
+        config_path.display(),
+        rt.plugins_dir.display()
+    )));
+    ui.emit(AgentEvent::Info(crate::i18n::t("Type /help to see all commands").into()));
+    ui.emit(AgentEvent::Info(crate::tf!(
+        "Project home {}",
+        // OSC 8 hyperlinks: clickable in Windows Terminal / VS Code etc.;
+        // old conhost doesn't support it and falls back to a plain-text URL
+        ui::style::link(ui::style::PROJECT_URL, ui::style::PROJECT_URL)
+    )));
+
+    // Restore persisted plugins. Silent on success (the banner above is already on screen),
     // speak up only on failure. To see loaded plugins, use /plugins.
     let load_results = plugin::load_all(&rt).await;
     for (name, result) in &load_results {
@@ -381,25 +405,6 @@ async fn main() -> Result<()> {
     // `prompt::build` — the CLI and GUI share one implementation.
     let mut agent = Agent::new(llm, rt.clone());
 
-    println!("\n{}", ui::style::logo());
-    println!(
-        "  {} {}",
-        ui::style::dim(crate::i18n::t("Model")),
-        ui::style::bold(&rt.config.provider.model)
-    );
-    ui.emit(AgentEvent::Info(crate::tf!(
-        "Config {}   plugins dir {}",
-        config_path.display(),
-        rt.plugins_dir.display()
-    )));
-    ui.emit(AgentEvent::Info(crate::i18n::t("Type /help to see all commands").into()));
-    ui.emit(AgentEvent::Info(crate::tf!(
-        "Project home {}",
-        // OSC 8 hyperlinks: clickable in Windows Terminal / VS Code etc.;
-        // old conhost doesn't support it and falls back to a plain-text URL
-        ui::style::link(ui::style::PROJECT_URL, ui::style::PROJECT_URL)
-    )));
-
     // Runtime hint: only an extra line when Python is missing; when runtimes are
     // complete the startup output stays clean.
     if let Some(hint) = runtimes::missing_hint(&rt.root, &rt.config.runtimes) {
@@ -433,30 +438,57 @@ async fn main() -> Result<()> {
                 ui.emit(AgentEvent::Info(crate::tf!("Tools: {}", rt.tool_names().await.join(", "))));
             }
             "/plugins" => {
-                let plugins = rt.plugins.lock().await;
-                if plugins.is_empty() {
+                // Snapshot the slots, then drop the plugin table lock: `stat` takes each slot's own
+                // lock and awaits, and the table has to stay usable while this prints.
+                let slots: Vec<(String, std::sync::Arc<crate::plugin::PluginHandle>)> = {
+                    let plugins = rt.plugins.lock().await;
+                    let mut v: Vec<_> = plugins.iter().map(|(n, h)| (n.clone(), h.clone())).collect();
+                    v.sort_by(|a, b| a.0.cmp(&b.0));
+                    v
+                };
+                if slots.is_empty() {
                     ui.emit(AgentEvent::Info(crate::i18n::t("(no plugins loaded)").into()));
                 } else {
-                    let mut names: Vec<_> = plugins.keys().cloned().collect();
-                    names.sort();
-                    // Also surface the **fence status**: `fence ✗` means this process
-                    // never entered a Job (the sandbox is off, or the outer Job doesn't
-                    // allow nesting). It isn't a fatal error, but "thinking there's
-                    // protection when there isn't" deserves a glance.
-                    let listed: Vec<String> = names
-                        .iter()
-                        .map(|n| match plugins.get(n) {
-                            Some(h) => crate::tf!("{} ({})", n, h.fence_status()),
-                            None => n.clone(),
-                        })
-                        .collect();
+                    // Each slot prints which of its two states it is in. **Dormant is normal**, not a
+                    // problem: the plugin's tools are registered and callable, it just has no process
+                    // yet. A live one also shows its **fence status** — `fence ✗` means that process
+                    // never entered a Job (the sandbox is off, or the outer Job doesn't allow
+                    // nesting). It isn't a fatal error, but "thinking there's protection when there
+                    // isn't" deserves a glance.
+                    let mut running = 0usize;
+                    let listed: Vec<String> = {
+                        let mut v = Vec::new();
+                        for (name, h) in &slots {
+                            let st = h.stat().await;
+                            if st.running {
+                                running += 1;
+                            }
+                            v.push(crate::tf!("{} ({})", name, st.label()));
+                        }
+                        v
+                    };
                     ui.emit(AgentEvent::Info(crate::tf!("Plugins: {}", listed.join(", "))));
+                    // The mode line: without it, "everything says dormant" is ambiguous — it could be
+                    // lazy loading working, or a reaper that never ran.
+                    let mode = if rt.config.plugins.lazy {
+                        crate::tf!(
+                            "lazy loading on; processes are closed after {}s idle",
+                            rt.config.plugins.idle_timeout_secs
+                        )
+                    } else {
+                        crate::i18n::t("lazy loading off; plugin processes stay resident").to_string()
+                    };
+                    ui.emit(AgentEvent::Info(crate::tf!(
+                        "Plugin slots: {} · running: {} · {}",
+                        slots.len(),
+                        running,
+                        mode
+                    )));
                     // Component contributions (phase 6 · 6b): only list those that **have
                     // contributions** — old plugins that only provide tools don't reappear
                     // here (the line above already mentioned them).
                     let mut extra: Vec<String> = Vec::new();
-                    for n in &names {
-                        let Some(h) = plugins.get(n) else { continue };
+                    for (n, h) in &slots {
                         let c = &h.contributes;
                         if c.is_empty() {
                             continue;
@@ -643,9 +675,13 @@ async fn main() -> Result<()> {
     }
 
     // ---- Shut down all plugin processes before exiting
+    //
+    // Only the slots that actually have a process do any work here — under lazy loading that is
+    // usually none of them, and `stop` decides that itself (the dormant case is a no-op rather than
+    // a branch to keep in sync in two front ends).
     let handles: Vec<_> = rt.plugins.lock().await.values().cloned().collect();
     for h in handles {
-        h.shutdown().await;
+        h.stop().await;
     }
     Ok(())
 }

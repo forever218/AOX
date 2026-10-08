@@ -456,6 +456,10 @@ impl ComponentHook {
     /// Send one hook RPC. **Every** abnormal path (component absent, timeout, error) collapses
     /// into `None`, and the caller lets it through accordingly — nothing on the hook path is
     /// allowed to throw an error back into the main loop.
+    ///
+    /// The RPC goes through `rpc_ready`, not a raw `rpc`: under lazy loading a hook-only component
+    /// is normally **dormant**, and this is what starts it. A component that fires on every turn and
+    /// should not pay for that start each time belongs in `[plugins] eager` — see the config docs.
     async fn ask(&self, rt: &Arc<Runtime>, point: &str, params: Value) -> Option<Value> {
         let handle = rt.plugins.lock().await.get(&self.plugin).cloned();
         let Some(handle) = handle else {
@@ -463,7 +467,7 @@ impl ComponentHook {
             return None;
         };
         let method = format!("hooks/{point}");
-        match tokio::time::timeout(HOOK_TIMEOUT, handle.rpc(&method, params)).await {
+        match tokio::time::timeout(HOOK_TIMEOUT, handle.rpc_ready(rt, &method, params)).await {
             Ok(Ok(v)) => Some(v),
             Ok(Err(e)) => {
                 self.note_failure(format!("{method}: {e:#}"));
