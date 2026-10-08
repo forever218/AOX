@@ -38,6 +38,85 @@ pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+// ─────────────────────────── Local time ───────────────────────────
+
+/// A broken-down local time.
+///
+/// **Moved up from `store::jsonl`** (2026-10-08) so that the history filename stamp and the
+/// prompt's "today" line share one implementation. Computing the timezone offset ourselves would
+/// drag in a chrono / time style dependency, but all we need is a human-readable date, so we just
+/// ask the OS — on Windows `GetLocalTime`, with zero new crates.
+pub(crate) struct Local {
+    pub(crate) year: u16,
+    pub(crate) month: u16,
+    pub(crate) day: u16,
+    pub(crate) hour: u16,
+    pub(crate) minute: u16,
+    pub(crate) second: u16,
+}
+
+#[cfg(windows)]
+pub(crate) fn local_now() -> Local {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+
+    // windows-sys's SYSTEMTIME is plain POD (only Clone/Copy), with no Default, so it can only be
+    // zero-initialized
+    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { GetLocalTime(&mut st) };
+    Local {
+        year: st.wYear,
+        month: st.wMonth,
+        day: st.wDay,
+        hour: st.wHour,
+        minute: st.wMinute,
+        second: st.wSecond,
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn local_now() -> Local {
+    // If the time zone isn't available, honestly record UTC — don't fool anyone with an
+    // "approximate UTC+8".
+    let secs = unix_now();
+    let (y, m, d, hh, mm, ss) = civil_from_unix(secs);
+    Local { year: y, month: m, day: d, hour: hh, minute: mm, second: ss }
+}
+
+/// Unix seconds → year/month/day/hour/minute/second (Howard Hinnant's civil_from_days).
+#[cfg(not(windows))]
+pub(crate) fn civil_from_unix(secs: u64) -> (u16, u16, u16, u16, u16, u16) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (
+        y as u16,
+        m as u16,
+        d as u16,
+        (rem / 3600) as u16,
+        ((rem % 3600) / 60) as u16,
+        (rem % 60) as u16,
+    )
+}
+
+/// Today's local date as `YYYY-MM-DD` (zero-padded, so it sorts correctly).
+///
+/// Injected into the prompt so the model can name its dated memory note (`.aox/memory/<date>.md`)
+/// without guessing the day.
+pub fn local_date() -> String {
+    let t = local_now();
+    format!("{:04}-{:02}-{:02}", t.year, t.month, t.day)
+}
+
 // ─────────────────────────── Records ───────────────────────────
 
 /// The conversation file's header record (the first line of the jsonl).

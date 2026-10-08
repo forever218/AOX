@@ -7,9 +7,28 @@
 //!
 //! | Tier | Meaning | Decision |
 //! |------|------|------|
-//! | `default` (**config default**) | each new conversation opens a plot under `<app root>/workplace/<YYYYMMDDHHMMSS>/` | write·delete only allowed in this plot; **read unrestricted** |
+//! | `default` (**config default**) | the workspace **is the app root itself** — no per-conversation subfolder (see the layout below) | write·delete only allowed under the app root; **read unrestricted** |
 //! | `full` | full access, byte-for-byte identical to before the workspace layer was added | everything allowed |
-//! | `fixed` (`root = "..."`) | a fixed plot (the GUI's "choose workspace" is equivalent to it) | same as `default` |
+//! | `fixed` (`root = "..."`) | a fixed root (the GUI's "choose workspace" is equivalent to it) | same as `default` |
+//!
+//! # The default workspace's layout
+//!
+//! Until 2026-10-08 the `default` tier opened a **fresh timestamped plot per conversation**
+//! (`<app root>/workplace/<YYYYMMDDHHMMSS>/`). The user asked for that to go: the workspace is now
+//! simply the **app root** —— every conversation works in the same place, and the tree is kept tidy
+//! by convention rather than by a new folder each time:
+//!
+//! - `<app root>/temp/` —— scratch: screenshots, caches, anything throwaway. Pre-created by
+//!   [`Workplace::ensure_started`] so a plugin can `open()` a file there without a separate mkdir.
+//! - `<app root>/workplace/<project>/` —— a durable deliverable (a document, a code project), one
+//!   folder per project, named after the project in a few words.
+//! - `<root>/.aox/memory/<YYYY-MM-DD>.md` —— the AI's own dated notes (what it did, pitfalls hit,
+//!   how it got past them). Created at the **workspace root** on first use; inside a project the AI
+//!   keeps them in that project's own `.aox/memory/`.
+//!
+//! These conventions are spelled out to the model too, in the prompt's "Run environment" segment
+//! (`src/prompt.rs`). The boundary is the whole app root: writes and deletes are allowed anywhere
+//! under it, and nowhere else.
 //!
 //! **The config default is `default` (confined)**, changed from `full` on 2026-10-05: what the
 //! user wants is "**confined by default on every launch**". So the rule "omit `[workplace]` = behavior
@@ -61,8 +80,22 @@ use crate::config::WorkplaceConfig;
 use crate::i18n::t;
 use crate::tf;
 
-/// Subdirectory name for the workspace under the confined tier (`<app root>/workplace/`).
+/// Subdirectory under the app root where **durable deliverables** go, one folder per project
+/// (`<app root>/workplace/<project>/`).
 pub const WORKPLACE_DIR: &str = "workplace";
+
+/// Scratch subdirectory under the app root (`<app root>/temp/`) —— screenshots, caches, one-off
+/// output. Pre-created when the `default` tier starts (see [`Workplace::ensure_started`]).
+pub const TEMP_DIR: &str = "temp";
+
+/// Hidden marker directory created at a workspace root on first use (`<root>/.aox/`). Today it only
+/// holds the AI's own dated notes under [`MEMORY_DIR`], but it is the natural home for any future
+/// per-workspace state that should travel with the project.
+pub const AOX_DIR: &str = ".aox";
+
+/// Subdirectory of [`AOX_DIR`] holding the AI's own dated markdown notes
+/// (`<root>/.aox/memory/<YYYY-MM-DD>.md`). Created alongside [`AOX_DIR`] on first use.
+pub const MEMORY_DIR: &str = "memory";
 
 /// The key in the **parameters** of the host's built-in file tools that denotes "path".
 ///
@@ -101,7 +134,7 @@ const PATH_KEYS: &[&str] = &[
 /// is judged under the new tier).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    /// Each new conversation opens a fresh plot.
+    /// Confined to the app root; every new conversation starts there again.
     Default,
     /// A fixed plot.
     Fixed(PathBuf),
@@ -166,11 +199,11 @@ enum Active {
 /// A conversation's **workspace record** (the `kind:"workplace"` line in `.jsonl`).
 ///
 /// The three fields each answer a question:
-/// - `mode` / `root`: the **current** tier and the plot it is bound to (`fixed` is the named one;
-///   `default` is the self-built one);
-/// - `own`: this conversation's own plot under the "default" tier —— **must be kept even under the
-///   `full` / `fixed` tiers**, otherwise "switch away then switch back to default" can only rebuild
-///   a plot, and the workspaces accumulate without bound.
+/// - `mode` / `root`: the **current** tier and the root it is bound to (`fixed` is the named one;
+///   `default` is the app root);
+/// - `own`: this conversation's own root under the "default" tier —— **must be kept even under the
+///   `full` / `fixed` tiers**, otherwise "switch away then switch back to default" has nothing to
+///   return to.
 ///
 /// Why store it in the conversation file rather than a separate side file: it belongs to this
 /// conversation. When the conversation is deleted, trimmed, or has its backend swapped, this
@@ -182,7 +215,7 @@ pub struct Record {
     pub mode: String,
     /// The root bound to the current tier; `full` has no root.
     pub root: Option<PathBuf>,
-    /// This conversation's own plot under the "default" tier (is `None` if not yet built).
+    /// This conversation's own root under the "default" tier (is `None` if not yet established).
     pub own: Option<PathBuf>,
 }
 
@@ -238,26 +271,24 @@ pub struct Workplace {
 #[derive(Debug)]
 struct State {
     active: Active,
-    /// Whether this conversation has "started" (= has already built / selected a root).
-    /// The `default` tier relies on it to guarantee "a conversation builds a directory only once",
-    /// rather than one per turn.
+    /// Whether this conversation has "started" (= has already decided a root).
+    /// The `default` tier relies on it to guarantee "a conversation decides its root only once",
+    /// rather than once per turn.
     started: bool,
-    /// **This conversation's own plot under the "default" tier** (built on the first message);
-    /// `None` = not yet built.
+    /// **This conversation's own root under the "default" tier** (fixed on the first message —
+    /// the app root, since 2026-10-08); `None` = not yet established.
     ///
     /// Must be recorded separately from `active`: `active` gets overwritten by tier switches. When
     /// you switch to "full access" and back to "default", looking only at `active` you no longer
-    /// know which plot was the original one, and can only rebuild —— the result is one extra empty
-    /// directory per round trip, piling up a bunch of `workplace/<timestamp>/` (reported by a user
-    /// on 2026-10-05).
-    /// With this, "as long as the tier is default, it's still the first plot this conversation
-    /// built" holds.
+    /// know which root was the original one, and can only re-decide —— the historical symptom was
+    /// one extra empty directory per round trip, piling up a bunch of `workplace/<timestamp>/`
+    /// (reported by a user on 2026-10-05; that timestamped scheme is gone now, but the field still
+    /// keeps "switch away and back → the same root" true).
     ///
-    /// Cleared when a new conversation is created / another conversation is opened (a new
-    /// conversation should after all open a separate plot).
+    /// Cleared when a new conversation is created / another conversation is opened.
     own: Option<PathBuf>,
-    /// Is the root in `active` **a plot the user explicitly picked** (`fixed`, or a runtime tier
-    /// switch), or one built on the fly by the `default` tier?
+    /// Is the root in `active` **one the user explicitly picked** (`fixed`, or a runtime tier
+    /// switch), or one handed out by the `default` tier?
     ///
     /// This can only live in the state, **it cannot be derived from `cfg.mode`**: a user whose
     /// config says `default` can still pick a fixed plot at runtime (`/workplace <dir>`, or the
@@ -283,7 +314,7 @@ impl Workplace {
                 if raw.is_empty() {
                     anyhow::bail!(
                         t("[workplace] mode = \"fixed\" also needs root = \"<dir>\"\
-                         (for a fresh plot per conversation, use mode = \"default\")")
+                         (for the confined default tier —— the app root —— use mode = \"default\")")
                     );
                 }
                 let p = PathBuf::from(raw);
@@ -298,7 +329,7 @@ impl Workplace {
                 Active::At(p)
             }
             other => anyhow::bail!(tf!(
-                "{} is not a recognised [workplace] mode. Valid values: \"default\" (a fresh plot per conversation, the default), \
+                "{} is not a recognised [workplace] mode. Valid values: \"default\" (confined to the app root, the default), \
                  \"full\" (unrestricted), \"fixed\" (together with root: a fixed directory)",
                 format!("{other:?}")
             )),
@@ -315,11 +346,6 @@ impl Workplace {
                 picked: mode == "fixed",
             }),
         })
-    }
-
-    /// The app root (used to build `workplace/`).
-    fn workdir_of(app_root: &Path) -> PathBuf {
-        app_root.join(WORKPLACE_DIR)
     }
 
     /// The currently effective root; `None` = unrestricted.
@@ -396,11 +422,10 @@ impl Workplace {
     ///
     /// Both points are critical:
     /// - **If the `default` tier's root was saved, reuse it** (`At` + `picked = false`), don't
-    ///   wait for the first message to build a fresh one —— that is the cause of "every time I
+    ///   wait for the first message to re-decide it —— that is the cause of "every time I
     ///   enter the same conversation it's a different workspace";
     /// - **`own` must also be restored** —— without it, "reopen this conversation → switch to
-    ///   full access → switch back to default" would build a new plot again, which is the other
-    ///   half of the workspace-accumulation source.
+    ///   full access → switch back to default" would have nothing to return to.
     pub fn restore(&self, rec: &Record) {
         let mut st = self.lock();
         st.own = rec.own.clone();
@@ -429,7 +454,7 @@ impl Workplace {
                 }
             }
             // `default` gave no root, or the tier name is unrecognized: back to "not yet
-            // decided", build a fresh plot on the first message.
+            // decided", fixed to the app root on the first message.
             _ => {
                 st.active = Active::Pending;
                 st.started = false;
@@ -449,55 +474,68 @@ impl Workplace {
     ///
     /// ⚠️ **The cost** (the user has accepted it): for a user who writes `mode = "fixed"` in
     /// config, only the **first conversation of this launch** lands in the config-named plot;
-    /// every subsequent new conversation is "default" and opens a fresh plot under `workplace/`.
+    /// every subsequent new conversation is "default" and works in the app root.
     /// To keep a fixed plot always in effect, you must switch per conversation.
     ///
-    /// **No directory is built here** —— the `default` tier's directory waits for the **first
-    /// message** to be built (when the user clicks "+" but says nothing, no empty directory
-    /// should be left on disk).
+    /// **Nothing is built here** —— the `default` tier's root is fixed on the **first message**
+    /// (when the user clicks "+" but says nothing, nothing is touched on disk).
     pub fn reset_for_new_conversation(&self) {
         let mut st = self.lock();
         st.started = false;
         st.active = Active::Pending;
         st.picked = false;
-        // A new conversation must open a separate plot: clear "this conversation's own plot" too,
-        // otherwise it would reuse **the previous conversation's** plot (which is the other half
-        // of the "new conversation still carries the previous workspace" source).
+        // A new conversation starts over: clear "this conversation's own root" too, so a later
+        // `ensure_started` re-decides it from scratch instead of reusing a stale one.
         st.own = None;
     }
 
     /// Ensure the root is decided before this conversation starts. Returning `Some(dir)` means
-    /// **this call is exactly the one that built it** (or first decided it for this conversation),
-    /// and the caller should notify the user with an `Info`.
+    /// **this call is exactly the one that established it** (or first decided it for this
+    /// conversation), and the caller should notify the user with an `Info`.
     ///
-    /// The "one fresh plot per conversation" semantics land here: `started` guarantees a
-    /// conversation builds only once.
+    /// The "establish once per conversation" semantics land here: `started` guarantees a
+    /// conversation decides its root only once.
     pub fn ensure_started(&self, app_root: &Path) -> anyhow::Result<Option<PathBuf>> {
         let mut st = self.lock();
         if st.started {
             return Ok(None);
         }
-        // `Pending`: the **only** branch that actually needs to build a directory; pulled out on
-        // its own —— so we don't write `st.active` while borrowing it (the borrow checker won't
-        // allow it, and separating "read state" from "write state" also reads more clearly).
+        // `Pending`: the **only** branch that does real work; pulled out on its own —— so we don't
+        // write `st.active` while borrowing it (the borrow checker won't allow it, and separating
+        // "read state" from "write state" also reads more clearly).
         if matches!(st.active, Active::Pending) {
-            let dir = normalize(&unique_dir(&Self::workdir_of(app_root), &stamp()));
+            // The default workspace **is the app root** (changed 2026-10-08 by user request): no
+            // per-conversation `<timestamp>/` plot any more. Conventional subdirectories are made
+            // up front so the model (and its plugins, which call `open()` directly) can drop files
+            // straight in without a separate mkdir step:
+            //   temp/         scratch —— screenshots, caches, one-off output
+            //   workplace/    durable deliverables, one folder per project
+            //   .aox/memory/  the AI's own dated notes (see the prompt's "# Memory" segment)
+            // The prompt's "Run environment" segment teaches the model this same layout.
+            let dir = normalize(app_root);
             std::fs::create_dir_all(&dir)
                 .map_err(|e| anyhow::anyhow!("{}", tf!("failed to create the workspace ({}): {}", dir.display(), e)))?;
+            for sub in [TEMP_DIR, WORKPLACE_DIR] {
+                // Best-effort: if this fails the model can still create the directory itself
+                // (`write_file` creates missing parents), so it must not fail the turn.
+                let _ = std::fs::create_dir_all(dir.join(sub));
+            }
+            // The AI's per-workspace notes. Also best-effort —— `write_file` creates parents, so a
+            // failure here only means the model makes the folder itself when it writes its first note.
+            let _ = std::fs::create_dir_all(dir.join(AOX_DIR).join(MEMORY_DIR));
             st.active = Active::At(dir.clone());
-            // A plot built on the fly ⇒ reports "default" not "choose workspace" (criterion is
-            // `picked`, see `State`).
+            // A root handed out by the `default` tier ⇒ reports "default" not "choose workspace"
+            // (criterion is `picked`, see `State`).
             st.picked = false;
-            // Record it as "this conversation's own plot": afterwards, no matter which tier you
-            // switch to and back to default, it's this same plot (if each switch built a new
-            // directory, `workplace/` would be filled with empty dirs).
+            // Record it as "this conversation's own root": afterwards, no matter which tier you
+            // switch to and back to default, it's this same root.
             st.own = Some(dir.clone());
             st.started = true;
             return Ok(Some(dir));
         }
         // `Full` / `At`: first time this conversation decides its root, just record it. The
         // `At` root must be reported back to the caller, so it can tell the user with an `Info`
-        // "this plot is this conversation's workspace".
+        // "this is this conversation's workspace".
         let root = match &st.active {
             Active::At(p) => Some(p.clone()),
             _ => None,
@@ -529,6 +567,10 @@ impl Workplace {
             if !d.is_dir() {
                 anyhow::bail!("{}", tf!("{} is not a directory", d.display()));
             }
+            // First use of a user-picked workspace: lay down its `.aox/memory/` too (best-effort),
+            // matching the convention the `default` tier sets up. A relative pick resolves under the
+            // app root (above), so the notes stay inside the workspace.
+            let _ = std::fs::create_dir_all(d.join(AOX_DIR).join(MEMORY_DIR));
         }
         let mut st = self.lock();
         match mode {
@@ -548,13 +590,13 @@ impl Workplace {
             Mode::Default => {
                 st.picked = false;
                 let _ = app_root;
-                // **This conversation has already built a plot for "default" ⇒ go back to that
-                // one, don't build another.**
-                // See `State::own`: if switching to "full access" and back built a new directory,
-                // `workplace/` would be filled with empty dirs (reported by a user on
-                // 2026-10-05).
-                // Only if this conversation hasn't built one yet do we go back to "not yet
-                // decided" and wait for the first message to build.
+                // **This conversation has already decided its "default" root ⇒ go back to that
+                // one, don't decide another.**
+                // See `State::own`: the historical failure was that switching to "full access" and
+                // back built a new directory, filling `workplace/` with empty dirs (reported by a
+                // user on 2026-10-05).
+                // Only if this conversation hasn't decided yet do we go back to "not yet
+                // decided" and wait for the first message.
                 match st.own.clone() {
                     Some(p) => {
                         st.active = Active::At(p.clone());
@@ -564,7 +606,7 @@ impl Workplace {
                     None => {
                         st.active = Active::Pending;
                         st.started = false;
-                        Ok(t("Switched to \"Default\": a new workspace will be opened under workplace/ when the next message is sent.")
+                        Ok(t("Switched to \"Default\": the next message will work in the app root.")
                             .into())
                     }
                 }
@@ -674,8 +716,8 @@ impl Workplace {
             Active::Pending => {
                 out.push_str(&tf!(
                     "  Tier: Default (confined)\n  \
-                     Root: not decided yet — sending the next message will open a fresh workspace under {}.\n",
-                    Self::workdir_of(app_root).display()
+                     Root: not decided yet — sending the next message will work in the app root ({}).\n",
+                    app_root.display()
                 ));
             }
             Active::At(p) => {
@@ -746,7 +788,7 @@ fn cmd_arg(line: &str) -> Option<&str> {
 ///
 /// - `/workplace` (no argument) → print the current tier and root
 /// - `/workplace full` → full access (unrestricted)
-/// - `/workplace default` → a fresh plot per conversation (takes effect on the **next
+/// - `/workplace default` → confined to the app root (takes effect on the **next
 ///   message**)
 /// - `/workplace <dir>` → pin to that directory (a relative path is resolved against the **app
 ///   root**)
@@ -811,7 +853,7 @@ impl Reject {
                 root.display()
             ),
             Reject::NotStarted => {
-                t("The workspace for this conversation is not decided yet in this tier (it is created when the user sends the first message),\
+                t("The workspace for this conversation is not decided yet in this tier (it is fixed when the user sends the first message),\
                  so nothing can be written into it yet.")
                     .to_string()
             }
@@ -835,7 +877,7 @@ impl Reject {
              if you only need to read something outside the boundary, just read it; no escalation needed.\
              If the user really needs to write or delete there, tell them the permission can be raised like this:\n  \
              - UI: click \"Workspace\" at the bottom-left of the input box, choose \"Default / Picked workspace / Full access\"\n  \
-             - CLI: `/workplace default` (a fresh plot per conversation), `/workplace <dir>` (a fixed directory)\
+             - CLI: `/workplace default` (confined to the app root), `/workplace <dir>` (a fixed directory)\
              or `/workplace full` (full access — AOX can read and write any file on the machine)\n  \
              - or edit `[workplace]` in config.toml (mode = \"full\" / \"default\" / \"fixed\") and restart\n\n\
              Until the user changes the permission, fall back to what is possible inside the workspace for the rest,\
@@ -866,7 +908,7 @@ impl Reject {
                 root.display()
             ),
             Reject::NotStarted => {
-                t("The workspace hasn't been created yet; this write/delete was blocked — send a message and it will work.").to_string()
+                t("This conversation's workspace isn't established yet; this write/delete was blocked — send a message and it will work.").to_string()
             }
         }
     }
@@ -1078,76 +1120,10 @@ fn inside(root: &Path, p: &Path) -> bool {
     }
 }
 
-// ─────────────────────────── Timestamps ───────────────────────────
-
-/// An `<YYYYMMDDHHMMSS>` local timestamp (the workspace directory name).
-///
-/// Same convention as `store::jsonl`'s file names (local time, zero new crates). There is only one
-/// `GetLocalTime` call here, with no shared logic —— pulling the storage backend's time helper into
-/// a common layer for ten lines of FFI would touch more than it's worth.
-fn stamp() -> String {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::SYSTEMTIME;
-        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-        let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
-        unsafe { GetLocalTime(&mut st) };
-        format!(
-            "{:04}{:02}{:02}{:02}{:02}{:02}",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
-        )
-    }
-    #[cfg(not(windows))]
-    {
-        // If the local time zone isn't available, honestly record UTC rather than fooling anyone
-        // with an "approximate UTC+8" (same convention as store).
-        let secs = crate::history::unix_now();
-        let days = (secs / 86_400) as i64;
-        let rem = secs % 86_400;
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z.rem_euclid(146_097);
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let y = if m <= 2 { y + 1 } else { y };
-        format!(
-            "{y:04}{m:02}{d:02}{:02}{:02}{:02}",
-            rem / 3600,
-            (rem % 3600) / 60,
-            rem % 60
-        )
-    }
-}
-
-/// Pick a not-yet-taken directory name under `base`: `<stamp>`, and on a collision `<stamp>-2`,
-/// `<stamp>-3`…
-///
-/// Why it's needed: the timestamp is only accurate to the second, and "starting two new
-/// conversations within the same second" really does happen with fast clicking or scripted driving.
-/// On a collision `create_dir_all` won't error —— it would **quietly stuff** the second conversation
-/// into the first one's plot, merging two plots into one while the user believes they're separate.
-/// The `-N` suffix is the cheapest deduplication: in the normal case (different seconds) it's never
-/// reached, and the name never grows a meaningless random number.
-fn unique_dir(base: &Path, stamp: &str) -> PathBuf {
-    let first = base.join(stamp);
-    if !first.exists() {
-        return first;
-    }
-    for n in 2..1000u32 {
-        let cand = base.join(format!("{stamp}-{n}"));
-        if !cand.exists() {
-            return cand;
-        }
-    }
-    // A thousand attempts all taken: essentially impossible (unless someone filled it by hand);
-    // return the first one anyway and let it succeed normally in `create_dir_all` —— silently
-    // reusing is better than panicking here.
-    first
-}
+// ─────────────────────────── (no timestamped plots any more) ───────────────────────────
+// Until 2026-10-08 the `default` tier named its plot with an `<YYYYMMDDHHMMSS>` stamp and needed a
+// collision-unique variant (`stamp()` + `unique_dir()`). The workspace is now the app root itself,
+// so no name is generated and both helpers are gone.
 
 #[cfg(test)]
 mod tests {
@@ -1277,25 +1253,57 @@ mod tests {
     #[test]
     fn pending_is_rejected_not_silently_allowed() {
         let app = std::env::temp_dir().join("aox-ws-pending");
+        // Pre-create the app root: in production it always exists, and this makes `normalize`
+        // below canonicalize on both sides instead of one side falling back to `lexical`.
+        std::fs::create_dir_all(&app).unwrap();
         let w = ws("default", None);
         let e = w.check("C:\\Windows").expect_err("with the root undecided it must reject, not pass");
         assert!(matches!(e, Reject::NotStarted), "{e:?}");
 
-        let dir = w.ensure_started(&app).unwrap().expect("a fresh plot should have been created");
+        let dir = w.ensure_started(&app).unwrap().expect("the default root should be established");
         assert!(dir.is_dir(), "the directory should really exist");
-        // Compare the prefix with `normalize`: what `ensure_started` hands back is a normalized
-        // path, whereas the one `temp_dir()` gives may still carry 8.3 short names / case
-        // differences (after `canonicalize` it becomes a different string), so a direct
-        // `starts_with` would go falsely red.
-        assert!(dir.starts_with(normalize(&app.join(WORKPLACE_DIR))));
+        // The default workspace **is the app root** (changed 2026-10-08) — not a `<timestamp>/`
+        // plot under `workplace/`.
+        assert_eq!(dir, normalize(&app), "the default root must be the app root itself");
+        // The two conventional subdirs are made up front.
+        assert!(app.join(TEMP_DIR).is_dir(), "temp/ should be created");
+        assert!(app.join(WORKPLACE_DIR).is_dir(), "workplace/ should be created");
+        // …and so is the AI's own notes folder.
+        assert!(app.join(AOX_DIR).join(MEMORY_DIR).is_dir(), ".aox/memory/ should be created");
         assert!(w.check(&dir.join("x.txt").to_string_lossy()).is_ok());
-        // A conversation builds only once
-        assert!(w.ensure_started(&app).unwrap().is_none(), "the same conversation must not create the directory twice");
-        // Only a new conversation changes the plot
+        // A conversation establishes its root only once
+        assert!(w.ensure_started(&app).unwrap().is_none(), "the same conversation must not re-establish the root");
+        // A new conversation goes back to the default tier — same app root again.
         w.reset_for_new_conversation();
         let dir2 = w.ensure_started(&app).unwrap().unwrap();
-        assert_ne!(dir, dir2, "a new conversation should get a fresh plot");
-        let _ = std::fs::remove_dir_all(app.join(WORKPLACE_DIR));
+        assert_eq!(dir, dir2, "every conversation's default root is the app root");
+        let _ = std::fs::remove_dir_all(&app);
+    }
+
+    /// The AI's own notes folder is laid down when a **user-picked** workspace is first used (the
+    /// `set_mode(Fixed)` path —— `/workplace <dir>` and the GUI picker), matching the `default` tier.
+    #[test]
+    fn picking_a_workspace_lays_down_its_notes_folder() {
+        let app = std::env::temp_dir().join("aox-ws-pick-notes");
+        std::fs::create_dir_all(&app).unwrap();
+        let w = ws("default", None);
+
+        // A relative pick resolves under the app root (same rule as the `fixed` tier in `new()`).
+        w.set_mode(Mode::Fixed(PathBuf::from("picked-here")), &app).unwrap();
+        assert!(
+            app.join("picked-here").join(AOX_DIR).join(MEMORY_DIR).is_dir(),
+            ".aox/memory/ should be created on a relative pick"
+        );
+
+        // An absolute pick works the same way.
+        let abs = app.join("abs-pick");
+        std::fs::create_dir_all(&abs).unwrap();
+        w.set_mode(Mode::Fixed(abs.clone()), &app).unwrap();
+        assert!(
+            abs.join(AOX_DIR).join(MEMORY_DIR).is_dir(),
+            ".aox/memory/ should be created under an absolute pick"
+        );
+        let _ = std::fs::remove_dir_all(&app);
     }
 
     #[test]
@@ -1375,15 +1383,15 @@ mod tests {
             Err(_) => panic!("report() did not return within 5s — the state lock was reentered (deadlock)"),
         }
 
-        // After the `default` tier builds its plot, **the tier is still "default"** —— it must not
+        // After the `default` tier decides its root, **the tier is still "default"** —— it must not
         // be called "choose workspace" just because the root was built on the fly
         let app2 = std::env::temp_dir().join("aox-ws-report-default");
         let w2 = ws("default", None);
-        w2.ensure_started(&app2).unwrap().expect("a fresh plot should have been created");
+        w2.ensure_started(&app2).unwrap().expect("the default root should be established");
         let text = w2.report(&app2);
         assert!(text.contains("Default"), "{text}");
         assert!(!text.contains("Picked workspace"), "the default tier must not be reported as Picked workspace: {text}");
-        let _ = std::fs::remove_dir_all(app2.join(WORKPLACE_DIR));
+        let _ = std::fs::remove_dir_all(&app2);
     }
 
     /// Regression: **a whole block of source code must not be taken for a path**. A real defect
@@ -1494,7 +1502,7 @@ mod tests {
     /// ② It does not itself **re-enter the state lock** (re-entering would mean that line never
     ///    comes back —— the same pit as `report_after_switching_does_not_deadlock`).
     ///
-    /// Especially after the `default` tier builds its plot: the tier must **still be `Default`**,
+    /// Especially after the `default` tier decides its root: the tier must **still be `Default`**,
     /// just with the root going from `None` to that directory —— which is precisely the point of
     /// `snapshot()` writing the "tier-to-root mapping" only once.
     #[test]
@@ -1509,14 +1517,14 @@ mod tests {
         let d = ws("default", None);
         assert_eq!(d.snapshot(), (Mode::Default, None));
 
-        // default after building: the tier is still Default, but the root now exists
-        let dir = d.ensure_started(&app).unwrap().expect("a fresh plot should have been created");
+        // default after establishing: the tier is still Default, but the root now exists
+        let dir = d.ensure_started(&app).unwrap().expect("the default root should be established");
         let (m, r) = d.snapshot();
-        assert_eq!(m, Mode::Default, "after the default plot is built the mode must not become Picked workspace");
+        assert_eq!(m, Mode::Default, "after the default root is established the mode must not become Picked workspace");
         assert_eq!(r.as_deref(), Some(dir.as_path()));
         assert_eq!(d.mode(), m, "snapshot and mode must agree");
         assert_eq!(d.active_root(), r, "snapshot and active_root must agree");
-        let _ = std::fs::remove_dir_all(app.join(WORKPLACE_DIR));
+        let _ = std::fs::remove_dir_all(&app);
 
         // fixed: the tier carries a path, and the root is itself
         let base = std::env::temp_dir().join("aox-ws-snapshot-fixed");
@@ -1550,14 +1558,13 @@ mod tests {
         assert_eq!(r, Some(normalize(&d)));
         assert_eq!(w.persisted().mode, "fixed", "the record must say fixed, otherwise the next open falls back to default");
 
-        // Whereas a plot built on the fly by the `default` tier still reports "default"
-        // (picked=false)
+        // Whereas a root handed out by the `default` tier still reports "default" (picked=false)
         let w2 = ws("default", None);
         let app2 = std::env::temp_dir().join("aox-ws-origin-default");
-        w2.ensure_started(&app2).unwrap().expect("a fresh plot should have been created");
+        w2.ensure_started(&app2).unwrap().expect("the default root should be established");
         assert_eq!(w2.snapshot().0, Mode::Default);
         assert_eq!(w2.persisted().mode, "default");
-        let _ = std::fs::remove_dir_all(app2.join(WORKPLACE_DIR));
+        let _ = std::fs::remove_dir_all(&app2);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1567,13 +1574,15 @@ mod tests {
     /// The old implementation only reset when `cfg.mode == "default"`, so "the previous
     /// conversation picked some directory, and after clicking + the new conversation is still in
     /// that directory". Now, whatever the config says and whichever tier the previous one switched
-    /// to, after turning the page it is always "default" with the root **not yet decided** (waiting
-    /// for the first message to build a fresh plot).
+    /// to, after turning the page it is always "default" with the root **not yet decided** (fixed
+    /// on the first message).
     #[test]
     fn new_conversation_always_returns_to_default() {
         let base = std::env::temp_dir().join("aox-ws-newconv");
         std::fs::create_dir_all(base.join("picked")).unwrap();
         let app = std::env::temp_dir().join("aox-ws-newconv-app");
+        // The app root exists in production; pre-create it so `normalize` is stable on both sides.
+        std::fs::create_dir_all(&app).unwrap();
 
         // Likewise with the config saying `fixed`: after turning the page it's no longer that fixed
         // plot
@@ -1589,15 +1598,11 @@ mod tests {
         w.reset_for_new_conversation();
         assert_eq!(w.snapshot(), (Mode::Default, None));
 
-        // The "root not decided" semantics must really hold: the next message builds a **new** plot
-        // (under workplace/)
-        let built = w.ensure_started(&app).unwrap().expect("a fresh plot should be created on the spot");
-        assert!(
-            built.starts_with(normalize(&app.join(WORKPLACE_DIR))),
-            "the new conversation's plot should live under workplace/, got {}",
-            built.display()
-        );
-        let _ = std::fs::remove_dir_all(app.join(WORKPLACE_DIR));
+        // The "root not decided" semantics must really hold: the next message fixes it to the app
+        // root (not a `<timestamp>/` plot).
+        let built = w.ensure_started(&app).unwrap().expect("the default root should be established on the spot");
+        assert_eq!(built, normalize(&app), "the new conversation's root must be the app root");
+        let _ = std::fs::remove_dir_all(&app);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1613,21 +1618,22 @@ mod tests {
         let base = std::env::temp_dir().join("aox-ws-persist");
         std::fs::create_dir_all(base.join("picked")).unwrap();
         let app = std::env::temp_dir().join("aox-ws-persist-app");
+        std::fs::create_dir_all(&app).unwrap(); // the app root exists in production
 
-        // ① default: the plot was built on the fly → the archive has mode=default, and both root
-        //    and own are that plot
+        // ① default: the root is the app root → the archive has mode=default, and both root
+        //    and own are the app root
         let w = ws("default", None);
-        let dir = w.ensure_started(&app).unwrap().expect("a fresh plot should have been created");
+        let dir = w.ensure_started(&app).unwrap().expect("the default root should be established");
         let saved = w.persisted();
         assert_eq!(saved.mode, "default");
         assert_eq!(saved.root.as_ref(), Some(&normalize(&dir)));
-        assert_eq!(saved.own.as_ref(), Some(&normalize(&dir)), "the self-created plot must be recorded too");
+        assert_eq!(saved.own.as_ref(), Some(&normalize(&dir)), "the self-decided root must be recorded too");
         let fresh = ws("full", None); // deliberately start from another tier —— restore must override it
         fresh.restore(&saved);
         assert_eq!(fresh.snapshot(), (Mode::Default, Some(normalize(&dir))));
         assert_eq!(fresh.persisted(), saved, "a round-trip must be identical");
 
-        // ② fixed: a named plot, `own` empty
+        // ② fixed: a named directory, `own` empty
         let w = fixed(&base.join("picked").to_string_lossy());
         let saved = w.persisted();
         assert_eq!(saved.mode, "fixed");
@@ -1638,43 +1644,46 @@ mod tests {
         assert!(matches!(m, Mode::Fixed(_)), "{m:?}");
         assert_eq!(r, saved.root);
 
-        // ③ full: the current tier has no root, but **the self-built plot must stay** —— switching
-        //    back to default relies on it to find the original plot again
+        // ③ full: the current tier has no root, but **the own root must stay** —— switching back
+        //    to default relies on it. (`own` here emulates an old record left by the pre-2026-10-08
+        //    timestamped scheme.)
         let own = normalize(&app.join(WORKPLACE_DIR).join("20260101000000"));
         let saved = Record { mode: "full".into(), root: None, own: Some(own.clone()) };
         let fresh = fixed(&base.join("picked").to_string_lossy());
         fresh.restore(&saved);
         assert_eq!(fresh.snapshot(), (Mode::Full, None));
-        assert_eq!(fresh.persisted().own.as_ref(), Some(&own), "even under full the self-created plot must be kept");
+        assert_eq!(fresh.persisted().own.as_ref(), Some(&own), "even under full the own root must be kept");
         fresh.set_mode(Mode::Default, &base).unwrap();
-        assert_eq!(fresh.snapshot(), (Mode::Default, Some(own)), "switching back to default must return to the recorded plot");
+        assert_eq!(fresh.snapshot(), (Mode::Default, Some(own)), "switching back to default must return to the recorded root");
 
         // ④ An unrecognized tier name (or `default` with no root) ⇒ back to "not yet decided",
-        //    letting the first message build
+        //    letting the first message decide
         let fresh = ws("full", None);
         fresh.restore(&Record { mode: "nonsense".into(), root: None, own: None });
         assert_eq!(fresh.snapshot(), (Mode::Default, None));
 
-        let _ = std::fs::remove_dir_all(app.join(WORKPLACE_DIR));
+        let _ = std::fs::remove_dir_all(&app);
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// **Switching away and back to "default" must return to this conversation's original plot, not
-    /// build a new one.**
+    /// **Switching away and back to "default" must return to this conversation's original root, not
+    /// pick a different one.**
     ///
-    /// Reported by the user on 2026-10-05: "new conversation → say the first thing (a plot gets
-    /// built) → switch to full access → switch back to default" opened another one, so `workplace/`
-    /// got piled up with empty directories ("endless workspace accumulation").
+    /// Reported by the user on 2026-10-05: "new conversation → say the first thing → switch to full
+    /// access → switch back to default" opened another directory, so `workplace/` got piled up with
+    /// empty directories ("endless workspace accumulation"). Under the app-root model there is
+    /// nothing per-conversation to pile up, but the invariant still holds: `own` is remembered.
     #[test]
-    fn switching_back_to_default_reuses_the_conversation_own_dir() {
+    fn switching_back_to_default_reuses_the_conversation_own_root() {
         let app = std::env::temp_dir().join("aox-ws-own");
         let base = std::env::temp_dir().join("aox-ws-own-base");
         std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&app).unwrap(); // the app root exists in production
 
         let w = ws("default", None);
-        let first = w.ensure_started(&app).unwrap().expect("the first message should create a plot");
+        let first = w.ensure_started(&app).unwrap().expect("the first message should establish the root");
 
-        // Switch back and forth a few times: each time it must be the same plot, and no new
+        // Switch back and forth a few times: each time it must be the same root, and no new
         // directory is built
         for _ in 0..3 {
             w.set_mode(Mode::Full, &base).unwrap();
@@ -1683,24 +1692,24 @@ mod tests {
             assert_eq!(
                 w.snapshot(),
                 (Mode::Default, Some(normalize(&first))),
-                "switching back to default must return to this conversation's plot"
+                "switching back to default must return to this conversation's root"
             );
-            assert!(msg.contains("stays in"), "the message should say it stays in the same plot, got: {msg}");
-            // The first-message step must not build again (`started` is still true ⇒ returns None)
-            assert!(w.ensure_started(&app).unwrap().is_none(), "a second plot must not be created");
+            assert!(msg.contains("stays in"), "the message should say it stays in the same root, got: {msg}");
+            // The first-message step must not run again (`started` is still true ⇒ returns None)
+            assert!(w.ensure_started(&app).unwrap().is_none(), "the root must not be re-established");
         }
 
+        // No per-conversation directories accumulate under workplace/ any more.
         let made = std::fs::read_dir(app.join(WORKPLACE_DIR)).map(|d| d.count()).unwrap_or(0);
-        assert_eq!(made, 1, "switching back and forth must not accumulate directories, got {made}");
+        assert_eq!(made, 0, "the default tier must not create per-conversation dirs, got {made}");
 
-        // Only a **new conversation** opens another one: `reset_for_new_conversation` clears the
-        // self-built plot
+        // A **new conversation** re-establishes its root — the same app root.
         w.reset_for_new_conversation();
         assert_eq!(w.snapshot(), (Mode::Default, None));
-        let second = w.ensure_started(&app).unwrap().expect("a new conversation should create another plot");
-        assert_ne!(second, first, "a new conversation's plot should be a different one");
+        let second = w.ensure_started(&app).unwrap().expect("a new conversation should establish the root again");
+        assert_eq!(second, first, "every conversation's default root is the same app root");
 
-        let _ = std::fs::remove_dir_all(app.join(WORKPLACE_DIR));
+        let _ = std::fs::remove_dir_all(&app);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -64,6 +64,21 @@ pub struct Agent {
     /// Lives on `Agent`, not as a loop-local variable: the loop is swappable, the books are not —
     /// a different implementation must still record onto the same books (see [`TurnAcc`]'s docs).
     turn: TurnAcc,
+    /// The workspace root **already baked into `messages[0]`** (the system prompt).
+    ///
+    /// The prompt names the workspace (`prompt::env_section`), and the root only exists after the
+    /// first turn and can change mid-conversation (`/workplace`, the GUI button). Comparing against
+    /// this is what lets [`Agent::refresh_system_prompt`] rebuild the prompt **only when it actually
+    /// changed** — otherwise the model keeps believing it is still in the previous directory.
+    prompt_ws: PathBuf,
+}
+
+/// The workspace root that should appear in the system prompt.
+///
+/// The live root when there is one; otherwise the app root — that covers both "not decided yet"
+/// (`Pending`, before the first turn) and the unrestricted tier (`Full`, which has no root).
+fn prompt_workspace_root(rt: &Runtime) -> PathBuf {
+    rt.workplace.snapshot().1.unwrap_or_else(|| rt.root.clone())
 }
 
 impl Agent {
@@ -75,6 +90,9 @@ impl Agent {
     /// and the GUI (`gui/src/bridge.rs`) separately; now it lives in one place, `prompt`.
     pub fn new(llm: Arc<dyn LlmProvider>, rt: Arc<Runtime>) -> Self {
         let sys = crate::prompt::build(&rt);
+        // Remember which workspace that prompt names, so `refresh_system_prompt` can tell when it
+        // has gone stale (see the `prompt_ws` field docs).
+        let prompt_ws = prompt_workspace_root(&rt);
         Self {
             llm,
             rt,
@@ -86,6 +104,7 @@ impl Agent {
             usage_log: Vec::new(),
             workplace_logged: None,
             turn: TurnAcc::default(),
+            prompt_ws,
         }
     }
 
@@ -110,6 +129,31 @@ impl Agent {
         }
         log.append_workplace(&cur);
         self.workplace_logged = Some(cur);
+    }
+
+    /// Rebuild the system prompt (`messages[0]`) so it names the **current** workspace.
+    ///
+    /// The prompt bakes in the workspace root (`prompt::env_section`); that root only exists after
+    /// the first turn and can change mid-conversation (`/workplace`, the GUI button). Without this,
+    /// the model keeps believing it is still in the previous directory — the reported symptom was
+    /// "I picked the Desktop, but the model asked whether it should tidy the documents in its own
+    /// install directory". Rebuilding **only when the root actually changed** keeps it free in the
+    /// common case.
+    ///
+    /// The system message is **memory-only**: it is never persisted and is rebuilt on resume, so
+    /// replacing it here does not break the "all writes to `messages` go through `push_message`"
+    /// invariant — that one is about conversation messages.
+    fn refresh_system_prompt(&mut self) {
+        let cur = prompt_workspace_root(&self.rt);
+        if cur == self.prompt_ws {
+            return;
+        }
+        let sys = crate::prompt::build(&self.rt);
+        match self.messages.first_mut() {
+            Some(first) => *first = Message::system(sys),
+            None => self.messages.push(Message::system(sys)),
+        }
+        self.prompt_ws = cur;
     }
 
     /// Ensure the current conversation already has an on-disk file. On failure we warn only once and don't interrupt the conversation.
@@ -268,7 +312,7 @@ impl Agent {
         self.session_calls = 0;
         self.usage_log.clear();
         // The workplace turns the page too: **always back to the "default" tier** (semantics set by the user on 2026-10-04) —
-        // the tier temporarily switched to in the last conversation is not inherited; the next turn's first message opens a fresh dir under `workplace/`.
+        // the tier temporarily switched to in the last conversation is not inherited; the next turn's first message works in the app root.
         // Without clearing it, after "+" the model would still write into the dir picked in the last conversation, which is no longer a new conversation.
         self.rt.workplace.reset_for_new_conversation();
         // The new conversation's file isn't created yet; the persisted record is filled in by `persist_workplace` on the first message;
@@ -316,7 +360,7 @@ impl Agent {
     /// in later turns the model refers back to them via the paths recorded in the message and reads them itself — the attachment bytes stay in context,
     /// so every turn pays token cost for them again.
     pub async fn run_turn(&mut self, ui: &mut dyn Ui, input: &str, files: &[PathBuf]) -> Result<()> {
-        // Workplace: the `default` tier opens a fresh dir on the **first message** (`started` guarantees one dir per conversation).
+        // Workplace: the `default` tier fixes its root (the app root) on the **first message** (`started` guarantees this happens once per conversation).
         //
         // Placed at the very front of the turn (before `push_message` and the loop) so the root is
         // fixed **before any tool call this turn**. Otherwise, when the model wants to write a file in
@@ -326,13 +370,17 @@ impl Agent {
             Ok(Some(dir)) => ui.emit(AgentEvent::Info(crate::tf!(
                 // Wording follows the new semantics (reads unrestricted, writes/deletes restricted): saying "can only read and write files"
                 // would make the user think reads are locked down too, prompting a needless privilege escalation — a sentence missed when the semantics changed on 2026-10-04.
-                "this conversation's workspace: {}\n  writes and deletes are restricted to this directory (reads are unrestricted — any file on the device can be read). To loosen it: `/workplace`, or the \"workspace\" control at the bottom-left of the input box.",
+                "this conversation's workspace: {}\n  writes and deletes are restricted to this directory (reads are unrestricted — any file on the device can be read). Put scratch files in temp\\, new projects in a folder under workplace\\, and notes in .aox\\memory\\. To loosen it: `/workplace`, or the \"workspace\" control at the bottom-left of the input box.",
                 dir.display()
             ))),
             Ok(None) => {}
             // Directory creation itself failed (permissions / disk); report it honestly but don't interrupt the conversation: from now on file writes will be rejected by the boundary.
             Err(e) => ui.emit(AgentEvent::Warn(crate::tf!("failed to create the workspace: {}", format!("{e:#}")))),
         }
+        // `ensure_started` may have just decided the root (first turn), and the user may have
+        // switched it since the last turn — either way the prompt must name the current workspace
+        // before the model sees this message.
+        self.refresh_system_prompt();
         self.ensure_log(ui);
         // On this first message, record "which dir this conversation works in" into the archive (`ensure_started` just fixed the root,
         // so this record carries that dir's real path). After that we only write again when the tier switches.
@@ -634,6 +682,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The system prompt must name the workspace the model is confined to, and be **rebuilt when
+    /// that workspace changes** — otherwise the model keeps answering as if it were still in the
+    /// previous directory ("should I tidy the documents in my own install directory?" after the
+    /// user had picked the Desktop).
+    #[tokio::test]
+    async fn system_prompt_follows_a_workspace_switch() {
+        let ws = tmp("sysprompt");
+        let mut agent = agent_with(&ws, "t", crate::workplace::Access::Read).await;
+        let app_root = agent.rt.root.clone();
+
+        // Unchanged root ⇒ no rebuild (the prompt string is identical).
+        let before = agent.messages[0].flat_text();
+        agent.refresh_system_prompt();
+        assert_eq!(agent.messages[0].flat_text(), before, "an unchanged root must not rebuild the prompt");
+
+        // Switch to another folder ⇒ the next refresh swaps the new root into the prompt.
+        let picked = std::env::temp_dir().join("aox-agent-sysprompt-picked");
+        let _ = std::fs::remove_dir_all(&picked);
+        std::fs::create_dir_all(&picked).unwrap();
+        agent
+            .rt
+            .workplace
+            .set_mode(crate::workplace::Mode::Fixed(picked.clone()), &app_root)
+            .unwrap();
+        agent.refresh_system_prompt();
+
+        let after = agent.messages[0].flat_text();
+        assert!(after.contains(&picked.display().to_string()), "the prompt must name the picked root:\n{after}");
+        assert_ne!(after, before, "the prompt must actually change after the switch");
+
+        let _ = std::fs::remove_dir_all(&picked);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     /// **A/B comparison**: the same tool, the same out-of-workplace path, differing only by one declaration.

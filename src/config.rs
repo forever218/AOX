@@ -484,18 +484,20 @@ impl Default for PluginsConfig {
 /// - `[workplace]` governs **which files the model may touch this time** (the path boundary for writes
 ///   and deletes; reads are unrestricted).
 ///
-/// Default `mode = "default"` (each conversation opens a fresh dir under `workplace/`). **Changed from
-/// `"full"` to this on 2026-10-05** — honoring the user's original "**confined by default** on every start".
+/// Default `mode = "default"` (the workspace **is the app root**; `temp/` for scratch, `workplace/`
+/// for durable deliverables). **Changed from `"full"` to this on 2026-10-05** — honoring the user's
+/// original "**confined by default** on every start"; the per-conversation `<timestamp>/` plot was
+/// dropped on 2026-10-08 in favour of a single app-root workspace.
 ///
 /// ⚠️ The cost: "no `[workplace]` config = byte-identical to before this layer" **no longer holds**.
-/// Writing nothing now means the confined tier (writes and deletes may only land in
-/// `workplace/<timestamp>/`, reads remain unrestricted); to be unrestricted you must explicitly write
+/// Writing nothing now means the confined tier (writes and deletes may only land **under the app
+/// root**, reads remain unrestricted); to be unrestricted you must explicitly write
 /// `mode = "full"`, or switch to "full access" in the UI (that is a runtime choice, valid only for the
 /// current conversation).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct WorkplaceConfig {
-    /// `"default"` (**default**: each conversation opens a fresh dir under `<app root>/workplace/<timestamp>/`) /
+    /// `"default"` (**default**: confined to the app root — the workspace itself) /
     /// `"full"` (unrestricted) / `"fixed"` (with `root` naming a fixed directory).
     ///
     /// **An unrecognized value errors out at startup**, no silent fallback to the default tier — the
@@ -1103,7 +1105,7 @@ api_key = "k"
     /// The factory default is the **confined tier** (`default`) — changed from `full` on 2026-10-05.
     ///
     /// This pins a **product decision**: a user who writes no `[workplace]` should start confined
-    /// (writes and deletes may only land in `workplace/<timestamp>/`). Reverting to `full` would
+    /// (writes and deletes may only land under the app root). Reverting to `full` would
     /// **silently** open everyone's write boundary — a regression in the safety direction, so a test
     /// must speak up rather than relying on review to remember.
     #[test]

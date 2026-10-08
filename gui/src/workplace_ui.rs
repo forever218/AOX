@@ -260,7 +260,7 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
                     if row(
                         ui,
                         aox::i18n::t("Default"),
-                        aox::i18n::t("each new conversation starts a fresh plot under workplace/"),
+                        aox::i18n::t("the app root; temp/ for scratch, workplace/ for projects"),
                         matches!(cur, Some(Mode::Default)),
                         false,
                     )

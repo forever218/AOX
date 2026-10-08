@@ -261,6 +261,46 @@ fn env_section(rt: &Runtime) -> String {
         rt.plugins_dir.display(),
         std::env::consts::OS,
     );
+    // The workspace the model is **actually** confined to. **Read live, never from a startup-time
+    // value**: under the `default` tier the root is only decided on the first turn, and it can
+    // change mid-conversation (`/workplace`, the GUI button). Baking in the app root here is
+    // exactly why the model once answered "should I tidy the documents in my own install
+    // directory?" after the user had picked the Desktop. `Agent::refresh_system_prompt` rebuilds
+    // this whole prompt whenever the root changes, so this line stays honest.
+    //
+    // Kept out of the big `tf!` above so that block's translation key is untouched.
+    let (ws_mode, ws_root) = rt.workplace.snapshot();
+    // No root means "not decided yet" (`Pending`) or the unrestricted tier (`Full`); either way the
+    // conventional base is the app root.
+    let ws = ws_root.unwrap_or_else(|| rt.root.clone());
+    let rule = if matches!(ws_mode, crate::workplace::Mode::Full) {
+        t("it is unrestricted (full access): you may read, write and delete anywhere")
+    } else {
+        t("writes and deletes may only land under it; reading anywhere is still allowed")
+    };
+    s.push_str(&tf!(
+        "\n\n# Workspace layout\n\
+         Your workspace is {} —— {}. The \"app root\" above is only where plugins run; your workspace can be a different directory, and it is where the user expects you to work.\n\
+         - Temporary or scratch files —— screenshots, caches, one-off output —— go under {}\\temp\\. Don't scatter them in the workspace root.\n\
+         - When the user asks you to create something durable (a document, a code project), give it its own folder: {}\\workplace\\<short project name>\\, and work inside it. Name the folder after the project in a few words (e.g. workplace\\business-site).\n",
+        ws.display(),
+        rule,
+        ws.display(),
+        ws.display(),
+    ));
+    // The AI's own per-workspace notes (see `src/workplace.rs`: the `.aox/memory/` folder). Today's
+    // local date is passed in so the model can name the file without guessing. Kept in its own `tf!`
+    // so the big "run environment" key above is untouched.
+    s.push_str(&tf!(
+        "\n\n# Memory (your own notes about this workspace)\n\
+         The host sets aside a `.aox\\memory\\` folder at the workspace root for your notes. Record durable work there, in the folder you are actually working in:\n\
+         - If you are working inside a project folder (e.g. `workplace\\<project>\\`), keep the note in that project's own `.aox\\memory\\`; otherwise use the workspace root's one.\n\
+         - One markdown file per day, named after the date: `<YYYY-MM-DD>.md`. **Today is {}**.\n\
+         - **Append** to today's file rather than overwriting it: read it first, then write back the old content plus what you just added. Never wipe notes from earlier in the same day.\n\
+         - Core content only, no filler: what you did, any pitfall you hit, how you got past it, and what got finished. A few terse bullets beat a paragraph of prose.\n\
+         - Skip it for trivial questions or a one-line answer. For long-running or multi-session work, read the most recent notes first when it helps.\n",
+        crate::history::local_date(),
+    ));
     // Tell the model truthfully whether this machine has python / node / rustc.
     // Otherwise it would repeatedly create doomed python plugins on a bare machine and
     // burn the whole round.
@@ -479,6 +519,57 @@ mod tests {
             assert!(!s.body.starts_with('\n'), "segment {} starts with a newline", s.id);
             assert!(!s.body.ends_with('\n'), "segment {} ends with a newline", s.id);
         }
+    }
+
+    /// The env segment must teach the workspace-memory convention **and carry today's date**, so
+    /// the model can name its note file (`<YYYY-MM-DD>.md`) without guessing the day.
+    #[test]
+    fn env_segment_carries_the_memory_rule_and_todays_date() {
+        let rt = rt_with(PromptConfig::default());
+        let env = env_section(&rt);
+        assert!(
+            env.contains("# Memory (your own notes about this workspace)"),
+            "the memory rule must be in the env segment:\n{env}"
+        );
+        assert!(env.contains(".aox\\memory"), "the note folder must be named:\n{env}");
+        assert!(
+            env.contains(&crate::history::local_date()),
+            "the env segment must carry today's local date ({})",
+            crate::history::local_date()
+        );
+    }
+
+    /// The layout segment must name the **current** workspace and follow a mid-conversation switch.
+    ///
+    /// Regression: it used to hardcode `rt.root` (the app root / install dir), so after the user
+    /// picked another folder (`/workplace <dir>`, the GUI button) the model still believed it was
+    /// confined to the install directory — it then asked whether it should tidy "its own install
+    /// directory" instead of the folder the user meant.
+    #[test]
+    fn layout_segment_names_the_current_workspace() {
+        let rt = rt_with(PromptConfig::default());
+        let app = rt.root.clone();
+        // Before the root is decided, the app root is the honest fallback.
+        assert!(env_section(&rt).contains(&app.display().to_string()), "the undecided root should fall back to the app root");
+
+        let picked = std::env::temp_dir().join("aox-prompt-ws-picked");
+        let _ = std::fs::remove_dir_all(&picked);
+        std::fs::create_dir_all(&picked).unwrap();
+        rt.workplace
+            .set_mode(crate::workplace::Mode::Fixed(picked.clone()), &app)
+            .unwrap();
+
+        let env = env_section(&rt);
+        assert!(env.contains(&picked.display().to_string()), "the picked root must be named:\n{env}");
+        assert!(
+            !env.contains(&format!("Your workspace is {} ——", app.display())),
+            "the app root must no longer be presented as the workspace:\n{env}"
+        );
+
+        // The unrestricted tier must say so rather than claim a confined root.
+        rt.workplace.set_mode(crate::workplace::Mode::Full, &app).unwrap();
+        assert!(env_section(&rt).contains("unrestricted"), "the full tier must be described as unrestricted");
+        let _ = std::fs::remove_dir_all(&picked);
     }
 
     #[test]

@@ -167,23 +167,28 @@ doesn't use them and builds its own plugin instead, which is a different class o
 
 | Tier | Meaning | What it governs when restricted |
 |------|------|------|
-| `default` | each new conversation opens a fresh plot at `<app root>/workplace/<YYYYMMDDHHMMSS>/` (a name collision within the same second appends `-2`) | writes and deletes only inside that plot; **reads are unrestricted** |
+| `default` | **the app root itself** — every new conversation starts there (changed 2026-10-08; previously each conversation opened a fresh `<app root>/workplace/<YYYYMMDDHHMMSS>/` plot). `temp/` for scratch, `workplace/<project>/` for durable deliverables | writes and deletes only inside the app root; **reads are unrestricted** |
 | `full` | unrestricted. **You have to write `mode = "full"` explicitly** — the factory default is `default` (changed 2026-10-05) | governs nothing |
-| `fixed` (with `root = "..."`) | one fixed plot (the GUI's "choose workplace" is equivalent to it) | same as `default` |
+| `fixed` (with `root = "..."`) | one fixed root (the GUI's "choose workplace" is equivalent to it) | same as `default` |
+
+Under the confined tiers the AI also keeps its **own dated notes**: on first use the host lays down
+`<root>/.aox/memory/`, and the model writes one `<YYYY-MM-DD>.md` per day there (what it did, the
+pitfalls, what got finished) —— inside a project it uses that project's own `.aox/memory/`. The
+prompt teaches the convention; the host only creates the folder (and hands the model today's date).
 
 **Reads and writes are asymmetric (the semantics settled on 2026-10-04; the single most
 important rule at this layer)**:
 
 | Tool | Intent (`workplace::Access`) | When restricted |
 |---|---|---|
-| `read_file` / `list_dir` | `Read` | **the whole device is readable, unrestricted by the workplace** (it reads even when "the plot isn't open yet") |
+| `read_file` / `list_dir` | `Read` | **the whole device is readable, unrestricted by the workplace** (it reads even when "the root isn't established yet") |
 | `write_file` / `remove` | `Write` | must be inside the workplace; relative paths are always refused |
 
 Why split them: **the consequences are asymmetric** — reading takes information, writing and
 deleting change the device (and irreversibly). Wanting to read material that lives somewhere else
 (logs, configs, another project) is a very common legitimate need; putting an elevation flow in
 front of it only pushes users into leaving "full access" on permanently, which makes the boundary
-looser instead. Whereas "AOX may only put its pen down inside the plot drawn for it" is what this
+looser instead. Whereas "AOX may only put its pen down inside the root drawn for it" is what this
 layer actually has to protect. Its price is in the first item under "known limits".
 
 Switching at runtime: `/workplace` at the command line (show the current state) and
@@ -234,9 +239,9 @@ Switching at runtime: `/workplace` at the command line (show the current state) 
   thing, changing with which tool you use, and hardest of all to explain. To tighten one
   individually, override by name: `[auth.overrides] read_file = "ask"`.
 - **The tier's test is "how it came about at runtime", not "what the config says."** The state
-  records an extra `picked` (whether this plot was named by the user or freshly created by the
+  records an extra `picked` (whether this root was named by the user or freshly decided by the
   `default` tier), and `snapshot()` reads it. Deriving it from `cfg.mode` goes wrong: a user
-  whose config says `default` can still pick one fixed plot at runtime (`/workplace <dir>`, or
+  whose config says `default` can still pick one fixed root at runtime (`/workplace <dir>`, or
   the GUI's picker), and then `set_mode` reports "switched to 'choose workplace': X" while
   `snapshot()` immediately after reports "tier: default" — one action, two stories; on the GUI
   that is "the button says default and the tick is on default, while writes actually go to X".
@@ -298,18 +303,24 @@ Switching at runtime: `/workplace` at the command line (show the current state) 
   written into that conversation's `.jsonl`
   (`{"kind":"workplace","mode":"default|fixed|full","root":"..."}`, **appended only when it
   changes**, and reading takes the last entry). So:
-  - Opening an old conversation hands back its own plot — previously nothing was persisted and a
-    restored conversation reused "the current plot", so the same conversation had a different
+  - Opening an old conversation hands back its own root — previously nothing was persisted and a
+    restored conversation reused "the current root", so the same conversation had a different
     workplace every time you entered it (reported by the user).
   - **`/new` always returns to the "default" tier** (`Agent::new_conversation` ->
     `reset_for_new_conversation`); a tier switched temporarily in the previous conversation is
-    not inherited. ⚠️ The price: a user with `mode = "fixed"` in config gets the plot named by
+    not inherited. ⚠️ The price: a user with `mode = "fixed"` in config gets the root named by
     the config only for **the first conversation of this launch**, and every new conversation
-    after that opens another plot under `workplace/`.
+    after that falls back to the app root.
   - Old conversation files have no such record (the feature didn't exist yet): on restore
     **nothing is touched**, and it is recorded the next time it lands on disk, after which that
-    conversation has its own plot too.
-- **Workplace directories are not cleaned up automatically** (like `history/`, they only grow).
+    conversation has its own root too.
+  - **The model is told the *current* workspace, not the app root (fixed 2026-10-08)**: the prompt's
+    layout segment reads the root live, and `Agent::refresh_system_prompt` rebuilds the system prompt
+    whenever the root changes (first turn, `/workplace`, the GUI button; only on change, so it is
+    free otherwise). Before the fix it hardcoded the app root, so after the user picked another
+    folder the model kept asking about "its own install directory".
+- **Nothing under the app root is cleaned up automatically** (like `history/`, `temp/` and the
+  `workplace/<project>/` folders only grow; sweeping them is the user's call).
 
 **Measured overhead (2026-10-04, release build, this machine)** — to answer "do these boundaries
 slow the model down":
@@ -427,9 +438,9 @@ max_memory_mb = 512  # only turn the memory cap on if you mean it: exceeding it 
 ui_limits = false    # let the plugin touch the host's window/clipboard (normally unnecessary)
 
 [workplace]          # renamed from [workspace] to [workplace] on 2026-10-04; the old name still works
-mode = "default"     # factory default: each conversation opens a fresh plot under workplace/ (writes and deletes only inside)
+mode = "default"     # factory default: the app root itself is the workspace (writes and deletes only inside)
 # mode = "full"      # unrestricted -- it has to be written explicitly (the default stopped being full on 2026-10-05)
-# mode = "default"   # one fresh plot per conversation: <app root>/workplace/<timestamp>/
+# mode = "default"   # scratch -> <app root>/temp/, durable deliverables -> <app root>/workplace/<project>/
 # mode = "fixed"
 # root = "sandbox-work"   # a fixed workplace (relative paths are relative to the app root)
 ```

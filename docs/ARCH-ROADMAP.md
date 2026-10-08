@@ -1748,4 +1748,70 @@ implementation notes for the four alternatives: ②a AppContainer / ②b low int
     while the same binary ran fine in earlier rounds — most likely an issue with this session's
     desktop/focus environment, not a program problem. These three items **need you to go through
     them on real hardware**.
+- ✅ **The `default` workspace became the app root itself · `temp/` + `workplace/` conventions
+  (2026-10-08)**:
+  - The user asked to drop the per-conversation `<app root>/workplace/<YYYYMMDDHHMMSS>/` plot:
+    "the default workspace should be the AOX install directory, not a new folder every time."
+    The three tiers keep their names; only what `default` resolves to changed.
+    `Workplace::ensure_started` no longer stamps a directory — on the first message it normalises
+    the app root, adopts it as `own`, and **best-effort pre-creates `temp/` (scratch) and
+    `workplace/` (durable deliverables)** so plugins can `open()` right away. `stamp()` /
+    `unique_dir()` / `workdir_of` are gone; the "same-second name collision" trap went with them.
+  - **Convention, taught to the model** (a new `# Workspace layout` section in the built-in prompt
+    + the first-turn Info line): scratch files (screenshots, caches, one-off output) → `temp/`;
+    durable deliverables → `workplace/<short project name>/`. The boundary is still the whole app
+    root, so nothing outside it is touched.
+  - **Backward compatible**: old `.jsonl` records with `root = workplace/<stamp>` still `restore()`
+    verbatim (old conversations keep their old plot); only new conversations use the app root. The
+    `full` tier keeps zero drift (no pre-create).
+  - Verification: en/zh `cargo check --workspace --all-targets` green · `cargo test --workspace`
+    **188 + 180 + 25 all passing** · zh catalog still parses at runtime (703 → 702 keys; the
+    orphaned GUI-hint key removed) · CLI smoke against an unreachable endpoint → first-turn Info
+    printed `this conversation's workspace: E:\rustapp`, `temp/` pre-created, and `/workplace`
+    reported "not decided yet … app root" then "E:\rustapp".
+- ✅ **Per-workspace memory —— the AI keeps its own dated notes under `.aox/memory/` (2026-10-08)**:
+  - The user asked that each workspace, on first use, get a `.aox/` folder with a `memory/` inside,
+    holding one markdown note per day (`YYYY-MM-DD.md`) recording what the AI did, the pitfalls it
+    hit and how it got past them, and what got finished —— **core content only, no filler**.
+  - **Where**: at the root the AI is actually working in —— a project's own `.aox/memory/` when it
+    is inside one (`workplace/<project>/`), otherwise the workspace root's. The host lays down
+    `.aox/memory/` at the **workspace root** on first use (`ensure_started` for `default`,
+    `set_mode(Fixed)` for a user pick, both best-effort); a project-level folder appears when the
+    model first writes a note there (`write_file` creates parents). The `full` tier is unchanged
+    (no pre-create —— the zero-drift promise holds).
+  - **Who writes**: the model, driven by a new `# Memory` section in the env segment of the prompt
+    (path rule, `<date>.md` naming, *append* —— read then write back, never overwrite —— core-only
+    content, skip trivial turns, read recent notes first for long-running work). No new tool.
+  - **Prerequisite: the date.** The host never told the model the date before, and the filename
+    needs it. The env segment now carries **today's local date**; `Local` / `local_now()` /
+    `civil_from_unix` moved up from `store::jsonl` to `src/history.rs` so the history stamp and the
+    prompt share one implementation (`pub fn local_date() -> String`; `GetLocalTime` on Windows ——
+    still zero new crates). The `# Memory` block deliberately uses `\`-style paths, matching the
+    neighbouring `# Workspace layout` block.
+  - Verification: en/zh `cargo check --workspace --all-targets` green · `cargo test --workspace`
+    **190 + 182 + 25 all passing** (was 188 + 180 + 25; +2 new: `.aox/memory/` is laid down by the
+    `default` tier and by a user pick, and the env segment carries the memory rule + today's date) ·
+    the zh catalogue is re-parsed by the real `toml` crate (**703** keys; both new keys present with
+    matching `{}` counts) · CLI smoke against an unreachable endpoint → workspace `E:\rustapp`,
+    `.aox\memory\` created on the first turn, the Info line names it. (Release size to be recorded
+    with the next installer build.)
+- ✅ **The model is told the *current* workspace, not the app root (2026-10-08)**:
+  - Reported: the user started a conversation, switched the workspace to the Desktop, then asked the
+    model to tidy up some documents — and the model replied asking *which* documents, "should I tidy
+    the ones in my own install directory?".
+  - **Root cause**: `prompt::env_section` built the layout segment from `rt.root` (the app root /
+    install dir), and the system prompt is assembled **once**, in `Agent::new` (`src/agent.rs:77`).
+    So the prompt never reflected the runtime workspace; the `this conversation's workspace: …` line
+    went to the **UI only** (`AgentEvent::Info`), never into the model's context.
+  - **Fix**: the layout segment now reads the workspace **live** from `rt.workplace.snapshot()`,
+    states the confinement rule (and says "unrestricted" under the `full` tier), and spells out that
+    the app root is merely where plugins run. A new `Agent::refresh_system_prompt` rebuilds
+    `messages[0]` **only when the root actually changes** (first turn, `/workplace`, the GUI button),
+    so the common case costs nothing. The system message is memory-only (never persisted, rebuilt on
+    resume), which is why replacing it outside `push_message` does not break that invariant.
+  - Verification: en/zh `cargo check --workspace --all-targets` green · `cargo test --workspace`
+    **192 + 184 + 25 all passing** (was 190 + 182 + 25; +2: the layout segment names the current
+    workspace and follows a switch, and the prompt is genuinely rebuilt when the workspace switches)
+    · zh catalogue **705** keys, the one rewritten + two new entries all present with matching `{}`
+    counts.
 - **Next**: the 30-minute spike on ②b (if it works, ②a can be demoted to a fallback).

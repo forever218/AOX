@@ -264,13 +264,15 @@ max_resident = 0
 # The section was renamed from [workspace] to [workplace] on 2026-10-04 (**the old name still
 # works**, so older configs don't break).
 #
-# "default" = **the default**: each new conversation opens a fresh plot at
-#             <app root>/workplace/<timestamp>/, and writes and deletes may land only inside it
-#             (reading is unrestricted).
+# "default" = **the default**: the workspace is the app root itself, and writes and deletes may
+#             land only under it (reading is unrestricted). Keep the tree tidy by convention:
+#             scratch files go in <app root>/temp/, and each durable deliverable gets its own
+#             folder under <app root>/workplace/<project>/. The AI also keeps its own dated notes
+#             in <root>/.aox/memory/<YYYY-MM-DD>.md (that folder is created on first use).
 # "full"    = unrestricted. You must **write it explicitly** -- as of 2026-10-05 the factory
 #             default became "default" (the user wanted "restricted by default on every
 #             start"), so "leaving this section out" now means the restricted tier.
-# "fixed"   = one fixed plot; give the directory with `root` below.
+# "fixed"   = one fixed directory; give it with `root` below.
 # An unrecognized name **errors out at startup** rather than quietly falling back to default.
 #
 # ⚠️ Only "write" and "delete" are blocked: **reading files is not limited by the workplace** --

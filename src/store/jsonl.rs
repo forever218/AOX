@@ -53,7 +53,7 @@ use serde_json::{json, Value};
 
 use crate::attach;
 use crate::history::{
-    unix_now, Loaded, Meta, Summary, UsageRecord, DEFAULT_LIST_LIMIT, HOST_PREFIX,
+    local_now, unix_now, Local, Loaded, Meta, Summary, UsageRecord, DEFAULT_LIST_LIMIT, HOST_PREFIX,
 };
 use crate::message::Message;
 use crate::store::{Session, Store};
@@ -67,76 +67,6 @@ const TITLE_MAX_CHARS: usize = 46;
 /// The title is only searched for in the first few lines: the first user message is always on line 2,
 /// so a few lines of headroom is enough — no need to parse an entire tool result just for a title.
 const TITLE_SCAN_LINES: usize = 6;
-
-// ─────────────────────────── Local time ───────────────────────────
-
-struct Local {
-    year: u16,
-    month: u16,
-    day: u16,
-    hour: u16,
-    minute: u16,
-    second: u16,
-}
-
-/// Get the local time.
-///
-/// Computing the timezone offset ourselves would drag in a chrono / time style dependency, but all
-/// the host needs is a "human-readable filename", so we just ask the OS — on Windows that is
-/// `GetLocalTime`, with zero new crates. Non-Windows platforms fall back to UTC (the filename is still
-/// sortable, just a different timezone).
-#[cfg(windows)]
-fn local_now() -> Local {
-    use windows_sys::Win32::Foundation::SYSTEMTIME;
-    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-
-    // windows-sys's SYSTEMTIME is plain POD (only Clone/Copy), with no Default, so it can only be
-    // zero-initialized
-    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
-    unsafe { GetLocalTime(&mut st) };
-    Local {
-        year: st.wYear,
-        month: st.wMonth,
-        day: st.wDay,
-        hour: st.wHour,
-        minute: st.wMinute,
-        second: st.wSecond,
-    }
-}
-
-#[cfg(not(windows))]
-fn local_now() -> Local {
-    // If the time zone isn't available, honestly record UTC — don't fool anyone with an
-    // "approximate UTC+8".
-    let secs = unix_now();
-    let (y, m, d, hh, mm, ss) = civil_from_unix(secs);
-    Local { year: y, month: m, day: d, hour: hh, minute: mm, second: ss }
-}
-
-/// Unix seconds → year/month/day/hour/minute/second (Howard Hinnant's civil_from_days).
-#[cfg(not(windows))]
-fn civil_from_unix(secs: u64) -> (u16, u16, u16, u16, u16, u16) {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (
-        y as u16,
-        m as u16,
-        d as u16,
-        (rem / 3600) as u16,
-        ((rem % 3600) / 60) as u16,
-        (rem % 60) as u16,
-    )
-}
 
 /// Compose "10-02 15:39". Years other than the current one get the year prepended, otherwise
 /// "10-02" would be mistaken for this year.
@@ -217,7 +147,7 @@ fn local_from_system(t: SystemTime) -> Option<Local> {
 #[cfg(not(windows))]
 fn local_from_system(t: SystemTime) -> Option<Local> {
     let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let (year, month, day, hour, minute, second) = civil_from_unix(secs);
+    let (year, month, day, hour, minute, second) = crate::history::civil_from_unix(secs);
     Some(Local { year, month, day, hour, minute, second })
 }
 
