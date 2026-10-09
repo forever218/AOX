@@ -161,7 +161,11 @@ struct Live {
     /// by then the deltas are done, so the authoritative text overwrites once and a few
     /// dropped frames can't leave the screen a few characters off.
     streaming: String,
-    started: Instant,
+    /// The activity clock's reading when this turn started. The live "12.3s" readouts subtract it
+    /// from the clock's current reading, so they show the turn's **working** time — the turn
+    /// doesn't look like it took four minutes just because the user pondered a question for that
+    /// long (see [`Clock`]).
+    turn_base: f32,
     /// Characters received on the output side (reasoning + body), used to scroll a live
     /// token count that keeps climbing.
     ///
@@ -233,6 +237,58 @@ impl SettingsTab {
     }
 }
 
+/// The activity clock: seconds of *work* since launch, with the stretches where nothing was
+/// running **cut out**.
+///
+/// Everything timed in this program is timed against this clock rather than the wall, because the
+/// wall is the wrong unit for "how long did this take". Two stretches must not count:
+///
+/// * **Idle** — after a turn ends and before the next instruction. The user reading a reply or
+///   typing has nothing to do with how long the work took, and (worse) it is usually minutes, so
+///   leaving it in stretched one round away from the next and buried the actual work in a mostly
+///   empty timeline. Cutting it is also what makes consecutive rounds sit flush: the next round's
+///   first record lands exactly where the previous round's last one stopped.
+/// * **Waiting on the user** — an authorization prompt or an `ask_user` question. While the
+///   question is on screen the model is blocked on a person, not working, so that time belongs to
+///   neither side's duration. This is why a "waiting for your choice" bar no longer reads as if
+///   the tool ran for four minutes.
+///
+/// Summing instead of subtracting a start point (`Instant::now()` would give only the running
+/// stretch, losing every earlier one) is what makes it survive many pause/resume cycles: each
+/// stopped stretch is folded into `paused` once, on the way out.
+struct Clock {
+    started: Instant,
+    /// Seconds already accumulated as "not running"
+    paused: f32,
+    /// When the current pause began (`None` = running right now)
+    since: Option<Instant>,
+}
+
+impl Clock {
+    fn new() -> Self {
+        Self { started: Instant::now(), paused: 0.0, since: None }
+    }
+
+    fn now(&self) -> f32 {
+        let paused = self.paused + self.since.map_or(0.0, |t: Instant| t.elapsed().as_secs_f32());
+        (self.started.elapsed().as_secs_f32() - paused).max(0.0)
+    }
+
+    /// Run or stop the clock. Idempotent, so it is safe to call every frame with a derived
+    /// condition: only the *change* folds time into `paused` (and `set_running` is the one place
+    /// that does, so no stretch can be counted twice or lost).
+    fn set_running(&mut self, run: bool) {
+        match (run, self.since) {
+            (false, None) => self.since = Some(Instant::now()),
+            (true, Some(t)) => {
+                self.paused += t.elapsed().as_secs_f32();
+                self.since = None;
+            }
+            _ => {}
+        }
+    }
+}
+
 // ─────────────────────────── App ───────────────────────────
 
 pub struct App {
@@ -241,7 +297,8 @@ pub struct App {
     flags: Arc<SessionFlags>,
     driver: Option<std::thread::JoinHandle<()>>,
 
-    started: Instant,
+    /// The single time base for everything the UI times (see [`Clock`]).
+    clock: Clock,
     boot: Option<BootInfo>,
 
     items: Vec<Item>,
@@ -420,7 +477,7 @@ impl App {
             flags,
             driver,
             demo,
-            started: Instant::now(),
+            clock: Clock::new(),
             boot: None,
             items: Vec::new(),
             live: None,
@@ -477,8 +534,24 @@ impl App {
         app
     }
 
+    /// Current reading of the activity clock (seconds of work since launch, pauses excluded).
     fn now(&self) -> f32 {
-        self.started.elapsed().as_secs_f32()
+        self.clock.now()
+    }
+
+    /// Let the clock run only while a turn is actually working.
+    ///
+    /// Derived from the flags rather than latched at each transition on purpose: every place that
+    /// could start or stop a wait would otherwise have to remember to call in (and the ones that
+    /// *clear* a wait — a turn ending mid-question, a fatal error, a conversation switch — are
+    /// exactly the ones easiest to forget). Deriving it every frame can't be missed, and being a
+    /// frame late at a transition is worth nothing on a chart whose bars are seconds wide.
+    ///
+    /// Called at the *top* of the frame, before [`App::pump`], so the events handled this frame
+    /// read a clock that already reflects the state they are about to change.
+    fn sync_clock(&mut self) {
+        let running = self.busy && !self.waiting_auth && self.choice_reply.is_none();
+        self.clock.set_running(running);
     }
 
     /// On the first frame, converge the window into the screen and place it explicitly.
@@ -626,6 +699,9 @@ impl App {
                     self.refresh_history();
                 }
                 FromAgent::TurnStart => {
+                    // Read the clock before `busy` is set: the turn's own time starts where the
+                    // instruction landed, and the turn's readouts then measure from here.
+                    let base = self.now();
                     self.live = Some(Live {
                         status: aox::i18n::t("Thinking").into(),
                         reasoning: String::new(),
@@ -635,7 +711,7 @@ impl App {
                         cuts: Vec::new(),
                         pending_final: None,
                         streaming: String::new(),
-                        started: Instant::now(),
+                        turn_base: base,
                         out: TokenEstimate::default(),
                     });
                     self.busy = true;
@@ -684,9 +760,12 @@ impl App {
                 }
                 FromAgent::Reasoning(d) => {
                     if let Some(l) = self.live.as_mut() {
-                        // Careful: `self.now()` cannot be used here (it borrows all of self), while
-                        // `l` is holding a mutable borrow of `self.live`.
-                        let at = self.started.elapsed().as_secs_f32();
+                        // `self.now()` cannot be used here (it borrows all of self), while `l` is
+                        // holding a mutable borrow of `self.live`. `self.clock` is a *different*
+                        // field, so borrowing it alone is fine — and it has to be this clock, not
+                        // `Instant::now()`, or the model segment would start on the wall clock and
+                        // drift away from every other record the moment a pause happened.
+                        let at = self.clock.now();
                         if !l.reasoning_live {
                             l.reasoning_live = true;
                             activity::lock(&self.act).model_begin(at);
@@ -1048,7 +1127,7 @@ impl App {
             AgentEvent::AssistantText(t) => {
                 match self.live.as_mut() {
                     Some(l) => {
-                        let at = self.started.elapsed().as_secs_f32();
+                        let at = self.clock.now();
                         // The model starting to emit body text = the "model" segment starts (if it
                         // hasn't already)
                         activity::lock(&self.act).model_begin(at);
@@ -1065,7 +1144,7 @@ impl App {
             }
             AgentEvent::InterimText(t) => {
                 if let Some(l) = self.live.as_mut() {
-                    let at = self.started.elapsed().as_secs_f32();
+                    let at = self.clock.now();
                     activity::lock(&self.act).model_begin(at);
                     // The stage note is final here: it goes into `interim` (which stays in the live
                     // area and ends up in the process card afterwards) and `streaming` is cleared --
@@ -1166,7 +1245,9 @@ impl App {
         self.choice_reply = None;
         self.status = aox::i18n::t("Ready").into();
         let Some(l) = self.live.take() else { return };
-        let elapsed = l.started.elapsed().as_secs_f32();
+        // Working time, not wall time: a turn the user sat on for ten minutes while answering a
+        // question is not a ten-minute turn (see [`Clock`]).
+        let elapsed = (self.now() - l.turn_base).max(0.0);
 
         if !l.steps.is_empty() {
             self.items.push(Item::Process(Process {
@@ -1608,10 +1689,13 @@ impl App {
                                             RichText::new(&self.status).color(P::text()).size(14.0),
                                         );
                                         ui.add_space(7.0);
+                                        // Working time, same basis as every other readout (see
+                                        // [`Clock`]) -- otherwise the number here would keep
+                                        // climbing while the model sits waiting on the user.
                                         let secs = self
                                             .live
                                             .as_ref()
-                                            .map_or(0.0, |l| l.started.elapsed().as_secs_f32());
+                                            .map_or(0.0, |l| (self.now() - l.turn_base).max(0.0));
                                         ui.label(
                                             RichText::new(format!("{secs:.1}s"))
                                                 .color(P::text_faint())
@@ -1943,7 +2027,7 @@ impl App {
             );
             ui.add_space(8.0);
             ui.label(
-                RichText::new(format!("{:.1}s", l.started.elapsed().as_secs_f32()))
+                RichText::new(format!("{:.1}s", (self.now() - l.turn_base).max(0.0)))
                     .color(P::text_faint())
                     .size(13.0),
             );
@@ -2746,16 +2830,21 @@ fn seed_demo(app: &mut App) {
         a.end_round(11.9);
         a.tick(11.9, aox::i18n::t("Ready"), false);
 
-        // Second turn: the cross-turn, cross-plugin connector effect is demonstrated too
-        a.round_begin(aox::i18n::t("Write the plugin's usage into the README"), 13.2);
-        a.model_begin(13.8);
+        // Second turn: the cross-turn, cross-plugin connector effect is demonstrated too.
+        //
+        // It starts at 11.9, exactly where the first turn ended. That is not a cosmetic choice:
+        // the clock stops between turns (`Clock`), so in a real session the gap between one round's
+        // last record and the next round's instruction is always zero. Seeding an idle gap here
+        // would make the preview show a layout the program can no longer produce.
+        a.round_begin(aox::i18n::t("Write the plugin's usage into the README"), 11.9);
+        a.model_begin(12.5);
         a.model_push(aox::i18n::t("Just add a \"filestat usage\" section to the README."));
-        a.tool_begin("fs_write", Some("fs"), r#"{"path":"README.md"}"#, 14.6);
-        a.tool_end(false, aox::i18n::t("Wrote 1.2 KB"), 15.4);
-        a.model_begin(15.5);
+        a.tool_begin("fs_write", Some("fs"), r#"{"path":"README.md"}"#, 13.3);
+        a.tool_end(false, aox::i18n::t("Wrote 1.2 KB"), 14.1);
+        a.model_begin(14.2);
         a.model_push(aox::i18n::t("Done."));
-        a.end_round(18.1);
-        a.tick(18.1, aox::i18n::t("Ready"), false);
+        a.end_round(16.8);
+        a.tick(16.8, aox::i18n::t("Ready"), false);
     }
 }
 
@@ -2779,6 +2868,10 @@ pub(crate) fn default_window_size(mon: Vec2, chrome: Vec2) -> Vec2 {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.fit_window(ctx);
+        // Before `pump`: the clock's run/stop state has to be settled from the *current* flags
+        // before this frame's events are timestamped, so nothing records a moment that belongs to
+        // a stretch that shouldn't be counted (see [`Clock`]).
+        self.sync_clock();
         self.pump();
         // Drag and drop: anywhere in the window accepts (see `take_dropped`). Placed after
         // `pump` and before painting -- an attachment received this frame has to appear in the
@@ -2849,6 +2942,10 @@ impl eframe::App for App {
         // right now" over every frame and re-declares that viewport (egui viewports are
         // declarative; one that isn't declared gets reclaimed).
         activity::lock(&self.act).tick(self.now(), &self.status, self.busy);
+        // Hand the stream window this window's native handle, once: it needs it to keep this window
+        // painting while a turn runs (the stream window takes the foreground when it opens, and a
+        // frozen pass loop here is a frozen timeline there — see `activity::poke_main`).
+        activity::remember_main_window(&self.act, frame);
         activity::sync(ctx, &self.act);
         let frame = Frame::NONE.fill(P::bg());
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
