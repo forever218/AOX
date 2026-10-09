@@ -1467,6 +1467,7 @@ reordered.
 | — UI customization layer (formerly 6c) | **chartered, deferred** → `docs/UI-CUSTOMIZATION.md` | — |
 | 7a plugin fence (new line · ① Job Object) | **awaiting acceptance** → `docs/SANDBOX.md` | — |
 | 7b workplace boundary (new line · ③ file capability back to the host + GUI entry + read/write semantics + naming unified) | **awaiting acceptance** → `docs/SANDBOX.md` | — |
+| — subagents (self-spawn a headless instance) | **chartered, deferred** → `docs/SUBAGENT.md` | — |
 
 ---
 
