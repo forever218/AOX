@@ -852,7 +852,15 @@ async fn boot_and_run(
                 let _ = ui.tx.send(FromAgent::Fatal(format!("{e:#}")));
             }
             Outcome::Aborted => {
-                agent.truncate_messages(mark);
+                // Roll back to the last **legal** boundary, not to the start of the turn: the
+                // user's instruction and every completed step stay in the model's context, and only
+                // the in-flight step is dropped. Exactly the same call as the CLI's — the
+                // granularity decision lives in `Agent::interrupt_rollback_point`, so the two front
+                // ends cannot drift apart.
+                //
+                // The attachment tray needs nothing here: the GUI clears it at send time
+                // (`app.rs`), which is already consistent with "this message was delivered".
+                agent.rollback_interrupted_turn(mark);
                 let _ = ui.tx.send(FromAgent::TurnAborted);
             }
         }

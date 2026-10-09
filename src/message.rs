@@ -181,9 +181,80 @@ impl Message {
     }
 }
 
+/// Whether a message list is a **legal request body** for an OpenAI-compatible endpoint.
+///
+/// The rule in one sentence: every `assistant` message that carries `tool_calls` must be followed
+/// by a `tool` message for **each** of its call ids. Anything else is refused with a flat 400 —
+/// and for a thinking model the request dies even earlier, because `reasoning_content` has to
+/// travel back together with the `tool_calls` it belongs to.
+///
+/// **This is the single definition of "a legal boundary" in this crate.** It has two consumers,
+/// and each used to carry its own copy of the argument above:
+/// - the trim point in `agent_loop.rs` — "dropping the oldest turns must not leave a `tool` result
+///   whose `assistant` was dropped";
+/// - the interrupt rollback in `agent.rs` — "rolling back must not leave a dangling `tool_calls`".
+///
+/// When a third one appears, call this instead of writing a third version of the argument.
+pub fn is_legal_body(msgs: &[Message]) -> bool {
+    msgs.iter().enumerate().all(|(i, m)| {
+        if m.role != "assistant" {
+            return true;
+        }
+        let Some(calls) = m.tool_calls.as_ref().filter(|c| !c.is_empty()) else {
+            return true;
+        };
+        calls.iter().all(|c| {
+            msgs[i + 1..]
+                .iter()
+                .any(|r| r.role == "tool" && r.tool_call_id.as_deref() == Some(c.id.as_str()))
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool call with the given id, for building bodies by hand.
+    fn call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall { name: "fs_read".into(), arguments: "{}".into() },
+        }
+    }
+
+    /// Pin the one definition of a legal boundary against **the real shapes this code produces**
+    /// (see `agent_loop.rs`): only the complete batch is a legal request body. The "half a parallel
+    /// batch" case is the one an interrupt lands on most often, and it is exactly why "keep the
+    /// completed calls" cannot mean "keep everything".
+    #[test]
+    fn a_tool_call_without_its_result_makes_the_body_illegal() {
+        let sys = Message::system("sys");
+        let user = Message::user("do it");
+
+        let done = vec![
+            sys.clone(),
+            user.clone(),
+            Message::assistant(None, None, vec![call("c1")]),
+            Message::tool_result("c1", "fs_read", "ok".into()),
+        ];
+        assert!(is_legal_body(&done), "a finished batch is a legal body");
+
+        let dangling =
+            vec![sys.clone(), user.clone(), Message::assistant(None, None, vec![call("c1")])];
+        assert!(!is_legal_body(&dangling), "an unanswered tool call is not");
+
+        let half = vec![
+            sys.clone(),
+            user.clone(),
+            Message::assistant(None, None, vec![call("c1"), call("c2")]),
+            Message::tool_result("c1", "fs_read", "ok".into()),
+        ];
+        assert!(!is_legal_body(&half), "one id out of two answered is still illegal");
+
+        assert!(is_legal_body(&[sys, user]), "no tool call anywhere is trivially legal");
+    }
 
     /// **The key zero-drift assertion**: with no attachment, a serialised user message must be
     /// byte-for-byte identical to before the type changed — `content` is a JSON string, not

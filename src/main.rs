@@ -652,21 +652,36 @@ async fn main() -> Result<()> {
                     }
                 };
                 match outcome {
-                    // Clear on send (one-shot). On interrupt, **keep** them — that round
-                    // was rolled back, so this message was as good as never sent, and
-                    // swallowing the attachments too would only make the user attach them
-                    // all over again.
+                    // Clear on send (one-shot): the attachments have gone into the history with
+                    // this message, and must not ride along a second time with the next one.
                     TurnOutcome::Done(_) => pending.clear(),
-                    TurnOutcome::Interrupted => {}
+                    // On interrupt this now hinges on a single fact: did this turn's user message
+                    // actually make it into the history? Rolling back to the last **legal** boundary
+                    // (`Agent::interrupt_rollback_point`) keeps it in every real case, so the
+                    // attachments are already in context and must be cleared too. The old code kept
+                    // them because its rollback went back to the *turn* start, which dropped the
+                    // message — a reason that no longer exists. The one case that still keeps them
+                    // is "interrupted before `run_turn` had pushed the message at all": nothing was
+                    // sent, and swallowing the attachments would only make the user attach them all
+                    // over again.
+                    TurnOutcome::Interrupted => {
+                        if agent.messages_len() > mark {
+                            pending.clear();
+                        }
+                    }
                 }
                 match outcome {
                     TurnOutcome::Done(Ok(())) => {}
                     TurnOutcome::Done(Err(e)) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
                     TurnOutcome::Interrupted => {
                         ui.abort_turn().await;
-                        agent.truncate_messages(mark);
+                        // Roll back to the last **legal** boundary, not to the start of the turn:
+                        // the user's instruction and every completed step stay in context, and only
+                        // the in-flight (unreplayable) step is dropped. The granularity decision
+                        // lives in `Agent::interrupt_rollback_point`, shared with the GUI.
+                        agent.rollback_interrupted_turn(mark);
                         ui.emit(AgentEvent::Warn(
-                            crate::i18n::t("Interrupted the current task (the conversation has been rolled back to its pre-task state; attachments in the pending-upload tray are still there)").into(),
+                            crate::i18n::t("Interrupted the current task (only the step that was still running was dropped; everything already done stays in context)").into(),
                         ));
                     }
                 }

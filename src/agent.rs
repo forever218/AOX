@@ -320,14 +320,75 @@ impl Agent {
         self.workplace_logged = None;
     }
 
-    /// After interrupting the current task, roll back the conversation history to avoid leaving half messages "with tool_calls but no result".
+    /// Drop everything from `len` onward, in memory **and** on disk.
     ///
-    /// The on-disk file rolls back in sync: whatever is dropped from memory must also be dropped from the file,
-    /// otherwise we'd leave a broken record that can't be replayed as a request body.
+    /// `Vec::truncate` semantics: **keeps the first `len`**. The on-disk file rolls back in sync —
+    /// whatever is dropped from memory must also be dropped from the file, otherwise we'd leave a
+    /// broken record that can't be replayed as a request body.
+    ///
+    /// This is the blunt primitive. The *policy* for "how far back an interrupt should reach" lives
+    /// in [`Self::interrupt_rollback_point`], and that is what both front ends call.
     pub fn truncate_messages(&mut self, len: usize) {
         self.messages.truncate(len);
         if let Some(log) = self.log.as_mut() {
             log.rewrite(&self.messages);
+        }
+    }
+
+    /// Where to roll the conversation back to when the user interrupts a running turn.
+    ///
+    /// Returns the **largest** `n` in `[mark, messages.len()]` for which `messages[..n]` is still a
+    /// legal request body (see [`crate::message::is_legal_body`]) — i.e. drop the in-flight,
+    /// unreplayable tail and **nothing more**.
+    ///
+    /// ⚠️ Deliberately *not* the start of the turn. That was the old behaviour, and it threw away
+    /// two things it had no business touching: the user's own instruction for this turn, and every
+    /// tool call that had **already run**. The model then saw a bare message with no context and
+    /// restarted the task from scratch — while the files on disk still carried the edits it had
+    /// just made, so the conversation history and reality disagreed with each other.
+    ///
+    /// The original motive was sound and still is — a dangling `tool_calls` is refused by the
+    /// endpoint with a flat 400 — but it only argues for "cut back to a legal boundary", not for
+    /// "cut back to the *turn* boundary". Those are different points, and only the second one is
+    /// destructive.
+    ///
+    /// `mark` is the history length **before** this turn (`run_turn` pushes the user message
+    /// itself, so `messages[mark]` is that message). It acts as a floor: we never roll back past
+    /// where this turn started.
+    pub fn interrupt_rollback_point(&self, mark: usize) -> usize {
+        let msgs = &self.messages;
+        // At most **one** batch can be incomplete, and it is the last one: the loop only asks the
+        // model again once every call of the previous batch has its result. So finding the last
+        // assistant that carries calls is enough — no need to validate the whole history.
+        let Some(i) = msgs.iter().rposition(|m| {
+            m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|c| !c.is_empty())
+        }) else {
+            // No tool call anywhere: the tail is a plain message, so nothing needs rolling back.
+            return msgs.len();
+        };
+        if crate::message::is_legal_body(&msgs[i..]) {
+            // The batch finished; the abort landed while waiting for the next reply.
+            msgs.len()
+        } else {
+            // Drop the dangling (or half-answered) batch, keeping the user's instruction and every
+            // completed step before it. `mark` is the floor for the pathological case where the
+            // last incomplete batch somehow sits *before* this turn.
+            i.max(mark)
+        }
+    }
+
+    /// Roll the conversation back after an interrupt, keeping every completed step.
+    ///
+    /// The single entry point for both front ends (`src/main.rs` CLI, `gui/src/bridge.rs` GUI) —
+    /// the granularity decision lives in [`Self::interrupt_rollback_point`], not in the front ends,
+    /// so the two cannot drift apart.
+    ///
+    /// A **no-op** when that point is already the end of the history (nothing was mid-flight): no
+    /// truncation, and therefore no pointless rewrite of the conversation file either.
+    pub fn rollback_interrupted_turn(&mut self, mark: usize) {
+        let n = self.interrupt_rollback_point(mark);
+        if n < self.messages.len() {
+            self.truncate_messages(n);
         }
     }
 
@@ -779,5 +840,120 @@ mod tests {
 
         let host = reject_text(&ToolKind::Host, &rej);
         assert_eq!(host, base, "host tools must not receive that plugin-only escape hatch");
+    }
+
+    /// A tool call with the given id — enough for the rollback scan, which only reads ids.
+    fn call(id: &str) -> crate::message::ToolCall {
+        crate::message::ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: crate::message::FunctionCall { name: "fs_read".into(), arguments: "{}".into() },
+        }
+    }
+
+    /// The whole point of the fix: an interrupt keeps the user's instruction and every
+    /// **completed** step, and drops only the in-flight one.
+    ///
+    /// Rolling back to the start of the turn (the old behaviour) left the model with no context at
+    /// all — while the files on disk still carried the edits it had already made, so the history it
+    /// was given contradicted what it could read.
+    #[tokio::test]
+    async fn an_interrupt_keeps_the_instruction_and_the_completed_steps() {
+        let ws = std::env::temp_dir().join("aox-rollback-keep");
+        let _ = std::fs::create_dir_all(&ws);
+        let mut a = agent_with(&ws, "t", crate::workplace::Access::Read).await;
+
+        let mark = a.messages_len(); // before the turn, as both front ends record it
+        a.push_message(Message::user("rewrite the project"), None);
+        a.push_message(Message::assistant(None, None, vec![call("c1")]), None);
+        a.push_message(Message::tool_result("c1", "fs_read", "ok".into()), Some(false));
+        a.push_message(Message::assistant(None, None, vec![call("c2")]), None); // ← interrupted here
+
+        // [0] system · [1] user · [2] assistant(c1) · [3] tool(c1) · [4] assistant(c2) ← dangling
+        assert_eq!(a.interrupt_rollback_point(mark), 4, "only the dangling batch may go");
+
+        a.rollback_interrupted_turn(mark);
+        assert_eq!(a.messages_len(), 4);
+        assert_eq!(a.messages()[1].role, "user", "the user's instruction survives");
+        assert_eq!(a.messages()[3].role, "tool", "the completed step survives");
+        assert!(crate::message::is_legal_body(a.messages()), "and what remains is replayable");
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Half a parallel batch is **still** illegal: the endpoint wants a result for every call id, so
+    /// "keep the completed calls" cannot mean "keep everything". The whole batch goes — but the
+    /// user's instruction, which is all the model needs to carry on, stays.
+    #[tokio::test]
+    async fn half_a_parallel_batch_is_dropped_whole() {
+        let ws = std::env::temp_dir().join("aox-rollback-half");
+        let _ = std::fs::create_dir_all(&ws);
+        let mut a = agent_with(&ws, "t", crate::workplace::Access::Read).await;
+
+        let mark = a.messages_len();
+        a.push_message(Message::user("rewrite the project"), None);
+        a.push_message(Message::assistant(None, None, vec![call("c1"), call("c2")]), None);
+        a.push_message(Message::tool_result("c1", "fs_read", "ok".into()), Some(false)); // c2 missing
+
+        assert_eq!(a.interrupt_rollback_point(mark), 2, "the half-answered batch goes as a unit");
+        a.rollback_interrupted_turn(mark);
+        assert_eq!(a.messages_len(), 2);
+        assert_eq!(a.messages()[1].role, "user");
+        assert!(crate::message::is_legal_body(a.messages()));
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// When nothing was mid-flight there is nothing to undo, and the conversation file must not be
+    /// rewritten for nothing (`rollback_interrupted_turn` only calls `truncate_messages` when the
+    /// point actually moves).
+    ///
+    /// Covers the two shapes that mean "no rollback": a finished batch (the abort landed while
+    /// waiting for the next reply) and no tool call at all (the abort landed during the very first
+    /// request of the turn) — in the second case the user's instruction must still be kept.
+    #[tokio::test]
+    async fn an_interrupt_with_nothing_in_flight_rolls_back_nothing() {
+        let ws = std::env::temp_dir().join("aox-rollback-noop");
+        let _ = std::fs::create_dir_all(&ws);
+
+        let mut a = agent_with(&ws, "t", crate::workplace::Access::Read).await;
+        let mark = a.messages_len();
+        a.push_message(Message::user("rewrite the project"), None);
+        a.push_message(Message::assistant(None, None, vec![call("c1")]), None);
+        a.push_message(Message::tool_result("c1", "fs_read", "ok".into()), Some(false));
+        let before = a.messages_len();
+        assert_eq!(a.interrupt_rollback_point(mark), before);
+        a.rollback_interrupted_turn(mark);
+        assert_eq!(a.messages_len(), before, "a finished batch is left alone");
+
+        let mut b = agent_with(&ws, "t", crate::workplace::Access::Read).await;
+        let mark = b.messages_len();
+        b.push_message(Message::user("rewrite the project"), None);
+        let before = b.messages_len();
+        assert_eq!(b.interrupt_rollback_point(mark), before, "no tool call → nothing to drop");
+        b.rollback_interrupted_turn(mark);
+        assert_eq!(b.messages_len(), before, "the instruction is not thrown away");
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// The floor: `mark` is never crossed. Should a dangling batch somehow sit *before* this turn,
+    /// the rollback must not reach back into earlier history — the worst case is a no-op, never
+    /// "erase a previous turn as well".
+    #[tokio::test]
+    async fn the_rollback_never_reaches_past_the_turn_start() {
+        let ws = std::env::temp_dir().join("aox-rollback-floor");
+        let _ = std::fs::create_dir_all(&ws);
+        let mut a = agent_with(&ws, "t", crate::workplace::Access::Read).await;
+
+        a.push_message(Message::user("earlier turn"), None);
+        a.push_message(Message::assistant(None, None, vec![call("c1")]), None); // dangling, before mark
+        let mark = a.messages_len();
+
+        assert_eq!(a.interrupt_rollback_point(mark), mark, "the floor holds");
+        a.rollback_interrupted_turn(mark);
+        assert_eq!(a.messages_len(), mark);
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

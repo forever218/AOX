@@ -118,8 +118,9 @@ pub fn report(rt: &Runtime) -> String {
 /// - The cut point **naturally lands on a user message**, so no extra alignment is needed: dropping
 ///   the oldest whole turn leaves a suffix that is itself a legal request body — you never get the
 ///   state where "a tool result remains while its assistant was dropped", which the endpoint would
-///   reject with a straight 400. This is the only genuinely dangerous point in the whole trimming
-///   mechanism; see the `debug_assert` below.
+///   reject with a straight 400. That property is **not re-argued here**: it *is*
+///   [`crate::message::is_legal_body`], the crate's one definition of a legal boundary, and the
+///   `debug_assert` below simply checks this cut against it.
 fn trim_point(msgs: &[Message], max_rounds: usize) -> Option<usize> {
     if max_rounds == 0 {
         return None;
@@ -137,6 +138,14 @@ fn trim_point(msgs: &[Message], max_rounds: usize) -> Option<usize> {
     }
     let cut = turns[turns.len() - max_rounds];
     debug_assert_eq!(msgs[cut].role, "user", "the trim cut point must land on a user message");
+    // The surviving body must still be replayable: no `tool` result may be left without the
+    // `assistant` that asked for it. Checked against the shared definition rather than a
+    // hand-rolled version of it (the same predicate guards the interrupt rollback in `agent.rs`).
+    // Debug-only, so release builds pay nothing.
+    debug_assert!(
+        crate::message::is_legal_body(&msgs[cut..]),
+        "the trimmed body must remain a legal request body"
+    );
     Some(cut)
 }
 

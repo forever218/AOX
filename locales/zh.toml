@@ -163,7 +163,7 @@
 "Info" = "信息"
 "Input" = "输入"
 "Install Python runtime (~10 MB)" = "安装 Python 运行时（约 10 MB）"
-"Interrupted the current task (the conversation has been rolled back to its pre-task state; attachments in the pending-upload tray are still there)" = "已中断当前任务（对话已回滚到任务前状态；待上传栏里的附件仍在）"
+"Interrupted the current task (only the step that was still running was dropped; everything already done stays in context)" = "已中断当前任务（只丢掉了还没跑完的那一步，已完成的内容仍在上文中）"
 "Interrupting…" = "正在中断…"
 "Invalid number: {}" = "序号不合法: {}"
 "Join the blocks head-to-tail in true execution order; each line takes the color of the block it leaves" = "按真实执行顺序把各条色块首尾相连，线色取自出发的那一条"
