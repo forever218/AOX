@@ -2,7 +2,7 @@
 //! need it.
 //!
 //! Those two call sites are: showing an image inside the conversation
-//! (`app::App::poll_images`) and the illustration on the first screen ([`crate::brand::Art`]).
+//! (`app::App::poll_images`) and the first screen's background ([`crate::brand::Art`]).
 //! Both are exactly the same step: `aox::image::Bitmap` → `TextureHandle`.
 //!
 //! Why this deserves its own module instead of being written twice: **every argument here

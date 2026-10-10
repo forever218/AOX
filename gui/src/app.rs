@@ -324,13 +324,20 @@ pub struct App {
     /// Decoded / decoding images. The key is the **local path** (see [`Tex`]).
     tex: HashMap<PathBuf, Tex>,
 
-    /// The empty-state illustration (one light, one dark, embedded in the binary -- see
-    /// [`crate::brand`]).
+    /// The first screen's background (one pool for light, one for dark -- see [`crate::brand`]).
     ///
     /// Stored separately from `tex`: `tex` is keyed by path and driven by the conversation,
-    /// whereas this is **two fixed images** unrelated to it. Mixing them in would only blur
+    /// whereas this is **two pools of artwork** unrelated to it. Mixing them in would only blur
     /// what the map is keyed on.
     brand: brand::Art,
+
+    /// Why the background couldn't be shown, if it couldn't.
+    ///
+    /// The image is painted from inside `App::update` (it has to be laid down **before** the
+    /// transcript, so it sits behind the content), but the place with room for a line of text is
+    /// `empty_state`, which runs later -- so the reason is carried across in one field rather than
+    /// plumbed through `transcript` as a parameter.
+    brand_err: Option<String>,
 
     input: String,
     /// Attachments in the pending-upload bar (dragged in by the user / attached via
@@ -489,6 +496,7 @@ impl App {
             choice_reply: None,
             tex: HashMap::new(),
             brand: brand::Art::new(),
+            brand_err: None,
             input: String::new(),
             pending: Vec::new(),
             dragging_files: false,
@@ -911,6 +919,14 @@ impl App {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
+        // A brand-new conversation draws a fresh background (the user's ask: "pick one at startup
+        // and on every new conversation"). Opening an existing conversation keeps whatever is
+        // showing -- only `None` means "nothing has been said yet", which is the one state the
+        // background belongs to. Note that this re-rolls even when startup already rolled once:
+        // the second roll is the one that lands on screen, so there is nothing to reconcile.
+        if id.is_none() {
+            self.brand.reroll();
+        }
         // Swap out the previous conversation's in-progress state along with the activity
         // stream, otherwise the right side would show the new conversation while scrolling the
         // old conversation's tool calls.
@@ -1874,13 +1890,12 @@ impl App {
                         // nailed down once at the column root and every descendant Ui (including
                         // inside a Frame) inherits `Wrap`.
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                        // Until the real conversation starts, show the brand area first (there may
-                        // already be loading / error notices in `items` at this point)
-                        let started = self
-                            .items
-                            .iter()
-                            .any(|i| matches!(i, Item::User(..) | Item::Assistant(_)));
-                        if !started && self.live.is_none() {
+                        // Until the real conversation starts, show the first screen (there may
+                        // already be loading / error notices in `items` at this point). The same
+                        // predicate decides whether the background gets painted, in `App::update`
+                        // -- one function, so "the image is up" and "the first screen is up" cannot
+                        // drift apart.
+                        if self.on_empty_state() {
                             self.empty_state(ui);
                         }
                         // Image rendering has to consult the texture cache. `self.items` and
@@ -1916,39 +1931,52 @@ impl App {
         }
     }
 
+    /// Is the first screen (nothing said yet) the thing on show?
+    ///
+    /// This decides two things that must agree: whether the transcript draws the first screen, and
+    /// whether the background image is painted behind it. Notices that arrived before any message
+    /// (a load failure, "model not ready") do **not** end the first screen -- they are the first
+    /// screen's content, not a conversation.
+    fn on_empty_state(&self) -> bool {
+        self.live.is_none()
+            && !self
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::User(..) | Item::Assistant(_)))
+    }
+
     fn empty_state(&mut self, ui: &mut Ui) {
-        // The empty state is just the illustration (a pair supplied by the user on 2026-10-06:
-        // one light, one dark). The old "Hi there" line and the preset examples beneath it were
-        // removed at the user's request -- the empty state no longer presumes to think of what
-        // the user might say; it just has to look good.
-        let dark = theme::mode() == theme::Mode::Dark;
-        // A little room on each side, so the illustration doesn't press against the edge of the
-        // transcript area
-        let max_w = (ui.available_width() - 48.0).max(160.0);
-        let art_h = brand::height(dark, max_w);
+        // What used to be here was the illustration itself. It is now a **full-bleed background**
+        // painted behind the whole column (`App::update` -> `brand::show_background`), so there is
+        // nothing left to reserve space for or centre: the empty state is just the "model not
+        // ready" card, or nothing at all. The old "Hi there" line and the preset examples beneath
+        // it were removed at the user's request (2026-10-06) -- the empty state no longer presumes
+        // to think of what the user might say.
+        //
+        // A background that failed to load is reported *here* rather than where it was painted:
+        // this is where there is room for a line of text in the column, and "a file in the folder
+        // isn't really a PNG" is otherwise invisible -- the first screen would simply be plain, at
+        // random, which reads as "the feature is flaky".
+        if self.log_error.is_none() {
+            if let Some(e) = self.brand_err.clone() {
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(aox::tf!("The background image could not be loaded: {}", e))
+                            .color(P::text_faint())
+                            .size(13.0),
+                    );
+                });
+            }
+            return;
+        }
 
-        // The vertical position comes in two flavours, and neither is arbitrary:
-        // - Normal empty state: centred in "the region above the input box". The input box
-        //   **floats** at the bottom, and `COMPOSER_RESERVE` is exactly the height it takes up;
-        //   without subtracting it the illustration sits low overall.
-        // - With an error card (model not configured): not centred. The single most important
-        //   thing on screen then is that error, and centring the illustration would squash the
-        //   card downward or even push it out of the visible area.
-        // ⚠️ `ui.available_height()` **cannot** be used here: the Ui `empty_state` lives in is a
-        // sub-region nested inside `horizontal(...) -> vertical(...)`, and when it is created
-        // inside a horizontal layout its height is computed only from "whatever the content has
-        // used so far" -- measured at 30pt for a whole 828pt window, so the leftover came out
-        // exactly 0 and the illustration stuck to the top. Subtract the cursor's current y from
-        // the **clip rect** (the ScrollArea's viewport, i.e. the whole content area) and you get
-        // "how much visible room is left below".
-        let room =
-            (ui.clip_rect().bottom() - ui.next_widget_position().y - COMPOSER_RESERVE).max(0.0);
-        let top = if self.log_error.is_some() { 8.0 } else { ((room - art_h) * 0.5).max(0.0) };
-
-        ui.add_space(top);
+        // With an error card (model not configured) the card is **not** centred: the single most
+        // important thing on screen then is that error, and centring it would push it down out of
+        // sight on a short window. (This 8.0 is what the illustrated version used in the same case,
+        // so the card has not moved.)
+        ui.add_space(8.0);
         ui.vertical_centered(|ui| {
-            self.brand.show(ui, max_w);
-
             if let Some(err) = &self.log_error {
                 ui.add_space(38.0);
                 let w = 640.0_f32.min(ui.available_width() - 8.0);
@@ -2950,6 +2978,20 @@ impl eframe::App for App {
         let frame = Frame::NONE.fill(P::bg());
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             let column_rect = ui.max_rect();
+            // The first screen's background goes down **first**: the transcript and the floating
+            // input card (a Foreground `Area`) are then painted on top of it for free.
+            //
+            // It is painted from here rather than from inside `transcript` because that one lives in
+            // a scroll area: its coordinates are offset by the scroll, so a rect taken from there
+            // would land in the wrong place the moment the content is taller than the viewport.
+            //
+            // Only the first screen gets it. Once something has been said the column goes back to
+            // the plain background, exactly as before -- the picture belongs to the *empty* state.
+            self.brand_err = if self.on_empty_state() {
+                self.brand.show_background(ui, column_rect)
+            } else {
+                None
+            };
             // The transcript fills the whole central panel; no bottom bar is given up for the
             // input box any more
             self.transcript(ui);

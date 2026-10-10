@@ -29,6 +29,9 @@
 ;    * config.toml is not packaged (so a personal API key is never baked into the installer);
 ;      the program generates one on first run.
 ;    * plugins/ is not packaged either: the host creates plugins/sdk on startup.
+;    * assets/light + assets/dark ARE packaged: the first screen reads them at run time and picks
+;      one at random per theme (see gui/src/brand.rs). They are removable -- with no folder the
+;      exe falls back to the pair embedded in it -- so losing them degrades the look, not the app.
 ;    * Uninstalling does not delete plugins/ -- capability the model accumulated is kept.
 ;    * PATH is not written: the GUI edition doesn't need launching from a terminal, and this
 ;      avoids fighting with the CLI edition's PATH entry.
@@ -124,6 +127,13 @@ Source: "{#ProjectRoot}\assets\aox.ico";               DestDir: "{app}"; Flags: 
 Source: "{#ProjectRoot}\config.example.toml";          DestDir: "{app}"; Flags: ignoreversion
 Source: "{#ProjectRoot}\README.md";                    DestDir: "{app}"; Flags: ignoreversion isreadme
 Source: "{#ProjectRoot}\LICENSE";                      DestDir: "{app}"; Flags: ignoreversion
+; The first screen's background pools (`gui/src/brand.rs`): at run time the app lists
+; `assets\light\*.png` / `assets\dark\*.png` and picks one of each at random, re-rolling on
+; startup and on every new conversation. Missing them is not fatal -- the exe falls back to the
+; pair embedded in it -- hence `skipifsourcedoesntexist`: a checkout whose folders are still
+; empty must not fail the build.
+Source: "{#ProjectRoot}\assets\light\*.png"; DestDir: "{app}\assets\light"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#ProjectRoot}\assets\dark\*.png";  DestDir: "{app}\assets\dark";  Flags: ignoreversion skipifsourcedoesntexist
 #ifdef BUNDLE_PYTHON
 ; Bundled variant: the Python runtime goes straight into the application directory, and the
 ; host discovers <app root>\runtime\python\python.exe on startup (tier 2 of the three-tier
