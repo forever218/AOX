@@ -231,16 +231,231 @@ impl Tool for WriteFileTool {
             }
         }
         let existed = path.exists();
+        // Read the previous version **before** overwriting it — this is the only moment both
+        // versions are in hand, and the "+N / −N" the UI shows comes from comparing them.
+        // A file that is missing starts from empty (everything counts as added); one that is not
+        // valid UTF-8 text yields `None`, and "no number" is the honest answer in that case.
+        let previous = if existed { std::fs::read_to_string(&path).ok() } else { Some(String::new()) };
         match std::fs::write(&path, content.as_bytes()) {
-            Ok(()) => ToolOutput::ok(crate::tf!(
-                "{} {} ({} bytes)",
-                if existed { crate::i18n::t("Overwrote") } else { crate::i18n::t("Created") },
-                path.display(),
-                content.len()
-            )),
+            Ok(()) => {
+                let out = ToolOutput::ok(crate::tf!(
+                    "{} {} ({} bytes)",
+                    if existed { crate::i18n::t("Overwrote") } else { crate::i18n::t("Created") },
+                    path.display(),
+                    content.len()
+                ));
+                match &previous {
+                    Some(old) => {
+                        let (added, removed) = line_diff(old, content);
+                        out.with_diff(added, removed).with_diff_detail(diff_text(old, content))
+                    }
+                    None => out,
+                }
+            }
             Err(e) => ToolOutput::err(crate::tf!("failed to write {}: {}", path.display(), e)),
         }
     }
+}
+
+/// Beyond this many (post-trim) lines the LCS table is skipped, see below.
+const DIFF_MAX_LINES: usize = 2000;
+
+/// Lines added / removed between `old` and `new`, as a **line-level** LCS — not a character diff.
+///
+/// Written by hand rather than pulled from a crate: this is the project's only diff, the inputs are
+/// source-code sized, and answering "how much did that write change" should not cost a dependency.
+/// A common head/tail is trimmed first (edits are usually local, and that is what keeps the table
+/// small in the normal case); the LCS itself uses two rolling rows, so memory stays `O(min(n, m))`
+/// instead of `O(n·m)`. Past `DIFF_MAX_LINES` the table is skipped entirely and a blunt line-by-line
+/// comparison is used — it never *under*-reports a change, which is the direction that matters for a
+/// number a human reads at a glance.
+fn line_diff(old: &str, new: &str) -> (usize, usize) {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+
+    let mut head = 0;
+    while head < a.len() && head < b.len() && a[head] == b[head] {
+        head += 1;
+    }
+    let mut tail = 0;
+    while tail < a.len() - head && tail < b.len() - head && a[a.len() - 1 - tail] == b[b.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    let a = &a[head..a.len() - tail];
+    let b = &b[head..b.len() - tail];
+
+    if a.len() > DIFF_MAX_LINES || b.len() > DIFF_MAX_LINES {
+        let common = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
+        return (b.len() - common, a.len() - common);
+    }
+
+    // LCS length, computed bottom-up with only two rows alive at once.
+    let mut prev = vec![0u32; b.len() + 1];
+    let mut cur = vec![0u32; b.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            cur[j] = if a[i] == b[j] { prev[j + 1] + 1 } else { prev[j].max(cur[j + 1]) };
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    let lcs = prev[0] as usize;
+    // Everything not in the LCS was added (on the new side) or removed (on the old side).
+    (b.len() - lcs, a.len() - lcs)
+}
+
+/// Unchanged lines kept around each change in the unfolded diff.
+const DIFF_CONTEXT: usize = 3;
+/// Most lines the unfolded diff carries; past this it is cut off and says so.
+const DIFF_SHOW_MAX: usize = 400;
+/// Longest line drawn in the unfolded diff, in characters — a minified file is one enormous line.
+const DIFF_LINE_MAX: usize = 200;
+/// Above this many cells the alignment table is skipped and the two middles are drawn as one block of
+/// removals followed by one block of additions (see [`diff_text`]). ~1 MB of `u32`.
+const DIFF_TABLE_CELLS: usize = 250_000;
+/// The marker for a stretch of the file left out of the unfolded diff.
+const ELISION: &str = "⋯";
+
+/// Render the difference between two versions of a file, ready to be drawn line by line.
+///
+/// Each output line starts with `+` (added), `-` (removed) or a space (context); a line that is only
+/// `⋯` stands in for a stretch left out. That is the classic shape on purpose: a front end can tell
+/// what a line is from its first character alone, with no extra structure to pass around.
+///
+/// Alignment is the same head/tail trim + LCS as [`line_diff`], and is only attempted while the
+/// changed middles are small enough to hold a table; past [`DIFF_TABLE_CELLS`] the two middles are
+/// drawn as one block of removals followed by one block of additions. That fallback degrades the
+/// *interleaving*, never the information — and a file written from scratch is all additions anyway.
+fn diff_text(old: &str, new: &str) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+
+    let mut head = 0;
+    while head < a.len() && head < b.len() && a[head] == b[head] {
+        head += 1;
+    }
+    let mut tail = 0;
+    while tail < a.len() - head && tail < b.len() - head && a[a.len() - 1 - tail] == b[b.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    let mid_a = &a[head..a.len() - tail];
+    let mid_b = &b[head..b.len() - tail];
+
+    // The changes, as (prefix, text). Nothing is trimmed off the ends any more, so the first and the
+    // last entry are always a real change.
+    let mut ops: Vec<(char, &str)> = Vec::new();
+    if mid_a.len().saturating_mul(mid_b.len()) <= DIFF_TABLE_CELLS {
+        // The full table, so walking it back can tell an insertion from a deletion properly (the
+        // two-rolling-row trick `line_diff` uses saves memory by throwing that information away).
+        let cols = mid_b.len() + 1;
+        let mut dp = vec![0u32; (mid_a.len() + 1) * cols];
+        for i in (0..mid_a.len()).rev() {
+            for j in (0..mid_b.len()).rev() {
+                dp[i * cols + j] = if mid_a[i] == mid_b[j] {
+                    dp[(i + 1) * cols + j + 1] + 1
+                } else {
+                    dp[(i + 1) * cols + j].max(dp[i * cols + j + 1])
+                };
+            }
+        }
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < mid_a.len() && j < mid_b.len() {
+            if mid_a[i] == mid_b[j] {
+                ops.push((' ', mid_a[i]));
+                i += 1;
+                j += 1;
+            } else if dp[(i + 1) * cols + j] >= dp[i * cols + j + 1] {
+                ops.push(('-', mid_a[i]));
+                i += 1;
+            } else {
+                ops.push(('+', mid_b[j]));
+                j += 1;
+            }
+        }
+        // One side ran out first; whatever is left of the other is a plain tail.
+        for l in &mid_a[i..] {
+            ops.push(('-', l));
+        }
+        for l in &mid_b[j..] {
+            ops.push(('+', l));
+        }
+    } else {
+        for l in mid_a {
+            ops.push(('-', l));
+        }
+        for l in mid_b {
+            ops.push(('+', l));
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    // Context above the change, and an elision marker when there is more file above that.
+    if head > 0 {
+        let start = head.saturating_sub(DIFF_CONTEXT);
+        if start > 0 {
+            out.push(ELISION.to_string());
+        }
+        for l in &a[start..head] {
+            out.push(format!(" {}", clip_line(l)));
+        }
+    }
+    // Unchanged runs *inside* the change are elided too: one edited line in the middle of a long
+    // block should not drag the whole block onto the screen.
+    let mut k = 0;
+    while k < ops.len() {
+        if ops[k].0 != ' ' {
+            out.push(format!("{}{}", ops[k].0, clip_line(ops[k].1)));
+            k += 1;
+            continue;
+        }
+        let run = k;
+        while k < ops.len() && ops[k].0 == ' ' {
+            k += 1;
+        }
+        if k - run <= DIFF_CONTEXT * 2 + 1 {
+            for op in &ops[run..k] {
+                out.push(format!(" {}", clip_line(op.1)));
+            }
+        } else {
+            for op in &ops[run..run + DIFF_CONTEXT] {
+                out.push(format!(" {}", clip_line(op.1)));
+            }
+            out.push(ELISION.to_string());
+            for op in &ops[k - DIFF_CONTEXT..k] {
+                out.push(format!(" {}", clip_line(op.1)));
+            }
+        }
+    }
+    if tail > 0 {
+        let shown = DIFF_CONTEXT.min(tail);
+        for l in &a[a.len() - tail..a.len() - tail + shown] {
+            out.push(format!(" {}", clip_line(l)));
+        }
+        if tail > shown {
+            out.push(ELISION.to_string());
+        }
+    }
+
+    if out.len() > DIFF_SHOW_MAX {
+        let rest = out.len() - DIFF_SHOW_MAX;
+        out.truncate(DIFF_SHOW_MAX);
+        out.push(crate::tf!("… {} more lines", rest));
+    }
+    out.join("\n")
+}
+
+/// One line of the unfolded diff, clipped — a single minified line must not smuggle a whole file in.
+fn clip_line(s: &str) -> String {
+    let mut out = String::new();
+    for (n, c) in s.chars().enumerate() {
+        if n >= DIFF_LINE_MAX {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 // ---------------------------------------------------------------- list_dir
@@ -424,14 +639,14 @@ impl Tool for RemoveTool {
         host_tool_access(self.name())
     }
     fn description(&self) -> &str {
-        crate::i18n::t("Delete a file or an empty directory (provided by the host; subject to the workspace). Deleting a non-empty directory requires an explicit recursive = true.")
+        crate::i18n::t("Move a file or an empty directory to the system recycle bin (provided by the host; subject to the workspace) — nothing is erased, and the user can still restore it. Moving a non-empty directory as a whole requires an explicit recursive = true.")
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                PATH_ARG: {"type": "string", "description": crate::i18n::t("Path to delete (absolute, inside the workspace)")},
-                "recursive": {"type": "boolean", "description": crate::i18n::t("Whether to delete a non-empty directory recursively; default false")}
+                PATH_ARG: {"type": "string", "description": crate::i18n::t("Path to move to the recycle bin (absolute, inside the workspace)")},
+                "recursive": {"type": "boolean", "description": crate::i18n::t("Whether to move a non-empty directory to the recycle bin as a whole; default false")}
             },
             "required": [PATH_ARG]
         })
@@ -460,33 +675,33 @@ impl Tool for RemoveTool {
             return ToolOutput::err(crate::tf!("{} does not exist", path.display()));
         }
         let recursive = args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
-        let is_dir = path.is_dir();
-        if is_dir {
-            if !recursive {
-                // A non-empty directory won't be deleted: this is the only gate
-                // against "one slip wipes out a whole tree"
-                let non_empty = std::fs::read_dir(&path).map(|mut it| it.next().is_some()).unwrap_or(false);
-                if non_empty {
-                    return ToolOutput::err(crate::tf!(
-                        "{} is a non-empty directory. To really delete it recursively, pass recursive = true explicitly.",
-                        path.display()
-                    ));
-                }
+        // A **non-empty directory** is the only case that has to ask permission out loud: it is the
+        // one shape of call that can send a whole tree to the bin on a single slip. A file, and an
+        // empty directory, go without a second thought.
+        if !recursive && path.is_dir() {
+            let non_empty = std::fs::read_dir(&path).map(|mut it| it.next().is_some()).unwrap_or(false);
+            if non_empty {
+                return ToolOutput::err(crate::tf!(
+                    "{} is a non-empty directory. To move it to the recycle bin as a whole, pass recursive = true explicitly.",
+                    path.display()
+                ));
             }
-            let r = if recursive { std::fs::remove_dir_all(&path) } else { std::fs::remove_dir(&path) };
-            match r {
-                Ok(()) => ToolOutput::ok(crate::tf!(
-                    "Deleted directory {} ({})",
-                    path.display(),
-                    if recursive { crate::i18n::t("recursive") } else { crate::i18n::t("empty dir") }
-                )),
-                Err(e) => ToolOutput::err(crate::tf!("failed to delete directory {}: {}", path.display(), e)),
-            }
-        } else {
-            match std::fs::remove_file(&path) {
-                Ok(()) => ToolOutput::ok(crate::tf!("Deleted file {}", path.display())),
-                Err(e) => ToolOutput::err(crate::tf!("failed to delete file {}: {}", path.display(), e)),
-            }
+        }
+        // Count **before** the move: once the shell has taken the files there is nothing left to
+        // walk, and the shell does not tell us how much it took (see `recycle::count_files`). That
+        // number is what the UI turns into "N files moved to the recycle bin".
+        let count = crate::recycle::count_files(&path);
+        // The delete goes to the **recycle bin**, not to oblivion — see the module note in
+        // `crate::recycle` for why it is the shell's own delete rather than `remove_file`, and for
+        // the two cases where the shell can still erase outright.
+        match crate::recycle::recycle(&path).await {
+            Ok(()) => ToolOutput::ok(crate::tf!("Moved {} to the system recycle bin", path.display()))
+                .with_recycled(count),
+            Err(e) => ToolOutput::err(crate::tf!(
+                "failed to move {} to the system recycle bin: {}",
+                path.display(),
+                format!("{e:#}")
+            )),
         }
     }
 }
@@ -496,6 +711,53 @@ mod tests {
     use super::*;
     use crate::config::{Config, WorkplaceConfig};
     use crate::runtime::Runtime;
+
+    #[test]
+    fn line_diff_counts_insertions_and_deletions() {
+        // A file appearing from nothing is all additions; emptying one is all removals.
+        assert_eq!(line_diff("", "a\nb"), (2, 0));
+        assert_eq!(line_diff("a\nb", ""), (0, 2));
+        // Neither side changed.
+        assert_eq!(line_diff("a\nb\nc", "a\nb\nc"), (0, 0));
+    }
+
+    #[test]
+    fn line_diff_leaves_shared_lines_out_of_the_tally() {
+        // One middle line swapped: exactly 1 added and 1 removed, neighbours untouched.
+        assert_eq!(line_diff("a\nb\nc\n", "a\nB\nc\n"), (1, 1));
+        // A pure append is 1 added, 0 removed.
+        assert_eq!(line_diff("a\nb\n", "a\nb\nc\n"), (1, 0));
+    }
+
+    /// The unfolded diff. The prefixes are the whole contract with the front end, and the elisions
+    /// are what keep a one-line edit from dragging an entire file onto the screen.
+    #[test]
+    fn diff_text_marks_every_line_and_elides_the_unchanged() {
+        // A file appearing from nothing is additions and nothing else.
+        assert_eq!(diff_text("", "a\nb"), "+a\n+b");
+        // Nothing changed at all: no change lines to show.
+        assert_eq!(diff_text("a\nb\n", "a\nb\n"), " a\n b");
+        // One edited line inside a long file: the change, three lines of context on each side, and an
+        // elision marker wherever the rest of the file was left out.
+        let old: String = (0..12).map(|i| format!("line{i}\n")).collect();
+        let new = old.replace("line5\n", "LINE5\n");
+        assert_eq!(
+            diff_text(&old, &new),
+            "⋯\n line2\n line3\n line4\n-line5\n+LINE5\n line6\n line7\n line8\n⋯"
+        );
+        // An unchanged stretch *between* two changes is elided the same way.
+        let a = "a\nX\nc1\nc2\nc3\nc4\nc5\nc6\nc7\nc8\nc9\nc10\nY\nz";
+        let b = "a\nX2\nc1\nc2\nc3\nc4\nc5\nc6\nc7\nc8\nc9\nc10\nY2\nz";
+        let d = diff_text(a, b);
+        assert!(d.contains("-X\n+X2\n"), "{d}");
+        assert!(d.contains("⋯"), "the middle stretch should be elided: {d}");
+        // Past the size the panel may grow to, the diff is cut off — and says so rather than
+        // pretending the file ended there.
+        let big: String = (0..DIFF_SHOW_MAX + 50).map(|i| format!("l{i}\n")).collect();
+        let d = diff_text("", &big);
+        assert_eq!(d.lines().count(), DIFF_SHOW_MAX + 1);
+        assert!(d.ends_with(" more lines"), "{d}");
+    }
 
     /// Build a runtime with a "fixed workplace", to verify the tools really are
     /// bound by the boundary.

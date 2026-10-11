@@ -24,8 +24,21 @@ pub enum AgentEvent {
     ToolCall { name: String, args: Value },
     /// The tool passed authorisation and is starting to run (may take a while)
     ToolRunning { name: String, timeout_secs: u64 },
-    /// The tool call finished
-    ToolResult { name: String, is_error: bool, preview: String },
+    /// The tool call finished. `diff` is the edit statistic — `(added, removed)` lines, or `None`
+    /// when the call was not an edit; the GUI shows it as "+N / −N" on the call's own row. The same
+    /// row can be unfolded, and `diff_detail` is what it then draws — the diff itself, one line per
+    /// entry, each prefixed with `+`, `-` or a space (see `ToolOutput::diff_detail`).
+    ///
+    /// `#[allow(dead_code)]` for the same reason `Images` carries it: `src/main.rs` (the CLI bin)
+    /// compiles these modules a second time, and there the variant is only ever **written**.
+    #[allow(dead_code)]
+    ToolResult {
+        name: String,
+        is_error: bool,
+        preview: String,
+        diff: Option<(usize, usize)>,
+        diff_detail: Option<String>,
+    },
     Info(String),
     Warn(String),
     Error(String),
@@ -44,6 +57,17 @@ pub enum AgentEvent {
     /// the same-named modules" entry in `TRAPS.md`).
     #[allow(dead_code)]
     Images(Vec<std::path::PathBuf>),
+    /// **N files were moved to the system recycle bin** by a host file tool.
+    ///
+    /// A variant of its own rather than a sentence inside `Info`, for the same split as `Images`:
+    /// the CLI prints one dim line, whereas the graphical front end shows a **transient toast**
+    /// that fades away by itself. `Info` is the shape for neither — a note is a permanent line in
+    /// the transcript, which is the wrong weight for "something is in the bin now". It also
+    /// carries a **number, not a sentence**: the wording belongs to the front end.
+    ///
+    /// Emitted only when the count is non-zero, so "no event" means "nothing was deleted" — a
+    /// front end never has to decide whether a zero is worth mentioning.
+    Recycled(usize),
 }
 
 /// The outcome of an authorisation prompt

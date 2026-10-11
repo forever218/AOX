@@ -363,7 +363,13 @@ impl AgentLoop for StandardLoop {
                         // result as-is (exactly as before hooks existed).
                         let out = ToolOutput::err(crate::tf!("tool arguments are not valid JSON: {}", e));
                         ui.emit(AgentEvent::ToolCall { name: name.clone(), args: json!({}) });
-                        ui.emit(AgentEvent::ToolResult { name: name.clone(), is_error: true, preview: out.content.clone() });
+                        ui.emit(AgentEvent::ToolResult {
+                            name: name.clone(),
+                            is_error: true,
+                            preview: out.content.clone(),
+                            diff: None,
+                            diff_detail: None,
+                        });
                         agent.push_message(Message::tool_result(&call.id, &name, out.content), Some(true));
                         continue;
                     }
@@ -378,7 +384,13 @@ impl AgentLoop for StandardLoop {
                 if let Verdict::Reject(why) = rt.hooks.before_tool(&rt, &name, &mut args).await {
                     let out = ToolOutput::err(why);
                     ui.emit(AgentEvent::ToolCall { name: name.clone(), args: args.clone() });
-                    ui.emit(AgentEvent::ToolResult { name: name.clone(), is_error: true, preview: out.content.clone() });
+                    ui.emit(AgentEvent::ToolResult {
+                            name: name.clone(),
+                            is_error: true,
+                            preview: out.content.clone(),
+                            diff: None,
+                            diff_detail: None,
+                        });
                     agent.push_message(Message::tool_result(&call.id, &name, out.content), Some(true));
                     continue;
                 }
@@ -395,7 +407,17 @@ impl AgentLoop for StandardLoop {
                     name: name.clone(),
                     is_error: output.is_error,
                     preview: truncate(&output.content, 300),
+                    diff: output.diff,
+                    diff_detail: output.diff_detail,
                 });
+                // A delete lands in the **recycle bin**, and that is worth saying out loud: "it is
+                // not really gone" is the one thing a user has to know about a delete, and it is
+                // invisible from the transcript. The number comes from the result and nowhere else
+                // (see `ToolOutput::recycled`) — the tool's own `content` says it too, but that
+                // line is written for the model, whereas this event is the shape for a human.
+                if output.recycled > 0 {
+                    ui.emit(AgentEvent::Recycled(output.recycled));
+                }
                 let content = cap_chars(&output.content, rt.config.agent.max_result_chars);
                 produced.extend(output.attach.iter().cloned());
                 agent.push_message(

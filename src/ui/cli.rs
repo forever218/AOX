@@ -304,7 +304,7 @@ impl CliUi {
             AgentEvent::ToolRunning { name, .. } => {
                 self.set_label(&crate::tf!("running {}", name));
             }
-            AgentEvent::ToolResult { name, is_error, preview } => {
+            AgentEvent::ToolResult { name, is_error, preview, .. } => {
                 if let Some(t) = self.turn.as_mut() {
                     // Attach to the most recent step with the same name that has no result yet
                     match t.steps.iter_mut().rev().find(|s| s.name == name && s.result.is_none()) {
@@ -321,6 +321,11 @@ impl CliUi {
             AgentEvent::Info(m) => self.push_note('i', m),
             AgentEvent::Warn(m) => self.push_note('w', m),
             AgentEvent::Error(m) => self.push_note('e', m),
+            // The files went to the recycle bin. A **note** here (folded into the turn summary,
+            // unfolded with `/expand`) rather than a line of its own: a terminal has no "vanish
+            // after a few seconds", so a permanent line per delete would end up as clutter — and
+            // the tool result printed just above already names the path.
+            AgentEvent::Recycled(n) => self.push_note('i', crate::recycle::notice(n)),
             // An image produced by a tool: the terminal has nowhere to draw it. **Silently dropping
             // it** is deliberate — the accompanying message already lists the filenames (see
             // `attach`'s path list), and adding a "there's an image but it can't be shown" line
@@ -414,7 +419,7 @@ impl Ui for CliUi {
                 );
             }
             // ── Tool result: a green/red marker + a one-line summary
-            AgentEvent::ToolResult { name, is_error, preview } => {
+            AgentEvent::ToolResult { name, is_error, preview, .. } => {
                 let (mark, tag) = if is_error {
                     (s::red("✗"), s::red(crate::i18n::t("failed")))
                 } else {
@@ -431,6 +436,11 @@ impl Ui for CliUi {
             AgentEvent::Info(msg) => println!("{} {}", s::cyan("·"), s::dim(&msg)),
             AgentEvent::Warn(msg) => println!("{} {}", s::yellow("!"), s::yellow(&msg)),
             AgentEvent::Error(msg) => println!("{} {}", s::red("✗"), s::red(&msg)),
+            AgentEvent::Recycled(n) => println!(
+                "{} {}",
+                s::cyan("·"),
+                s::dim(&crate::recycle::notice(n))
+            ),
             AgentEvent::Images(_) => {}
         }
     }

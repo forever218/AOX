@@ -316,12 +316,29 @@ struct Palette {
     on_reverse: Color32,
     /// Drop-shadow color for floating cards. A faint ink is enough in light mode; in dark mode shadows are nearly invisible, so we compensate by darkening.
     shadow: Color32,
-    /// **The only hue in the entire palette**: dangerous actions (currently used only at the single "full access" point).
+    /// Dangerous actions — a brick-red (used at the single "full access" point).
     ///
-    /// The row above deliberately expresses semantics through lightness alone, but "past the boundary there is no boundary" is worth one exception —
-    /// it is the only toggle that, **once clicked, crosses every protection**, and lightness steps cannot convey "this is not an ordinary option".
-    /// So only this one spot keeps a brick-red; everything else stays fully gray.
+    /// Most of this palette expresses meaning through lightness alone; this is the first deliberate
+    /// exception, because "past the boundary there is no boundary" is not something a lightness step
+    /// can say. `add_green` / `del_red` and the `toast_*` trio are the other, smaller exceptions —
+    /// every hue in the struct carries a meaning, none of them is decoration.
     danger: Color32,
+    /// Lines **added** by an edit (the `+N` after a tool name). A calm green: it sits inside a text
+    /// row, so it has to read as information rather than as a signal light.
+    add_green: Color32,
+    /// Lines **removed** by an edit (the `−N` after a tool name).
+    del_red: Color32,
+    /// Background of the transient toast. A pale red — a softened relative of `danger`.
+    ///
+    /// The toast reports something that already happened (e.g. files moved to the recycle bin), so it
+    /// must read as a notice at a glance instead of blending into the ordinary gray cards. A washed-out
+    /// red does that without shouting; the text stays the regular ink color, so it remains legible.
+    toast_bg: Color32,
+    /// Border of the transient toast: one step darker than `toast_bg`, same hue.
+    toast_border: Color32,
+    /// Foreground of the toast — the text and the icon next to it. A **deep red**, darker than the
+    /// fill so the notice reads as red without turning into a signal light.
+    toast_text: Color32,
 }
 
 /// Paper: a slightly warm white, not pure white.
@@ -346,6 +363,14 @@ const LIGHT: Palette = Palette {
     shadow: Color32::from_rgba_unmultiplied_const(0x1A, 0x19, 0x16, 26),
     // Brick-red: not a signal-bright red, but a settled red that holds up on the page (in tune with the warm paper base).
     danger: Color32::from_rgb(0x9E, 0x2B, 0x21),
+    // Edit statistics: a settled green / red that hold up as text on the paper base (same calibration
+    // as `danger` — legible, not fluorescent).
+    add_green: Color32::from_rgb(0x2F, 0x7D, 0x4F),
+    del_red: Color32::from_rgb(0xA8, 0x32, 0x2A),
+    // A pale brick tint: the same hue as `danger`, lifted almost to paper so the toast pops out of the gray.
+    toast_bg: Color32::from_rgb(0xFA, 0xE7, 0xE3),
+    toast_border: Color32::from_rgb(0xEB, 0xC0, 0xB8),
+    toast_text: Color32::from_rgb(0x7A, 0x23, 0x1B),
 };
 
 /// Ink: a warm-tinted black, not pure black.
@@ -371,6 +396,15 @@ const DARK: Palette = Palette {
     // On the ink base we cannot reuse the light-mode brick-red (#9E2B21 is too dark to read on a near-black base),
     // so we swap in a brighter red of the same hue — still a "red" within the paper-and-ink system, not a signal light.
     danger: Color32::from_rgb(0xE0, 0x6C, 0x5C),
+    // Same hue family as the light theme, lifted one step so they read on the ink base.
+    add_green: Color32::from_rgb(0x5F, 0xBF, 0x7A),
+    del_red: Color32::from_rgb(0xDE, 0x80, 0x74),
+    // On the ink base a "pale red" means low-saturation dark: the hue has to be read off the warm tint, not the lightness.
+    toast_bg: Color32::from_rgb(0x35, 0x22, 0x1F),
+    toast_border: Color32::from_rgb(0x67, 0x3A, 0x32),
+    // On the ink base "deep red" would be unreadable, so the foreground flips to a light red of the
+    // same hue — the pale fill and the deep-on-light relationship are preserved in reverse.
+    toast_text: Color32::from_rgb(0xF0, 0xC0, 0xB8),
 };
 
 /// The two palettes after config overrides are merged in. Written once at `apply`, then read-only — so color lookups stay zero-cost.
@@ -412,6 +446,13 @@ fn merge_palette(base: &Palette, ov: &PaletteConfig) -> Palette {
         on_reverse: c(base.on_reverse, ov.on_reverse),
         shadow: c(base.shadow, ov.shadow),
         danger: c(base.danger, ov.danger),
+        // Not configurable: edit statistics are a fixed pairing, kept internal like the toast tint.
+        add_green: base.add_green,
+        del_red: base.del_red,
+        // Not configurable: the toast tint is a derived companion of `danger`, kept internal.
+        toast_bg: base.toast_bg,
+        toast_border: base.toast_border,
+        toast_text: base.toast_text,
     }
 }
 
@@ -490,6 +531,26 @@ impl P {
     /// that **cross every protection once clicked**; do not treat it as an ordinary accent.
     pub fn danger() -> Color32 {
         pal().danger
+    }
+    /// Foreground of the "lines added" figure in a tool row.
+    pub fn add_green() -> Color32 {
+        pal().add_green
+    }
+    /// Foreground of the "lines removed" figure in a tool row.
+    pub fn del_red() -> Color32 {
+        pal().del_red
+    }
+    /// Pale-red background of the transient toast (see `Palette::toast_bg`).
+    pub fn toast_bg() -> Color32 {
+        pal().toast_bg
+    }
+    /// Border of the transient toast.
+    pub fn toast_border() -> Color32 {
+        pal().toast_border
+    }
+    /// Foreground of the transient toast (its text and icon).
+    pub fn toast_text() -> Color32 {
+        pal().toast_text
     }
 }
 

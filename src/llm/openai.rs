@@ -252,6 +252,11 @@ impl StreamAcc {
             for (fallback, tc) in arr.iter().enumerate() {
                 let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(fallback as u64);
                 let entry = self.tool_calls.entry(idx).or_default();
+                // What this fragment actually carried, to hand to the UI below. The name and the
+                // arguments are collected rather than sent one by one so a fragment that brings
+                // both produces a single callback.
+                let mut name_delta: &str = "";
+                let mut arg_delta: &str = "";
                 if let Some(id) = tc.get("id").and_then(Value::as_str) {
                     if !id.is_empty() {
                         entry.id = id.to_string();
@@ -261,10 +266,21 @@ impl StreamAcc {
                     if let Some(n) = f.get("name").and_then(Value::as_str) {
                         if !n.is_empty() {
                             entry.name = n.to_string();
+                            name_delta = n;
                         }
                     }
                     if let Some(a) = f.get("arguments").and_then(Value::as_str) {
                         entry.arguments.push_str(a);
+                        arg_delta = a;
+                    }
+                }
+                // Tell the UI a call is being **written right now**. This stretches before the tool
+                // ever runs — the loop only sees tool calls once the whole response has landed — and
+                // for `write_file` it is by far the longest part of the job, so it is the only place
+                // a live "how much has arrived" reading can come from.
+                if let Some(s) = sink {
+                    if !name_delta.is_empty() || !arg_delta.is_empty() {
+                        s.on_tool_call(idx, name_delta, arg_delta);
                     }
                 }
             }

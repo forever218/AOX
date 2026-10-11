@@ -25,6 +25,7 @@ pub mod message;
 pub mod paths;
 pub mod plugin;
 pub mod prompt;
+pub mod recycle;
 pub mod runtime;
 pub mod runtimes;
 pub mod sandbox;

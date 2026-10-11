@@ -63,19 +63,82 @@ pub struct ToolOutput {
     /// `tool` result. The main loop injects them as a separate user message instead (see the
     /// closing section of `agent_loop`).
     pub attach: Vec<std::path::PathBuf>,
+    /// How many files this call **moved to the system recycle bin** (0 = "this call wasn't a
+    /// delete").
+    ///
+    /// It rides on the result for exactly the same reason `attach` does: it is *this step's*
+    /// outcome, so travelling with the result gives it the right owner and the right order for
+    /// free. Two things make a field the only workable shape here — the count has to be taken
+    /// **before** the move (afterwards the files are gone and there is nothing left to count), and
+    /// the UI needs a **number**, not prose: the `content` string below is written for the model,
+    /// and making a front end parse a sentence back out of it to feed a toast would be a needless
+    /// round trip through text. The front end does the wording (see `AgentEvent::Recycled`).
+    pub recycled: usize,
+    /// **Lines added / removed** by this call, when it edited a text file — `(added, removed)`.
+    ///
+    /// `None` means "this call wasn't an edit" (a read, a listing…), which is deliberately not the
+    /// same as `Some((0, 0))`: the latter is a real edit that happened to change nothing, and the UI
+    /// should say something different (nothing) for the two.
+    ///
+    /// Like `recycled`, it rides on the result because it is *this step's* outcome, and the UI wants
+    /// two **numbers** rather than a sentence: the diff has to be computed while both versions are
+    /// still in hand (see `write_file`), and having a front end re-parse prose to find them would be
+    /// a needless round trip through text.
+    pub diff: Option<(usize, usize)>,
+    /// The diff itself, ready to draw — one line per entry, each prefixed with `+`, `-` or a space
+    /// (`⋯` marks elided stretches). `None` when the call was not an edit.
+    ///
+    /// It travels beside the two counts rather than instead of them: the counts are what the row
+    /// shows at a glance, this is what the row unfolds into. Rendered **here**, in the tool, for the
+    /// same reason the counts are computed here — both versions of the file exist for exactly one
+    /// moment, and only this side can still see them.
+    pub diff_detail: Option<String>,
 }
 
 impl ToolOutput {
     pub fn ok(s: impl Into<String>) -> Self {
-        Self { content: s.into(), is_error: false, attach: Vec::new() }
+        Self {
+            content: s.into(),
+            is_error: false,
+            attach: Vec::new(),
+            recycled: 0,
+            diff: None,
+            diff_detail: None,
+        }
     }
+
     pub fn err(s: impl Into<String>) -> Self {
-        Self { content: s.into(), is_error: true, attach: Vec::new() }
+        Self {
+            content: s.into(),
+            is_error: true,
+            attach: Vec::new(),
+            recycled: 0,
+            diff: None,
+            diff_detail: None,
+        }
     }
 
     /// Carry the files this tool produced. Chain it after `ok(..)` / `err(..)`.
     pub fn with_attach(mut self, paths: Vec<std::path::PathBuf>) -> Self {
         self.attach = paths;
+        self
+    }
+
+    /// Report that this call sent `n` files to the recycle bin. Chain it after `ok(..)`.
+    pub fn with_recycled(mut self, n: usize) -> Self {
+        self.recycled = n;
+        self
+    }
+
+    /// Report how many lines this call **added / removed**. Chain it after `ok(..)`.
+    pub fn with_diff(mut self, added: usize, removed: usize) -> Self {
+        self.diff = Some((added, removed));
+        self
+    }
+
+    /// Carry the diff to draw when the row is unfolded. Chain it after `with_diff(..)`.
+    pub fn with_diff_detail(mut self, detail: String) -> Self {
+        self.diff_detail = Some(detail);
         self
     }
 }

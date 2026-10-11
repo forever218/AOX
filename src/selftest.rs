@@ -189,6 +189,8 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
         struct Capture {
             reasoning: Mutex<String>,
             content: Mutex<String>,
+            /// Every `on_tool_call` callback, in the order it fired: `(index, name, fragment)`.
+            tools: Mutex<Vec<(u64, String, String)>>,
         }
         impl StreamSink for Capture {
             fn on_reasoning(&self, delta: &str) {
@@ -196,6 +198,9 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
             }
             fn on_content(&self, delta: &str) {
                 self.content.lock().unwrap().push_str(delta);
+            }
+            fn on_tool_call(&self, index: u64, name: &str, delta: &str) {
+                self.tools.lock().unwrap().push((index, name.to_string(), delta.to_string()));
             }
         }
 
@@ -279,6 +284,29 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
             || u.cache_miss != Some(176)
         {
             bail!(crate::tf!("usage not captured completely: {}", format!("{u:?}")));
+        }
+
+        // Regression 6b: the same fragments must reach the sink **live**, with the call's index on
+        //            every one of them and its name only on the first. That is what lets a front end
+        //            open the call's row while the model is still writing it — without it, a long
+        //            `write_file` is a silent stretch and the row only shows up once the call is
+        //            already over (the reason the live line counter can exist at all).
+        let tools = cap.tools.lock().unwrap().clone();
+        if tools.len() != 4 {
+            bail!(crate::tf!("tool-call fragments were not pushed to the sink live: {}", format!("{tools:?}")));
+        }
+        if tools[0].0 != 0 || tools[0].1 != "list_plugins" {
+            bail!(crate::tf!("the first fragment must carry the call's index and name: {}", format!("{:?}", tools[0])));
+        }
+        if tools[1].0 != 1 || tools[1].1 != "fs_read" || !tools[1].2.is_empty() {
+            bail!(crate::tf!("the first fragment of call #2 is wrong: {}", format!("{:?}", tools[1])));
+        }
+        if !tools[2].1.is_empty() || !tools[3].1.is_empty() {
+            bail!(crate::tf!("the name must ride ONLY on the first fragment: {}", format!("{tools:?}")));
+        }
+        let live: String = tools.iter().filter(|t| t.0 == 1).map(|t| t.2.clone()).collect();
+        if live != "{\"path\":\"a.txt\"}" {
+            bail!(crate::tf!("the live fragments do not reassemble into the argument JSON: {}", live));
         }
     }
 

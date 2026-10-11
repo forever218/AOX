@@ -148,6 +148,169 @@ impl TokenEstimate {
     }
 }
 
+/// The **complete** string value of `key` in a JSON object — `None` while it is still arriving.
+///
+/// Same input as [`partial_json_lines`] (tool-call arguments, which stream in fragments), but for
+/// values that have to be shown **whole or not at all**: a `path`, say, where a half-typed
+/// `E:/exam` reads as a glitch rather than as progress. A value whose closing quote has not turned
+/// up yet simply counts as "not there yet".
+///
+/// The object is walked key by key rather than searched for the literal `"key"`: the arguments carry
+/// the model's own text (`write_file`'s `content` is a whole source file), and that text very often
+/// contains the string `"path"` itself — a plain `find` would happily match inside it.
+///
+/// `#[allow(dead_code)]` because `src/main.rs` (the CLI bin) compiles these modules a second time and
+/// has no live display to feed — the same reason [`partial_json_lines`] carries it.
+#[allow(dead_code)]
+pub fn partial_json_string(args: &str, key: &str) -> Option<String> {
+    match object_string_value(args, key) {
+        Some((text, true)) => Some(text),
+        _ => None,
+    }
+}
+
+/// How many lines the string value of `key` already holds in a **partially received** JSON object.
+///
+/// While the model streams a `write_file` call its arguments arrive in fragments, so for a while the
+/// value of `content` is a truncated JSON string — the closing quote has not arrived, and the last
+/// line is usually cut in half. This counts the lines that have arrived so far, which is what lets a
+/// front end put a **live, growing** number next to the call instead of going silent until the
+/// whole file is in.
+///
+/// It counts the way `str::lines` does, so the reading matches the tool's own final tally: newlines
+/// seen in the decoded value, plus one for a trailing partial line — but not for one that ended with
+/// a newline. It is deliberately a **lower bound**, never an over-report: the tool's real diff
+/// replaces it the moment the call actually runs.
+///
+/// Returns 0 when the key, or the opening quote of its value, has not arrived yet.
+///
+/// `#[allow(dead_code)]` because `src/main.rs` (the CLI bin) compiles these modules a second time,
+/// and the CLI has no live-progress display to feed — the same reason the `Images` / `ToolResult`
+/// events carry it.
+#[allow(dead_code)]
+pub fn partial_json_lines(args: &str, key: &str) -> usize {
+    match object_string_value(args, key) {
+        Some((text, _)) => text.lines().count(),
+        None => 0,
+    }
+}
+
+/// Walk a (possibly unfinished) JSON object and report the string value stored under `key`: the text
+/// decoded so far, plus whether its closing quote had arrived.
+///
+/// `None` means "not there yet, and cannot be for now": the key was not reached, the object has
+/// ended, or something *in front of* the key is itself still arriving — in which case where it ends
+/// is unknown, and a later key cannot be located at all.
+fn object_string_value(src: &str, key: &str) -> Option<(String, bool)> {
+    let mut rest = src.trim_start().strip_prefix('{')?;
+    loop {
+        rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix(',') {
+            rest = r.trim_start();
+        }
+        // End of the object (or of what has arrived so far): the key is not in it.
+        if !rest.starts_with('"') {
+            return None;
+        }
+        let (k, after) = read_json_string(rest)?;
+        // A key is only ever compared once it is whole — a fragment of one matching `key` would be
+        // pure accident.
+        let after = after?.trim_start().strip_prefix(':')?;
+        let after = after.trim_start();
+        if k == key {
+            return read_json_string(after).map(|(v, tail)| (v, tail.is_some()));
+        }
+        // Not the key we want: step over its value. A string is stepped over by the reader itself;
+        // anything else (number, bool, array, object) is stepped over by bracket depth.
+        rest = if after.starts_with('"') {
+            read_json_string(after)?.1?
+        } else {
+            skip_json_value(after)?
+        };
+    }
+}
+
+/// Read one JSON string starting at `s`. `None` as the whole result means `s` does not start with a
+/// quote, so it is not a string at all.
+///
+/// The second half of the pair is what follows the closing quote — `None` while the string is still
+/// in flight, including the case of a lone trailing backslash (the character it escapes does not
+/// exist yet).
+fn read_json_string(s: &str) -> Option<(String, Option<&str>)> {
+    let mut chars = s.char_indices();
+    match chars.next() {
+        Some((_, '"')) => {}
+        _ => return None,
+    }
+    let mut out = String::new();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            // The closing quote: whatever follows it is the caller's business.
+            '"' => return Some((out, Some(&s[i + 1..]))),
+            '\\' => {
+                let Some((_, e)) = chars.next() else { return Some((out, None)) };
+                match e {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    'b' => out.push('\u{8}'),
+                    'f' => out.push('\u{c}'),
+                    'u' => {
+                        // Four hex digits; if they have not all arrived the value is still in flight.
+                        // A code point from outside the BMP needs a surrogate *pair* to come through
+                        // exactly, so one that arrives alone shows as `?` here — this reading is only
+                        // ever the live one, and the call's own arguments (already parsed JSON)
+                        // replace it as soon as the model has finished writing.
+                        let mut hex = String::new();
+                        for _ in 0..4 {
+                            match chars.next() {
+                                Some((_, h)) => hex.push(h),
+                                None => return Some((out, None)),
+                            }
+                        }
+                        if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                            out.push(char::from_u32(cp).unwrap_or('?'));
+                        }
+                    }
+                    // `\"`, `\\`, `\/` and anything unrecognised: the character itself.
+                    e => out.push(e),
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    // Ran out of input: still arriving.
+    Some((out, None))
+}
+
+/// Step over one non-string JSON value, returning the remainder **starting at** whichever delimiter
+/// ends it (`,` or `}`) — or `None` if the value has not finished arriving.
+fn skip_json_value(s: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if in_str {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' if depth > 0 => depth -= 1,
+            ',' | '}' if depth == 0 => return Some(&s[i..]),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Thousands separators: `12345` → `12,345`. Everything that needs this lives here, so don't reinvent it.
 pub fn thousands(n: u64) -> String {
     let s = n.to_string();
@@ -181,6 +344,22 @@ pub trait StreamSink: Send + Sync {
     /// by contrast, has to count both — output-side spend already includes reasoning — so an
     /// implementation normally feeds both callbacks into the same estimator.
     fn on_content(&self, _delta: &str) {}
+
+    /// Fragments of a **tool call's arguments**, as the model writes them.
+    ///
+    /// This is the only signal that exists *before* a tool runs: the loop only learns about tool
+    /// calls once the whole response has arrived, so without this callback a long call — writing a
+    /// file, above all — is a silent stretch in which the UI can show nothing at all. `index`
+    /// identifies the call within the response (several may stream at once, and their fragments
+    /// interleave); `name` is non-empty **only on the fragment that first carries it**, so an
+    /// implementation that wants the tool's name should remember the first non-empty one.
+    ///
+    /// `delta` is a raw substring of the argument JSON and may be cut anywhere, including
+    /// mid-escape — never parse it as JSON, treat it as text (see [`partial_json_lines`]).
+    ///
+    /// The default implementation does nothing, so a front end that has nowhere to put a live
+    /// progress reading simply ignores it.
+    fn on_tool_call(&self, _index: u64, _name: &str, _delta: &str) {}
 
     /// This response ended (whether it succeeded or failed). The UI should tear down the temporarily
     /// displayed reasoning process here, realising "show instantly, vanish instantly".
@@ -315,5 +494,66 @@ mod tests {
         assert_eq!(thousands(1000), "1,000");
         assert_eq!(thousands(12345), "12,345");
         assert_eq!(thousands(1234567), "1,234,567");
+    }
+
+    /// The live reading has to behave while the JSON is still half-arrived: before the value starts,
+    /// midway through a line, and with an escape cut in half.
+    #[test]
+    fn partial_lines_reads_a_half_arrived_value() {
+        // Nothing of the value yet — the preamble alone must not invent a line.
+        assert_eq!(partial_json_lines(r##"{"path":"a.rs","##, "content"), 0);
+        assert_eq!(partial_json_lines(r##"{"path":"a.rs","content""##, "content"), 0);
+        assert_eq!(partial_json_lines(r##"{"path":"a.rs","content":"##, "content"), 0);
+        // The value started but holds no characters yet.
+        assert_eq!(partial_json_lines(r##"{"path":"a.rs","content":""##, "content"), 0);
+        // One line, still being written.
+        assert_eq!(partial_json_lines(r##"{"path":"a.rs","content":"fn main() {}"##, "content"), 1);
+        // ... and it grows as the escapes arrive.
+        assert_eq!(
+            partial_json_lines(r##"{"path":"a.rs","content":"fn main() {\n    println!(\"hi\");"##, "content"),
+            2
+        );
+        // A trailing newline is not a line of its own -- the same rule as `str::lines`.
+        assert_eq!(partial_json_lines(r##"{"path":"a.rs","content":"a\nb\n"##, "content"), 2);
+        // A complete value: the count matches `lines()` exactly.
+        assert_eq!(partial_json_lines(r##"{"path":"a.rs","content":"a\nb\nc"}"##, "content"), 3);
+        // A lone backslash, with the escaped character still in flight, must not turn into a
+        // phantom line.
+        assert_eq!(partial_json_lines(r##"{"content":"ab\"##, "content"), 1);
+        // A different key is not the one we count.
+        assert_eq!(partial_json_lines(r##"{"content":"a\nb"}"##, "path"), 0);
+    }
+
+    /// A value that has to be shown **whole or not at all** — the reading a `path` needs, and the
+    /// reason the object is walked rather than searched.
+    #[test]
+    fn partial_string_only_yields_a_finished_value() {
+        // Not there yet, at every stage before the closing quote.
+        assert_eq!(partial_json_string("{", "path"), None);
+        assert_eq!(partial_json_string(r##"{"path"##, "path"), None);
+        assert_eq!(partial_json_string(r##"{"path":"##, "path"), None);
+        assert_eq!(partial_json_string(r##"{"path":"E:/ex"##, "path"), None);
+        // Complete: the text comes back decoded, with other keys (in any order) sitting around it.
+        assert_eq!(
+            partial_json_string(r##"{"path":"E:/ex.html"}"##, "path").as_deref(),
+            Some("E:/ex.html")
+        );
+        assert_eq!(
+            partial_json_string(r##"{"content":"x","path":"/a/b.rs","create_dirs":true}"##, "path")
+                .as_deref(),
+            Some("/a/b.rs")
+        );
+        // The trap this walker exists for: the value of an **earlier** key contains the literal text
+        // `"path"`, exactly as any source file about paths would. A search would match inside it.
+        let tricky = r##"{"content":"let p = \"path\";\nfn f() {}","path":"/real/one.rs"}"##;
+        assert_eq!(partial_json_string(tricky, "path").as_deref(), Some("/real/one.rs"));
+        // The same arguments, still arriving: no path yet, even though the bogus one is long since in.
+        let half = r##"{"content":"let p = \"path\";\nfn f() {}","path":"/real"##;
+        assert_eq!(partial_json_string(half, "path"), None);
+        // A key that is not in the object, and arguments that are not an object (a tool called with
+        // no arguments at all), both mean "nothing".
+        assert_eq!(partial_json_string(r##"{"content":"x"}"##, "path"), None);
+        assert_eq!(partial_json_string("{}", "path"), None);
+        assert_eq!(partial_json_string("not json", "path"), None);
     }
 }

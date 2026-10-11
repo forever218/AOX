@@ -88,6 +88,14 @@ pub enum FromAgent {
     /// **only for live token counting** — the main thread needs to know "how many more characters just
     /// came out this instant" for the number to keep climbing.
     Content(String),
+    /// A fragment of a tool call the model is **still writing** (its arguments are arriving in
+    /// pieces) — see `StreamSink::on_tool_call`.
+    ///
+    /// This is the one signal that arrives *before* a tool runs, and it is what lets the main thread
+    /// put the call's row on screen and keep a live reading on it while the model writes, instead of
+    /// showing nothing until the whole call has come back. `index` identifies the call within the
+    /// response; `name` is filled in only on the fragment that first carries it.
+    ToolDelta { index: u64, name: String, delta: String },
     /// Request authorization (blocks waiting for the main thread to fill in)
     AuthRequest { tool: String, args: String, reply: oneshot::Sender<AuthDecision> },
     /// A "multiple-choice question" (`ask_user`): likewise blocks waiting for the main thread to fill in.
@@ -311,6 +319,14 @@ impl StreamSink for ChanSink {
 
     fn on_content(&self, delta: &str) {
         let _ = self.tx.send(FromAgent::Content(delta.to_string()));
+    }
+
+    fn on_tool_call(&self, index: u64, name: &str, delta: &str) {
+        let _ = self.tx.send(FromAgent::ToolDelta {
+            index,
+            name: name.to_string(),
+            delta: delta.to_string(),
+        });
     }
 
     fn on_finish(&self) {

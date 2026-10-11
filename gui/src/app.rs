@@ -83,12 +83,48 @@ impl NoteKind {
 struct StepView {
     name: String,
     plugin: Option<String>,
+    /// The file this call is *about*, when naming it is worth a glance — `write_file`'s `path`, read
+    /// off the arguments. `None` for every other tool (see `SUBJECT_TOOLS`).
+    ///
+    /// A field of its own rather than a read of `args` below: while the model is still *writing* the
+    /// call the row is already on screen and the arguments are not in yet, and this is what lets the
+    /// row name the file from its very first fragment.
+    subject: Option<String>,
     /// Call arguments (a JSON string). **Not shown in the UI** -- the row keeps only the
     /// tool name, see `step_row`; the field is kept so that when debugging you can line it
     /// up with the matching row in `history/*.jsonl` at a glance.
     #[allow(dead_code)]
     args: String,
     result: Option<(bool, String)>,
+    /// `(added, removed)` lines when this call edited a text file (see `ToolOutput::diff`), drawn as
+    /// "+N / −N" after the tool name. `None` on every non-edit call — and on edits restored from an
+    /// old `history/*.jsonl`, which never carried the number.
+    diff: Option<(usize, usize)>,
+    /// The edit itself, one line per entry, each prefixed with `+`, `-` or a space (see
+    /// `ToolOutput::diff_detail`). This is what the row unfolds into; `None` wherever `diff` is.
+    diff_detail: Option<String>,
+    /// Whether the row is unfolded. Clicking it flips this — possible only when there is a
+    /// `diff_detail` to unfold, which is also exactly when the row shows its caret.
+    expanded: bool,
+}
+
+/// A tool call the model is **still writing** — its arguments are arriving in fragments.
+///
+/// This is what keeps a call from being invisible until it is over. The loop only learns about tool
+/// calls once the whole response has landed, and by then a `write_file` is usually done, so on its
+/// own the conversation sits still through the longest part of the job and then shows a finished
+/// row. A `StreamCall` is opened on the first fragment (`StreamSink::on_tool_call`), which puts the
+/// row and its waiting marquee on screen straight away, and carries the fragments in `args` so the
+/// reading next to the name can grow while the model writes.
+///
+/// `step` is the row's slot in `Live::steps`. `usize::MAX` means "the row is not drawn yet" — a
+/// provider is free to send arguments before it sends the name, and a row with no name has nothing
+/// to show.
+struct StreamCall {
+    index: u64,
+    name: String,
+    args: String,
+    step: usize,
 }
 
 /// The "process" of one turn (collapsed into a single row once it ends).
@@ -462,6 +498,89 @@ pub struct App {
     /// have to remember the mutual exclusions (see the "open one, close two" bit in
     /// `workplace_ui::button`).
     ws: workplace_ui::WorkplaceUi,
+
+    /// The transient toast currently on screen: how many files it accounts for, and the moment it
+    /// stops being shown.
+    ///
+    /// Timed on the **wall clock** (`Instant`), deliberately not on [`Clock`]: the activity clock
+    /// stops whenever the program is idle, and the moment a toast appears the program usually *is*
+    /// idle — a toast measured on it would sit there until the user happened to do something.
+    ///
+    /// A **count**, not a finished sentence: a `remove` call takes one path, so deleting two files
+    /// arrives as two events — and the count is what lets the second one merge into the toast
+    /// already on screen instead of overwriting it. The sentence is built at draw time via
+    /// [`aox::recycle::notice`].
+    toast: Option<(usize, Instant)>,
+
+    /// The tool calls the model is writing **right now** (see [`StreamCall`]).
+    ///
+    /// Cleared at every turn boundary. A call leaves this list the moment its `ToolCall` event
+    /// arrives and the row becomes an ordinary one; anything still here when a turn ends never ran
+    /// and its row is dropped.
+    stream_calls: Vec<StreamCall>,
+}
+
+/// How long a toast stays up, in seconds. Also the window in which a second delete merges into it.
+const TOAST_SECS: f32 = 6.0;
+/// The last stretch of that, during which it fades instead of vanishing mid-read.
+const TOAST_FADE_SECS: f32 = 0.6;
+/// Corner radius of the toast. Deliberately larger than a card's: the notice is a small rounded
+/// capsule, not a piece of page furniture.
+const TOAST_RADIUS: u8 = 14;
+
+/// The host's file-writing tool, by name.
+///
+/// The GUI needs it to know which call is carrying text it can count line by line
+/// (`StreamCall::args` → `aox::llm::partial_json_lines`). It is written out here because the core's
+/// table (`tool::HOST_FILE_TOOLS`) is `pub(crate)` and unreachable from this crate — same reason
+/// `plugin_of` spells out the three `meta` tool names.
+const WRITE_FILE_TOOL: &str = "write_file";
+
+/// Tools whose row **names the file it works on**.
+///
+/// Only the file writer for now (user request, 2026-10-11: "also show the file being edited"). Adding
+/// a read or a delete here is a one-line change the day the same is wanted for them — nothing else
+/// keys off this list.
+const SUBJECT_TOOLS: &[&str] = &[WRITE_FILE_TOOL];
+
+/// Height cap of the unfolded diff panel. A peephole into the edit, not a second editor — the point
+/// is "which lines moved", and the panel scrolls for the rest.
+///
+/// **Not draggable** (the grab strip was built and then dropped, user decision 2026-10-11: "forget
+/// the resizing, just double the height"): a fixed cap is predictable, and the panel still shrinks to
+/// fit a short diff, so a two-line edit is not buried in empty background.
+const DIFF_PANEL_H: f32 = 480.0;
+
+/// Longest path shown on a call row before it is shortened from the middle. The tail is the half
+/// that identifies a file, so a shortened path keeps it.
+const SUBJECT_MAX: usize = 56;
+
+/// The file a call is about, straight off its **parsed** arguments.
+fn subject_from_value(name: &str, args: &serde_json::Value) -> Option<String> {
+    if !SUBJECT_TOOLS.contains(&name) {
+        return None;
+    }
+    args.get("path").and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// The same, from the arguments as text (a row rebuilt from `history/*.jsonl`, which keeps them as
+/// the model wrote them).
+fn subject_from_json(name: &str, args: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(args).ok()?;
+    subject_from_value(name, &v)
+}
+
+/// Shorten a path from the middle: `keep/both/ends.rs`. See `SUBJECT_MAX`.
+fn clip_path(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= SUBJECT_MAX {
+        return s.to_string();
+    }
+    let keep_head = SUBJECT_MAX / 4;
+    let keep_tail = SUBJECT_MAX - keep_head - 1;
+    let head: String = s.chars().take(keep_head).collect();
+    let tail: String = s.chars().skip(n - keep_tail).collect();
+    format!("{head}…{tail}")
 }
 
 impl App {
@@ -535,6 +654,8 @@ impl App {
             fit_tries: 0,
             native_theme: None,
             ws: workplace_ui::WorkplaceUi::new(),
+            toast: None,
+            stream_calls: Vec::new(),
         };
         if demo {
             seed_demo(&mut app);
@@ -724,6 +845,9 @@ impl App {
                     });
                     self.busy = true;
                     self.status = aox::i18n::t("Thinking").into();
+                    // Defensive: a call still marked as "being written" from the previous turn would
+                    // otherwise be adopted by a call of the same name in this one.
+                    self.stream_calls.clear();
                 }
                 FromAgent::Status(s) => {
                     self.status = s.clone();
@@ -744,6 +868,12 @@ impl App {
                         l.out.add(&d);
                         l.streaming.push_str(&d);
                     }
+                    // Body text means the model is past any call it was writing, so the status must
+                    // stop claiming a tool is running (`stream_tool_delta` makes the opposite switch).
+                    self.status_back_to_thinking();
+                }
+                FromAgent::ToolDelta { index, name, delta } => {
+                    self.stream_tool_delta(index, name, delta)
                 }
                 FromAgent::Usage(rec) => {
                     // If the endpoint reports no numbers, hide the whole block -- don't fob it off
@@ -786,6 +916,8 @@ impl App {
                         l.out.add(&d);
                         activity::lock(&self.act).model_push(&d);
                     }
+                    // Same switch as the body-text arm: thinking again means no tool is running.
+                    self.status_back_to_thinking();
                             }
                 FromAgent::ReasoningEnd => {
                     // Reasoning ending does not mean the model's segment has ended: it may go on
@@ -1134,6 +1266,116 @@ impl App {
         }
     }
 
+    /// A fragment of a tool call the model is **still writing**: open its row once, then keep the
+    /// reading next to it climbing as the fragments arrive.
+    ///
+    /// Without this the entire stretch in which the model writes a call is invisible — the tool
+    /// itself has not started, so there is nothing on screen to look at, and for `write_file`
+    /// (whose arguments *are* the file) that stretch is the whole job.
+    fn stream_tool_delta(&mut self, index: u64, name: String, delta: String) {
+        if self.live.is_none() {
+            return;
+        }
+        // One entry per call, keyed by the API's own call index: several calls may be in flight at
+        // once and their fragments interleave.
+        let slot = match self.stream_calls.iter().position(|c| c.index == index) {
+            Some(i) => i,
+            None => {
+                self.stream_calls.push(StreamCall {
+                    index,
+                    name: String::new(),
+                    args: String::new(),
+                    step: usize::MAX,
+                });
+                self.stream_calls.len() - 1
+            }
+        };
+        // The name only rides on the first fragment of a call; the fragments after it have to
+        // inherit it, or the row would be nameless.
+        if !name.is_empty() {
+            self.stream_calls[slot].name = name;
+        }
+        self.stream_calls[slot].args.push_str(&delta);
+
+        let call_name = self.stream_calls[slot].name.clone();
+        if call_name.is_empty() {
+            return; // No name yet, so there is no row to draw -- wait for the fragment that has it.
+        }
+        // Only the host's file writer has a reading to show: its arguments carry the text itself,
+        // so "how many lines have arrived" is meaningful. Everything else gets a bare marquee.
+        let lines = if call_name == WRITE_FILE_TOOL {
+            aox::llm::partial_json_lines(&self.stream_calls[slot].args, "content")
+        } else {
+            0
+        };
+        // The path is the first thing in the arguments, so it is normally in hand within a fragment
+        // or two — and naming the file is most of what this row has to say. Only the whole value is
+        // taken: a half-typed `E:/exam` would read as a glitch rather than as progress.
+        let subject = if SUBJECT_TOOLS.contains(&call_name.as_str()) {
+            aox::llm::partial_json_string(&self.stream_calls[slot].args, "path")
+        } else {
+            None
+        };
+        let fresh = self.stream_calls[slot].step == usize::MAX;
+        let step = self.stream_calls[slot].step;
+        let plugin = self.plugin_of(&call_name);
+        let Some(l) = self.live.as_mut() else { return };
+        let step = if fresh {
+            l.steps.push(StepView {
+                name: call_name.clone(),
+                plugin,
+                subject: subject.clone(),
+                // Left empty until the call really runs: the row shows no arguments (see
+                // `step_row`), and what the model eventually sends is filled in by the `ToolCall`
+                // arm, which adopts this row.
+                args: String::new(),
+                result: None,
+                diff: None,
+                // Not known until the call returns, and there is nothing to unfold before that.
+                diff_detail: None,
+                expanded: false,
+            });
+            l.steps.len() - 1
+        } else {
+            step
+        };
+        self.stream_calls[slot].step = step;
+        if let Some(st) = l.steps.get_mut(step) {
+            // Either reading may land a fragment after the row does — keep the row in step with
+            // whatever has arrived.
+            if subject.is_some() {
+                st.subject = subject;
+            }
+            // Only ever the added side: how many lines are *disappearing* cannot be known until the
+            // old file is read, which happens when the call runs.
+            if lines > 0 {
+                st.diff = Some((lines, 0));
+            }
+        }
+        if fresh {
+            // Name the tool that is working. "Thinking" would be plainly wrong once the model is
+            // visibly writing a call.
+            let want = aox::tf!("Running {}", call_name);
+            l.status = want.clone();
+            self.status = want;
+        }
+    }
+
+    /// The model is producing text again, so no tool can be running: put the status line back to
+    /// "Thinking".
+    ///
+    /// Called on every delta, hence the comparison before anything is built — this costs a string
+    /// compare in the common case and allocates nothing.
+    fn status_back_to_thinking(&mut self) {
+        let want = aox::i18n::t("Thinking");
+        if self.status != want {
+            self.status = want.to_string();
+            if let Some(l) = self.live.as_mut() {
+                l.status = want.to_string();
+            }
+        }
+    }
+
     fn on_event(&mut self, ev: AgentEvent) {
         // The activity stream records only "how a turn ran": events outside a turn (switching
         // conversations, the tail left behind after a fatal error, ...) never go on the
@@ -1174,14 +1416,52 @@ impl App {
             }
             AgentEvent::ToolCall { name, args } => {
                 let plugin = self.plugin_of(&name);
+                // Read the file name off the parsed arguments *before* they are flattened to text --
+                // this is the authoritative reading, and the streaming one (which has to decode a
+                // half-arrived string) is only ever a preview of it.
+                let subject = subject_from_value(&name, &args);
                 let args = compact_json(&args);
-                if let Some(l) = self.live.as_mut() {
-                    l.steps.push(StepView {
-                        name: name.clone(),
-                        plugin: plugin.clone(),
-                        args: args.clone(),
-                        result: None,
-                    });
+                // The model has just finished writing this call, so its row is normally already on
+                // screen (opened by the streaming fragments — see `stream_tool_delta`). Adopt that
+                // row rather than pushing a second one for the same call; `position` takes the first
+                // unclaimed entry, which is the right one when a response calls the same tool twice.
+                let mut adopted = false;
+                if let Some(i) = self
+                    .stream_calls
+                    .iter()
+                    .position(|c| c.name == name && c.step != usize::MAX)
+                {
+                    let step = self.stream_calls[i].step;
+                    if let Some(l) = self.live.as_mut() {
+                        if let Some(st) = l.steps.get_mut(step) {
+                            st.args = args.clone();
+                            // The streaming reading of the path is a preview; this one wins.
+                            if subject.is_some() {
+                                st.subject = subject.clone();
+                            }
+                            adopted = true;
+                        }
+                    }
+                    // The live reading (`diff`) is deliberately left in place: there is no reason to
+                    // blank it for the moment between "model finished writing" and "tool returned".
+                    if adopted {
+                        self.stream_calls.remove(i);
+                    }
+                }
+                if !adopted {
+                    if let Some(l) = self.live.as_mut() {
+                        l.steps.push(StepView {
+                            name: name.clone(),
+                            plugin: plugin.clone(),
+                            subject,
+                            args: args.clone(),
+                            result: None,
+                            // Unknown until the call returns; filled in by the `ToolResult` arm.
+                            diff: None,
+                            diff_detail: None,
+                            expanded: false,
+                        });
+                    }
                 }
                 if live {
                     // Only one bar is opened on the activity stream: call -> execute -> return is a
@@ -1201,12 +1481,16 @@ impl App {
                     activity::lock(&self.act).tool_note(&aox::tf!("Timeout limit {}s", timeout_secs));
                 }
             }
-            AgentEvent::ToolResult { name, is_error, preview } => {
+            AgentEvent::ToolResult { name, is_error, preview, diff, diff_detail } => {
                 if let Some(l) = self.live.as_mut() {
                     if let Some(st) =
                         l.steps.iter_mut().rev().find(|s| s.name == name && s.result.is_none())
                     {
                         st.result = Some((is_error, preview.clone()));
+                        st.diff = diff;
+                        // What the row can be unfolded into. The row is drawable-with-a-caret from
+                        // this instant on, which is the same instant the "+N / −N" lands.
+                        st.diff_detail = diff_detail;
                     }
                 }
                 if live {
@@ -1223,6 +1507,27 @@ impl App {
                 self.note_act(ActKind::Warn, aox::i18n::t("Warning"), &m);
                 if self.live.is_none() {
                     self.items.push(Item::Note(NoteKind::Warn, m));
+                }
+            }
+            AgentEvent::Recycled(n) => {
+                // Two audiences, two shapes (the same split as `Images` below): the activity stream
+                // gets a bar — "how this turn ran" — and the human gets a **toast** that fades on
+                // its own.
+                //
+                // The toast is set unconditionally, not only while a turn is running: a delete the
+                // user asked for can easily finish after the turn that ordered it has ended, and
+                // "where did my file go" is precisely the moment this has to be visible.
+                self.note_act(ActKind::Info, aox::i18n::t("Recycle bin"), &aox::recycle::notice(n));
+                // One `remove` call takes one path, so "delete two files" arrives as two events.
+                // Merge the new one into the total already on screen — two flashes of "1 file"
+                // read as a bug, and the number is the part the user is actually looking at.
+                // Restarting the timer keeps the merged toast up long enough to be read.
+                match &mut self.toast {
+                    Some((count, shown_at)) if shown_at.elapsed().as_secs_f32() < TOAST_SECS => {
+                        *count += n;
+                        *shown_at = Instant::now();
+                    }
+                    _ => self.toast = Some((n, Instant::now())),
                 }
             }
             AgentEvent::Images(paths) => {
@@ -1260,7 +1565,28 @@ impl App {
         self.choice = None;
         self.choice_reply = None;
         self.status = aox::i18n::t("Ready").into();
-        let Some(l) = self.live.take() else { return };
+        let Some(mut l) = self.live.take() else {
+            self.stream_calls.clear();
+            return;
+        };
+        // A call the model was still writing when the turn ended never ran — the response was cut
+        // off, or the turn was aborted. Its row has to go, otherwise the process card keeps a
+        // marquee spinning forever for a step that never happened.
+        //
+        // They are always the *trailing* rows (a streaming row is appended at the tail, and a row
+        // stops streaming once its `ToolCall` arrives), so one truncation removes exactly them.
+        if !self.stream_calls.is_empty() {
+            let first = self
+                .stream_calls
+                .iter()
+                .map(|c| c.step)
+                .filter(|s| *s != usize::MAX)
+                .min();
+            if let Some(first) = first {
+                l.steps.truncate(first);
+            }
+            self.stream_calls.clear();
+        }
         // Working time, not wall time: a turn the user sat on for ten minutes while answering a
         // question is not a ten-minute turn (see [`Clock`]).
         let elapsed = (self.now() - l.turn_base).max(0.0);
@@ -1914,8 +2240,8 @@ impl App {
                                 Item::Error(t) => error_card(ui, t, inner),
                             }
                         }
-                        if let Some(l) = &self.live {
-                            self.live_block(ui, l, inner);
+                        if self.live.is_some() {
+                            self.live_block(ui, inner);
                         }
                         // Reserve the floating input box's height at the end, so the last message
                         // can scroll above it instead of being permanently half-covered.
@@ -2016,8 +2342,14 @@ impl App {
         });
     }
 
-    fn live_block(&self, ui: &mut Ui, l: &Live, width: f32) {
+    fn live_block(&mut self, ui: &mut Ui, width: f32) {
         let _ = width;
+        // Taken off `self` before the live state is borrowed below: a call row can now be unfolded,
+        // which needs the step list `&mut`, and `self.now()` would be a second, conflicting borrow of
+        // the whole struct.
+        let spin = self.spin;
+        let now = self.now();
+        let Some(l) = self.live.as_mut() else { return };
         // The live area is cut by **stage**: a stretch of call stream -> one interim reply ->
         // another stretch of call stream -> ...
         // (user request, 2026-10-05: previously all the calls were crammed at the top and all
@@ -2029,7 +2361,7 @@ impl App {
             let from = if seg == 0 { 0 } else { l.cuts.get(seg - 1).copied().unwrap_or(0) };
             let to = l.cuts.get(seg).copied().unwrap_or(l.steps.len()).min(l.steps.len());
             if from < to {
-                calls_card(ui, &l.steps[from..to]);
+                calls_card(ui, &mut l.steps[from..to]);
                 ui.add_space(14.0);
             }
             if let Some(say) = l.interim.get(seg) {
@@ -2046,7 +2378,7 @@ impl App {
 
         // waiting animation + status
         ui.horizontal(|ui| {
-            spinner_dot(ui, self.spin, P::ink());
+            spinner_dot(ui, spin, P::ink());
             ui.add_space(8.0);
             ui.label(
                 RichText::new(if l.status.is_empty() { aox::i18n::t("Thinking") } else { &l.status })
@@ -2055,7 +2387,7 @@ impl App {
             );
             ui.add_space(8.0);
             ui.label(
-                RichText::new(format!("{:.1}s", (self.now() - l.turn_base).max(0.0)))
+                RichText::new(format!("{:.1}s", (now - l.turn_base).max(0.0)))
                     .color(P::text_faint())
                     .size(13.0),
             );
@@ -2699,6 +3031,81 @@ impl App {
             None => self.auth = Some(card),
         }
     }
+    /// The transient toast: one line about something that just happened, gone a few seconds later.
+    ///
+    /// Why an overlay rather than an `Item` in the transcript: the transcript is a **record** — it
+    /// goes to `history/*.jsonl` and is replayed when a conversation is resumed — whereas this is a
+    /// passing notice that should not outlive its moment. Being able to sit *above* the transcript
+    /// is the other half of the reason it is drawn from `update()` next to the other overlays.
+    fn toast_overlay(&mut self, ctx: &egui::Context) {
+        let Some((count, shown_at)) = self.toast else { return };
+        let age = shown_at.elapsed().as_secs_f32();
+        if age >= TOAST_SECS {
+            self.toast = None;
+            return;
+        }
+        // A toast has to leave **on its own**, and an idle egui window doesn't repaint by itself:
+        // without this it would sit there until the mouse happened to move.
+        ctx.request_repaint_after(Duration::from_millis(50));
+        // Only the tail fades, so the text is fully legible for as long as it is up and then leaves
+        // without a snap. The whole card fades (fill, border, shadow and text together) — fading the
+        // text alone leaves an empty box hanging in the air.
+        let alpha = ((TOAST_SECS - age) / TOAST_FADE_SECS).clamp(0.0, 1.0);
+        // Built here, not stored: the count may still grow while the toast is on screen.
+        let text = aox::recycle::notice(count);
+        egui::Area::new(egui::Id::new("aox-toast"))
+            .order(egui::Order::Tooltip)
+            .movable(false)
+            .interactable(false)
+            .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 18.0))
+            .show(ctx, |ui| {
+                Frame::NONE
+                    .fill(P::toast_bg().gamma_multiply(alpha))
+                    .stroke(Stroke::new(1.0, P::toast_border().gamma_multiply(alpha)))
+                    .corner_radius(CornerRadius::same(TOAST_RADIUS))
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 20,
+                        spread: 0,
+                        color: P::shadow().gamma_multiply(alpha),
+                    })
+                    .inner_margin(Margin::symmetric(18, 13))
+                    .show(ui, |ui| {
+                        // The icon and the sentence are one row, vertically centred. The whole
+                        // foreground (icon + text) is the deep red, so the notice reads as one object.
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            let ink = P::toast_text().gamma_multiply(alpha);
+                            trash_glyph(ui, 20.0, ink);
+                            ui.add_space(10.0);
+                            ui.label(RichText::new(&text).color(ink).size(14.5));
+                        });
+                    });
+            });
+    }
+}
+
+/// A stroke-drawn trash can, sized to sit at the left of a toast line.
+///
+/// Hand-drawn like the other glyphs in this file (`history_icon` / `plus_icon` / `gear_icon`): the
+/// project carries no icon font, and a dozen line segments on a 20×20 grid cost less than a dependency.
+fn trash_glyph(ui: &mut Ui, size: f32, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    // Everything below is laid out on a 20×20 grid, then scaled to `size`.
+    let s = size / 20.0;
+    let o = rect.min.to_vec2();
+    let p = |x: f32, y: f32| Pos2::new(o.x + x * s, o.y + y * s);
+    let w = Stroke::new((1.5 * s).max(1.0), color);
+    let painter = ui.painter();
+    // Handle, then lid.
+    painter.line_segment([p(8.0, 3.0), p(12.0, 3.0)], w);
+    painter.line_segment([p(3.0, 6.0), p(17.0, 6.0)], w);
+    // Body: two slightly tapered sides and the base.
+    painter.line_segment([p(5.2, 6.0), p(6.4, 17.0)], w);
+    painter.line_segment([p(14.8, 6.0), p(13.6, 17.0)], w);
+    painter.line_segment([p(6.4, 17.0), p(13.6, 17.0)], w);
+    // Two ribs.
+    painter.line_segment([p(8.9, 9.0), p(8.9, 14.4)], w);
+    painter.line_segment([p(11.1, 9.0), p(11.1, 14.4)], w);
 }
 
 // ─────────────────────────── demo data (--demo) ───────────────────────────
@@ -2786,20 +3193,47 @@ fn seed_demo(app: &mut App) {
             StepView {
                 name: "list_plugins".into(),
                 plugin: Some("meta".into()),
+                subject: None,
                 args: "{}".into(),
                 result: Some((false, aox::i18n::t("Plugins loaded: probe_screen, fs").into())),
+                diff: None,
+                diff_detail: None,
+                expanded: false,
             },
             StepView {
                 name: "create_plugin".into(),
                 plugin: Some("meta".into()),
+                subject: None,
                 args: r#"{"name":"filestat","language":"python"}"#.into(),
                 result: Some((false, aox::i18n::t("Plugin filestat created, registered and persisted (1 tool)").into())),
+                diff: None,
+                diff_detail: None,
+                expanded: false,
+            },
+            StepView {
+                name: "write_file".into(),
+                plugin: None,
+                subject: Some("plugins/filestat/main.py".into()),
+                args: r#"{"path":"plugins/filestat/main.py"}"#.into(),
+                result: Some((false, aox::i18n::t("Overwrote plugins/filestat/main.py (2.4 KB)").into())),
+                // Demo data for the edit statistic — the row draws it as "+46 / −2", and unfolds
+                // into a diff in the very shape `diff_text` produces.
+                diff: Some((46, 2)),
+                diff_detail: Some(
+                    "⋯\n import os\n \n def count(path):\n     out = {}\n-    for f in os.listdir(path):\n+    for f in sorted(os.listdir(path)):\n         ext = os.path.splitext(f)[1]\n         out[ext] = out.get(ext, 0) + 1\n+    return out\n⋯"
+                        .into(),
+                ),
+                expanded: false,
             },
             StepView {
                 name: "filestat_count".into(),
                 plugin: Some("filestat".into()),
+                subject: None,
                 args: r#"{"path":".","ext":null}"#.into(),
                 result: Some((false, ".rs 14 · .py 9 · .toml 4 · .md 2 · .lock 1".into())),
+                diff: None,
+                diff_detail: None,
+                expanded: false,
             },
         ],
         interim: vec![aox::i18n::t("Check for existing capabilities to reuse first.").into()],
@@ -3033,6 +3467,10 @@ impl eframe::App for App {
 
         self.settings_overlay(ctx);
         self.auth_overlay(ctx);
+        // Last, so the toast sits above everything: it reports something that has **already**
+        // happened, and being hidden behind a card that is asking a question would lose exactly the
+        // moment it was needed.
+        self.toast_overlay(ctx);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -3392,8 +3830,18 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
                         p.steps.push(StepView {
                             name: c.function.name.clone(),
                             plugin: None,
+                            // The file name still comes from the arguments, which the history file
+                            // does keep — only the diff itself was never written down.
+                            subject: subject_from_json(
+                                &c.function.name,
+                                &c.function.arguments,
+                            ),
                             args: c.function.arguments.trim().to_string(),
                             result: None,
+                            // Not persisted, so a resumed turn shows no figure on its edit rows.
+                            diff: None,
+                            diff_detail: None,
+                            expanded: false,
                         });
                     }
                 }
@@ -4325,8 +4773,8 @@ fn process_block(ui: &mut Ui, p: &mut Process, width: f32) {
                 let w = ui.available_width();
                 ui.set_width(w);
                 ui.set_max_width(w);
-                for st in &p.steps {
-                    step_row(ui, st);
+                for (i, st) in p.steps.iter_mut().enumerate() {
+                    step_row(ui, st, i);
                 }
                 if !p.interim.is_empty() {
                     ui.add_space(8.0);
@@ -4382,40 +4830,153 @@ fn live_plain_text(ui: &mut Ui, text: &str, color: Color32) {
     ui.add(Label::new(job));
 }
 
-fn step_row(ui: &mut Ui, st: &StepView) {
-    ui.horizontal_top(|ui| {
-        // Status markers (the form settled on with the user, 2026-10-05): in progress = a three-dot
-        // marquee (**deliberately a different shape from the 8-dot orbiting spinner used for
-        // reasoning**), success = ✓, failure = ✗.
-        // They are no longer numbered either -- numbering reads "a few calls in one stage" as a
-        // checklist, whereas what is wanted here is "one after another".
-        match &st.result {
-            None => call_marquee(ui, P::text_dim()),
-            Some((is_err, _)) if *is_err => call_glyph(ui, false, P::ink()),
-            Some(_) => call_glyph(ui, true, P::ink()),
-        }
-        ui.add_space(4.0);
-        ui.label(RichText::new(&st.name).color(P::text()).size(14.5));
-        if let Some(pl) = &st.plugin {
-            ui.add_space(2.0);
-            Frame::NONE
-                .fill(P::surface_hi())
-                .corner_radius(CornerRadius::same(20))
-                .inner_margin(Margin::symmetric(9, 2))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(if pl == "meta" { "meta" } else { pl.as_str() })
-                            .color(P::text_dim())
-                            .size(12.0),
-                    );
+/// One call row, plus the diff panel it can unfold into.
+///
+/// `idx` is the row's slot in its container and is used **only** to give the row an id of its own.
+/// Two rows in one card can both be unfolded, and each panel is *its own* scroll area and *its own*
+/// draggable height — with a shared id they fight over one offset and one size (user report,
+/// 2026-10-11: "unfold two diff panels and scrolling one scrolls the other too").
+fn step_row(ui: &mut Ui, st: &mut StepView, idx: usize) {
+    ui.push_id(idx, |ui| step_row_inner(ui, st));
+}
+
+fn step_row_inner(ui: &mut Ui, st: &mut StepView) {
+    // A row with a diff behind it is **foldable** (user request, 2026-10-11: "the file being edited,
+    // and clicking it opens the change"). Every other row stays plain and inert.
+    let foldable = st.diff_detail.is_some();
+    let unfolded = st.expanded;
+    let row = ui
+        .horizontal_top(|ui| {
+            // Status markers (the form settled on with the user, 2026-10-05): in progress = a three-dot
+            // marquee (**deliberately a different shape from the 8-dot orbiting spinner used for
+            // reasoning**), success = ✓, failure = ✗.
+            // They are no longer numbered either -- numbering reads "a few calls in one stage" as a
+            // checklist, whereas what is wanted here is "one after another".
+            match &st.result {
+                None => call_marquee(ui, P::text_dim()),
+                Some((is_err, _)) if *is_err => call_glyph(ui, false, P::ink()),
+                Some(_) => call_glyph(ui, true, P::ink()),
+            }
+            ui.add_space(4.0);
+            ui.label(RichText::new(&st.name).color(P::text()).size(14.5));
+            // The file this call works on, straight after its name (user request, 2026-10-11): a row
+            // reading only "write_file" leaves you counting back to find out which file it was.
+            // Monospaced so two paths line up, and shortened from the middle -- the tail is the half
+            // that identifies a file.
+            if let Some(sub) = &st.subject {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(clip_path(sub)).font(theme::mono_font(13.0)).color(P::text_dim()),
+                );
+            }
+            if let Some(pl) = &st.plugin {
+                ui.add_space(2.0);
+                Frame::NONE
+                    .fill(P::surface_hi())
+                    .corner_radius(CornerRadius::same(20))
+                    .inner_margin(Margin::symmetric(9, 2))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(if pl == "meta" { "meta" } else { pl.as_str() })
+                                .color(P::text_dim())
+                                .size(12.0),
+                        );
+                    });
+            }
+            // Edit statistic, right where the eye already is — next to the call it belongs to. Green
+            // for added lines, red for removed, and **nothing at all** when the call changed no lines:
+            // a "0 / 0" would just be noise on every read-only call.
+            if let Some((added, removed)) = st.diff {
+                if added > 0 {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(format!("+{added}")).color(P::add_green()).size(13.0));
+                }
+                if removed > 0 {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!("-{removed}")).color(P::del_red()).size(13.0));
+                }
+            }
+            // The caret sits at the far right edge of the row. It is also what makes the **whole
+            // row** the click target: "there is something to open here".
+            if foldable {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 18.0), Sense::hover());
+                    paint_tri(ui.painter(), rect.center(), 4.0, unfolded, P::text_faint());
                 });
+            }
+            // Arguments are **not shown here** (user request, 2026-10-05): a JSON blob would stretch
+            // this row into several lines, and expanded you can't see the bottom of it. The row keeps
+            // only "tool name + owning plugin", and the next row gives a one-line summary of the result.
+            // To really see the arguments, they are stored verbatim in `history/*.jsonl`.
+        })
+        .response;
+    if foldable {
+        // Re-register the row's own rect with a click sense, **after** the row has been built: egui
+        // hands a click to the topmost widget that wants it, and the labels inside the row are added
+        // before this, so the row wins.
+        let resp = row.interact(Sense::click());
+        if pointer_if(ui, &resp) && resp.clicked() {
+            st.expanded = !st.expanded;
         }
-        // Arguments are **not shown here** (user request, 2026-10-05): a JSON blob would stretch
-        // this row into several lines, and expanded you can't see the bottom of it. The row keeps
-        // only "tool name + owning plugin", and the next row gives a one-line summary of the result.
-        // To really see the arguments, they are stored verbatim in `history/*.jsonl`.
-    });
+    }
+    if st.expanded {
+        // Borrowed, never cloned: the transcript is laid out again on every repaint, and this string
+        // is the length of the diff.
+        if let Some(diff) = st.diff_detail.as_deref() {
+            step_diff(ui, diff);
+        }
+    }
     ui.add_space(5.0);
+}
+
+/// The unfolded edit: every line of the diff, tinted by what the line is.
+///
+/// A **short** panel that scrolls (user request, 2026-10-11). The question it answers is "which lines
+/// moved", and a panel that grew with the file would push the conversation off screen. Its cap is
+/// [`DIFF_PANEL_H`], and a diff shorter than that draws a shorter panel — a small edit leaves no
+/// empty background behind.
+fn step_diff(ui: &mut Ui, diff: &str) {
+    ui.add_space(6.0);
+    Frame::NONE
+        .fill(P::code_bg())
+        .corner_radius(CornerRadius::same(8))
+        .stroke(Stroke::new(1.0, P::border()))
+        .inner_margin(Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            // Inside the frame, so the panel can never be wider than the card holding it.
+            let w = ui.available_width();
+            ui.set_width(w);
+            ui.set_max_width(w);
+            // Claim the panel's height back from egui before building it.
+            //
+            // egui gives a nested `ScrollArea` only the height left in its parent's `max_rect`, and
+            // inside the transcript **every** parent's rect is one screen tall, however far down the
+            // page the row sits. A panel opened near the bottom of a long conversation was therefore
+            // handed a few dozen pixels and stayed that size: `max_height(DIFF_PANEL_H)` is a cap, not
+            // a request, and nothing could reach it (user report, 2026-10-11: "still too short", with
+            // a three-line panel under a +353 diff). `set_max_height` grows the rect from the cursor
+            // downwards, so asking for the full panel height here is exactly the fix.
+            ui.set_max_height(ui.available_height().max(DIFF_PANEL_H));
+            // The first character is the whole contract (see `diff_text`): `+` added, `-` removed, a
+            // space for context, and anything else is a marker — an elided stretch, or where a diff
+            // too large to draw was cut off — drawn faintest of all.
+            ScrollArea::vertical()
+                .id_salt("aox-step-diff")
+                .max_height(DIFF_PANEL_H)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    for line in diff.lines() {
+                        let color = match line.chars().next() {
+                            Some('+') => P::add_green(),
+                            Some('-') => P::del_red(),
+                            Some(' ') => P::text_dim(),
+                            _ => P::text_faint(),
+                        };
+                        ui.label(RichText::new(line).font(theme::mono_font(12.5)).color(color));
+                    }
+                });
+        });
 }
 
 /// A stretch of call stream in the live area (the calls preceding one interim reply).
@@ -4423,7 +4984,7 @@ fn step_row(ui: &mut Ui, st: &StepView) {
 /// The live area gets **one card per stretch** (see the segmentation loop in `live_block`), whereas
 /// the process card puts everything in a single card -- the row rendering is shared, only the
 /// grouping differs.
-fn calls_card(ui: &mut Ui, steps: &[StepView]) {
+fn calls_card(ui: &mut Ui, steps: &mut [StepView]) {
     Frame::NONE
         .fill(P::surface())
         .corner_radius(CornerRadius::same(theme::card_radius()))
@@ -4435,8 +4996,10 @@ fn calls_card(ui: &mut Ui, steps: &[StepView]) {
             let w = ui.available_width();
             ui.set_width(w);
             ui.set_max_width(w);
-            for st in steps {
-                step_row(ui, st);
+            for (i, st) in steps.iter_mut().enumerate() {
+                // Each row ids itself off its slot (see `step_row`), so panels never share a scroll
+                // offset or a height.
+                step_row(ui, st, i);
             }
         });
 }
