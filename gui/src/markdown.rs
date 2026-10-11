@@ -656,7 +656,76 @@ fn cells(ui: &mut Ui, widths: &[f32], row: &[String], head: bool, color: Color32
 }
 
 
-/// One fenced code block: monospace, with a lang label and a backing color.
+/// How long the copy button shows its tick after a click, in seconds.
+const COPIED_TTL: f64 = 1.4;
+
+/// Which code block was copied last, and when — one temp-data slot in egui's memory.
+///
+/// Keyed by a **hash of the block's text** rather than by a per-block index: `render` runs fresh
+/// every frame and has no stable block id, while only one block can have just been copied anyway.
+/// Two byte-identical blocks would both show the tick, which is honest — copying either one puts
+/// exactly the same text on the clipboard.
+fn copied_mark(ui: &Ui) -> Option<(u64, f64)> {
+    ui.ctx().data(|d| d.get_temp::<(u64, f64)>(egui::Id::new("aox-code-copied")))
+}
+
+/// The temp-data slot used by [`copied_mark`].
+fn copy_slot() -> egui::Id {
+    egui::Id::new("aox-code-copied")
+}
+
+fn text_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// The square button in a code block's top-right corner: a "copy" glyph that turns into a green
+/// tick once the code is on the clipboard.
+///
+/// Both glyphs are **drawn**, not typed: a text glyph would come from whatever font happens to be
+/// installed and would not sit on the same optical weight as the rest of the icon set.
+struct CopyButton {
+    copied: bool,
+}
+
+impl egui::Widget for CopyButton {
+    fn ui(self, ui: &mut Ui) -> egui::Response {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+        let hot = resp.hovered() || self.copied;
+        // The fill has to be opaque: it doubles as the "occluder" that makes the front sheet of the
+        // copy icon sit *on top of* the back one. Not hovered = the block's own background, so the
+        // button is invisible until you reach for it.
+        let bg = if hot { P::surface_hi() } else { P::code_bg() };
+        if hot {
+            ui.painter().rect_filled(rect, CornerRadius::same(7), bg);
+        }
+        let color = if self.copied {
+            P::add_green()
+        } else if resp.hovered() {
+            P::text()
+        } else {
+            P::text_faint()
+        };
+        let c = rect.center();
+        let stroke = Stroke::new(1.6, color);
+        let p = ui.painter();
+        if self.copied {
+            p.line_segment([egui::pos2(c.x - 5.5, c.y + 0.5), egui::pos2(c.x - 1.5, c.y + 4.5)], stroke);
+            p.line_segment([egui::pos2(c.x - 1.5, c.y + 4.5), egui::pos2(c.x + 6.0, c.y - 4.5)], stroke);
+        } else {
+            let back = egui::Rect::from_min_size(egui::pos2(c.x - 6.5, c.y - 6.5), egui::vec2(9.5, 9.5));
+            let front = egui::Rect::from_min_size(egui::pos2(c.x - 3.0, c.y - 3.0), egui::vec2(9.5, 9.5));
+            p.rect_stroke(back, CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            p.rect_filled(front, CornerRadius::same(2), bg);
+            p.rect_stroke(front, CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+        }
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+}
+
+/// One fenced code block: monospace, with a header row (language + copy button) and a backing color.
 ///
 /// Extracted because it has two call sites: an ordinary code block, and **the fallback when SVG
 /// drawing fails** (see the `Block::Code { lang, .. } if lang == "svg"` branch). Copying it into two
@@ -664,6 +733,15 @@ fn cells(ui: &mut Ui, widths: &[f32], row: &[String], head: bool, color: Color32
 /// only visible when "SVG happens to fail to draw".
 fn code_block(ui: &mut Ui, width: f32, lang: &str, lines: &[String]) {
     let code = lines.join("\n");
+    let hash = text_hash(&code);
+    let now = ui.input(|i| i.time);
+    let copied = copied_mark(ui).map_or(false, |(h, t)| h == hash && now - t < COPIED_TTL);
+    // While the tick is up, keep frames coming so it retires on its own — an idle window would
+    // otherwise freeze with the tick still showing.
+    if copied {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+    }
+
     Frame::NONE
         .fill(P::code_bg())
         .corner_radius(CornerRadius::same(12))
@@ -675,10 +753,22 @@ fn code_block(ui: &mut Ui, width: f32, lang: &str, lines: &[String]) {
             let inner = (width - 34.0).max(100.0);
             ui.set_width(inner);
             ui.set_max_width(inner);
-            if !lang.is_empty() {
-                ui.label(RichText::new(lang.to_lowercase()).color(P::text_faint()).size(13.0));
-                ui.add_space(7.0);
-            }
+            // Header row. It is drawn even with no language: giving the button its own row keeps it
+            // off the first line of code, which would otherwise sit right under it (code wraps to
+            // fill the card, so there is no "empty corner" to rely on).
+            ui.horizontal(|ui| {
+                if !lang.is_empty() {
+                    ui.label(RichText::new(lang.to_lowercase()).color(P::text_faint()).size(13.0));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(CopyButton { copied }).clicked() {
+                        ui.ctx().copy_text(code.clone());
+                        ui.ctx().data_mut(|d| d.insert_temp(copy_slot(), (hash, now)));
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+                    }
+                });
+            });
+            ui.add_space(7.0);
             wrap_label(ui, code_job(&code, inner, lang));
         });
 }
