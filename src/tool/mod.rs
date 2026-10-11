@@ -145,8 +145,8 @@ impl ToolOutput {
 
 #[derive(Debug, Clone)]
 pub enum ToolKind {
-    /// Host-provided meta tools (`create_plugin` / `list_plugins` / `remove_plugin`).
-    /// They change **the host itself** (adding and removing plugins), so by default they
+    /// Host-provided meta tools (`create_plugin` / `update_plugin` / `list_plugins` / `remove_plugin`).
+    /// They change **the host itself** (adding, replacing and removing plugins), so by default they
     /// ask first (`[auth] meta_tools`).
     Meta,
     /// Host-provided **file tools** (`read_file` / `write_file` / `list_dir` / `remove`,

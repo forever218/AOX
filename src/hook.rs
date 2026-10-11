@@ -221,6 +221,21 @@ impl HookChain {
         self.hooks.write().unwrap().push(hook);
     }
 
+    /// Drop every hook that belongs to `plugin`.
+    ///
+    /// This is the counterpart of [`HookChain::push`] that used to be unnecessary: with no way to
+    /// replace a live component, a hook could only ever stop by the plugin disappearing from the
+    /// `plugins` table (which `ComponentHook::ask` notices on its own). A **hot swap** breaks that
+    /// assumption — the plugin stays in the table under the same name, so the old hook would sit in
+    /// the chain as a ghost, firing against the new process with the previous declaration. Called
+    /// from `activate_slot` before the new contributions are pushed, it is a harmless no-op on the
+    /// create path (nothing was there yet) and the fix on the update path.
+    ///
+    /// Matching is by [`Hook::name`], which a `ComponentHook` returns as its plugin name.
+    pub fn remove_by_plugin(&self, plugin: &str) {
+        self.hooks.write().unwrap().retain(|h| h.name() != plugin);
+    }
+
     /// No hooks at all — in this case the path `run_loop` takes is equivalent, path by path, to
     /// before the "Loop seam".
     pub fn is_empty(&self) -> bool {

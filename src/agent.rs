@@ -610,7 +610,7 @@ impl Agent {
     ///
     /// Three paths by tool kind, of differing precision — all deliberate:
     ///
-    /// - `ToolKind::Meta` (`create_plugin` / `list_plugins` / `remove_plugin`): declares no path parameter, so allow outright.
+    /// - `ToolKind::Meta` (`create_plugin` / `update_plugin` / `list_plugins` / `remove_plugin`): declares no path parameter, so allow outright.
     ///
     /// - `ToolKind::Host` (host file tools): the schema is our own, so read the `path` parameter directly.
     ///   Reads (`read_file` / `list_dir` / `attach_file`) are not subject to the workplace restriction ⇒ this path is

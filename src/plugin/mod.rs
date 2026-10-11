@@ -1040,6 +1040,14 @@ fn assemble(
 /// - a contribution that fails to attach is that contribution's own problem (a malformed hook point
 ///   was already rejected earlier, by `Contributes::normalize`).
 async fn activate_slot(rt: &Arc<Runtime>, handle: Arc<PluginHandle>, segments: Vec<(String, String)>) -> Result<Vec<String>> {
+    // ---- ① Clear this plugin's previous *non-tool* contributions ----
+    // On the create path nothing is there and both are no-ops. On the update/hot-swap path they are
+    // essential: the plugin keeps its name, so a hook or prompt segment the new version dropped would
+    // otherwise survive as a ghost and keep firing against the new process with the old declaration.
+    // Tools are handled separately (unregister + re-register by name), so they are not touched here.
+    rt.hooks.remove_by_plugin(&handle.name);
+    rt.remove_prompt_segments_by_plugin(&handle.name);
+
     // ---- ② Tools: registration failure rolls back the whole thing (same as today) ----
     let mut registered: Vec<String> = vec![];
     for def in &handle.tools() {
@@ -1105,10 +1113,12 @@ pub async fn create_plugin(
         other => bail!(tf!("language must be python / node / rust, got: {}", other)),
     };
     let dir = rt.plugins_dir.join(name);
-    // Only a "currently running plugin" needs unloading first; a leftover directory (from a previous failed creation) is auto-cleaned and rebuilt,
-    // avoiding the dead loop of "creation says it already exists, removal says it does not exist".
+    // A name that is already live is no longer a hard error: rebuilding in place is exactly what a
+    // `update_plugin` does, and the source is in hand, so the two collapse into one path. This is
+    // also what the system prompt has always promised the model ("reuse the original name"), which
+    // used to be a promise the code did not keep.
     if rt.plugins.lock().await.contains_key(name) {
-        bail!(tf!("plugin {} is running; remove_plugin first if you want to rebuild it", name));
+        return update_plugin(rt, name, source, None).await;
     }
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
@@ -1124,6 +1134,142 @@ pub async fn create_plugin(
     result
 }
 
+/// Implementation of the `update_plugin` meta-tool: replace an existing plugin's source **in place**,
+/// retiring the old process and atomically re-registering the new one — a hot swap, no delete.
+///
+/// # Why this exists
+///
+/// Before it, "change a plugin" had no direct route. The model's only instinct was `write_file` on
+/// `plugins/<name>/main.py`, which **appears to do nothing**: the plugin is already registered and
+/// its process is already running, so the edit sits on disk while every call still reaches the old
+/// process. The model then reached for `remove_plugin` + `create_plugin` — three authorizations and
+/// a window in which the capability is simply gone — which is also what the old `create_plugin`
+/// error ("is running; remove_plugin first") forced.
+///
+/// # Semantics
+///
+/// - `language` is **not** a parameter: changing it is a rebuild, not an update (the entry file, the
+///   build step and the runtime all differ), so it stays whatever the plugin was created with.
+/// - `description` is optional; `None` keeps the existing one.
+/// - The old process is stopped **after** the new one has handshaken successfully, and the old source
+///   is restored if anything fails — so a failed update leaves a working plugin, not a dead one.
+///
+/// Errors when `name` is not a known plugin: that is a `create_plugin` job, and saying so is more
+/// useful to the model than silently creating one.
+pub async fn update_plugin(
+    rt: &Arc<Runtime>,
+    name: &str,
+    source: &str,
+    description: Option<&str>,
+) -> Result<Vec<String>> {
+    // Snapshot the old handle up front (its manifest/entry/language are what we keep), then release
+    // the table lock — the whole body below does I/O and RPC and must not hold it.
+    let old = { rt.plugins.lock().await.get(name).cloned() };
+    let Some(old) = old else {
+        bail!(tf!(
+            "no such plugin: {} — use create_plugin to make a new one (update_plugin only changes plugins that already exist)",
+            name
+        ));
+    };
+
+    let language = old.language.clone();
+    let entry = old.manifest.entry.clone();
+    let description = description.unwrap_or(&old.description).to_string();
+    let dir = old.dir.clone();
+
+    // The manifest keeps its language/entry but takes the new description; `[contributes]` starts
+    // from the on-disk value and is overridden by whatever the new `initialize` returns.
+    let manifest = PluginManifest {
+        name: name.to_string(),
+        language: language.clone(),
+        description,
+        entry: entry.clone(),
+        contributes: old.manifest.contributes.clone(),
+    };
+
+    // ---- Write the new source, remembering the old one so a failure can be rolled back ----
+    let entry_path = dir.join(&entry);
+    let previous = std::fs::read_to_string(&entry_path).ok();
+    std::fs::write(&entry_path, source).with_context(|| tf!("failed to write plugin source: {}", entry_path.display()))?;
+
+    // rust: recompile before anything is dismantled — a compile failure must not touch the running
+    // plugin at all, so it is treated like the write above: fail here, roll back the source, done.
+    if language == "rust" {
+        if let Err(e) = compile_rust_plugin(rt, name, &dir).await {
+            restore(&entry_path, previous.as_deref(), rt, name, &language, &dir).await;
+            return Err(e);
+        }
+    }
+
+    // Handshake the new version **before** dismantling the old one. If the new plugin is broken
+    // (bad syntax, an interpreter that will not start, a 20 s timeout), the error surfaces here and
+    // the old process is still up and serving — the capability never disappears, and the rollback
+    // only has to put the source file back.
+    let handshake = spawn_and_init(&rt.runtimes(), &rt.root, &dir, &manifest, &rt.sandbox).await;
+    let (live, init) = match handshake {
+        Ok(v) => v,
+        Err(e) => {
+            restore(&entry_path, previous.as_deref(), rt, name, &language, &dir).await;
+            return Err(e);
+        }
+    };
+
+    // ---- Dismantle the old slot (the new version has handshaken, so this is the safe moment) ----
+    // Unregister the old tools first: `Runtime::register` refuses a name that is taken, and the new
+    // version almost always reuses the same names.
+    for def in &old.tools() {
+        rt.unregister(&def.name).await;
+    }
+    // Close the old process. Otherwise `rpc_ready` on the stale handle would keep a second
+    // interpreter alive behind the same plugin name. The old hooks / prompt segments are removed
+    // by `activate_slot` below.
+    old.stop().await;
+    rt.plugins.lock().await.remove(name);
+
+    // ---- Install the new slot ----
+    let theme_patch = theme_of(&manifest.name, init.theme_patch.clone());
+    write_cache(&dir, &manifest, &init);
+    let segments: Vec<(String, String)> = init.prompt_segments.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let handle = assemble(
+        &dir,
+        &rt.root,
+        &manifest,
+        &rt.sandbox,
+        SlotParts { defs: init.tools, contributes: init.contributes, theme_patch, live: Some(live) },
+    );
+    match activate_slot(rt, handle, segments).await {
+        Ok(tools) => Ok(tools),
+        Err(e) => {
+            // Registration itself failed. The old process is already gone, so the caller's rollback
+            // restores the source; make sure no half-registered new slot is left behind either.
+            rt.plugins.lock().await.remove(name);
+            restore(&entry_path, previous.as_deref(), rt, name, &language, &dir).await;
+            Err(e)
+        }
+    }
+}
+
+/// Put the previous source back after a failed update, and recompile it for a rust plugin.
+///
+/// Failure to roll back is a warning, not an error: the update's own error is the one worth
+/// reporting, and `create_plugin` can rebuild the plugin from scratch if the file is left damaged.
+async fn restore(entry_path: &Path, previous: Option<&str>, rt: &Arc<Runtime>, name: &str, language: &str, dir: &Path) {
+    match previous {
+        Some(text) => {
+            if std::fs::write(entry_path, text).is_err() {
+                plugin_warn(name, t("failed to roll back the plugin source after a failed update"));
+            } else if language == "rust" {
+                let _ = compile_rust_plugin(rt, name, dir).await;
+            }
+        }
+        // The entry file did not exist before (a half-built plugin). Removing what we wrote returns
+        // the directory to the state `create_plugin`'s leftover-cleanup expects.
+        None => {
+            let _ = std::fs::remove_file(entry_path);
+        }
+    }
+}
+
 async fn create_plugin_inner(
     rt: &Arc<Runtime>,
     name: &str,
@@ -1135,27 +1281,8 @@ async fn create_plugin_inner(
     let mut entry = entry.to_string();
 
     if language == "rust" {
-        let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
-        // Use the resolved rustc (possibly the one bundled in the app directory), not the raw value from config
-        let runtimes = rt.runtimes();
-        let mut cmd = Command::new(&runtimes.rustc);
-        cmd.arg("--edition=2021").arg("-O");
-        // Statically link the CRT, consistent with the host's own build (see .cargo/config.toml).
-        // Only added on windows: on other platforms +crt-static has different semantics (it affects libc's static/dynamic linking),
-        // whereas the goal here is exactly one thing: "stop the plugin exe depending on VCRUNTIME140.dll".
-        if cfg!(windows) {
-            cmd.args(["-C", "target-feature=+crt-static"]);
-        }
-        cmd.arg("main.rs").arg("-o").arg(&exe).current_dir(dir);
-        cmd.hide_console();
-        let build = tokio::time::timeout(RUST_BUILD_TIMEOUT, cmd.output())
-            .await
-            .map_err(|_| anyhow!(t("rustc compile timed out")))?
-            .context(t("cannot start rustc (rust plugins need the Rust toolchain in PATH)"))?;
-        if !build.status.success() {
-            bail!(tf!("rustc compile failed:\n{}", String::from_utf8_lossy(&build.stderr)));
-        }
-        entry = exe;
+        compile_rust_plugin(rt, name, dir).await?;
+        entry = rust_entry(name);
     }
 
     let manifest = PluginManifest {
@@ -1187,7 +1314,43 @@ async fn create_plugin_inner(
     activate_slot(rt, handle, segments).await
 }
 
-/// Write (or refresh) the metadata cache from a handshake result.
+/// The compiled artifact's name for a rust plugin (`main.rs` → `<name>[.exe]`).
+fn rust_entry(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Compile a rust plugin's `main.rs` in place, writing `rust_entry(name)` next to it.
+///
+/// Split out of [`create_plugin_inner`] so [`update_plugin`] recompiles through the **same** command
+/// line: a second copy of the flags (edition, `-O`, the Windows-only `+crt-static`) is exactly the
+/// kind of drift that makes "works on create, breaks on update".
+async fn compile_rust_plugin(rt: &Arc<Runtime>, name: &str, dir: &Path) -> Result<()> {
+    let exe = rust_entry(name);
+    // Use the resolved rustc (possibly the one bundled in the app directory), not the raw value from config
+    let runtimes = rt.runtimes();
+    let mut cmd = Command::new(&runtimes.rustc);
+    cmd.arg("--edition=2021").arg("-O");
+    // Statically link the CRT, consistent with the host's own build (see .cargo/config.toml).
+    // Only added on windows: on other platforms +crt-static has different semantics (it affects libc's static/dynamic linking),
+    // whereas the goal here is exactly one thing: "stop the plugin exe depending on VCRUNTIME140.dll".
+    if cfg!(windows) {
+        cmd.args(["-C", "target-feature=+crt-static"]);
+    }
+    cmd.arg("main.rs").arg("-o").arg(&exe).current_dir(dir);
+    cmd.hide_console();
+    let build = tokio::time::timeout(RUST_BUILD_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| anyhow!(t("rustc compile timed out")))?
+        .context(t("cannot start rustc (rust plugins need the Rust toolchain in PATH)"))?;
+    if !build.status.success() {
+        bail!(tf!("rustc compile failed:\n{}", String::from_utf8_lossy(&build.stderr)));
+    }
+    Ok(())
+}
 ///
 /// A failure is a warning, never an error: the cache is an optimisation, and the plugin it describes
 /// works exactly the same without it — it would just take the slow path on the next start.
@@ -1630,6 +1793,68 @@ def serve(plugin_name, tools, contributes=None, hooks=None, prompt_segments=None
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hot swap must leave no ghost of the previous version behind. The plugin keeps its name, so
+    /// a hook or prompt segment the new source no longer declares would otherwise keep firing against
+    /// the new process. Both removals are keyed on the plugin name; here we prove they are selective
+    /// (another plugin's contributions survive) and that they are no-ops when nothing matches
+    /// (the create path, which runs through the same `activate_slot`).
+    #[test]
+    fn swapping_a_plugin_drops_only_its_own_contributions() {
+        use crate::hook::{Hook, HookChain};
+        use crate::prompt::{PromptSegment, Source};
+
+        // A minimal hook that only reports a name — enough for `remove_by_plugin`, which matches by it.
+        struct Named(String);
+        #[async_trait::async_trait]
+        impl Hook for Named {
+            fn name(&self) -> &str {
+                &self.0
+            }
+            fn describe(&self) -> String {
+                String::new()
+            }
+        }
+
+        let chain = HookChain::new(vec![
+            Arc::new(Named("alpha".into())) as Arc<dyn Hook>,
+            Arc::new(Named("beta".into())) as Arc<dyn Hook>,
+        ]);
+        chain.remove_by_plugin("alpha");
+        assert_eq!(chain.len(), 1, "only the swapped plugin's hook is dropped");
+
+        let rt = rt_for_contrib_tests();
+        let seg = |id: &str| PromptSegment {
+            id: id.into(),
+            title: String::new(),
+            body: "b".into(),
+            order: 60,
+            source: Source::Plugin,
+        };
+        rt.add_prompt_segment(seg("alpha:note"));
+        rt.add_prompt_segment(seg("beta:note"));
+        rt.remove_prompt_segments_by_plugin("alpha");
+        let ids: Vec<String> = rt.prompt_segments().into_iter().map(|s| s.id).collect();
+        assert!(ids.contains(&"beta:note".to_string()), "another plugin's segment is untouched");
+        assert!(!ids.contains(&"alpha:note".to_string()), "the swapped plugin's segment is gone");
+
+        // No-op when nothing matches — this is what every `create_plugin` runs into.
+        chain.remove_by_plugin("gamma");
+        rt.remove_prompt_segments_by_plugin("gamma");
+        assert_eq!(chain.len(), 1);
+    }
+
+    /// Build a throwaway Runtime for the contribution-cleanup test (no plugins, no I/O).
+    fn rt_for_contrib_tests() -> Arc<Runtime> {
+        let root = std::env::temp_dir().join("aox-plugin-contrib-test");
+        let _ = std::fs::create_dir_all(&root);
+        // The only required section is `[provider]`; everything else defaults.
+        let cfg: crate::config::Config = toml::from_str(
+            "[provider]\nbase_url = \"https://example.com/v1\"\nmodel = \"m\"\napi_key = \"k\"\n",
+        )
+        .expect("the minimal test config must parse");
+        Runtime::new(cfg, root.clone(), root.join("plugins")).expect("the test runtime must build")
+    }
 
     /// An old manifest (no `[contributes]`) must still parse as-is — backward compatibility is a hard requirement of this stage.
     #[test]

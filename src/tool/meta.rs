@@ -11,7 +11,12 @@ use crate::plugin;
 use crate::runtime::Runtime;
 
 pub fn meta_tools() -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(CreatePluginTool), Arc::new(ListPluginsTool), Arc::new(RemovePluginTool)]
+    vec![
+        Arc::new(CreatePluginTool),
+        Arc::new(UpdatePluginTool),
+        Arc::new(ListPluginsTool),
+        Arc::new(RemovePluginTool),
+    ]
 }
 
 // ---------------------------------------------------------------- create_plugin
@@ -62,6 +67,53 @@ impl Tool for CreatePluginTool {
                 tools.join(", ")
             )),
             Err(e) => ToolOutput::err(crate::tf!("failed to create plugin: {}", format!("{e:#}"))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------- update_plugin
+
+struct UpdatePluginTool;
+
+#[async_trait]
+impl Tool for UpdatePluginTool {
+    fn name(&self) -> &str {
+        "update_plugin"
+    }
+    fn kind(&self) -> ToolKind {
+        ToolKind::Meta
+    }
+    fn description(&self) -> &str {
+        crate::i18n::t("Change the source of an existing plugin and hot-swap it in place: the old process is retired and its tools are re-registered with the new code, all in one step — no remove_plugin first, and the capability never goes away. Use this whenever your first version of a plugin was wrong or incomplete and you want to fix it. Always pass the full new source, not a patch. To change a plugin created in this session, or one you can see in list_plugins, call this instead of editing plugins/<name>/main.py with write_file: a running plugin keeps its old process, so a plain file edit appears to have no effect.")
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": crate::i18n::t("name of the existing plugin to update (it must already exist; to make a new one use create_plugin)")},
+                "source": {"type": "string", "description": crate::i18n::t("the plugin's full new source code (complete replacement; the language and entry file stay as they were)")},
+                "description": {"type": "string", "description": crate::i18n::t("optional new one-sentence description; omit to keep the current one")}
+            },
+            "required": ["name", "source"]
+        })
+    }
+
+    async fn call(&self, args: Value, rt: &Arc<Runtime>) -> ToolOutput {
+        let Some(name) = args.get("name").and_then(|v| v.as_str()) else {
+            return ToolOutput::err(crate::i18n::t("missing argument name"));
+        };
+        let Some(source) = args.get("source").and_then(|v| v.as_str()) else {
+            return ToolOutput::err(crate::i18n::t("missing argument source"));
+        };
+        let description = args.get("description").and_then(|v| v.as_str());
+        match plugin::update_plugin(rt, name, source, description).await {
+            Ok(tools) => ToolOutput::ok(crate::tf!(
+                "plugin {} updated and hot-swapped; it now registers {} tool(s): {}. The new code is live right away.",
+                name,
+                tools.len(),
+                tools.join(", ")
+            )),
+            Err(e) => ToolOutput::err(crate::tf!("failed to update plugin: {}", format!("{e:#}"))),
         }
     }
 }

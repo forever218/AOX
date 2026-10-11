@@ -184,6 +184,17 @@ impl Runtime {
         }
     }
 
+    /// Drop every prompt segment contributed by `plugin`.
+    ///
+    /// Segment ids are prefixed with the owning plugin (`<plugin>:<id>`, see `activate_slot`), which
+    /// is the only thing that makes this decidable. Needed for the same reason as
+    /// [`crate::hook::HookChain::remove_by_plugin`]: a hot swap must not leave behind a segment the
+    /// new version no longer declares. On the create path nothing matches and this is a no-op.
+    pub fn remove_prompt_segments_by_plugin(&self, plugin: &str) {
+        let prefix = format!("{plugin}:");
+        self.prompt_segments.write().unwrap().retain(|s| !s.id.starts_with(&prefix));
+    }
+
     /// Append a loop hook at runtime (component-contributed hooks come in here).
     ///
     /// Why "at runtime" is needed: plugins are loaded **after** `Runtime::new`, whereas
