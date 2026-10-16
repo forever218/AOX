@@ -157,6 +157,11 @@ impl Agent {
     }
 
     /// Ensure the current conversation already has an on-disk file. On failure we warn only once and don't interrupt the conversation.
+    ///
+    /// The file lands in **this conversation's workspace** (`<workspace>/.aox/history/`), which is why
+    /// this runs *after* `ensure_started` in `run_turn`: by the time the first message is persisted the
+    /// root is already decided, so the file is written in the right place from the start and never has
+    /// to be migrated afterwards.
     fn ensure_log(&mut self, ui: &mut dyn Ui) {
         if self.log.is_some() {
             return;
@@ -165,13 +170,14 @@ impl Agent {
         if !cfg.enabled {
             return;
         }
-        match self.rt.store.create(Some(&self.rt.config.provider.model)) {
+        let at = self.rt.workplace.active_root();
+        match self.rt.store.create(Some(&self.rt.config.provider.model), at.as_deref()) {
             Ok(log) => self.log = Some(log),
             Err(e) if !self.log_error_reported => {
                 self.log_error_reported = true;
                 ui.emit(AgentEvent::Warn(crate::tf!(
                     "conversation history cannot be written to {} ({}): this conversation will not be saved",
-                    self.rt.store.location().display(),
+                    self.rt.store.history_dir_for(at.as_deref()).display(),
                     format!("{e:#}")
                 )));
             }
@@ -297,6 +303,37 @@ impl Agent {
             None => None,
         };
         Ok(items.len())
+    }
+
+    /// Rename a conversation by appending a `kind:"title"` row to its file.
+    ///
+    /// `None` — or a title that is blank once trimmed — means "show the automatic title again": the
+    /// row is written with no value at all, which is exactly how readers spell "no rename" (see
+    /// `store::jsonl`). The user-facing validation (one line, a length limit) belongs to the front end
+    /// that asked the question; what is enforced here is only what must hold for the file's sake.
+    ///
+    /// The **current** conversation goes through the session we already hold instead of opening the
+    /// file a second time: two append handles on one file would race, and this thread is the only one
+    /// allowed to write into it (the same rule `append_acts` follows). Every other conversation has
+    /// nobody holding it, so it is opened just long enough to append the row and dropped again.
+    ///
+    /// ⚠️ The CLI has no rename entry point, so on that target this is dead code and the compiler says
+    /// so. Silenced here rather than by a `cfg` or a `#[allow]` on the module: the two targets genuinely
+    /// differ (`src/main.rs` compiles these files as its own modules, so each target gets its own
+    /// dead-code pass), and this is the item the difference is about -- the same reason `mod space`
+    /// carries the attribute in `src/main.rs`.
+    #[allow(dead_code)]
+    pub fn rename_conversation(&mut self, id: &str, title: Option<&str>) -> Result<()> {
+        let title = title.map(str::trim).filter(|t| !t.is_empty());
+        if self.history_id() == Some(id) {
+            if let Some(log) = self.log.as_mut() {
+                log.append_title(title);
+            }
+            return Ok(());
+        }
+        let mut session = self.rt.store.open(id)?;
+        session.append_title(title);
+        Ok(())
     }
 
     /// Start a new conversation.
@@ -431,7 +468,7 @@ impl Agent {
             Ok(Some(dir)) => ui.emit(AgentEvent::Info(crate::tf!(
                 // Wording follows the new semantics (reads unrestricted, writes/deletes restricted): saying "can only read and write files"
                 // would make the user think reads are locked down too, prompting a needless privilege escalation — a sentence missed when the semantics changed on 2026-10-04.
-                "this conversation's workspace: {}\n  writes and deletes are restricted to this directory (reads are unrestricted — any file on the device can be read). Put scratch files in temp\\, new projects in a folder under workplace\\, and notes in .aox\\memory\\. To loosen it: `/workplace`, or the \"workspace\" control at the bottom-left of the input box.",
+                "this conversation's workspace: {}\n  writes and deletes are restricted to this directory (reads are unrestricted — any file on the device can be read). Put scratch files in .aox\\tmp\\, new projects in a folder under workplace\\, and notes in .aox\\memory\\. To loosen it: `/workplace`, or the \"workspace\" control at the bottom-left of the input box.",
                 dir.display()
             ))),
             Ok(None) => {}

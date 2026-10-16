@@ -296,15 +296,16 @@ mode = "default"
 # root = "sandbox-work"
 
 [history]
-# Conversation history is written to disk automatically. The directory is fixed at
-# <app root>/history, one .jsonl file per conversation; the CLI and the GUI share the same
-# layout (each keeps its own copy under its own application root).
+# Conversation history is written to disk automatically, **per workspace**: one .jsonl file per
+# conversation, under <workspace>/.aox/history/. History therefore travels with the folder it was
+# made in -- copy a workspace and its conversations come along. The default workspace is the app
+# root, so its own history sits at <app root>/.aox/history/.
 # Use /history in the CLI; in the GUI use the leftmost icon to open the sidebar.
 #
 # With this off, no new file is written (existing history stays readable and viewable).
 enabled = true
-# How many recent conversations to keep; older ones beyond that are deleted oldest-first.
-# 0 = unlimited.
+# How many recent conversations to keep, **counted across all workspaces together**; older ones
+# beyond that are deleted oldest-first. 0 = unlimited.
 # Cleanup only happens alongside creating a new conversation file -- nothing scans in the
 # background or deletes on a timer.
 keep = 200

@@ -22,6 +22,10 @@ config.*.toml
 /plugins/*
 !/plugins/.gitkeep
 /history/
+# AOX 自己的每工作区数据：对话历史、草稿、笔记。
+# 2026-10-14 起历史移进 <工作区>/.aox/history（默认工作区就是本项目根），
+# 不忽略这里会把整份对话历史塞进 git。旧的 /history/ 已废弃，留着只为旧检出。
+.aox/
 **/stderr.log
 
 # 按需装配的插件运行时（约 21 MB，机器相关；由 /runtime install python

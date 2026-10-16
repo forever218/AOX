@@ -4,6 +4,9 @@
     python tools/gui_click.py --title AOX --right 146 --y 25     # 距右边 146
     python tools/gui_click.py --title AOX --left 38  --y 25      # 距左边 38
 
+    # 打开右键菜单并**把它拍下来**（菜单停在指针处）：历史面板里的对话行右击
+    python tools/gui_click.py --pid 1234 --button right --left 60 --y 150 --out gui/_menu.png
+
     # 只悬停不点击（验证悬停才出现的面板），停 1.2s 后顺手截图：
     python tools/gui_click.py --title AOX --left 45 --y 25 --move --hold 1.2 --out gui/_hover.png
 
@@ -34,15 +37,37 @@ EnumWindowsProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
 
 
-def find_window(title_substr, exact=False, pid=0):
-    """找目标窗口，两种定位方式二选一：
+def screenshot(hwnd, out):
+    """把整个窗口（含原生标题栏）截到 `out`。
+
+    按**窗口**矩形而不是客户区：右键菜单这类浮层会画到客户区之外一点点（贴边时），
+    只截客户区会把它切掉一角。
+    """
+    from PIL import ImageGrab
+
+    r = wt.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(r))
+    ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom), all_screens=True).save(out)
+    print(f"已截图 -> {out}")
+
+
+def find_window(title_substr, exact=False, pid=0, hwnd=0):
+    """找目标窗口，三种定位方式：
 
     - 按标题（默认）：子串或全等匹配；
     - 按 `pid`：主窗口标题改成空串之后（2026-10-04 用户要求删掉标题栏字样），
       按标题这条路走不通 —— 改成「该进程可见窗口里**面积最大**的那个」，就是主窗口。
+    - 按 `hwnd`：最不含糊的一种。开活动流时该进程有两个尺寸相近的大窗口，
+      「面积最大」不再等于「主窗口」（EnumWindows 的顺序和 rect 都会变），
+      这时先枚举出 hwnd 再直给。
     """
+    if hwnd:
+        return [(hwnd, f"(hwnd {hwnd})")]
+
     found = []
 
     def cb(hwnd, _):
@@ -93,8 +118,22 @@ def main() -> int:
         help="按进程 ID 找窗口（取该进程可见窗口中面积最大的）。主窗口标题改成空串后，"
         "按标题找不到它了 —— 用 tasklist 拿到 aox-gui.exe 的 pid 再传进来。",
     )
+    ap.add_argument(
+        "--hwnd",
+        type=int,
+        default=0,
+        help="直接给窗口句柄（最不含糊）。开活动流时进程里有多个大窗口，"
+        "`--pid` 的「面积最大」可能选错，这时用 hwnd。",
+    )
     ap.add_argument("--right", type=float, help="距客户区右边多少逻辑像素")
     ap.add_argument("--left", type=float, help="距客户区左边多少逻辑像素")
+    ap.add_argument(
+        "--button",
+        choices=["left", "right"],
+        default="left",
+        help="按左键（默认）还是右键。右键用来打开右键菜单；菜单会停在指针那里，"
+        "所以配 --out 就能把「刚弹出的菜单」拍下来。",
+    )
     ap.add_argument("--y", type=float, default=25.0, help="距客户区顶部多少逻辑像素")
     ap.add_argument(
         "--move",
@@ -109,7 +148,7 @@ def main() -> int:
         print("必须给出 --left 或 --right", file=sys.stderr)
         return 2
 
-    win = find_window(a.title, a.exact, a.pid)
+    win = find_window(a.title, a.exact, a.pid, a.hwnd)
     if not win:
         print(f"NOTFOUND: 没有标题包含 {a.title!r} 的可见窗口", file=sys.stderr)
         return 2
@@ -162,19 +201,22 @@ def main() -> int:
         # 立刻截图会拍到「面板还没出来」的上一帧。
         time.sleep(a.hold)
         if a.out:
-            from PIL import ImageGrab
-
-            r = wt.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(r))
-            ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom), all_screens=True).save(a.out)
-            print(f"已截图 -> {a.out}")
+            screenshot(hwnd, a.out)
         user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE_NOSIZE)
         return 0
     time.sleep(0.25)
-    user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+    if a.button == "right":
+        down, up = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
+    else:
+        down, up = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
+    user32.mouse_event(down, 0, 0, 0, 0)
     time.sleep(0.06)
-    user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    user32.mouse_event(up, 0, 0, 0, 0)
     time.sleep(1.2)
+    # A right-click leaving a menu open is the case this is for: the wait above lets the popup
+    # render, and the grab then catches it before anything dismisses it.
+    if a.out:
+        screenshot(hwnd, a.out)
     user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE_NOSIZE)
     return 0
 

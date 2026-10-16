@@ -230,6 +230,20 @@ pub struct Summary {
     /// time as the list sorting — the moment the sort key and the displayed time aren't the same one,
     /// the list looks mis-sorted.
     pub time: String,
+    /// The workspace root this conversation is bound to — the `root` of the **last**
+    /// `kind:"workplace"` record in the file (`None` when the file has no such record, or the tier
+    /// had no root at all).
+    ///
+    /// Filled in **during the same pass** that reads the title, so grouping the list by workspace
+    /// costs no second scan of the directory. `None` means "no root" and must not be read as "the app
+    /// root" — what a missing root implies is the reader's call (see [`crate::space`]).
+    pub ws_root: Option<std::path::PathBuf>,
+    /// Whether that last workplace record's tier was the **unrestricted** one (`mode == "full"`).
+    ///
+    /// Kept next to [`Summary::ws_root`] rather than folded into it because the two answer different
+    /// questions and both are needed: an unrestricted record has no root, and "no root because
+    /// unrestricted" has to be told apart from "no record at all" (an older file) when grouping.
+    pub ws_full: bool,
 }
 
 /// One message read back out.
@@ -296,7 +310,15 @@ pub fn list_text(items: &[Summary], location: &Path, current: Option<&str>) -> S
     if items.is_empty() {
         return crate::tf!("(no history yet)\n  Directory: {}", location.display());
     }
-    let mut s = crate::tf!("History ({} conversations, most recently active first)  {}", items.len(), location.display());
+    // The path printed is the **default workspace's** directory, not "the" directory: since
+    // 2026-10-14 conversations are stored per workspace, under `<workspace>/.aox/history`. Saying it
+    // out loud keeps this header and `/history dir` from looking contradictory, and stops the user
+    // hunting for a conversation in a folder it was never in.
+    let mut s = crate::tf!(
+        "History ({} conversations, most recently active first)  {}\n  (stored per workspace, under <workspace>/.aox/history; the path above is the default workspace's)",
+        items.len(),
+        location.display()
+    );
     for (i, it) in items.iter().enumerate() {
         let cur = if Some(it.id.as_str()) == current { crate::i18n::t("  ← current") } else { "" };
         s.push_str(&crate::tf!(

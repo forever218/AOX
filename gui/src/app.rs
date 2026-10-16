@@ -31,8 +31,8 @@
 //! There is no separate "input area" row at the bottom: the input box is a card floating
 //! above the transcript, and scrolling can carry it all the way under it.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,7 @@ use crate::bridge::{
 };
 use crate::markdown;
 use crate::theme::{self, P};
+use crate::uistate;
 use crate::workplace_ui;
 
 // ─────────────────────────── data model ───────────────────────────
@@ -460,6 +461,40 @@ pub struct App {
     /// and the "clicked outside" paths -- the opening action is cancelled by itself on the
     /// spot, which shows up as "I clicked and nothing happened".
     bar_hist_rect: Option<Rect>,
+    /// The conversation list **grouped into workspaces**, newest group first.
+    ///
+    /// Built once per [`App::refresh_history`] and read every frame the overlay is open: grouping
+    /// walks the whole flat list, and doing that per frame would re-sort and re-allocate eighty
+    /// entries sixty times a second for a list that only changes when a turn ends.
+    /// Empty until the first refresh (when `history` is empty too, so nothing draws it).
+    hist_groups: Vec<aox::space::Group>,
+    /// Workspace groups the user has **explicitly unfolded** in the history overlay, by
+    /// [`aox::space::Group::id`].
+    ///
+    /// Two sets rather than one "collapsed" flag, because the **default** is the load-bearing part:
+    /// a group nobody has touched is drawn open iff it holds the conversation being chatted in, so
+    /// opening History shows you where you are without a click while the other workspaces stay
+    /// folded and the panel stays short. A click writes to one of the two sets, and an explicit
+    /// choice always outranks the default.
+    hist_open: HashSet<String>,
+    /// Workspace groups the user has **explicitly folded** (see [`App::hist_open`]).
+    hist_closed: HashSet<String>,
+    /// Whether the two sets above have been read from disk yet.
+    ///
+    /// Loaded **once**, lazily, on the first refresh that knows the app root — not on every refresh:
+    /// re-reading would overwrite the in-memory sets (the ones the user is toggling) with whatever was
+    /// last written, so any choice not yet saved would be silently reverted. The flag keeps "load" a
+    /// one-shot inside a function that already has `app_root` in hand, so both the real boot path and
+    /// the `--demo` constructor get it for free.
+    hist_fold_loaded: bool,
+    /// The name dialog's in-progress state — "new workspace", "rename workspace" or "rename
+    /// conversation"; `None` while it is closed.
+    ///
+    /// One `Option` rather than loose fields on `App`: "a typed name with no dialog" (or an error
+    /// message with no name) is not a state this screen can be in, and splitting it would mean
+    /// remembering to reset both on every close path. The mode lives **inside** the struct rather
+    /// than in a second `Option` beside it, so "open, but for what?" is answered in one place.
+    name_dialog: Option<NameDialog>,
 
     /// Demo mode (--demo): no LLM attached, just shows the layout and the shape of the
     /// event stream
@@ -642,6 +677,11 @@ impl App {
             // real height.
             hist_h: 320.0,
             bar_hist_rect: None,
+            hist_groups: Vec::new(),
+            hist_open: HashSet::new(),
+            hist_closed: HashSet::new(),
+            hist_fold_loaded: false,
+            name_dialog: None,
             // The history overlay starts collapsed: the full width goes to the transcript,
             // and you click the top-left icon when you want it.
             follow: true,
@@ -782,14 +822,17 @@ impl App {
                     // The UI-side history backend is shipped along by the bridge: the same
                     // implementation the agent thread uses.
                     self.store = Some(b.store.clone());
-                    self.refresh_history();
                     if let Some(note) = &b.note {
                         self.log_error = Some(note.clone());
                         self.items.push(Item::Error(note.clone()));
                     }
                     self.status = if b.provider_ready { aox::i18n::t("Ready").to_string() } else { aox::i18n::t("No model configured").to_string() };
                     let ready = b.provider_ready;
+                    // The boot info has to be in place **before** the first refresh: `refresh_history`
+                    // reads the app root out of it (`App::app_root`) to find the space registry, and a
+                    // refresh that landed first would build an empty history tree.
                     self.boot = Some(*b);
+                    self.refresh_history();
                     if ready {
                         // --prompt: send the first instruction automatically once the model is ready
                         if let Some(p) = self.pending_prompt.take() {
@@ -993,6 +1036,29 @@ impl App {
         let Some(store) = self.store.clone() else {
             return;
         };
+        // Read the registry and hand its workspace roots to the store **before** listing. `list()`
+        // only scans the workspaces the store has been told about, so doing this afterwards would
+        // make the first refresh after a workspace is added (or removed) draw the **old** tree --
+        // and in the add case the new workspace's conversations would be missing from it.
+        //
+        // The registry is re-read every time (one small JSON file): a workspace can change while the
+        // app runs, and a cached copy would keep drawing a tree that no longer matches the disk.
+        let root = self.app_root();
+        // Fold state, read **once** — the first refresh that knows the root (see
+        // `App::hist_fold_loaded`). Doing it here rather than in the boot arm means the `--demo`
+        // constructor, which sets up its own synthetic boot and then refreshes, is covered too.
+        if !self.hist_fold_loaded {
+            if let Some(root) = root.as_deref() {
+                let fs = uistate::FoldState::load(root);
+                self.hist_open = fs.open;
+                self.hist_closed = fs.closed;
+                self.hist_fold_loaded = true;
+            }
+        }
+        let reg = root.as_deref().map(aox::space::Registry::load);
+        if let (Some(root), Some(reg)) = (root.as_deref(), reg.as_ref()) {
+            store.set_workspaces(&reg.workspace_roots(root));
+        }
         let mut items = store.list(HISTORY_LIST_LIMIT);
         // The conversation being chatted in is always pinned to the top.
         //
@@ -1007,7 +1073,186 @@ impl App {
                 items.insert(0, it);
             }
         }
+        // Group the (already newest-first) list into workspaces, for the overlay's tree.
+        //
+        // Done here rather than in the overlay: the overlay redraws at frame rate, and grouping
+        // walks and re-sorts the whole list. There is a useful side effect of the pinning above --
+        // `group` orders groups by their newest item's position in the list it is handed, so the
+        // workspace holding the current conversation comes out first among the user's workspaces,
+        // and the current conversation is first inside its group. That is the two-level pin for free.
+        self.hist_groups = match (root.as_deref(), reg.as_ref()) {
+            (Some(root), Some(reg)) => aox::space::group(root, reg, items.clone()),
+            _ => Vec::new(),
+        };
         self.history = items;
+    }
+
+    /// The application root, as the bridge resolved it.
+    ///
+    /// Taken from the boot info rather than re-derived from `store.location()`: the bridge is the
+    /// one place that decides the root (it honours `--config`-style overrides), and a second
+    /// derivation would silently disagree with it the day that logic changes.
+    fn app_root(&self) -> Option<PathBuf> {
+        self.boot.as_ref().map(|b| PathBuf::from(&b.paths.root))
+    }
+
+    /// Drop a workspace from AOX: **registration only, nothing on disk is touched**.
+    ///
+    /// Writes the `hidden` mark into the registry so the folder stops being listed *and* stops being
+    /// scanned -- dropping it from the spaces alone would not do, because `group()` invents a space
+    /// for any unknown root it meets, so the row would be back on the very next refresh.
+    ///
+    /// A failed write is swallowed on purpose: the visible result of "the file could not be saved" is
+    /// the row still being there, which is the same thing the user sees if they cancel. There is no
+    /// separate error surface for this, and a toast for a UI-organisation file would be noise.
+    fn forget_workspace(&mut self, root: &Path) {
+        let Some(app_root) = self.app_root() else {
+            return;
+        };
+        if let Err(e) = (|| -> anyhow::Result<()> {
+            let mut reg = aox::space::Registry::load(&app_root);
+            reg.remove_workspace(root);
+            reg.save(&app_root)
+        })() {
+            // The row staying on screen *is* the failure report; put the reason in the log where a
+            // developer can find it (`log_error` shows on screen, which this does not deserve).
+            eprintln!("aox-gui: could not save the space registry: {e:#}");
+            return;
+        }
+        // The fold state is deliberately **not** reset here. The removed group's id stops being drawn
+        // (`hist_groups` is rebuilt without it), so whatever it left in the two sets is inert -- and
+        // clearing them would mean "I dropped one workspace and all my other groups jumped open",
+        // which is a side effect on places the user did not touch.
+        self.refresh_history();
+    }
+
+    /// Create a workspace, register it, and move this conversation into it.
+    ///
+    /// Three steps, in this order and each for its own reason:
+    ///
+    /// 1. **The folder**, under `<app root>/workplace/` — the layout convention the system prompt
+    ///    already describes to the model, so "make yourself a project folder" and this button agree
+    ///    about where projects live. An **existing** folder is adopted instead of refused: putting a
+    ///    directory you already have back into the tree is the same gesture as making a new one, and
+    ///    `create_dir_all` is a no-op when it is already there. Nothing is ever overwritten.
+    /// 2. **The registry**, which is what makes the group exist at all. The tree is rebuilt from that
+    ///    file on every refresh, so a folder nobody registered is not a workspace, it is just a folder.
+    /// 3. **The conversation's own workspace**, over the bridge: the root only decides where writes
+    ///    may land once the agent thread has applied it (`ToAgent::Workplace`), because the tier
+    ///    belongs to the conversation, not to the window. The bridge answers with a `Workplace` push,
+    ///    which is what renames the chip at the bottom of the input box -- this call is a request.
+    ///
+    /// Returns the reason it failed, for the dialog to show. Both are things the user can act on (a
+    /// name that cannot be a folder, a directory that cannot be written), which is why the message
+    /// belongs in the dialog rather than in a toast that has already faded.
+    fn create_workspace(&mut self, raw: &str, app_root: Option<&Path>) -> Result<(), String> {
+        let Some(app_root) = app_root else {
+            return Err(aox::i18n::t("AOX does not know its own application root").to_string());
+        };
+        let name = check_ws_name(raw)?;
+        let dir = app_root.join(aox::workplace::WORKPLACE_DIR).join(&name);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| aox::tf!("Could not make the workspace: {}", e))?;
+
+        let mut reg = aox::space::Registry::load(app_root);
+        let id = reg.add_workspace(&dir, Some(name));
+        reg.save(app_root)
+            .map_err(|e| aox::tf!("Could not make the workspace: {}", format!("{e:#}")))?;
+
+        // The tree is rebuilt from the registry, so the new group is on screen from this frame on.
+        self.refresh_history();
+        // Unfold it, so the group the button just made is visibly there instead of being one more
+        // folded header among the others. The stale "explicitly folded" mark is dropped first --
+        // re-adding a folder that had been removed lands on the same id, and a group the user once
+        // folded must not come back folded when they have just asked for it by name.
+        self.hist_closed.remove(&id);
+        self.hist_open.insert(id);
+        // The unfold is a fold-state change like any other, so it is written through the same path --
+        // otherwise "create a workspace, restart" would show the new group folded again.
+        self.save_fold_state();
+        // ...and move this conversation in, so the next thing written lands in the new folder. The
+        // bridge answers with a `Workplace` push, which is what renames the chip at the bottom of the
+        // input box -- this call is a request, not a state change.
+        self.send_ws(Mode::Fixed(dir));
+        Ok(())
+    }
+
+    /// Open the rename dialog for a workspace, pre-filled with the name the tree is showing.
+    ///
+    /// The current name is read from the **drawn group** rather than from a fresh registry read:
+    /// they are the same value, and this way the name in the field is exactly the one the user just
+    /// right-clicked, with no chance of the two disagreeing mid-frame.
+    fn start_rename_workspace(&mut self, root: &Path) {
+        let current = self
+            .hist_groups
+            .iter()
+            .find(|g| g.root.as_deref() == Some(root))
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        self.name_dialog = Some(NameDialog::renaming(root.to_path_buf(), current));
+    }
+
+    /// Rename a workspace's **label**, and nothing else. See [`aox::space::Registry::rename_workspace`]
+    /// for why the folder is not moved; from here it matters that this is a registry edit only, so it
+    /// cannot disturb the conversation being chatted in, and it does not go near the bridge.
+    ///
+    /// `None` for `raw` (or a blank name) means "show the folder's own name again" — the rename
+    /// dialog's working undo, since a label equal to the folder name is what "no name" already
+    /// displays as. Anything else goes through **the same** validation as creating: the name lands in
+    /// the same file and the same tree, and a looser rule here would just be a second way to write a
+    /// name the create dialog refuses.
+    fn rename_workspace(&mut self, root: &Path, raw: Option<&str>) -> Result<(), String> {
+        let Some(app_root) = self.app_root() else {
+            return Err(aox::i18n::t("AOX does not know its own application root").to_string());
+        };
+        let name = match raw.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => Some(check_ws_name(n)?),
+            None => None,
+        };
+        let mut reg = aox::space::Registry::load(&app_root);
+        reg.rename_workspace(root, name);
+        reg.save(&app_root)
+            .map_err(|e| aox::tf!("Could not rename the workspace: {}", format!("{e:#}")))?;
+        // The fold state is deliberately **not** touched: a group's header is on screen whether it is
+        // folded or not, so the new name is visible either way — and forcing the group open would be
+        // an unasked-for change to a place the user did not click. (Creating a workspace does unfold,
+        // because there the group is brand new and folded is how it would arrive.)
+        self.refresh_history();
+        Ok(())
+    }
+
+    /// Open the rename dialog for a conversation, pre-filled with the title the row is showing.
+    ///
+    /// Read from the **drawn row** for the same reason as the workspace case: it is the exact string
+    /// the user just right-clicked, with no chance of the dialog and the row disagreeing.
+    fn start_rename_conversation(&mut self, id: &str, current: String) {
+        self.name_dialog = Some(NameDialog::renaming_conversation(id.to_string(), current));
+    }
+
+    /// Rename one conversation's **label**, and nothing else: the id (the filename), the workspace it
+    /// is bound to and every message in it are all untouched. A `kind:"title"` row is appended to the
+    /// conversation's own file (see [`aox::store::Session::append_title`]) — which is what makes this
+    /// survive a rollback, and why the newest row is the one that counts.
+    ///
+    /// `None` (or a blank name) means "show the automatic title again" — the first user message. That
+    /// is the dialog's working undo, and it needs the store's nested `Option` to be distinguishable
+    /// from "never renamed": a cleared label is a row with no `title` key, not the absence of a row.
+    ///
+    /// This goes **over the bridge** rather than touching the file here. The conversation being
+    /// chatted in has its file owned by the agent thread (that is where the append handle lives), so
+    /// writing it from the UI thread would be a second writer on the same file; and for any other
+    /// conversation the agent is the one that owns the store handle. So this is a request — the tree
+    /// is rebuilt when the bridge answers with a fresh history list.
+    fn rename_conversation(&mut self, id: &str, raw: Option<&str>) -> Result<(), String> {
+        let title = match raw.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => Some(check_conv_title(t)?),
+            None => None,
+        };
+        let _ = self.tx.send(ToAgent::RenameConversation {
+            id: id.to_string(),
+            title,
+        });
+        Ok(())
     }
 
     /// Switch to a history conversation.
@@ -1035,6 +1280,75 @@ impl App {
         }
         self.switching = true;
         let _ = self.tx.send(ToAgent::NewConversation);
+    }
+
+    /// Start a **new conversation bound to a particular workspace** — the "＋" on a group header, and
+    /// the same row in its right-click menu.
+    ///
+    /// Two messages, and the **order is the whole implementation**: `NewConversation` first, then
+    /// `Workplace(Fixed(root))`. The agent's `new_conversation` resets the workspace tier to `Default`,
+    /// so sending the root first would have it wiped a moment later and the new thread would land back
+    /// in the app root — the exact opposite of what the row promised. Both go down one channel, which
+    /// the agent drains in order, so "first" here really is first there.
+    ///
+    /// The early return for an already-empty conversation is deliberately **not** copied from
+    /// [`App::new_conversation`]: there, doing nothing is right, because the point is "give me a fresh
+    /// one" and a fresh one is already on screen. Here the point is **where the next thing gets
+    /// written**, and a blank conversation that is still bound to the app root is not in the workspace
+    /// the user just clicked — so the `Workplace` half has to go through in that case too.
+    ///
+    /// Like every other conversation switch this is a request: the UI moves when the bridge answers
+    /// (`FromAgent::Switched`, `FromAgent::Workplace`).
+    fn new_conversation_in(&mut self, root: &Path) {
+        if self.busy || self.switching {
+            return;
+        }
+        if self.demo {
+            // No agent thread to answer, so put the one thing the demo can show -- the workspace the
+            // chip at the bottom of the input box names -- into place the same way `send_ws` does.
+            self.send_ws(Mode::Fixed(root.to_path_buf()));
+            return;
+        }
+        self.switching = true;
+        let _ = self.tx.send(ToAgent::NewConversation);
+        let _ = self.tx.send(ToAgent::Workplace(Mode::Fixed(root.to_path_buf())));
+    }
+
+    /// Re-file a conversation into another group — **a registry edit only**; nothing on disk moves.
+    ///
+    /// See [`aox::space::Registry::place_conversation`] for what "placement" does and does not mean
+    /// (the file stays put, the write boundary is untouched). From here the interesting part is the
+    /// target: the menu hands back a **group id**, which may be an `auto:` id for an unregistered root,
+    /// so the root is read off the drawn tree rather than assumed to be in the registry.
+    ///
+    /// The destination is unfolded on the way, so the moved row is visibly there instead of vanishing
+    /// into a folded group — the same gesture `create_workspace` makes for the group it just made. A
+    /// move whose destination you cannot see is the one outcome worth spending a fold on.
+    fn move_conversation(&mut self, conv_id: &str, target_group_id: &str) {
+        let Some(app_root) = self.app_root() else {
+            return;
+        };
+        // The root comes off the **drawn** group, which is what lets an auto group (a root the
+        // registry has never heard of) be registered by the placement itself.
+        let target_root = self
+            .hist_groups
+            .iter()
+            .find(|g| g.id == target_group_id)
+            .and_then(|g| g.root.clone());
+        let mut reg = aox::space::Registry::load(&app_root);
+        let id = reg.place_conversation(conv_id, target_group_id, target_root.as_deref());
+        if let Err(e) = reg.save(&app_root) {
+            // As with the other registry edits: the row not moving *is* the failure report.
+            eprintln!("aox-gui: could not save the space registry: {e:#}");
+            return;
+        }
+        // Rebuilding the tree is what actually moves the row between groups.
+        self.refresh_history();
+        // Unfold the destination -- under the id it ended up with, which differs from the target's when
+        // the target was an auto group that the placement just registered.
+        self.hist_closed.remove(&id);
+        self.hist_open.insert(id);
+        self.save_fold_state();
     }
 
     /// Move the UI to the conversation with id `id` (`None` = a brand-new empty one).
@@ -1132,14 +1446,78 @@ impl App {
         let x = BAR_LEFT;
         let top = BAR_TOP + BAR_BTN + 8.0;
         let w = HISTORY_W;
-        // The panel height is set by the content (how many records there are); this only caps
-        // it, since going past the window's lower edge gets sliced off hard by the window
-        // boundary. 22px is left for the bottom corner radius and the shadow.
-        let max_h = (ctx.content_rect().bottom() - top - 22.0).clamp(150.0, 620.0);
+        // How tall the panel is. The **content no longer decides this**: with grouping, a
+        // content-driven height made the panel jump between one and three workspaces' worth of rows
+        // every time a group was folded, which reads as "sometimes small, sometimes large". It now
+        // takes a stable share of the window and scrolls inside, so the frame around the list stays
+        // put and the list moves.
+        //
+        // The window's height comes from **the largest of two independent reports**, because they
+        // can disagree: `content_rect` is what the rest of this file uses for coordinates, but on a
+        // window whose DPI the backend reports differently it can come back at a fraction of the real
+        // client area. Taking the max is safe in both directions: the values are only ever used to
+        // bound a height.
+        //
+        // ⚠️ Compare **heights**, not `bottom()`s: `viewport().inner_rect` is in *screen* coordinates
+        // (its `min` is the window's position on the desktop), so its `bottom()` is where the window
+        // ends on the **monitor**, not how tall it is. Mixing the two made this 83px too generous on
+        // a window that happened to sit low on the screen.
+        let win_h = ctx.content_rect().height().max(
+            ctx.input(|i| i.viewport().inner_rect.map_or(0.0, |r| r.height())),
+        );
+        // 22px is left at the bottom for the corner radius and the shadow.
+        let avail_h = (win_h - top - 22.0).max(180.0);
+        // 80% of what is available, with a floor so a short list still looks like a panel rather
+        // than a stub, and never taller than the window allows.
+        let panel_h = (avail_h * 0.80).clamp(420.0_f32.min(avail_h), avail_h);
+        // Space left for the scrolling list: the panel minus the head (title + rule), the foot (the
+        // two rows) and the frame's bottom margin. `HIST_HEAD` covers the top margin and the head;
+        // `HIST_FOOT` covers the foot; the 12 is the bottom margin. All three are measured from the
+        // real layout rather than computed (egui's `item_spacing` sits between every allocated
+        // widget and this theme sets it to 10), so that the frame comes out this tall:
+        //     panel_h ≈ 12 + head + list_h + foot + 12
+        // measured 605.5 against a `panel_h` of 604.5 (2026-10-14).
+        let list_h = (panel_h - HIST_HEAD - HIST_FOOT - 12.0).max(120.0);
+        // The tallest the frame can come out: the list's allowance plus the head, the foot and the
+        // frame's two inner margins. The clip rect below is bounded by *this* rather than by
+        // `panel_h`: `panel_h` is only the target share of the window, and the moment the real
+        // layout came out taller than it (which it did -- see `HIST_FOOT`), the clip shaved the last
+        // slice off the panel and flat-cut both bottom corners.
+        let frame_max = list_h + HIST_HEAD + HIST_FOOT + 24.0;
         let slide = -(1.0 - ease) * self.hist_h;
 
         let mut want_refresh = false;
+        let mut want_new_ws = false;
+        let mut want_open_ws = false;
+        // Read once, for the foot row that opens `<app root>/workplace/`: the closure that draws the
+        // panel holds only `&self`, and "is there a root at all" is also what decides whether that row
+        // is clickable.
+        let app_root = self.app_root();
         let mut open: Option<String> = None;
+        // Group folds requested this frame. Collected rather than applied in place: the tree is
+        // drawn inside the `Area` closure, which only holds `&self`, so `&mut self` edits have to
+        // wait until after it returns (the same shape `open` already used for switching).
+        let mut toggles: Vec<String> = Vec::new();
+        // Row / header requests, collected for the same reason as `toggles`: a menu row's click
+        // arrives from inside the `Area` closure, where only `&self` is in hand. One slot per
+        // destination rather than one enum because each lands somewhere different afterwards (a
+        // message to the agent / a registry edit / a shell open / a dialog), and a single click can
+        // only ever produce one of them.
+        let mut recycle: Vec<PathBuf> = Vec::new();
+        let mut forget_ws: Option<PathBuf> = None;
+        let mut reveal_ws: Option<PathBuf> = None;
+        let mut rename_ws: Option<PathBuf> = None;
+        // "Start a conversation in this workspace" -- fed by the header's hover "＋" and by the
+        // workspace menu's first row. One slot for both because they are one action with two doors.
+        let mut new_conv_ws: Option<PathBuf> = None;
+        // "Rename this conversation", as `(id, the title currently shown)`. The second half is what
+        // pre-fills the dialog, and it carries the **title** rather than a path because a conversation
+        // rename never touches the filesystem (see `NameDialogMode::RenameConversation`).
+        let mut rename_conv: Option<(String, String)> = None;
+        // "Re-file this conversation into that group", as `(conversation id, group id)`. The group id
+        // is the id the tree drew -- possibly an `auto:` one -- and the lookup back to its root happens
+        // in `move_conversation`, which has the drawn tree in hand.
+        let mut move_conv: Option<(String, String)> = None;
 
         let area = egui::Area::new(egui::Id::new("aox-history"))
             .order(egui::Order::Foreground)
@@ -1151,10 +1529,13 @@ impl App {
             .constrain_to(loose_rect())
             .show(ctx, |ui| {
                 // The visible region is loosened a ring beyond the panel on each side, so the
-                // corner stroke and the shadow don't get cut into hard edges.
+                // corner stroke and the shadow don't get cut into hard edges. The top bound doubles
+                // as the mask for the slide-in (the panel emerges from behind the button); the
+                // bottom one must never be tighter than the tallest frame the layout can produce,
+                // or the rounded corners get clipped off the bottom (2026-10-14).
                 ui.set_clip_rect(Rect::from_min_max(
                     Pos2::new(x - 26.0, top - 2.0),
-                    Pos2::new(x + w + 26.0, top + max_h + 30.0),
+                    Pos2::new(x + w + 26.0, top + frame_max + 30.0),
                 ));
                 Frame::NONE
                     .fill(P::surface())
@@ -1188,55 +1569,110 @@ impl App {
                         );
                         ui.add_space(9.0);
 
-                        if self.history.is_empty() {
-                            ui.label(
-                                RichText::new(
-                                    aox::i18n::t("No history yet.\nAfter your first message, the conversation is saved here automatically."),
-                                )
-                                .color(P::text_faint())
-                                .size(13.0),
-                            );
-                            ui.add_space(10.0);
-                            // A directory path can be long; use truncate so it closes itself off
-                            // within the panel width instead of being cut by the panel boundary.
-                            ui.add(
-                                Label::new(
-                                    RichText::new(
-                                        self.store
-                                            .as_ref()
-                                            .map(|s| s.location().display().to_string())
-                                            .unwrap_or_default(),
-                                    )
-                                    .color(P::text_faint())
-                                    .size(11.5),
-                                )
-                                .truncate(),
-                            );
-                            return;
-                        }
+                        // Is there anything in the tree other than the two built-ins? A registered
+                        // workspace counts as "something" **even while it is empty** -- that is exactly
+                        // the state the "new workspace" button leaves behind -- so the friendly
+                        // first-run screen below is reserved for a genuinely empty install.
+                        let custom_group = self.hist_groups.iter().any(|g| g.builtin.is_none());
 
-                        // Height **hugs the content** (the second component of `auto_shrink`), with
-                        // only an upper cap: with few records the panel is short, and no empty
-                        // stretch trails below the last row.
+                        // `auto_shrink([false, false])` is the load-bearing part: the scroll area
+                        // takes the height we decided instead of collapsing back onto its content,
+                        // which is what stops the panel resizing itself whenever a group is folded.
                         //
-                        // ⚠️ Don't change this to "height from the row count" (`rows * row
-                        // height`). The previous version did exactly that, but that product is the
-                        // height of **the rows alone**, while the scroll area computes its own
-                        // margins on top -- the estimate doesn't match what the panel really looks
-                        // like, and a one-record panel ends up with twenty-odd logical pixels of
-                        // blank underneath it (only a screenshot comparison showed it).
+                        // `min_scrolled_height` is the *other* half, and it is not redundant. A
+                        // `ScrollArea` sizes itself from `ui.available_rect_before_wrap()`, and inside
+                        // an `Area` that is **the Area's own rect from the previous frame** (`Area::show`
+                        // builds its `Ui` with `max_rect = self.state.rect()`). So "take all available
+                        // space" quietly means "stay exactly as big as you were": the panel came out at
+                        // the Area's first-frame default (~400) no matter what `panel_h` said, and it
+                        // sat there. Forcing the inner height is what actually makes `panel_h` real.
                         ScrollArea::vertical()
-                            .max_height((max_h - HIST_HEAD).max(60.0))
-                            .auto_shrink([false, true])
+                            .max_height(list_h)
+                            .min_scrolled_height(list_h)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                for s in &self.history {
-                                    let current =
-                                        Some(s.id.as_str()) == self.current_history.as_deref();
-                                    if history_row(ui, s, current, locked, pw).clicked() && !locked {
-                                        open = Some(s.id.clone());
-                                    }
+                                // The empty state is drawn **inside** the scroll area rather than
+                                // short-circuiting the panel. It has to be: "no conversations yet" is
+                                // not the same statement as "no workspaces yet", and returning early
+                                // here would hide the very group a workspace just created shows up as
+                                // -- and the button that made it, which sits below the list.
+                                if self.history.is_empty() && !custom_group {
+                                    ui.label(
+                                        RichText::new(
+                                            aox::i18n::t("No history yet.\nAfter your first message, the conversation is saved here automatically."),
+                                        )
+                                        .color(P::text_faint())
+                                        .size(13.0),
+                                    );
+                                    ui.add_space(10.0);
+                                    // A directory path can be long; use truncate so it closes itself
+                                    // off within the panel width instead of being cut by the panel
+                                    // boundary.
+                                    ui.add(
+                                        Label::new(
+                                            RichText::new(
+                                                self.store
+                                                    .as_ref()
+                                                    .map(|s| s.location().display().to_string())
+                                                    .unwrap_or_default(),
+                                            )
+                                            .color(P::text_faint())
+                                            .size(11.5),
+                                        )
+                                        .truncate(),
+                                    );
+                                } else {
+                                    self.hist_tree(
+                                        ui,
+                                        pw,
+                                        locked,
+                                        &mut open,
+                                        &mut toggles,
+                                        &mut recycle,
+                                        &mut forget_ws,
+                                        &mut reveal_ws,
+                                        &mut rename_ws,
+                                        &mut new_conv_ws,
+                                        &mut rename_conv,
+                                        &mut move_conv,
+                                    );
                                 }
                             });
+
+                        // The foot: the one action the panel has that is not about a row. Below the
+                        // list rather than in the head, so the head stays a title bar and this reads
+                        // as a list-level verb -- and pinned outside the scroll area, so it cannot be
+                        // scrolled away by a workspace with eighty conversations in it.
+                        ui.add_space(8.0);
+                        let (rule, _) = ui.allocate_exact_size(Vec2::new(pw, 1.0), Sense::hover());
+                        ui.painter().hline(
+                            rule.left()..=rule.right(),
+                            rule.center().y,
+                            Stroke::new(1.0, P::border()),
+                        );
+                        ui.add_space(7.0);
+                        // "New workspace" only goes live when no turn is running: it hands this
+                        // conversation to a new root, which is a workspace switch like any other.
+                        if foot_row(ui, pw, !locked, FootIcon::Plus, aox::i18n::t("New workspace"))
+                            .clicked()
+                        {
+                            want_new_ws = true;
+                        }
+                        ui.add_space(2.0);
+                        // ...whereas opening the folder touches nothing at all, so this row stays
+                        // live during a turn. Disabled only when the app root is unknown -- which is
+                        // the one case with no folder to name and no path to hand the shell.
+                        if foot_row(
+                            ui,
+                            pw,
+                            app_root.is_some(),
+                            FootIcon::Folder,
+                            aox::i18n::t("Open workspace folder"),
+                        )
+                        .clicked()
+                        {
+                            want_open_ws = true;
+                        }
                     });
             });
         let panel = area.response.rect;
@@ -1247,6 +1683,12 @@ impl App {
 
         // Clicking outside the panel, or pressing Esc, collapses it. The button's own click
         // doesn't count as "outside" (see `bar_hist_rect`).
+        //
+        // **Unless a right-click menu is up.** A menu is drawn at the pointer, i.e. outside the
+        // panel's own rect, so without this a click on a menu row would be read as "clicked
+        // outside" and collapse the overlay out from under the menu being used. Esc belongs to the
+        // menu first for the same reason -- egui closes the popup itself.
+        let menu_open = egui::Popup::is_any_open(ctx);
         let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let clicked_outside = ctx.input(|i| {
             i.pointer.any_pressed()
@@ -1254,16 +1696,309 @@ impl App {
                     !panel.contains(p) && !self.bar_hist_rect.is_some_and(|r| r.contains(p))
                 })
         });
-        if esc || clicked_outside {
+        // The workspace dialog is drawn in its own modal, i.e. outside this panel's rect, so
+        // without the second check every click *inside the dialog* would read as "clicked outside"
+        // and collapse the panel that opened it -- and the workspace would appear in a panel the
+        // user is no longer looking at. (The same hazard as the right-click menus above, from a
+        // different direction: one is a popup that overlaps the panel, this is one that replaces it.)
+        if !menu_open && self.name_dialog.is_none() && (esc || clicked_outside) {
             self.show_history = false;
         }
 
+        for id in toggles {
+            self.toggle_group(&id);
+        }
+        // The order here is deliberate: the workspace edits come before the refresh, so the refresh
+        // sees the registry as it is *after* the edit (see `refresh_history`, which re-reads it).
+        if let Some(root) = reveal_ws {
+            reveal_in_file_manager(&root);
+        }
+        if let Some(root) = forget_ws {
+            self.forget_workspace(&root);
+        }
+        if let Some(root) = rename_ws {
+            // Opens the dialog; nothing is written until the name is confirmed. Unlike the two above
+            // this is not an edit at all yet, which is why it is here rather than among them.
+            self.start_rename_workspace(&root);
+        }
+        if let Some((id, current)) = rename_conv {
+            // Same shape as the workspace rename: the dialog is opened, and nothing is written until
+            // "Save". The pre-fill is the title the row was showing, so an empty field visibly means
+            // "back to the first message".
+            self.start_rename_conversation(&id, current);
+        }
+        if let Some((conv, target)) = move_conv {
+            // A registry edit, done here (after the `Area` closure) because it needs `&mut self`.
+            // Unlike the rename above it writes immediately -- moving a row has no dialog to confirm.
+            self.move_conversation(&conv, &target);
+        }
+        if let Some(root) = new_conv_ws {
+            // New conversation **bound to that workspace** -- two messages down the queue, in an order
+            // that matters (see `new_conversation_in`). The panel stays open: the new thread is empty
+            // and its row only appears once something is written, so closing the panel here would make
+            // the click look like it did nothing.
+            self.new_conversation_in(&root);
+        }
+        if !recycle.is_empty() {
+            // Handed to the agent thread rather than recycled here: the move is a blocking shell
+            // call, and it also keeps one code path for "a conversation was deleted" -- the toast
+            // and the list refresh then come back through the same `AgentEvent::Recycled` the
+            // model's own deletions use.
+            let _ = self.tx.send(ToAgent::Recycle(recycle));
+        }
+        if want_new_ws {
+            // Just opens the dialog. The folder is not touched until the user has named it and hit
+            // "Create" -- this is the one action in the panel that writes to disk, so it gets a step
+            // of its own rather than happening under the pointer.
+            self.name_dialog = Some(NameDialog::new());
+        }
+        if want_open_ws {
+            if let Some(root) = app_root.as_deref() {
+                let dir = root.join(aox::workplace::WORKPLACE_DIR);
+                // Made if it is not there yet: `ensure_started` normally creates it, but the panel can
+                // be opened before the agent thread has run, and handing `explorer` a path that does
+                // not exist opens nothing at all -- a button that silently does nothing.
+                let _ = std::fs::create_dir_all(&dir);
+                reveal_in_file_manager(&dir);
+            }
+        }
         if want_refresh {
             self.refresh_history();
         }
         if let Some(id) = open {
             self.switch_history(&id);
         }
+    }
+
+    /// Draw the workspace-grouped conversation tree inside the overlay's scroll area.
+    ///
+    /// Takes `&self` -- the overlay's `Area` closure only holds an immutable borrow -- and hands
+    /// everything it wants to change back to the caller: `open` (switch to this conversation),
+    /// `toggles` (fold / unfold this group), and the seven right-click requests `recycle` /
+    /// `forget_ws` / `reveal_ws` / `rename_ws` / `new_conv_ws` / `rename_conv` / `move_conv` (delete
+    /// this conversation / drop this workspace / open its folder / rename it / start a conversation in
+    /// an existing workspace / rename a conversation / re-file a conversation into another group).
+    ///
+    /// The groups arrive from [`aox::space::group`] in a **fixed order** (Default, Full access, then
+    /// the user's workspaces, most recently active first). Exactly one adjustment is made on top:
+    /// the workspace holding the current conversation is pulled to the very top, so the place you
+    /// are in is the first thing in the panel -- the tree's counterpart of the old flat list pinning
+    /// the current row. It is applied as an index order, so the groups themselves are never touched.
+    #[allow(clippy::too_many_arguments)] // one `&mut` slot per thing the tree can ask for; see above
+    fn hist_tree(
+        &self,
+        ui: &mut Ui,
+        width: f32,
+        locked: bool,
+        open: &mut Option<String>,
+        toggles: &mut Vec<String>,
+        recycle: &mut Vec<PathBuf>,
+        forget_ws: &mut Option<PathBuf>,
+        reveal_ws: &mut Option<PathBuf>,
+        rename_ws: &mut Option<PathBuf>,
+        new_conv_ws: &mut Option<PathBuf>,
+        rename_conv: &mut Option<(String, String)>,
+        move_conv: &mut Option<(String, String)>,
+    ) {
+        let mut order: Vec<usize> = (0..self.hist_groups.len()).collect();
+        if let Some(cur) = self.current_group_id() {
+            if let Some(i) = self.hist_groups.iter().position(|g| g.id == cur) {
+                order.retain(|&j| j != i);
+                order.insert(0, i);
+            }
+        }
+
+        let cur = self.current_history.as_deref();
+        for (n, &gi) in order.iter().enumerate() {
+            let g = &self.hist_groups[gi];
+            if n > 0 {
+                // A breath between groups; without it the last row of one group sits flush against
+                // the next group's header and the whole thing reads as one undifferentiated list.
+                ui.add_space(3.0);
+            }
+            let unfolded = self.group_is_open(&g.id);
+            let (head, plus) = history_group_header(ui, g, width);
+            if head.clicked() {
+                toggles.push(g.id.clone());
+            }
+            // The header's own "＋" and its menu row say the same thing, so they feed the same slot.
+            // A group with no root has no "＋" (see `history_group_header`), so the root here is a
+            // formality -- but it is still read from `g` rather than assumed.
+            if plus {
+                if let Some(root) = g.root.clone() {
+                    *new_conv_ws = Some(root);
+                }
+            }
+            // Only a real folder gets a menu. `Default` and `Full access` have no root of their own
+            // (and are not the user's to remove), so neither "new conversation", "rename", "open in
+            // the file manager" nor "remove from AOX" has anything to act on -- a menu whose every
+            // row is dead is worse than no menu at all.
+            if let Some(root) = g.root.clone() {
+                head.context_menu(|ui| {
+                    // First row, because it is the one thing this menu can do that the header cannot
+                    // do without hovering: make a conversation here. Not gated on `locked` -- the
+                    // click goes down the same queue as the "＋", which refuses a switch while a turn
+                    // runs by doing nothing, and graying the row out here would only be a second,
+                    // silent copy of that rule.
+                    if menu_item(ui, aox::i18n::t("New conversation"), MENU_W, true, false).clicked() {
+                        *new_conv_ws = Some(root.clone());
+                        ui.close();
+                    }
+                    // Renaming here moves **the label, never the folder**: the conversations record
+                    // the folder they were written to, so a folder move would strand every one of
+                    // them under a root the registry no longer knows (see
+                    // `Registry::rename_workspace`). The dialog says which part is being renamed --
+                    // a menu row that has to explain itself is a menu row nobody reads.
+                    if menu_item(ui, aox::i18n::t("Rename"), MENU_W, true, false).clicked() {
+                        *rename_ws = Some(root.clone());
+                        ui.close();
+                    }
+                    if menu_item(ui, aox::i18n::t("Open in file manager"), MENU_W, true, false)
+                        .clicked()
+                    {
+                        *reveal_ws = Some(root.clone());
+                        ui.close();
+                    }
+                    // Deliberately not styled as a danger action and not confirmed: nothing is
+                    // deleted. The folder, its conversations and everything inside stay exactly
+                    // where they are; this only drops the row from the tree, and re-adding the
+                    // folder is a working undo (see `Registry`'s `hidden` mark).
+                    if menu_item(ui, aox::i18n::t("Remove from AOX"), MENU_W, true, false).clicked() {
+                        *forget_ws = Some(root.clone());
+                        ui.close();
+                    }
+                });
+            }
+            if !unfolded {
+                continue;
+            }
+            // The "Move to" targets: every drawn group except this one. Built once per group rather
+            // than per row, since the list is identical for every row inside it. It is a pair of
+            // (group id, display name): the id is what the move records, the name is what the menu
+            // shows -- and the name is never re-derived from the id, because for `Default`/`Full
+            // access` and for a renamed workspace they have nothing to do with each other.
+            let move_targets: Vec<(String, String)> = self
+                .hist_groups
+                .iter()
+                .filter(|x| x.id != g.id)
+                .map(|x| (x.id.clone(), x.name.clone()))
+                .collect();
+            for s in &g.items {
+                let current = Some(s.id.as_str()) == cur;
+                let row = history_row(ui, s, current, locked, width, HIST_INDENT);
+                if row.clicked() && !locked {
+                    *open = Some(s.id.clone());
+                }
+                // A row's menu is offered **even while a turn runs**: deleting an old conversation
+                // touches nothing the running turn holds (the move happens on the agent thread).
+                // Only *switching* has to wait for the turn, and that is the `locked` gate above.
+                let path = s.path.clone();
+                let id = s.id.clone();
+                // What the dialog's field is pre-filled with. The **title**, not the id: the id is a
+                // timestamp, and "edit the timestamp" is not the thing anybody right-clicked.
+                let title = s.title.clone();
+                row.context_menu(|ui| {
+                    // Renaming is offered on **every** row, the current one included (unlike Delete
+                    // below): the current conversation is the one whose file the agent already has
+                    // open, and the append is exactly what makes the rename work there.
+                    if menu_item(ui, aox::i18n::t("Rename"), MENU_W, true, false).clicked() {
+                        *rename_conv = Some((id.clone(), title.clone()));
+                        ui.close();
+                    }
+                    // Move to → another group. A submenu rather than one flat row per group: the
+                    // target list grows with the user's workspaces, and a menu that keeps getting
+                    // taller is worse than one click deeper. Offered on every row including the
+                    // current one -- re-filing is a registry edit, so it touches neither the open file
+                    // nor the running turn. Hidden when there is only one group, so it is never a row
+                    // that opens onto nothing.
+                    if !move_targets.is_empty() {
+                        ui.menu_button(aox::i18n::t("Move to"), |ui| {
+                            for (tid, tname) in &move_targets {
+                                if menu_item(ui, tname, MENU_W, true, false).clicked() {
+                                    *move_conv = Some((id.clone(), tid.clone()));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                    // The conversation being chatted in is refused rather than hidden: the agent has
+                    // it open and would keep appending to a file that is no longer there. The row
+                    // stays visible but greyed, with the reason on hover, so the menu looks the same
+                    // everywhere and the missing row is never a mystery.
+                    let del = menu_item(ui, aox::i18n::t("Delete"), MENU_W, !current, true);
+                    if current {
+                        del.on_hover_text(aox::i18n::t("Cannot delete the conversation you are in"));
+                    } else if del.clicked() {
+                        recycle.push(path.clone());
+                        ui.close();
+                    }
+                });
+            }
+        }
+    }
+
+    /// Whether the workspace group `id` is drawn unfolded (see [`App::hist_open`] / [`App::hist_closed`]).
+    fn group_is_open(&self, id: &str) -> bool {
+        if self.hist_closed.contains(id) {
+            return false;
+        }
+        if self.hist_open.contains(id) {
+            return true;
+        }
+        match self.current_group_id() {
+            Some(cur) => cur == id,
+            // Nothing is on screen yet (a brand-new conversation that has not reached disk), so
+            // there is no "where you are" to point at. Unfold everything rather than greet the user
+            // with a wall of headers and nothing underneath.
+            None => true,
+        }
+    }
+
+    /// Fold / unfold a workspace group.
+    ///
+    /// Flips relative to **what is on screen right now** rather than inserting into a chosen set:
+    /// the effective state is the two explicit sets plus the default, so a caller holding only the
+    /// id would have to re-derive all three just to know which set to write to.
+    fn toggle_group(&mut self, id: &str) {
+        let now = self.group_is_open(id);
+        self.hist_open.remove(id);
+        self.hist_closed.remove(id);
+        if now {
+            self.hist_closed.insert(id.to_string());
+        } else {
+            self.hist_open.insert(id.to_string());
+        }
+        // Persisted right away: a fold is a deliberate click, it is cheap to write (one tiny file),
+        // and deferring it would mean choosing a moment to flush that always turns out to be the
+        // wrong one (the app being killed is exactly when nothing gets flushed).
+        self.save_fold_state();
+    }
+
+    /// Write the two fold sets to `<app root>/.aox/ui.json`.
+    ///
+    /// Best-effort, like the registry: a failure is logged, never surfaced. The tree keeps working
+    /// with the in-memory sets either way, so a failure only costs "the fold is not remembered next
+    /// launch" — not worth an error the user has to dismiss.
+    fn save_fold_state(&self) {
+        let Some(root) = self.app_root() else {
+            return;
+        };
+        let fs = uistate::FoldState {
+            open: self.hist_open.clone(),
+            closed: self.hist_closed.clone(),
+        };
+        if let Err(e) = fs.save(&root) {
+            eprintln!("aox-gui: could not save the fold state: {e:#}");
+        }
+    }
+
+    /// The id of the group holding the conversation being chatted in, if any.
+    fn current_group_id(&self) -> Option<&str> {
+        let cur = self.current_history.as_deref()?;
+        self.hist_groups
+            .iter()
+            .find(|g| g.items.iter().any(|s| s.id == cur))
+            .map(|g| g.id.as_str())
     }
 
     /// A fragment of a tool call the model is **still writing**: open its row once, then keep the
@@ -1528,6 +2263,14 @@ impl App {
                         *shown_at = Instant::now();
                     }
                     _ => self.toast = Some((n, Instant::now())),
+                }
+                // The tree is redrawn only when something asks for it, and a recycled conversation is
+                // exactly such a thing: without this, a row right-clicked away would sit in the list
+                // until the next turn ended. Done **here** rather than at the point the delete was
+                // requested -- the move happens on the agent thread, so a refresh issued then would
+                // race it and put the row straight back on screen.
+                if self.show_history {
+                    self.refresh_history();
                 }
             }
             AgentEvent::Images(paths) => {
@@ -2603,6 +3346,52 @@ impl App {
         });
     }
 
+    /// The name dialog ("new workspace" from the panel's foot row, "rename workspace" from a
+    /// group's right-click menu, or "rename conversation" from a conversation row's).
+    ///
+    /// The state is `take()`n out of `self.name_dialog` and put back at the end, rather than borrowed
+    /// across the draw: the body needs `&mut self` (the app root, and on confirm the registry), and a
+    /// `&mut` into `App::name_dialog` held over that is exactly the double borrow the compiler refuses.
+    /// Taking it keeps one owner at a time without cloning the whole struct every frame.
+    fn name_dialog_overlay(&mut self, ctx: &egui::Context) {
+        let Some(mut st) = self.name_dialog.take() else {
+            return;
+        };
+        let root = self.app_root();
+        let action = name_dialog_modal(ctx, &mut st, root.as_deref());
+        match action {
+            // Still open: put the state back, so the next frame draws the same text and keeps the
+            // caret where the user left it. (Anything else would make the field feel like it resets
+            // itself every frame.)
+            None => self.name_dialog = Some(st),
+            // Cancelled -- backdrop click, Esc, or the button. Nothing was written, so there is
+            // nothing to clean up.
+            Some(DialogAction::Cancel) => {}
+            Some(DialogAction::Confirm) => {
+                let res = match &st.mode {
+                    NameDialogMode::New => self.create_workspace(&st.name, root.as_deref()),
+                    // Blank is not refused here, it is the undo: the dialog says the folder's own name
+                    // is what an empty field means, so it has to be what an empty field does.
+                    NameDialogMode::Rename { root: ws } => {
+                        self.rename_workspace(ws, Some(st.name.as_str()))
+                    }
+                    // Same shape as the workspace rename: whatever is in the field is the answer,
+                    // because a **blank** field is the real answer here too ("go back to the first
+                    // message"), and the caller is the one that reads the blank.
+                    NameDialogMode::RenameConversation { id } => {
+                        self.rename_conversation(id, Some(st.name.as_str()))
+                    }
+                };
+                // Refused: the dialog **stays open** with the message, so the name can be fixed
+                // without typing it all again. On success it closes and the field stays `None`.
+                if let Err(e) = res {
+                    st.error = Some(e);
+                    self.name_dialog = Some(st);
+                }
+            }
+        }
+    }
+
     /// Settings: one large centred card, pick on the left, read on the right.
     ///
     /// It replaces the three buttons that used to be at the top-right (activity stream / theme /
@@ -3122,6 +3911,11 @@ fn seed_demo(app: &mut App) {
     // ornamental.
     let root = aox::paths::resolve_workplace().0;
     let store = aox::store::default_store(&root, 0);
+    // The same wiring a real boot does: `--demo` should show the conversations that are actually on
+    // this machine, including the ones made in other workspaces. Without this the preview would look
+    // poorer than the real thing for no reason.
+    let spaces = aox::space::Registry::load(&root);
+    store.set_workspaces(&spaces.workspace_roots(&root));
     app.boot = Some(BootInfo {
         config_path: app.config_path.clone(),
         // The demo data gets a realistic layer chain too, so that row in the "About" window is
@@ -3465,6 +4259,9 @@ impl eframe::App for App {
             self.send_ws(mode);
         }
 
+        // Before the settings dialog, because it belongs to the history panel: the two are never
+        // open at once, and a modal drawn later wins any overlap.
+        self.name_dialog_overlay(ctx);
         self.settings_overlay(ctx);
         self.auth_overlay(ctx);
         // Last, so the toast sits above everything: it reports something that has **already**
@@ -3541,12 +4338,48 @@ const BAR_LEFT: f32 = 20.0;
 /// 50px top bar -- the buttons' centre line coincides exactly with the pre-removal one.
 const BAR_TOP: f32 = 7.0;
 /// Width of the history overlay.
-const HISTORY_W: f32 = 300.0;
+///
+/// 400 rather than the old 300: each conversation row now spends an indent on being nested under
+/// its group header, and titles are elided against what is left, so the old width started cutting
+/// titles that used to fit.
+const HISTORY_W: f32 = 400.0;
+/// Left inset of a conversation row under its group header.
+///
+/// Chosen so a nested row starts under the header's name (just right of the folder), and so the
+/// hairline `history_row` draws lines up with the folder above it.
+const HIST_INDENT: f32 = 18.0;
+/// Width of a right-click menu's rows.
+///
+/// Fixed rather than "as wide as the longest label": the two menus (a conversation's and a
+/// workspace's) would otherwise come out different widths, and a menu that resizes itself when the
+/// pointer crosses rows reads as the UI twitching under the hand.
+const MENU_W: f32 = 178.0;
 /// Height of the "above the list" part of the history overlay (padding + title row + separator).
 ///
-/// Used only to work out how tall the list may be at most; rounding is fine -- the panel's real
-/// height is decided by its content, not by this.
-const HIST_HEAD: f32 = 74.0;
+/// Used to work out how tall the list may be at most. **Measured, not computed**: the panel's real
+/// height is decided by its content, and this is the number that makes the two agree -- so a drift
+/// here shows up as the panel being a few pixels off its share of the window, not as a broken
+/// layout. It is not a clean sum because egui adds `item_spacing` around every allocated widget and
+/// this theme sets that to 10 (see `theme.rs`); measured 80 with the title row at 31.
+///
+/// ⚠️ The bottom of the clip rect is derived from this and [`HIST_FOOT`] (see `history_overlay`), so
+/// the two must stay in step with what is actually drawn.
+const HIST_HEAD: f32 = 80.0;
+/// Height of the "below the list" part of the history overlay (separator + spacing + the two rows).
+///
+/// Subtracted from the list's allowance, the same way [`HIST_HEAD`] is: the foot is pinned outside
+/// the scroll area, so if it were not accounted for here the list would just be drawn 40-odd pixels
+/// too tall and the panel would grow past the share of the window it was given.
+///
+/// Two rows since 2026-10-14 ("New workspace", then "Open workspace folder"): 8 + 28 + 2 + 28 of
+/// explicit spacing and rows, plus the `item_spacing` egui keeps around each of them -- 104 measured
+/// at this theme's 10, which is why the number is not the 74 it looks like it should be. Landing
+/// this 36px short of the truth is what let the panel come out taller than `panel_h` and had the
+/// clip rect shave the bottom corners off (2026-10-14).
+///
+/// The panel's own height does not move with it -- `panel_h` is still the share of the window it was
+/// given, so this comes out of the list, not out of the panel.
+const HIST_FOOT: f32 = 104.0;
 /// The slide-out / collapse animation duration (seconds).
 ///
 /// 0.24 is the "you can see it moving, but you don't have to wait" setting: shorter falls back to
@@ -3698,17 +4531,641 @@ fn elide(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<e
     ui.painter().layout_job(job)
 }
 
+/// One workspace group header in the history overlay: a folder, the name, and how many
+/// conversations are in it. The whole row is the click target for folding / unfolding.
+/// The count is drawn whether or not the group is folded: `list()` scans every workspace in one go
+/// (see the store's multi-directory layout), so the number is already in hand -- a "not counted yet"
+/// placeholder would be a promise the panel has no reason to break.
+///
+/// Returns the row's own response (the fold toggle) plus whether the hovered "＋" was clicked. Two
+/// answers rather than one because they are two different gestures on one rect: the "＋" is a
+/// **child** click target nested inside the row, and it has to be the one that wins the pointer or
+/// "new conversation here" would also fold the group the user is pointing at.
+fn history_group_header(ui: &mut Ui, g: &aox::space::Group, width: f32) -> (egui::Response, bool) {
+    let w = (width - 6.0).max(60.0);
+    // 34 rather than 30 (user request, 2026-10-14): the header carries a folder, a name, a "＋" and
+    // a count on one line, and at 30 it read as a *row* -- the same weight as the conversations under
+    // it, which are 46 tall. A couple more pixels gives the header the extra air that says "this one
+    // is a heading over the list", which is what its bold name was already trying to say alone.
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
+    // Pointer over the row -- asked of the **rect**, not `resp.hovered()`. The "＋" below is a child
+    // interact target nested inside this rect, so on the frames the pointer is on it the row is no
+    // longer the *hovered widget*; `resp.hovered()` would flip to false and take the row's fill --
+    // and, since the "＋" is only drawn while the row reads as hovered, the glyph with it -- which is
+    // a stable-looking half-frame flicker: draw, erase, draw. `rect_contains_pointer` is the one
+    // reading that does not depend on which of the two widgets won the hit test.
+    let hov = ui.rect_contains_pointer(rect);
+    if hov {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().rect_filled(rect, CornerRadius::same(7), P::surface());
+    }
+    let fg = if hov { P::text() } else { P::text_dim() };
+    let cy = rect.center().y;
+    let icon_x = rect.left() + 11.0;
+
+    let count = aox::tf!("{}", g.items.len());
+    let count_w = 26.0;
+    // Far enough right that the name clears the folder instead of sitting on its corner.
+    let name_x = icon_x + 12.0;
+    // The "＋" gutter is **always** taken off the name's width, whether or not the glyph is being
+    // drawn right now. If the width only shrank on hover, the name and the count would both jump a
+    // few pixels sideways the instant the pointer arrived -- the one thing a hover affordance must
+    // never do, since it moves the ground out from under the click that is about to happen.
+    let plus_w = 22.0;
+    let name_w = (rect.right() - 8.0 - count_w - plus_w - name_x).max(24.0);
+    // Bold marks the header as a heading rather than a row (same treatment as markdown titles and
+    // the activity stream's headings).
+    let name = elide(ui, &g.name, theme::bold_font(12.5), fg, name_w);
+    let cnt = elide(ui, &count, theme::body_font(11.5), P::text_faint(), count_w);
+
+    let painter = ui.painter();
+    // A folder, where this used to be a disclosure triangle (user request, 2026-10-14). The triangle
+    // was the only thing saying folded-or-not; that signal is the rows underneath now -- and the
+    // count on the right says how many to expect -- while what the folder adds is the one thing a
+    // header could never show: that this row is a *directory*, which is also what tells a workspace
+    // apart from a conversation at a glance. Same 13x11 box the workplace picker's rows use, so the
+    // two trees draw the same folder.
+    workplace_ui::paint_folder(
+        painter,
+        Rect::from_center_size(Pos2::new(icon_x, cy), Vec2::new(13.0, 11.0)),
+        fg,
+    );
+    painter.galley(Pos2::new(name_x, cy - name.size().y * 0.5), name, fg);
+    painter.galley(
+        Pos2::new(rect.right() - 8.0 - cnt.size().x, cy - cnt.size().y * 0.5),
+        cnt,
+        P::text_faint(),
+    );
+
+    // ── the "＋": new conversation *in this workspace* ──
+    //
+    // Drawn only for a group with a real folder (`g.root.is_some()`), matching the context menu
+    // below: `Default` and `Full access` are not directories, so there is nowhere to put a
+    // conversation and the glyph would be a lie. Drawn only on hover for the same reason it is
+    // hidden at rest -- at rest the header is a *label*, and five of them at once wearing a "＋"
+    // would turn a list of workspaces into a row of buttons.
+    //
+    // It sits **before the count** (user request, 2026-10-14) rather than at the far right: the count
+    // is the row's own data and it should not be pushed around by a control, and "＋ 3" reads as
+    // "add one to these three", which is exactly what the click does.
+    let mut plus_clicked = false;
+    if g.root.is_some() && hov {
+        let plus_rect =
+            Rect::from_center_size(Pos2::new(rect.right() - 8.0 - count_w - plus_w * 0.5, cy), Vec2::splat(20.0));
+        let click = ui.interact(plus_rect, resp.id.with("new-conv"), Sense::click());
+        let on = pointer_if(ui, &click);
+        if on {
+            // The same raised fill the toolbar's buttons use, so a second hoverable thing inside a
+            // hovered row is still readable as "this, specifically, is the target".
+            ui.painter().rect_filled(plus_rect, CornerRadius::same(6), P::surface_hi());
+        }
+        let pfg = if on { P::ink() } else { P::text_dim() };
+        let s = 3.8;
+        let p = ui.painter();
+        p.line_segment(
+            [Pos2::new(plus_rect.center().x - s, cy), Pos2::new(plus_rect.center().x + s, cy)],
+            Stroke::new(1.5, pfg),
+        );
+        p.line_segment(
+            [Pos2::new(plus_rect.center().x, cy - s), Pos2::new(plus_rect.center().x, cy + s)],
+            Stroke::new(1.5, pfg),
+        );
+        plus_clicked = click.clicked();
+        if click.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+
+    // The workspace's directory is the one thing a header can't show (a path doesn't fit, and for
+    // the built-ins there is nothing to show anyway), so it rides on the tooltip: with several
+    // workspaces listed, "which folder is this one again" is exactly the question the tree raises.
+    let resp = match g.root.as_deref() {
+        Some(root) => resp.on_hover_text(root.display().to_string()),
+        None => resp,
+    };
+    (resp, plus_clicked)
+}
+
+/// The name dialog's state while it is open (see [`App::name_dialog`]).
+struct NameDialog {
+    /// Which question is being asked. The shapes below are shared by all three.
+    mode: NameDialogMode,
+    /// What the user has typed, bound straight to the text field.
+    name: String,
+    /// Why the last attempt was refused. Cleared as soon as the name changes, so the message can
+    /// never outlive the input it was about.
+    error: Option<String>,
+    /// Whether the field has been handed the caret yet. It has to be done **once**, on the frame the
+    /// dialog appears: asking every frame would fight the user from the moment they clicked anywhere
+    /// else in the dialog, and `request_focus` on an already-focused field is not idempotent in the
+    /// way that would fix it -- it would just keep pulling the caret back.
+    focused: bool,
+}
+
+/// Which question the shared shell is asking.
+///
+/// The type is named after none of its three jobs on purpose: it asks about a workspace's folder, a
+/// workspace's label and a conversation's label, and a name taken from one of them is a name that
+/// gets read instead of the code.
+enum NameDialogMode {
+    /// Make a folder under `<app root>/workplace/` and register it.
+    New,
+    /// Re-label an **existing** folder. The folder itself is never moved — see
+    /// [`aox::space::Registry::rename_workspace`] — which is why the path below is read from here
+    /// rather than computed from the typed name.
+    Rename { root: PathBuf },
+    /// Re-label one **conversation**. Nothing on disk is renamed: the id (which is the filename) is
+    /// left alone and a row carrying the new title is appended to the conversation's own file. So
+    /// there is no path to spell out here, and the folder-name rule does not apply either — a title
+    /// is only a label, so `notes/2026` and `v1.2.` are both fine (see [`check_conv_title`]).
+    RenameConversation { id: String },
+}
+
+impl NameDialogMode {
+    /// A stable tag for the `Modal` id. Three questions share one body, and a `Modal` keeps its state
+    /// under its id — one id for all three would let a rename inherit whatever the previous question
+    /// left in the field.
+    fn tag(&self) -> u8 {
+        match self {
+            Self::New => 0,
+            Self::Rename { .. } => 1,
+            Self::RenameConversation { .. } => 2,
+        }
+    }
+}
+
+impl NameDialog {
+    fn new() -> Self {
+        Self { mode: NameDialogMode::New, name: String::new(), error: None, focused: false }
+    }
+
+    /// Open for a workspace rename, with the field **pre-filled**: the current name is the thing being
+    /// edited, so an empty field would make the common case (fix one character) the awkward one.
+    fn renaming(root: PathBuf, current: String) -> Self {
+        Self { mode: NameDialogMode::Rename { root }, name: current, error: None, focused: false }
+    }
+
+    /// Open for a conversation rename. Pre-filled for the same reason as the workspace case — and with
+    /// the title the row is *showing*, so clearing it and saving is visibly "back to the first
+    /// message" rather than "back to something invisible".
+    fn renaming_conversation(id: String, current: String) -> Self {
+        Self {
+            mode: NameDialogMode::RenameConversation { id },
+            name: current,
+            error: None,
+            focused: false,
+        }
+    }
+
+    /// The folder being renamed, or `None` in the other two modes.
+    fn rename_root(&self) -> Option<&Path> {
+        match &self.mode {
+            NameDialogMode::Rename { root } => Some(root),
+            _ => None,
+        }
+    }
+
+    /// The conversation being renamed, or `None` in the other two modes.
+    fn conv_id(&self) -> Option<&str> {
+        match &self.mode {
+            NameDialogMode::RenameConversation { id } => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// What the user did with the workspace dialog this frame.
+enum DialogAction {
+    /// "Create" in the new-workspace mode, "Save" in the rename mode.
+    Confirm,
+    Cancel,
+}
+
+/// Draw the name dialog — "new workspace", "rename workspace" or "rename conversation". Returns
+/// what the user asked for, if anything.
+///
+/// A free function taking the state by `&mut` rather than a method on `App`: the body needs no
+/// `App` state at all (`app_root` comes in as a parameter), so keeping it out of the `impl` is what
+/// lets the caller hold the dialog's state apart from `self` while it is open.
+///
+/// The three modes share one body on purpose. They ask the same kind of question — "what should
+/// this thing be called?" — and differ only in the words around the field (the title, the one-line
+/// blurb, the button's verb) and in **which rule validates it and what the answer goes to**. Three
+/// dialogs would duplicate the input handling, the Enter key, the caret handoff and the error slot —
+/// i.e. every part of this that can have a bug in it.
+fn name_dialog_modal(
+    ctx: &egui::Context,
+    st: &mut NameDialog,
+    app_root: Option<&Path>,
+) -> Option<DialogAction> {
+    // Which of the three questions this is, read once here instead of five times below. Booleans and
+    // a `u8` rather than a held reference to the mode: the body needs `&mut st.name` a few lines down,
+    // and a borrow of `st` living across that is exactly what the compiler refuses.
+    let creating = matches!(st.mode, NameDialogMode::New);
+    let renaming_conversation = st.conv_id().is_some();
+    let mut action = None;
+    // A separate id per question: all three share one body, and a `Modal` keeps its state under this
+    // id, so one id would let a rename inherit whatever the previous question left in the field.
+    let resp = egui::Modal::new(egui::Id::new(("aox-name", st.mode.tag())))
+        .frame(
+            Frame::NONE
+                .fill(P::surface())
+                .corner_radius(CornerRadius::same(theme::card_radius()))
+                .stroke(Stroke::new(1.0, P::border()))
+                .inner_margin(Margin::symmetric(22, 18)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(430.0);
+            // The words, the field's hint and the one sentence of explanation — the only things the
+            // three questions do not share. Everything else (the field, the caret handoff, Enter, the
+            // error slot, the buttons) is one body for a reason: it is all the part that can have a
+            // bug in it.
+            let (title, blurb, hint) = match &st.mode {
+                NameDialogMode::New => (
+                    "New workspace",
+                    aox::i18n::t("A folder of its own, with its own conversations. Writes and deletes stay inside it."),
+                    aox::i18n::t("Workspace name"),
+                ),
+                NameDialogMode::Rename { .. } => (
+                    "Rename workspace",
+                    aox::i18n::t("Only this label changes — the folder stays where it is. Clear the name to use the folder's own name."),
+                    aox::i18n::t("Workspace name"),
+                ),
+                // The one thing worth saying here is that nothing on disk is renamed: the *row* is a
+                // label, the file behind it keeps its name, and clearing the field is how you get the
+                // automatic title back.
+                NameDialogMode::RenameConversation { .. } => (
+                    "Rename conversation",
+                    aox::i18n::t("Only this row's label changes; the file keeps its name on disk. Clear it to go back to the first message."),
+                    aox::i18n::t("Conversation name"),
+                ),
+            };
+            ui.label(RichText::new(aox::i18n::t(title)).color(P::text()).size(16.0).strong());
+            ui.add_space(5.0);
+            // One line, and it says what the thing *is* rather than where it goes: in the workspace
+            // modes the concrete path below answers "where" far better than prose can, and this screen
+            // has room for exactly one sentence.
+            //
+            // In the workspace-rename case the sentence is doing real work rather than setting a tone.
+            // The field holds a *name* and the box below holds a *folder*, and without saying so it is
+            // perfectly reasonable to read this screen as "these two are kept in step" — which is the
+            // one thing it does not do.
+            ui.label(RichText::new(blurb).color(P::text_faint()).size(12.5));
+            ui.add_space(12.0);
+
+            // The field's height comes from **this margin**, not from a minimum size. A `TextEdit`'s
+            // box is its text plus its margin, and singleline text is drawn aligned inside whatever
+            // box it is handed -- so padding is the only way to get a taller field without the text
+            // ending up stuck to the top edge. The default (`Margin::symmetric(4, 2)`) makes a ~23px
+            // strip, which reads as cramped next to this dialog's 16px title and its buttons.
+            let edit = ui.add(
+                TextEdit::singleline(&mut st.name)
+                    .desired_width(f32::INFINITY)
+                    .margin(Margin::symmetric(11, 10))
+                    .font(FontId::proportional(14.0))
+                    .hint_text(
+                        RichText::new(hint).color(P::text_faint()).size(13.5),
+                    ),
+            );
+            if !st.focused {
+                edit.request_focus();
+                // ...and put the caret at the **end of the pre-filled name**, explicitly.
+                //
+                // `request_focus` alone does not promise *where in the text* the caret lands.
+                // `TextEdit` only falls back to "end of text" when it has no stored cursor to
+                // resume from (`default_cursor_range`, consulted in egui's own `events`), and this
+                // field keeps its state under one id across every opening of the dialog. So the
+                // second time it is opened, the index a previous rename left behind is what the
+                // caret resumes at -- and when that is 0 the caret sits *before* the pre-filled
+                // name, which makes backspace do nothing and typing prepend: "rename this" turns
+                // into "rename thisOld name". Written out here, the common case (adjust the tail of
+                // the name) works on the first try, every time the dialog is opened.
+                let mut state =
+                    egui::TextEdit::load_state(ui.ctx(), edit.id).unwrap_or_default();
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(st.name.chars().count()),
+                )));
+                state.store(ui.ctx(), edit.id);
+                st.focused = true;
+            }
+            if edit.changed() {
+                st.error = None;
+            }
+
+            // The path, spelled out. It means a different thing in each of the two modes that have
+            // one -- the folder that *is* there vs. the folder that *will* be -- which is why the
+            // arms stay separate instead of one expression with a flag inside it. The conversation
+            // rename is the third state and has no path at all.
+            ui.add_space(8.0);
+            match (renaming_conversation, st.rename_root(), app_root) {
+                // **Renaming a conversation**: nothing on disk moves -- the id keeps its filename and
+                // the new label is a row inside the file -- so there is no directory to spell out
+                // here. The same vertical space is reserved anyway, so the buttons sit in the same
+                // place as in the other two questions.
+                (true, _, _) => ui.add_space(31.0),
+                // **Renaming**: the folder that is already there. Tied to no typed text, so the box
+                // does not flicker as the name is edited — and it is shown even while the field is
+                // blank, which is the state that means "use the folder's own name".
+                (_, Some(ws), _) => {
+                    let path = ws.display().to_string();
+                    Frame::NONE
+                        .fill(P::code_bg())
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(10, 7))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                RichText::new(workplace_ui::elide_path(&path, 56))
+                                    .font(theme::mono_font(12.5))
+                                    .color(P::text_dim()),
+                            );
+                        });
+                }
+                // **Creating**: where the folder *will* land. The user is about to let the model write
+                // inside this directory, so "which directory" is the one thing this screen must not
+                // leave implied -- and the name typed above is only half of the answer.
+                //
+                // Drawn for an empty or unusable name too, showing just the parent: `workplace/`. The
+                // space below the field is reserved in every case anyway (see the catch-all arm), and
+                // an empty box was the one state where that reservation read as a hole in the dialog.
+                // A box that is always there is also a box that never jumps.
+                (_, None, Some(root)) => {
+                    let base = root.join(aox::workplace::WORKPLACE_DIR);
+                    let path = match check_ws_name(&st.name) {
+                        Ok(name) => base.join(name),
+                        Err(_) => base,
+                    };
+                    Frame::NONE
+                        .fill(P::code_bg())
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(10, 7))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                RichText::new(workplace_ui::elide_path(&path.display().to_string(), 56))
+                                    .font(theme::mono_font(12.5))
+                                    .color(P::text_dim()),
+                            );
+                        });
+                }
+                // The only case left: no known app root, so there is no path to spell out. The same
+                // vertical space is reserved anyway, so the buttons sit in the same place in every
+                // state this dialog can be in.
+                _ => ui.add_space(31.0),
+            }
+
+            // Why the button would not do anything, shown **as it is typed** rather than only after
+            // a submit. The alternative is a confirm button that silently ignores the click, and "I
+            // pressed it and nothing happened" is the one thing this dialog must never do. The
+            // submit-time failure (a registry that cannot be written) rides in the same slot: it is
+            // about the same text, and it is dropped the moment that text changes.
+            //
+            // Nothing is said about an **empty** field: it starts that way, and a dialog that opens
+            // complaining has already spent the user's attention on nothing. (An empty field is not
+            // merely tolerated either -- in the rename mode it is a real answer, which is why nothing
+            // here refuses it and the caller is left to read the meaning.)
+            // A conversation title is validated by a **different rule** to a folder name: a title is
+            // only a label, so separators and dots are all perfectly good in it. The one thing it
+            // cannot be is longer than the row can show, and that is what `check_conv_title` says.
+            let live = if st.name.trim().is_empty() {
+                None
+            } else if renaming_conversation {
+                check_conv_title(&st.name).err()
+            } else {
+                check_ws_name(&st.name).err()
+            };
+            if let Some(e) = live.or_else(|| st.error.clone()) {
+                ui.add_space(8.0);
+                ui.label(RichText::new(e).color(P::text()).size(13.0));
+            }
+
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                // Enter in the name field does the same as the button. The standard test for it on a
+                // single-line field: it **lost focus** this frame, and Enter is what took the focus
+                // away (a bare `key_pressed` would also fire while the field still has it).
+                //
+                // The caret is handed straight back when that happens, **unconditionally**: a
+                // single-line field surrenders focus on Enter, so after a refusal the obvious next
+                // move -- fix the name, press Enter again -- would otherwise be typed into nothing.
+                // When the confirm does succeed this is a no-op; the dialog is gone by the next frame.
+                let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if entered {
+                    edit.request_focus();
+                    action = Some(DialogAction::Confirm);
+                }
+                // The button is deliberately **not** disabled while the name is invalid: a control
+                // that looks live and silently does nothing is the worst of both worlds, while
+                // pressing it just runs the validation and says why. The live message above is what
+                // makes that feel like an answer rather than a refusal.
+                let verb = if creating { "Create" } else { "Save" };
+                if primary_button(ui, aox::i18n::t(verb)).clicked() {
+                    action = Some(DialogAction::Confirm);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if flat_button(ui, aox::i18n::t("Cancel")).clicked() {
+                        action = Some(DialogAction::Cancel);
+                    }
+                });
+            });
+        });
+
+    // Clicking the backdrop or pressing Esc closes it -- the standard exit `egui::Modal` provides --
+    // and that has to mean **cancel**: nothing was asked for, so nothing is written.
+    if resp.should_close() {
+        action.get_or_insert(DialogAction::Cancel);
+    }
+    action
+}
+
+/// Validate a typed workspace name and hand back the trimmed form.
+///
+/// The only place in the GUI that has to think about what a filename may contain, and it matters
+/// more than it looks: the name becomes a **path segment**, so a separator or a `..` here would
+/// silently point the whole workspace -- and every write the model makes under it -- somewhere else
+/// than the dialog's path preview promised. The reserved characters are rejected on **every**
+/// platform rather than only on Windows: "works on my machine" is a worse outcome than one slightly
+/// stricter rule, and the registry has to stay readable by every build.
+fn check_ws_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(aox::i18n::t("Please give the workspace a name.").to_string());
+    }
+    // Structural, not "a character we dislike": a leading dot makes a hidden directory, and Windows
+    // silently drops a **trailing dot**, so `"notes."` and `"notes"` would be one folder wearing two
+    // different rows in the tree. Both get the same message -- the user's fix is identical in either
+    // case, which is to type a plain folder name.
+    //
+    // A trailing **space** is deliberately not in this list: the trim above already dealt with it,
+    // and refusing what `"notes "` becomes (`"notes"`, a perfectly good name) would be a puzzle
+    // rather than a rule.
+    let structural = name.starts_with('.') || name.ends_with('.');
+    let illegal = name
+        .chars()
+        .any(|c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control());
+    if structural || illegal {
+        return Err(aox::i18n::t("That name cannot be used for a folder.").to_string());
+    }
+    Ok(name.to_string())
+}
+
+/// Validate a typed conversation title and hand back the trimmed form.
+///
+/// Deliberately **not** [`check_ws_name`]. A title never becomes a path: it is one row inside the
+/// conversation's own file, so the separators, `?`, `"` and even a trailing dot are all perfectly
+/// good in it — a thread called `notes/2026` or `v1.2.` is fine, and refusing those would just be a
+/// folder rule leaking onto a label. What actually matters here is two other things:
+///
+/// - **Length.** The row draws the title on one line, and the store clamps what it reads back to
+///   [`aox::store::TITLE_MAX_CHARS`] — so a longer title would be silently cut, and "what I typed
+///   is not what got saved" is exactly the kind of quiet edit this dialog exists to prevent.
+///   Refusing it here states the limit instead of applying it behind the user's back.
+/// - **Control characters.** A tab or a stray `\r` would land in the persisted row and then in the
+///   row's layout. A single-line field cannot be *typed* into one, but a paste can carry one.
+///
+/// An **empty** string is `Ok`, not an error: for a title, blank is a real answer — "go back to the
+/// automatic title, the first message" — so refusing it is not this function's business. (The
+/// caller is what reads a blank as that meaning; see [`App::rename_conversation`].)
+fn check_conv_title(raw: &str) -> Result<String, String> {
+    let title = raw.trim();
+    if title.chars().any(char::is_control) {
+        return Err(aox::i18n::t("A conversation name cannot contain control characters.").to_string());
+    }
+    if title.chars().count() > aox::store::TITLE_MAX_CHARS {
+        return Err(aox::tf!(
+            "A conversation name can be at most {} characters.",
+            aox::store::TITLE_MAX_CHARS
+        ));
+    }
+    Ok(title.to_string())
+}
+
+/// Which glyph a history-panel foot row leads with.
+enum FootIcon {
+    /// A hand-drawn plus: "make one".
+    Plus,
+    /// The folder from [`workplace_ui::paint_folder`] — the same drawing a group header now carries:
+    /// "the directory they all live in".
+    Folder,
+}
+
+/// One row of the history panel's foot: a glyph, then a label.
+///
+/// Both rows go through here rather than each drawing itself: the hover fill, the three-way colour
+/// rule and the click sense are the parts with anything to get wrong, and they have to be identical
+/// or the two rows would answer the same pointer differently.
+///
+/// Hand-drawn like every other icon in this file (the folder in `workplace_ui`): a font's `+` would
+/// change shape and weight with whichever font the build picked. `enabled == false` swaps the sense
+/// to hover, so the row is **visible but not clickable** rather than absent -- the panel's shape does
+/// not depend on whether a turn happens to be running.
+fn foot_row(ui: &mut Ui, width: f32, enabled: bool, icon: FootIcon, label: &str) -> egui::Response {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new((width - 6.0).max(60.0), 28.0), sense);
+    let hov = pointer_if(ui, &resp) && enabled;
+    if hov {
+        ui.painter().rect_filled(rect, CornerRadius::same(7), P::surface());
+    }
+    let fg = if !enabled {
+        P::text_faint()
+    } else if hov {
+        P::text()
+    } else {
+        P::text_dim()
+    };
+    // Both glyphs sit on the same 11px gutter as a group header's folder, so the panel's left edge
+    // reads as one column from the list all the way down to the foot.
+    let cy = rect.center().y;
+    let cx = rect.left() + 11.0;
+    let painter = ui.painter();
+    match icon {
+        FootIcon::Plus => {
+            let s = 4.0;
+            let stroke = Stroke::new(1.5, fg);
+            painter.line_segment([Pos2::new(cx - s, cy), Pos2::new(cx + s, cy)], stroke);
+            painter.line_segment([Pos2::new(cx, cy - s), Pos2::new(cx, cy + s)], stroke);
+        }
+        FootIcon::Folder => {
+            // The same 13x11 box the workplace picker's rows and the group headers use.
+            workplace_ui::paint_folder(
+                painter,
+                Rect::from_center_size(Pos2::new(cx, cy), Vec2::new(13.0, 11.0)),
+                fg,
+            );
+        }
+    }
+    let g = painter.layout_no_wrap(label.to_string(), theme::body_font(13.0), Color32::PLACEHOLDER);
+    painter.galley(Pos2::new(rect.left() + 24.0, cy - g.size().y * 0.5), g, fg);
+    resp
+}
+
+/// One row of a right-click menu.
+///
+/// Full width and left-aligned, unlike [`flat_button`] (which hugs its text): the whole row should be
+/// the click target, so the pointer never has to land on the glyphs. `enabled == false` draws the
+/// label faint and swallows the click -- the row stays **visible** rather than being dropped, so a
+/// menu is never a different shape depending on which row it was opened over (the reason then rides
+/// on the tooltip, which the caller attaches).
+///
+/// `strong` marks the consequential row ("Delete"): it is emphasised by **contrast, not hue**, which
+/// is this palette's own rule -- hue is reserved for [`P::danger`], and that is a deep brick red the
+/// theme docs forbid spending on anything recoverable. A deletion that lands in the recycle bin is
+/// exactly that, so the row reads stronger rather than louder.
+fn menu_item(ui: &mut Ui, label: &str, w: f32, enabled: bool, strong: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
+    let hov = pointer_if(ui, &resp) && enabled;
+    if hov {
+        // Hover raises the surface one step -- the same language as list rows and the top-bar icons.
+        ui.painter().rect_filled(rect, CornerRadius::same(7), P::surface_hi());
+    }
+    let fg = if !enabled {
+        P::text_faint()
+    } else if strong {
+        P::text()
+    } else if hov {
+        P::text()
+    } else {
+        P::text_dim()
+    };
+    let galley =
+        ui.painter().layout_no_wrap(label.to_owned(), theme::body_font(13.5), Color32::PLACEHOLDER);
+    ui.painter().galley(
+        Pos2::new(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        fg,
+    );
+    resp
+}
+
+/// Show `dir` in the OS file manager.
+///
+/// Spawned and **not waited on**: the file manager is a separate, long-lived process, so waiting for
+/// it would block the UI thread until the user closed the window.
+fn reveal_in_file_manager(dir: &Path) {
+    // `explorer` reports a non-zero exit code even when it opened the window, so the status is
+    // deliberately dropped -- there is nothing actionable to report and no reason not to try.
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    #[cfg(not(windows))]
+    {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let _ = std::process::Command::new(opener).arg(dir).spawn();
+    }
+}
+
 /// One history conversation row in the sidebar: title + "last activity · message count".
 ///
 /// `current` = the one being chatted in right now (a filled dot on the right); `locked` = a switch
 /// request is in flight or a turn is running, in which case clicks are refused and the whole row
-/// is dimmed one step.
+/// is dimmed one step. `indent` shifts the text right so the row sits nested under its group header
+/// (the hover fill still spans the full width, so the clickable strip doesn't shrink with the depth).
 fn history_row(
     ui: &mut Ui,
     s: &aox::history::Summary,
     current: bool,
     locked: bool,
     width: f32,
+    indent: f32,
 ) -> egui::Response {
     let w = (width - 6.0).max(60.0); // leave room for the scroll bar
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 46.0), Sense::click());
@@ -3716,7 +5173,16 @@ fn history_row(
     if hov {
         ui.painter().rect_filled(rect, CornerRadius::same(8), P::surface());
     }
-    let x = rect.left() + 10.0;
+    // A hairline down the left of every nested row. Consecutive rows abut, so it becomes one
+    // continuous line running under the group header -- without it an indented row reads as "a row
+    // with a gap on the left" rather than "a child of the group above". Drawn **after** the hover
+    // fill, otherwise the fill paints over it.
+    ui.painter().vline(
+        rect.left() + 11.0,
+        rect.top()..=rect.bottom(),
+        Stroke::new(1.0, P::border()),
+    );
+    let x = rect.left() + 10.0 + indent;
     let title_color = if locked {
         P::text_faint()
     } else if hov || current {
@@ -5310,5 +6776,52 @@ mod tests {
             changed,
                         "egui no longer changes scroll-bar allocation per frame? Then the **rationale comment** for the `ui.set_width(content_w)` block in `App::settings_overlay` must be updated -- its only purpose is to dodge this animation (it is not redundant). Measured width sequence: {widths:?}"
         );
+    }
+
+    /// What a workspace name may be, pinned down as a table.
+    ///
+    /// Worth its own test because this is the **only** place in the GUI that decides what a
+    /// filename may contain, and it feeds a path straight into `create_dir_all` under the app root:
+    /// a separator or a `..` slipping through would not fail loudly, it would quietly point the
+    /// whole workspace (and every write the model makes under it) somewhere else than the dialog's
+    /// path preview promised. The refusals are therefore asserted individually rather than by a
+    /// generic "some are rejected".
+    #[test]
+    fn workspace_names_are_stripped_down_to_one_safe_segment() {
+        // Accepted, in the form the dialog previews it.
+        for (typed, want) in [
+            ("notes", "notes"),
+            // Surrounding whitespace is trimmed rather than refused: `"notes "` *is* `"notes"` as far
+            // as the filesystem is concerned, so the only sensible reading is that the user meant the
+            // name they typed.
+            ("  notes  ", "notes"),
+            ("notes ", "notes"),
+            ("My Notes 2", "My Notes 2"),
+            ("中文 工作区", "中文 工作区"),
+        ] {
+            assert_eq!(check_ws_name(typed).as_deref(), Ok(want), "typed {typed:?}");
+        }
+
+        for typed in [
+            "",
+            "   ",
+            ".",
+            "..",
+            ".hidden",        // a leading dot is a hidden directory, not a name we want by accident
+            "notes.",         // a trailing dot is dropped by Windows -> one folder, two rows
+            "a/b",
+            "a\\b",
+            "C:notes",
+            "a:b",
+            "a*b",
+            "a?b",
+            "a\"b",
+            "a<b",
+            "a>b",
+            "a|b",
+            "a\nb",           // control characters would end up literally in the folder name
+        ] {
+            assert!(check_ws_name(typed).is_err(), "{typed:?} must be refused");
+        }
     }
 }

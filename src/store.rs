@@ -19,7 +19,7 @@
 
 pub mod jsonl;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -61,6 +61,18 @@ pub trait Session: Send {
     /// conversation; ② so that "switch to full access and back to default" need
     /// not create another plot (see [`crate::workplace::Record`]).
     fn append_workplace(&mut self, rec: &crate::workplace::Record);
+    /// Append "this conversation is called X now" (`None` = drop the user's name and go back to the
+    /// automatic one, the first user message).
+    ///
+    /// Appended rather than patched into the header record: the file is only ever appended to, the
+    /// newest record wins on read, and clearing the name is then just one more row rather than a
+    /// rewrite of the one line that anchors the whole file.
+    ///
+    /// ⚠️ Only the GUI renames conversations, so the CLI target reports this as never used (it compiles
+    /// these files as its own modules, with its own dead-code pass). Silenced on the item, as `mod space`
+    /// is silenced in `src/main.rs`, so the reason sits next to the thing it is about.
+    #[allow(dead_code)]
+    fn append_title(&mut self, title: Option<&str>);
     /// Rewrite the whole file with the given message list (interrupt rollback);
     /// the activity stream and usage are preserved as-is.
     fn rewrite(&mut self, msgs: &[Message]);
@@ -70,10 +82,43 @@ pub trait Session: Send {
 pub trait Store: Send + Sync {
     /// The backend name, i.e. the value of `config.toml [store] backend`.
     fn backend(&self) -> &'static str;
-    /// The data location (for the UI to show "where history is kept").
+    /// Where the **default workspace's** history is kept — what the UI shows under "history lives
+    /// here", and what the CLI's `/history dir` prints.
+    ///
+    /// Since 2026-10-14 this is no longer the only location: every workspace keeps its own history
+    /// under `<workspace>/.aox/history`, and this is the app root's one. It stays a single path
+    /// because that is all every caller wants ("one place to point at"); the full set is what
+    /// [`Store::set_workspaces`] is for.
     fn location(&self) -> &Path;
     /// Create a new conversation and write the header record.
-    fn create(&self, model: Option<&str>) -> Result<Box<dyn Session>>;
+    ///
+    /// `at` is the **workspace root this conversation belongs to** (`None` = the default or
+    /// unrestricted one, i.e. the backend's home directory). The backend turns that into its own
+    /// layout; the caller must not spell out `.aox/history` itself, or the layout would leak out of
+    /// the storage seam (see the module docs on why paths stay off this interface).
+    ///
+    /// It is a parameter rather than a field on the backend because it varies **per conversation** and
+    /// can change mid-conversation (`/workplace`, the GUI's workspace button), while the backend is
+    /// built once at startup.
+    fn create(&self, model: Option<&str>, at: Option<&Path>) -> Result<Box<dyn Session>>;
+
+    /// Tell the backend which **workspaces** to read history from, in addition to its own home.
+    ///
+    /// History is per workspace (`<workspace>/.aox/history`), so "list every conversation" has to know
+    /// which workspaces exist. This method is the entire coupling with the space registry
+    /// (`crate::space`): the registry computes the list of roots, the backend only ever sees paths.
+    /// Swapping the storage backend therefore does not drag the registry along, and the registry does
+    /// not have to know how history is stored.
+    ///
+    /// Takes **workspace roots**, not history directories — the same rule as `create`.
+    fn set_workspaces(&self, roots: &[PathBuf]);
+
+    /// Where a conversation belonging to workspace `root` lands (`None` = the default workspace).
+    ///
+    /// Exposed **only** so a failure can name the directory it failed in. The alternative — letting
+    /// the caller join `.aox/history` itself — is exactly the layout leak this seam exists to prevent
+    /// (see the module docs on why paths stay off this interface).
+    fn history_dir_for(&self, root: Option<&Path>) -> PathBuf;
     /// Continue an existing conversation (keep writing by id).
     fn open(&self, id: &str) -> Result<Box<dyn Session>>;
     /// List conversations, **most recently used first**.
@@ -113,6 +158,15 @@ pub trait Store: Send + Sync {
 
 /// The known backend names. When adding a backend, update here and [`backend`] together.
 pub const BACKENDS: [&str; 1] = ["jsonl"];
+
+/// How long a conversation title may be, in **characters** (not bytes, so CJK is never cut in half).
+///
+/// It lives on the seam rather than inside the jsonl backend because it is a contract between two
+/// sides: the backend clamps a stored title to this length on the way out (a hand-edited file, or one
+/// written before the rule existed, must not be able to break the one-line row), and the dialog that
+/// asks for a title refuses anything longer. Two copies of the number would drift, and the symptom
+/// would be a title quietly shorter than the one the user typed.
+pub const TITLE_MAX_CHARS: usize = 46;
 
 /// The default backend name — used when `config.toml` does not set `[store] backend`.
 pub fn default_backend() -> &'static str {

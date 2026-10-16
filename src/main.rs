@@ -15,6 +15,13 @@ mod runtime;
 mod runtimes;
 mod sandbox;
 mod selftest;
+// Silenced **here** rather than in `space.rs`, because the two targets genuinely differ: the space
+// registry's tree-building half (`group`, `Group`, the writers) exists for the GUI's history panel,
+// and this CLI links the module only to call `Registry::load` / `workspace_roots` when it sets up
+// storage. With the attribute on the `mod` item the silence covers exactly the target that needs it,
+// so the library keeps its dead-code signal (see the note at the top of `src/space.rs`).
+#[allow(dead_code)]
+mod space;
 mod store;
 mod tool;
 mod ui;
@@ -188,7 +195,15 @@ fn history_command(agent: &mut Agent, line: &str, store: &dyn store::Store) -> R
         // Say which backend is in use as well: once sqlite really exists, seeing this
         // line tells the user whether their config change took effect, instead of
         // having to guess.
-        history::Cmd::Dir => crate::tf!("{} (backend {})", store.location().display(), store.backend()),
+        //
+        // The path named is the **default workspace's** directory. Conversations live per workspace
+        // since 2026-10-14, so printing one path without saying so would read as "this is all there
+        // is" — and send the user looking in the wrong folder for a conversation made elsewhere.
+        history::Cmd::Dir => crate::tf!(
+            "{} (backend {}; each workspace keeps its own conversations under <workspace>/.aox/history)",
+            store.location().display(),
+            store.backend()
+        ),
         history::Cmd::Show(key) => {
             let s = store.resolve(&key)?;
             let items = store.load(&s.id)?;

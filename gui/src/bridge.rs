@@ -45,6 +45,12 @@ pub enum ToAgent {
     /// handle is in the Agent thread's hands, and "new conversation" and "abort rollback" also happen
     /// on that thread — the queue naturally preserves write order.
     Act(Vec<Value>),
+    /// Rename a conversation (the history panel's conversation menu).
+    ///
+    /// Goes through the queue for the same reason `Act` does: the file handle for the conversation
+    /// being chatted in is in this thread's hands, and the row we append to ends up in that same file.
+    /// `title: None` = "show the automatic title again".
+    RenameConversation { id: String, title: Option<String> },
     /// Workplace: switch tier (the button at the bottom-left of the input box, see `gui/src/workplace_ui.rs`).
     ///
     /// Like `Input`, this can only be done **back on the Agent's thread** — `Workplace` lives inside
@@ -55,8 +61,39 @@ pub enum ToAgent {
     /// startup / at the end of every turn / after every tier switch the bridge proactively pushes a
     /// [`FromAgent::Workplace`].
     Workplace(aox::workplace::Mode),
+    /// Move these paths to the system recycle bin and report the total.
+    ///
+    /// The main thread cannot do this itself: `recycle` is async and can block for a while on the
+    /// shell, and the "N files moved to the recycle bin" notice is an [`AgentEvent`] — routing it
+    /// through the **same event** the model's own file deletion produces means both deletions look
+    /// identical to the user (one toast, same wording), instead of the GUI growing a second, subtly
+    /// different notion of "delete".
+    Recycle(Vec<PathBuf>),
     /// Exit: close the plugin child processes and end the driver thread
     Shutdown,
+}
+
+/// Move every path to the system recycle bin, reporting the total through `AgentEvent::Recycled`.
+///
+/// A failure is reported per path rather than swallowed: "I deleted three and only two went" is
+/// exactly the case where silence is worst, because the user believes the file is safely recoverable.
+async fn recycle_all(paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<FromAgent>) {
+    let mut moved = 0usize;
+    for p in paths {
+        match aox::recycle::recycle(&p).await {
+            Ok(()) => moved += 1,
+            Err(e) => {
+                let _ = tx.send(FromAgent::Event(AgentEvent::Warn(aox::tf!(
+                    "Could not move {} to the recycle bin: {}",
+                    p.display(),
+                    format!("{e:#}")
+                ))));
+            }
+        }
+    }
+    if moved > 0 {
+        let _ = tx.send(FromAgent::Event(AgentEvent::Recycled(moved)));
+    }
 }
 
 /// Agent thread → main thread
@@ -364,6 +401,8 @@ impl Ui for GuiUi {
                 Some(ToAgent::Resume(_))
                 | Some(ToAgent::NewConversation)
                 | Some(ToAgent::Act(_))
+                | Some(ToAgent::RenameConversation { .. })
+                | Some(ToAgent::Recycle(_))
                 | Some(ToAgent::Workplace(_)) => continue,
             }
         }
@@ -589,6 +628,18 @@ async fn idle_until_shutdown(
             }
             // There is no log to write in this stretch (the Agent never started); drop it honestly
             ToAgent::Act(_) => {}
+            // Recycling needs no Runtime at all (it is a shell call on a path), so unlike the arms
+            // around it this one really does the work.
+            ToAgent::Recycle(paths) => recycle_all(paths, tx).await,
+            // A rename does need the storage layer, and the storage layer only exists inside
+            // `Runtime` — which never started in this stretch. Say so rather than let the menu row
+            // look like it did nothing.
+            ToAgent::RenameConversation { .. } => {
+                let _ = tx.send(FromAgent::Event(AgentEvent::Warn(
+                    aox::i18n::t("model not ready; the conversation cannot be renamed right now.")
+                        .into(),
+                )));
+            }
             // The workplace button is also dead here — `Workplace` lives in `Runtime`, and the Runtime
             // never started. Say something rather than let the button look "unresponsive when clicked"
             // (the same reason as the `Input` arm above).
@@ -647,6 +698,26 @@ async fn next_command(
             // exactly the user's order of operations, so "this turn's timeline" always lands in this
             // turn's conversation file.
             Some(ToAgent::Act(acts)) => agent.append_acts(&acts),
+            // Renaming a conversation: one appended row, written in place, without entering the next
+            // turn — nothing about the model's context changes, so there is nothing to re-read.
+            //
+            // The receipt is `HistoryCurrent`: its meaning is already "a conversation file changed on
+            // disk, rescan the directory", which is exactly what the list needs to show the new name
+            // (and it is the only thing that refreshes the panel). A failed rename has to speak up —
+            // the user typed a name and would otherwise be left thinking it took.
+            Some(ToAgent::RenameConversation { id, title }) => {
+                match agent.rename_conversation(&id, title.as_deref()) {
+                    Ok(()) => send_history_current(tx, agent),
+                    Err(e) => ui.emit(AgentEvent::Warn(aox::tf!(
+                        "Could not rename the conversation: {}",
+                        format!("{e:#}")
+                    ))),
+                }
+            }
+            // Deleting a conversation from the history list. Nothing about it needs the Agent: the
+            // file is moved to the recycle bin and the count comes back as an `AgentEvent`, exactly
+            // as if a tool had deleted it.
+            Some(ToAgent::Recycle(paths)) => recycle_all(paths, tx).await,
             // Workplace button: switch tier / query state. Done in place — `Workplace` lives inside
             // `Runtime`, and this thread is the only place that can reach the Agent (and through it its
             // `rt`). It does not enter the next turn: a tier switch is a pure host action, unrelated to
@@ -723,6 +794,11 @@ async fn boot_and_run(
             // disabled. The history-reading backend uses the default one (the config is not read yet),
             // so the sidebar doesn't go empty along with it.
             let store = aox::store::default_store(&root, 0);
+            // Feed the workspaces even here: the registry only needs `.aox/spaces.json`, not the
+            // config, so a broken config must not also cost the user the conversations made in other
+            // workspaces. Exactly the call `Runtime::new` makes.
+            let spaces = aox::space::Registry::load(&root);
+            store.set_workspaces(&spaces.workspace_roots(&root));
             let paths = boot_paths(&root, &config_path, &plugins_dir, &store);
             boot(
                 &tx,

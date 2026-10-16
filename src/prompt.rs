@@ -282,7 +282,7 @@ fn env_section(rt: &Runtime) -> String {
     s.push_str(&tf!(
         "\n\n# Workspace layout\n\
          Your workspace is {} —— {}. The \"app root\" above is only where plugins run; your workspace can be a different directory, and it is where the user expects you to work.\n\
-         - Temporary or scratch files —— screenshots, caches, one-off output —— go under {}\\temp\\. Don't scatter them in the workspace root.\n\
+         - Scratch files —— screenshots, caches, one-off output —— go under {}\\.aox\\tmp\\. That `.aox\\` folder is the host's own: `history\\` holds this workspace's conversations and `memory\\` your notes (see the next section), so read them if they help, but never reorganise or delete them. Don't scatter files in the workspace root.\n\
          - When the user asks you to create something durable (a document, a code project), give it its own folder: {}\\workplace\\<short project name>\\, and work inside it. Name the folder after the project in a few words (e.g. workplace\\business-site).\n",
         ws.display(),
         rule,

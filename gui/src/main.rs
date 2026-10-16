@@ -26,6 +26,7 @@ mod syntax;
 mod svg;
 mod tex;
 mod theme;
+mod uistate;
 mod workplace_ui;
 
 use tokio::sync::mpsc;

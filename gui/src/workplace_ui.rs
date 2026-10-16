@@ -260,7 +260,7 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
                     if row(
                         ui,
                         aox::i18n::t("Default"),
-                        aox::i18n::t("the app root; temp/ for scratch, workplace/ for projects"),
+                        aox::i18n::t("the app root; .aox/tmp/ for scratch, workplace/ for projects"),
                         matches!(cur, Some(Mode::Default)),
                         false,
                     )
@@ -598,7 +598,11 @@ fn dir_name(p: &Path) -> String {
 }
 
 /// Middle-elide an over-long path: keep the head (drive letter) and tail (current dir name) — the middle part does not help identification.
-fn elide_path(s: &str, max: usize) -> String {
+///
+/// `pub(crate)` because the "new workspace" dialog shows the path it is about to create the same way;
+/// one implementation means the two screens elide identically, which is what makes them read as the
+/// same kind of statement.
+pub(crate) fn elide_path(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
         return s.to_string();
@@ -636,7 +640,11 @@ fn paint_check(painter: &egui::Painter, center: Pos2, s: f32, color: Color32) {
 ///
 /// Use **solid** rather than stroked: a stroked folder at 13px squares up into a mush on the tab inner horizontal line,
 /// while a solid silhouette stays clean under both themes.
-fn paint_folder(painter: &egui::Painter, rect: Rect, color: Color32) {
+///
+/// Shared with the history overlay's group headers, which lead with this same glyph — hence
+/// `pub(crate)`. The 13x11 box the rows below use is the size to match; see `App`'s
+/// `history_group_header`.
+pub(crate) fn paint_folder(painter: &egui::Painter, rect: Rect, color: Color32) {
     let tab = Rect::from_min_max(
         Pos2::new(rect.left(), rect.top() + rect.height() * 0.10),
         Pos2::new(rect.left() + rect.width() * 0.46, rect.top() + rect.height() * 0.34),

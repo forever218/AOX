@@ -103,6 +103,19 @@ pub struct Runtime {
     /// decision runs on the tool-call path) — the same reason as `runtimes` /
     /// `prompt_segments`: the lock is never held across an `await`.
     pub workplace: crate::workplace::Workplace,
+    /// The **space registry** (see `src/space.rs`): which workspaces exist, what they are called, and
+    /// which conversation sits where.
+    ///
+    /// Lives on the runtime rather than in each front end so the agent thread and the UI read the same
+    /// list. A `RwLock` because the editing phase (creating / removing a workspace) writes it at
+    /// runtime; today it is only read. The lock is never held across an `await` — the same rule as
+    /// `runtimes` / `prompt_segments`.
+    ///
+    /// `allow(dead_code)`: written at startup and read by the overlay that groups history by workspace,
+    /// which lands in the next phase — the phase that ships this field only needs it to exist and to
+    /// have fed `Store::set_workspaces`.
+    #[allow(dead_code)]
+    pub spaces: std::sync::RwLock<crate::space::Registry>,
 }
 
 impl Runtime {
@@ -129,6 +142,12 @@ impl Runtime {
         let prompt_segments = crate::prompt::registry_from_config(&config.prompt);
         // Fix the storage backend before `config` is moved into Self (it needs config.store / config.history).
         let store = crate::store::backend(&config.store.backend, &root, config.history.keep)?;
+        // The space registry, read before `root` is moved into Self. Its only job at startup is to
+        // tell the store **which workspaces to visit**: history is per workspace
+        // (`<workspace>/.aox/history`), so listing every conversation needs the list of workspaces —
+        // this call is the entire coupling between the registry and the storage seam.
+        let spaces = crate::space::Registry::load(&root);
+        store.set_workspaces(&spaces.workspace_roots(&root));
         // The loop hook chain is likewise fixed before `config` is moved.
         // `?` is used here: something unintelligible in `[hook]` (not an object, a value
         // that won't convert to JSON) errors **at startup** rather than quietly not taking
@@ -161,7 +180,18 @@ impl Runtime {
             loop_impl,
             sandbox,
             workplace,
+            spaces: std::sync::RwLock::new(spaces),
         }))
+    }
+
+    /// A snapshot of the space registry.
+    ///
+    /// Cloned rather than borrowed: a registry is small (a handful of spaces), and handing out a
+    /// reference would mean holding the lock across whatever the caller does next — the same hazard
+    /// `Workplace::report` documents ("take a snapshot first, then release the lock").
+    #[allow(dead_code)] // read by the history overlay in the next phase; see the `spaces` field
+    pub fn spaces(&self) -> crate::space::Registry {
+        self.spaces.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The currently registered prompt segments (a clone; the caller may sort/filter freely).

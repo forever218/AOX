@@ -64,14 +64,20 @@ user32.SendInput.argtypes = (wt.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
 user32.SendInput.restype = wt.UINT
 
 
-def find_window(title_substr, pid=0):
-    """找目标窗口，两种定位方式二选一：
+def find_window(title_substr, pid=0, hwnd=0):
+    """找目标窗口，三种定位方式：
 
     - 按标题：子串匹配；
     - 按 `pid`（推荐）：主窗口标题改成空串之后按标题找不到它 —— 改成
       「该进程可见窗口里**面积最大**的那个」，就是主窗口。
       与 `gui_shot.py` / `gui_click.py` 同一套做法。
+    - 按 `hwnd`：最不含糊的一种。开活动流时该进程有两个尺寸相近的大窗口，
+      「面积最大」不再等于「主窗口」—— 而键盘是发给**前台窗口**的，
+      选错就等于把字打进了另一个窗口。这时先枚举出 hwnd 再直给。
     """
+    if hwnd:
+        return [(hwnd, f"(hwnd {hwnd})")]
+
     found = []
 
     def cb(hwnd, _):
@@ -133,6 +139,12 @@ def main() -> int:
         help="按进程 id 找主窗口（标题为空串时按标题找不到它）。"
         "用 tasklist /FI \"IMAGENAME eq aox-gui.exe\" /FO CSV 拿 pid。",
     )
+    ap.add_argument(
+        "--hwnd",
+        type=int,
+        default=0,
+        help="直接给窗口句柄（最不含糊）。键盘发给前台窗口，选错窗口就等于打错了地方。",
+    )
     ap.add_argument("--left", type=float, help="先点击：距客户区左边多少逻辑像素")
     ap.add_argument("--right", type=float, help="先点击：距客户区右边多少逻辑像素")
     ap.add_argument("--y", type=float, default=0.0, help="先点击：距客户区顶部多少逻辑像素")
@@ -146,7 +158,7 @@ def main() -> int:
     ap.add_argument("--delay", type=float, default=0.02, help="逐字间隔秒数")
     a = ap.parse_args()
 
-    win = find_window(a.title, a.pid)
+    win = find_window(a.title, a.pid, a.hwnd)
     if not win:
         print(f"NOTFOUND: 没有标题包含 {a.title!r} 的可见窗口", file=sys.stderr)
         return 2
