@@ -1588,13 +1588,8 @@ impl App {
                 Frame::NONE
                     .fill(P::surface())
                     .corner_radius(CornerRadius::same(12))
-                    .stroke(Stroke::new(1.0, P::border()))
-                    .shadow(egui::Shadow {
-                        offset: [0, 8],
-                        blur: 22,
-                        spread: 0,
-                        color: P::shadow(),
-                    })
+                    .stroke(Stroke::new(1.0, P::edge_raised()))
+                    .shadow(theme::card_shadow())
                     .inner_margin(Margin::symmetric(14, 12))
                     .show(ui, |ui| {
                         ui.set_width(w - 28.0);
@@ -1609,12 +1604,8 @@ impl App {
                             });
                         });
                         ui.add_space(7.0);
-                        let (rule, _) = ui.allocate_exact_size(Vec2::new(pw, 1.0), Sense::hover());
-                        ui.painter().hline(
-                            rule.left()..=rule.right(),
-                            rule.center().y,
-                            Stroke::new(1.0, P::border()),
-                        );
+                        // No rule under the title. The head is already set apart by the gap above
+                        // the list, and a hairline there drew a box around the title for no gain.
                         ui.add_space(9.0);
 
                         // Is there anything in the tree other than the two built-ins? A registered
@@ -1692,12 +1683,9 @@ impl App {
                         // as a list-level verb -- and pinned outside the scroll area, so it cannot be
                         // scrolled away by a workspace with eighty conversations in it.
                         ui.add_space(8.0);
-                        let (rule, _) = ui.allocate_exact_size(Vec2::new(pw, 1.0), Sense::hover());
-                        ui.painter().hline(
-                            rule.left()..=rule.right(),
-                            rule.center().y,
-                            Stroke::new(1.0, P::border()),
-                        );
+                        // Same as the head: no rule above the foot. The gap does the separating,
+                        // and the two rows already read as a footer because they sit below the
+                        // list rather than beside it.
                         ui.add_space(7.0);
                         // "New workspace" only goes live when no turn is running: it hands this
                         // conversation to a new root, which is a workspace switch like any other.
@@ -2485,10 +2473,10 @@ impl App {
         let mut typed: Option<String> = None;
 
         ui.add_space(6.0);
-        Frame::NONE
-            .fill(P::panel())
-            .corner_radius(CornerRadius::same(14))
-            .stroke(Stroke::new(1.0, P::border()))
+        // The question the model is waiting on: a **raised** card, unlike everything else in the
+        // transcript. It is the one block that wants an answer, so it is allowed to sit above the
+        // page instead of in it — that is what the shadow and the brighter edge are saying.
+        theme::raised(theme::card_radius())
             .inner_margin(Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 let w = ui.available_width();
@@ -2927,8 +2915,8 @@ impl App {
             .show(ctx, |ui| {
                 let frame = Frame::popup(ui.style())
                     .fill(P::surface())
-                    .corner_radius(CornerRadius::same(10))
-                    .stroke(Stroke::new(1.0, P::border()))
+                    .corner_radius(CornerRadius::same(12))
+                    .stroke(Stroke::new(1.0, P::edge_raised()))
                     .inner_margin(Margin::symmetric(16, 13))
                     .show(ui, |ui| usage_detail(ui, log));
                 *hovering = resp.hovered() || ui.rect_contains_pointer(frame.response.rect);
@@ -3100,7 +3088,7 @@ impl App {
                 Frame::NONE
                     .fill(P::surface())
                     .corner_radius(CornerRadius::same(theme::card_radius()))
-                    .stroke(Stroke::new(1.0, P::border_strong()))
+                    .stroke(Stroke::new(1.0, P::edge_raised()))
                     .inner_margin(Margin::symmetric(22, 18))
                     .show(ui, |ui| {
                         ui.set_max_width(w);
@@ -3303,17 +3291,12 @@ impl App {
                         if self.dragging_files {
                             P::ink()
                         } else if self.busy || self.waiting_auth {
-                            P::border_strong()
+                            P::edge_raised()
                         } else {
-                            P::border()
+                            P::edge()
                         },
                     ))
-                    .shadow(egui::Shadow {
-                        offset: [0, 5],
-                        blur: 18,
-                        spread: 0,
-                        color: P::shadow(),
-                    })
+                    .shadow(theme::card_shadow())
                     .inner_margin(Margin::symmetric(22, 15))
                     .show(ui, |ui| {
                         let w = ui.available_width();
@@ -3458,11 +3441,9 @@ impl App {
         }
         let mut open = true;
         let resp = egui::Modal::new(egui::Id::new("aox-settings"))
+            .backdrop_color(P::scrim())
             .frame(
-                Frame::NONE
-                    .fill(P::surface())
-                    .corner_radius(CornerRadius::same(theme::card_radius()))
-                    .stroke(Stroke::new(1.0, P::border()))
+                theme::raised(theme::card_radius())
                     .inner_margin(Margin::symmetric(20, 18)),
             )
             .show(ctx, |ui| {
@@ -3494,22 +3475,13 @@ impl App {
                         }
                     });
 
-                    // A vertical rule separates "what you pick" from "what you read". Same
-                    // vocabulary as the horizontal rule in "About" (1px, border colour), just turned
-                    // a quarter turn.
+                    // No vertical rule between the two columns.
                     //
-                    // The height is **a constant** rather than `ui.available_height()`: inside a
-                    // horizontal layout the latter varies with how much the left column has already
-                    // taken up, so the rule would be tall and short by turns. A constant also states
-                    // plainly that "this line runs the full height of the card".
-                    let (rule, _) =
-                        ui.allocate_exact_size(Vec2::new(1.0, SETTINGS_H), Sense::hover());
-                    ui.painter().vline(
-                        rule.center().x,
-                        rule.y_range(),
-                        Stroke::new(1.0, P::border()),
-                    );
-                    ui.add_space(18.0);
+                    // The rule was there to say "picking on the left, reading on the right". The
+                    // two columns are already told apart by their size, their colour and the
+                    // selected row's marker; a line on top of that is one more line to look at, and
+                    // the card reads calmer without it. The gap does the same job.
+                    ui.add_space(SETTINGS_W - SETTINGS_NAV_W - SETTINGS_RIGHT_W);
 
                     // ── right: the content ──
                     ui.vertical(|ui| {
@@ -3579,28 +3551,20 @@ impl App {
         // Drop the lock first, then test: `is_open()` takes the lock, and `open()` in the click
         // branch takes it again -- two locks stacked in one statement is a self-deadlock (the
         // top-bar version ran into this).
+        //
+        // No caption line under either button. "Open the activity stream" already says what it
+        // opens; a grey sentence underneath only repeats it in smaller type and adds a second
+        // thing to read on a screen that holds two buttons.
         let on = activity::lock(&self.act).is_open();
         if activity_open_button(ui, on).clicked() {
             activity::open(ui.ctx(), &self.act);
         }
-        ui.add_space(9.0);
-        ui.label(RichText::new(aox::i18n::t("Observe the agent's inner loop")).color(P::text_faint()).size(13.0));
 
-        ui.add_space(20.0);
-
-        // The second entrance, drawn with the same vocabulary as the first: one kind of thing gets
-        // one drawing (see `activity_open_button`). Same lock discipline -- test first, lock again
-        // only to open.
+        ui.add_space(2.0);
         let on = cache::lock(&self.cache).is_open();
         if cache_open_button(ui, on).clicked() {
             cache::open(ui.ctx(), &self.cache);
         }
-        ui.add_space(9.0);
-        ui.label(
-            RichText::new(aox::i18n::t("See how much of the context the provider served from cache"))
-                .color(P::text_faint())
-                .size(13.0),
-        );
     }
 
     /// The "Appearance" column: three light/dark options (including follow system).
@@ -3749,27 +3713,24 @@ impl App {
                 );
             });
         });
-        ui.add_space(9.0);
-        let (rule, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-        ui.painter().hline(rule.x_range(), rule.center().y, Stroke::new(1.0, P::border()));
-
         ui.add_space(12.0);
+        // No rule under the masthead, and no "Full ISC license text" label above the box: the
+        // masthead is already the only large type on the column, and the box below it is plainly
+        // the licence. A label saying "here is the licence" is the definition of a line of text
+        // that earns nothing.
         ui.label(
             RichText::new(aox::i18n::t("AOX GUI, written in Rust. Licensed under the open-source ISC license."))
                 .color(P::text_dim())
                 .size(14.0),
         );
 
-        ui.add_space(16.0);
-        ui.label(RichText::new(aox::i18n::t("Full ISC license text")).color(P::text_faint()).size(12.5));
-        ui.add_space(6.0);
+        ui.add_space(14.0);
         // The license text sits in a filled box. **Selectable**: when quoting a clause you can
         // copy it directly instead of retyping it off the screen.
         Frame::NONE
             .fill(P::code_bg())
             .corner_radius(CornerRadius::same(12))
-            .stroke(Stroke::new(1.0, P::border()))
+            .stroke(Stroke::new(1.0, P::edge()))
             .inner_margin(Margin::symmetric(14, 12))
             .show(ui, |ui| {
                 ui.add(
@@ -3791,7 +3752,9 @@ impl App {
     fn auth_overlay(&mut self, ctx: &egui::Context) {
         let Some(card) = self.auth.take() else { return };
         let mut decision: Option<AuthDecision> = None;
-        egui::Modal::new(egui::Id::new("aox-auth")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::new("aox-auth"))
+            .backdrop_color(P::scrim())
+            .show(ctx, |ui| {
             ui.set_width(480.0);
             ui.label(
                 RichText::new(aox::i18n::t("Tool call needs authorization"))
@@ -3820,9 +3783,7 @@ impl App {
                     ..Default::default()
                 },
             );
-            Frame::NONE
-                .fill(P::code_bg())
-                .corner_radius(CornerRadius::same(8))
+            theme::well(8)
                 .inner_margin(Margin::symmetric(10, 8))
                 .show(ui, |ui| {
                     ui.add(Label::new(job));
@@ -4933,11 +4894,9 @@ fn name_dialog_modal(
     // A separate id per question: all three share one body, and a `Modal` keeps its state under this
     // id, so one id would let a rename inherit whatever the previous question left in the field.
     let resp = egui::Modal::new(egui::Id::new(("aox-name", st.mode.tag())))
+        .backdrop_color(P::scrim())
         .frame(
-            Frame::NONE
-                .fill(P::surface())
-                .corner_radius(CornerRadius::same(theme::card_radius()))
-                .stroke(Stroke::new(1.0, P::border()))
+            theme::raised(theme::card_radius())
                 .inner_margin(Margin::symmetric(22, 18)),
         )
         .show(ctx, |ui| {
@@ -5034,9 +4993,7 @@ fn name_dialog_modal(
                 // blank, which is the state that means "use the folder's own name".
                 (_, Some(ws), _) => {
                     let path = ws.display().to_string();
-                    Frame::NONE
-                        .fill(P::code_bg())
-                        .corner_radius(CornerRadius::same(8))
+                    theme::well(8)
                         .inner_margin(Margin::symmetric(10, 7))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -5061,9 +5018,7 @@ fn name_dialog_modal(
                         Ok(name) => base.join(name),
                         Err(_) => base,
                     };
-                    Frame::NONE
-                        .fill(P::code_bg())
-                        .corner_radius(CornerRadius::same(8))
+                    theme::well(8)
                         .inner_margin(Margin::symmetric(10, 7))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -5230,7 +5185,8 @@ fn foot_row(ui: &mut Ui, width: f32, enabled: bool, icon: FootIcon, label: &str)
     let (rect, resp) = ui.allocate_exact_size(Vec2::new((width - 6.0).max(60.0), 28.0), sense);
     let hov = pointer_if(ui, &resp) && enabled;
     if hov {
-        ui.painter().rect_filled(rect, CornerRadius::same(7), P::surface());
+        // Same reason as `history_row`: `surface` would vanish into the card this row sits on.
+        ui.painter().rect_filled(rect, CornerRadius::same(10), P::surface_hi());
     }
     let fg = if !enabled {
         P::text_faint()
@@ -5337,7 +5293,9 @@ fn history_row(
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 46.0), Sense::click());
     let hov = pointer_if(ui, &resp) && !locked;
     if hov {
-        ui.painter().rect_filled(rect, CornerRadius::same(8), P::surface());
+        // `surface_hi`, not `surface`: this row already sits **on** a surface card, so filling it
+        // with the card's own colour would be a hover that does nothing.
+        ui.painter().rect_filled(rect, CornerRadius::same(10), P::surface_hi());
     }
     // A hairline down the left of every nested row. Consecutive rows abut, so it becomes one
     // continuous line running under the group header -- without it an indented row reads as "a row
@@ -5615,10 +5573,19 @@ fn pointer_if(ui: &Ui, resp: &egui::Response) -> bool {
 }
 
 /// The skin for text buttons: sizing plus a colour pair for resting / hover.
+///
+/// Buttons come in exactly **three heights** (see [`flat_button`], [`primary_button`],
+/// [`danger_button`]); the height is a field rather than "text + padding" so that two buttons
+/// standing side by side always line up, whatever their labels are.
 #[derive(Clone, Copy)]
 struct Btn {
     size: f32,
+    /// Horizontal padding (the vertical one is implied by `h`: the label is centred).
     pad: Vec2,
+    /// Fixed height of the hot zone.
+    h: f32,
+    /// Lower bound on the width, so one-word buttons don't turn into tiny pills.
+    min_w: f32,
     radius: u8,
     stroke: Stroke,
     fg: Color32,
@@ -5642,7 +5609,8 @@ fn text_button(ui: &mut Ui, text: &str, b: Btn) -> egui::Response {
         egui::FontId::proportional(b.size),
         Color32::PLACEHOLDER,
     );
-    let (rect, resp) = ui.allocate_exact_size(galley.size() + b.pad * 2.0, Sense::click());
+    let w = (galley.size().x + b.pad.x * 2.0).max(b.min_w);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, b.h), Sense::click());
     let hov = pointer_if(ui, &resp);
 
     let painter = ui.painter();
@@ -5660,20 +5628,31 @@ fn text_button(ui: &mut Ui, text: &str, b: Btn) -> egui::Response {
         );
     }
     // The layout is done with PLACEHOLDER and the real colours are applied here -- so a hover
-    // recolour doesn't have to re-lay-out the text
-    painter.galley(rect.min + b.pad, galley, if hov { b.fg_hover } else { b.fg });
+    // recolour doesn't have to re-lay-out the text. Centred in both axes: with a fixed height the
+    // baseline can no longer be derived from the padding.
+    let pos = Pos2::new(
+        rect.center().x - galley.size().x * 0.5,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    painter.galley(pos, galley, if hov { b.fg_hover } else { b.fg });
 
     resp
 }
 
-/// A secondary button with a transparent backdrop (e.g. "Close" in dialogs).
+/// A secondary button (e.g. "Close" in dialogs, "Refresh" in the history panel).
+///
+/// Transparent at rest and **one fill step** on hover — the same hover language as a list row, a
+/// menu row and a toolbar icon, so "the pointer is on something clickable" always looks identical.
+/// 32 high: big enough to hit without aiming, which is what "the button is too small" was about.
 pub(crate) fn flat_button(ui: &mut Ui, text: &str) -> egui::Response {
     text_button(
         ui,
         text,
         Btn {
-            size: 13.5,
-            pad: Vec2::new(9.0, 5.0),
+            size: 14.0,
+            pad: Vec2::new(12.0, 0.0),
+            h: 32.0,
+            min_w: 0.0,
             radius: 8,
             stroke: Stroke::NONE,
             fg: P::text_dim(),
@@ -5692,7 +5671,9 @@ pub(crate) fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
         text,
         Btn {
             size: 14.5,
-            pad: Vec2::new(18.0, 9.0),
+            pad: Vec2::new(20.0, 0.0),
+            h: 38.0,
+            min_w: 88.0,
             radius: 10,
             stroke: Stroke::NONE,
             fg: P::on_reverse(),
@@ -5715,7 +5696,9 @@ pub(crate) fn danger_button(ui: &mut Ui, text: &str) -> egui::Response {
         text,
         Btn {
             size: 14.5,
-            pad: Vec2::new(18.0, 9.0),
+            pad: Vec2::new(20.0, 0.0),
+            h: 38.0,
+            min_w: 88.0,
             radius: 10,
             stroke: Stroke::NONE,
             fg: P::on_reverse(),
@@ -5813,7 +5796,7 @@ fn ask_row(ui: &mut Ui, w: f32, idx: usize, text: &str) -> bool {
 /// The number column takes a fixed width, so the left edges of A / B / C's text **line up** -- the
 /// option slot is a column, not a heap.
 fn ask_chip(ui: &mut Ui, w: f32, idx: usize, text: &str) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 32.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -5823,13 +5806,13 @@ fn ask_chip(ui: &mut Ui, w: f32, idx: usize, text: &str) -> bool {
         CornerRadius::same(10),
         if resp.hovered() { P::surface_hi() } else { P::surface() },
     );
-    // Add a stroke on hover: with the backdrop step alone, in the light theme you can barely tell
-    // which row the mouse is on
+    // A stroke on hover, but `edge_raised` — a full-ink ring made the row look selected rather than
+    // hovered, which is a different thing (the row is not selected until it is picked).
     if resp.hovered() {
         p.rect_stroke(
             rect,
             CornerRadius::same(10),
-            Stroke::new(1.0, P::ink()),
+            Stroke::new(1.0, P::edge_raised()),
             egui::StrokeKind::Inside,
         );
     }
@@ -5864,7 +5847,7 @@ fn attach_chip(ui: &mut Ui, name: &str) -> bool {
     Frame::NONE
         .fill(P::surface_hi())
         .corner_radius(CornerRadius::same(13))
-        .stroke(Stroke::new(1.0, P::border()))
+        .stroke(Stroke::new(1.0, P::edge()))
         .inner_margin(Margin::symmetric(11, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -5882,7 +5865,7 @@ fn attach_chip(ui: &mut Ui, name: &str) -> bool {
 /// as the ✓/✗ in the call stream: no betting on whether the font has the glyph (a missing glyph
 /// draws as a tofu box, which is worse than not drawing it).
 fn close_x(ui: &mut Ui) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(15.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(17.0), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(aox::i18n::t("Remove"));
     let col = if resp.hovered() { P::text() } else { P::text_faint() };
     let c = rect.center();
@@ -6160,7 +6143,7 @@ fn user_bubble(ui: &mut Ui, text: &str, files: &[String], max_w: f32) {
         Frame::NONE
             .fill(P::user_bg())
             .corner_radius(CornerRadius::same(16))
-            .stroke(Stroke::new(1.0, P::border()))
+            .stroke(Stroke::new(1.0, P::edge()))
             .inner_margin(Margin::symmetric(20, 15))
             .show(ui, |ui| {
                 // The width is **pinned** (min and max both set to the same value), so the content's
@@ -6231,7 +6214,7 @@ fn sent_chip(ui: &mut Ui, name: &str) {
     Frame::NONE
         .fill(P::surface())
         .corner_radius(CornerRadius::same(13))
-        .stroke(Stroke::new(1.0, P::border()))
+        .stroke(Stroke::new(1.0, P::edge()))
         .inner_margin(Margin::symmetric(11, 4))
         .show(ui, |ui| {
             ui.label(RichText::new(middle_elide(name, 30)).color(P::text_dim()).size(13.0));
@@ -6318,7 +6301,8 @@ fn error_card(ui: &mut Ui, text: &str, width: f32) {
     Frame::NONE
         .fill(P::surface())
         .corner_radius(CornerRadius::same(theme::card_radius()))
-        .stroke(Stroke::new(1.0, P::border_strong()))
+        .stroke(Stroke::new(1.0, P::edge_raised()))
+        .shadow(theme::card_shadow())
         .inner_margin(Margin::symmetric(20, 18))
         .show(ui, |ui| {
             ui.set_width(inner_w);
@@ -6572,7 +6556,7 @@ fn step_diff(ui: &mut Ui, diff: &str) {
     Frame::NONE
         .fill(P::code_bg())
         .corner_radius(CornerRadius::same(8))
-        .stroke(Stroke::new(1.0, P::border()))
+        .stroke(Stroke::new(1.0, P::edge()))
         .inner_margin(Margin::symmetric(12, 9))
         .show(ui, |ui| {
             // Inside the frame, so the panel can never be wider than the card holding it.
@@ -6716,8 +6700,8 @@ const SETTINGS_W: f32 = 700.0;
 const SETTINGS_H: f32 = 470.0;
 /// Width of the left column (the list of columns).
 const SETTINGS_NAV_W: f32 = 132.0;
-/// Right column width = total - left column - 1px rule - 18px spacing.
-const SETTINGS_RIGHT_W: f32 = SETTINGS_W - SETTINGS_NAV_W - 19.0;
+/// Right column width = total - left column - the gap between the two.
+const SETTINGS_RIGHT_W: f32 = SETTINGS_W - SETTINGS_NAV_W - 24.0;
 /// The height the bottom "Close" row takes up (including the gap between it and the content).
 const SETTINGS_FOOT_H: f32 = 44.0;
 /// Width taken by the left column (the name) in a "name + value" row. Fixing it is what makes the
@@ -6736,25 +6720,28 @@ const LICENSE_TEXT: &str = include_str!("../../LICENSE");
 /// this monochrome scheme's narrow range (`surface_hi` and `surface` are one step apart).
 fn tab_row(ui: &mut Ui, tab: SettingsTab, selected: bool) -> egui::Response {
     let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let fg = if selected { P::ink() } else { P::text_dim() };
 
     let painter = ui.painter();
+    // Selected and hovered share the **same** fill; only the marker on the left tells them apart.
+    // Two different greys for "you are here" and "the pointer is here" read as two different
+    // states of the same thing, which they are not.
+    if selected || resp.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(10), P::surface_hi());
+    }
     if selected {
-        painter.rect_filled(rect, CornerRadius::same(9), P::surface_hi());
         painter.rect_filled(
             Rect::from_min_size(
-                Pos2::new(rect.left() + 6.0, rect.center().y - 7.0),
-                Vec2::new(2.0, 14.0),
+                Pos2::new(rect.left() + 6.0, rect.center().y - 8.0),
+                Vec2::new(3.0, 16.0),
             ),
-            CornerRadius::same(1),
+            CornerRadius::same(2),
             fg,
         );
-    } else if resp.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(9), P::panel());
     }
 
     let g = painter.layout_no_wrap(tab.label().to_string(), egui::FontId::proportional(14.5), fg);
@@ -6769,14 +6756,14 @@ fn tab_row(ui: &mut Ui, tab: SettingsTab, selected: bool) -> egui::Response {
 /// Filled / hollow is the drawing that needs the least explaining for "selected / not selected".
 fn choice_row(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
     let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
     let painter = ui.painter();
     if resp.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(9), P::surface_hi());
+        painter.rect_filled(rect, CornerRadius::same(10), P::surface_hi());
     }
     let fg = if selected { P::text() } else { P::text_dim() };
     let g = painter.layout_no_wrap(label.to_string(), egui::FontId::proportional(14.5), fg);
@@ -6801,31 +6788,51 @@ fn choice_row(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
 /// **shouldn't close the window** when clicked again, so it isn't clickable then (which is what
 /// `activity::open` does too -- see its comment).
 fn activity_open_button(ui: &mut Ui, on: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(196.0, 42.0), Sense::click());
+    entry_row(ui, on, EntryMark::Flow, aox::i18n::t("Open activity stream"))
+}
+
+/// Which mark an entry row paints: the activity stream's flow line, or the cache map's grid.
+#[derive(Clone, Copy)]
+enum EntryMark {
+    Flow,
+    Grid,
+}
+
+/// One "opens a window" row on the settings page.
+///
+/// A row, not a bordered button. As a full-width filled block with an outline it read as a
+/// **disabled input field** — which is roughly what it looked like. The page is a column of
+/// settings, so the row obeys the same rules as every other row in the app: nothing at rest, one
+/// fill step on hover, full ink for the label. The chevron on the right says "this goes somewhere
+/// else" without a word of explanation under it.
+fn entry_row(ui: &mut Ui, on: bool, mark: EntryMark, label: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 48.0), Sense::click());
     let hot = resp.hovered() && !on;
     if hot {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    let fg = if on { P::text_faint() } else { P::text() };
+    // Already open: the row stays readable but stops responding. Dimming it all the way to
+    // `text_faint` made it look like a broken/disabled entry rather than "the window is already up".
+    let fg = if on { P::text_dim() } else { P::text() };
 
     let painter = ui.painter();
-    painter.rect_filled(
-        rect,
-        CornerRadius::same(12),
-        if hot { P::surface_hi() } else { P::panel() },
-    );
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(12),
-        Stroke::new(1.0, P::border()),
-        egui::StrokeKind::Inside,
-    );
-    // Icon: an 18px square flow line, inset 22 from the left
+    if hot {
+        painter.rect_filled(rect, CornerRadius::same(10), P::surface_hi());
+    }
     let icon =
-        Rect::from_center_size(Pos2::new(rect.left() + 22.0, rect.center().y), Vec2::splat(18.0));
-    draw_flow_curve(painter, icon, fg);
-    let g = painter.layout_no_wrap(aox::i18n::t("Open activity stream").to_string(), egui::FontId::proportional(14.5), fg);
-    painter.galley(Pos2::new(rect.left() + 42.0, rect.center().y - g.size().y * 0.5), g, fg);
+        Rect::from_center_size(Pos2::new(rect.left() + 20.0, rect.center().y), Vec2::splat(20.0));
+    match mark {
+        EntryMark::Flow => draw_flow_curve(painter, icon, fg),
+        EntryMark::Grid => draw_grid_mark(painter, icon, fg),
+    }
+    let g = painter.layout_no_wrap(label.to_string(), egui::FontId::proportional(15.0), fg);
+    painter.galley(Pos2::new(rect.left() + 48.0, rect.center().y - g.size().y * 0.5), g, fg);
+
+    let c = Pos2::new(rect.right() - 20.0, rect.center().y);
+    let s = 3.4;
+    let st = Stroke::new(1.4, if hot { P::text() } else { P::text_faint() });
+    painter.line_segment([c + Vec2::new(-s * 0.45, -s), c + Vec2::new(s * 0.65, 0.0)], st);
+    painter.line_segment([c + Vec2::new(s * 0.65, 0.0), c + Vec2::new(-s * 0.45, s)], st);
     resp
 }
 
@@ -6840,32 +6847,7 @@ fn activity_open_button(ui: &mut Ui, on: bool) -> egui::Response {
 /// The mark is a miniature of the window itself (hit cells filled, the rest outlined), so the two
 /// read as the same object at two scales.
 fn cache_open_button(ui: &mut Ui, on: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(196.0, 42.0), Sense::click());
-    let hot = resp.hovered() && !on;
-    if hot {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let fg = if on { P::text_faint() } else { P::text() };
-
-    let painter = ui.painter();
-    painter.rect_filled(
-        rect,
-        CornerRadius::same(12),
-        if hot { P::surface_hi() } else { P::panel() },
-    );
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(12),
-        Stroke::new(1.0, P::border()),
-        egui::StrokeKind::Inside,
-    );
-    // Same 18px square, same 22-point inset as the flow line beside it.
-    let icon =
-        Rect::from_center_size(Pos2::new(rect.left() + 22.0, rect.center().y), Vec2::splat(18.0));
-    draw_grid_mark(painter, icon, fg);
-    let g = painter.layout_no_wrap(aox::i18n::t("Open cache hit map").to_string(), egui::FontId::proportional(14.5), fg);
-    painter.galley(Pos2::new(rect.left() + 42.0, rect.center().y - g.size().y * 0.5), g, fg);
-    resp
+    entry_row(ui, on, EntryMark::Grid, aox::i18n::t("Open cache hit map"))
 }
 
 /// The 4×4 mark for the cache-hit button: ten cells filled, the rest outlined.

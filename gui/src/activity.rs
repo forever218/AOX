@@ -1837,13 +1837,8 @@ fn popover(ui: &mut Ui, st: &mut Activity, full: Rect) {
             Frame::NONE
                 .fill(P::surface())
                 .corner_radius(CornerRadius::same(theme::card_radius()))
-                .stroke(Stroke::new(1.0, P::border_strong()))
-                .shadow(egui::Shadow {
-                    offset: [0, 8],
-                    blur: 22,
-                    spread: 0,
-                    color: P::shadow(),
-                })
+                .stroke(Stroke::new(1.0, P::edge_raised()))
+                .shadow(theme::card_shadow())
                 .inner_margin(Margin::symmetric(16, 12))
                 .show(ui, |ui| {
                     // Content width = the nominal width minus the 16pt margins on each side, so the

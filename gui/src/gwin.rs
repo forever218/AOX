@@ -696,7 +696,7 @@ pub fn header(ui: &mut Ui, ctx: &egui::Context, gw: &mut Gwin, title: &str, info
 pub fn win_button(ui: &mut Ui, r: Rect, id: &str, glyph: Glyph) -> bool {
     let resp = ui.interact(r, ui.id().with(id), Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(r, CornerRadius::same(7), P::surface_hi());
+        ui.painter().rect_filled(r, CornerRadius::same(8), P::surface_hi());
     }
     // "Pinned" is a **persistent state** and must stay visible: give it the deepest foreground
     // colour even when not hovered, otherwise a grey pushpin on a grey background leaves the user
@@ -789,10 +789,15 @@ pub fn vsep(ui: &mut Ui) {
 }
 
 /// A pill button. `on` = the currently selected one (reversed).
+///
+/// Same hover language as every other control in the app: the fill steps up to `surface_hi` and the
+/// outline steps to `edge` — no second set of greys for the sub-windows.
 pub fn pill(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
     let font = FontId::proportional(14.0);
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER);
-    let pad = Vec2::new(12.0, 6.0);
+    // 7 rather than 6 of vertical padding: the pill is the toolbar's only hit target, so it gets the
+    // same "comfortably clickable" height as the buttons in the main window.
+    let pad = Vec2::new(13.0, 7.0);
     let size = galley.size() + pad * 2.0;
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let hov = resp.hovered();
@@ -816,7 +821,7 @@ pub fn pill(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
         p.rect_stroke(
             r,
             CornerRadius::same(10),
-            Stroke::new(1.0, if hov { P::border_strong() } else { P::border() }),
+            Stroke::new(1.0, if hov { P::edge_raised() } else { P::edge() }),
             egui::StrokeKind::Inside,
         );
     }

@@ -587,10 +587,7 @@ fn table(ui: &mut Ui, width: f32, header: &[String], rows: &[Vec<String>], base:
     let mut edges: Vec<f32> = Vec::new();
     let total = rows.len() + 1;
 
-    Frame::NONE
-        .fill(P::surface())
-        .stroke(Stroke::new(1.0, P::border_strong()))
-        .corner_radius(CornerRadius::same(TABLE_R))
+    theme::card(TABLE_R)
         .show(ui, |ui| {
             ui.set_width(inner);
             ui.set_max_width(inner);
@@ -745,7 +742,7 @@ fn code_block(ui: &mut Ui, width: f32, lang: &str, lines: &[String]) {
     Frame::NONE
         .fill(P::code_bg())
         .corner_radius(CornerRadius::same(12))
-        .stroke(Stroke::new(1.0, P::border()))
+        .stroke(Stroke::new(1.0, P::edge()))
         .inner_margin(Margin::symmetric(16, 14))
         .show(ui, |ui| {
             // The card's width must be locked explicitly, otherwise a long code line widens the card

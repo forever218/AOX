@@ -35,7 +35,7 @@
 use std::path::{Path, PathBuf};
 
 use egui::{
-    Align2, Color32, CornerRadius, Frame, Id, Margin, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2,
+    Align2, Color32, CornerRadius, Id, Margin, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2,
 };
 
 use aox::workplace::Mode;
@@ -177,9 +177,12 @@ pub fn button(ui: &mut Ui, st: &mut WorkplaceUi, enabled: bool) {
     let font = egui::FontId::proportional(13.0);
     let galley = ui.painter().layout_no_wrap(text, font, Color32::PLACEHOLDER);
 
-    let pad = Vec2::new(8.0, 4.0);
-    let icon = 14.0;
-    let size = Vec2::new(icon + 6.0 + galley.size().x + pad.x * 2.0, galley.size().y.max(icon) + pad.y * 2.0);
+    // One height for the whole chip row (28): the workplace tier sits next to the input box and has
+    // to be comfortable to hit without pushing the box taller.
+    let pad = Vec2::new(10.0, 0.0);
+    let icon = 15.0;
+    let gap = 7.0;
+    let size = Vec2::new(icon + gap + galley.size().x + pad.x * 2.0, 28.0);
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(size, sense);
 
@@ -196,7 +199,7 @@ pub fn button(ui: &mut Ui, st: &mut WorkplaceUi, enabled: bool) {
     );
     // Only stroke on hover: normally it sits inside the input card, and an extra border would make the bottom-left corner noisy.
     if hov {
-        painter.rect_stroke(rect, radius, Stroke::new(1.0, P::border()), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect, radius, Stroke::new(1.0, P::edge()), egui::StrokeKind::Inside);
     }
 
     let fg = if enabled { P::text_dim() } else { P::text_faint() };
@@ -205,7 +208,7 @@ pub fn button(ui: &mut Ui, st: &mut WorkplaceUi, enabled: bool) {
         Vec2::new(icon, icon * 0.82),
     );
     paint_folder(painter, icon_rect, fg);
-    painter.galley(Pos2::new(rect.left() + pad.x + icon + 6.0, rect.center().y - galley.size().y * 0.5), galley, fg);
+    painter.galley(Pos2::new(rect.left() + pad.x + icon + gap, rect.center().y - galley.size().y * 0.5), galley, fg);
 
     if resp.clicked() && enabled {
         st.open = !st.open;
@@ -247,20 +250,22 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
         .fixed_pos(anchor)
         .pivot(Align2::LEFT_BOTTOM)
         .show(ctx, |ui| {
-            Frame::NONE
-                .fill(P::surface())
-                .corner_radius(CornerRadius::same(10))
-                .stroke(Stroke::new(1.0, P::border()))
-                .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: P::shadow() })
+            theme::raised(12)
                 .inner_margin(Margin::symmetric(6, 6))
                 .show(ui, |ui| {
                     ui.set_width(276.0);
 
                     // ① Default
+                    //
+                    // No hint line here either (it used to read "the app root; .aox/tmp/ for
+                    // scratch, workplace/ for projects"). Three one-line rows of the same height
+                    // read as one list of three choices; a single two-line row made "Default" look
+                    // like a different kind of item, and the sentence was explaining the folder
+                    // layout inside a menu whose job is to switch tiers.
                     if row(
                         ui,
                         aox::i18n::t("Default"),
-                        aox::i18n::t("the app root; .aox/tmp/ for scratch, workplace/ for projects"),
+                        "",
                         matches!(cur, Some(Mode::Default)),
                         false,
                     )
@@ -367,14 +372,16 @@ fn row(ui: &mut Ui, label: &str, hint: &str, checked: bool, danger: bool) -> egu
 /// reusing the [`paint_folder`] from the button — the whole icon vocabulary has a single implementation.
 fn dir_row(ui: &mut Ui, name: &str) -> egui::Response {
     let width = ui.available_width();
-    const HEIGHT: f32 = 26.0;
+    // 30 and radius 8 — the same row vocabulary as the workspace menu above it (32/8), one step
+    // shorter because a directory list is scanned rather than picked from.
+    const HEIGHT: f32 = 30.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, HEIGHT), Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let painter = ui.painter();
     if resp.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(6), P::surface_hi());
+        painter.rect_filled(rect, CornerRadius::same(8), P::surface_hi());
     }
     let icon = Rect::from_center_size(Pos2::new(rect.left() + 13.0, rect.center().y), Vec2::new(13.0, 11.0));
     paint_folder(painter, icon, P::text_faint());
@@ -398,11 +405,9 @@ pub fn confirm(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     let mut keep = true;
 
     let resp = egui::Modal::new(Id::new("aox-workplace-confirm"))
+        .backdrop_color(P::scrim())
         .frame(
-            Frame::NONE
-                .fill(P::surface())
-                .corner_radius(CornerRadius::same(theme::card_radius()))
-                .stroke(Stroke::new(1.0, P::border()))
+            theme::raised(theme::card_radius())
                 .inner_margin(Margin::symmetric(26, 22)),
         )
         .show(ctx, |ui| {
@@ -459,11 +464,9 @@ pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     let mut close = false;
 
     let resp = egui::Modal::new(Id::new("aox-workplace-picker"))
+        .backdrop_color(P::scrim())
         .frame(
-            Frame::NONE
-                .fill(P::surface())
-                .corner_radius(CornerRadius::same(theme::card_radius()))
-                .stroke(Stroke::new(1.0, P::border()))
+            theme::raised(theme::card_radius())
                 .inner_margin(Margin::symmetric(22, 18)),
         )
         .show(ctx, |ui| {
@@ -480,9 +483,7 @@ pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
             ui.add_space(12.0);
 
             // Current path: monospace + middle-elide when too long (keep the head drive letter and tail dir name — the two ends with the most information).
-            Frame::NONE
-                .fill(P::code_bg())
-                .corner_radius(CornerRadius::same(8))
+            theme::well(8)
                 .inner_margin(Margin::symmetric(10, 7))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());

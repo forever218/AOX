@@ -1281,10 +1281,7 @@ fn stats_card(ui: &mut Ui, st: &CacheView) {
         }
     };
 
-    Frame::NONE
-        .fill(P::surface())
-        .corner_radius(CornerRadius::same(10))
-        .stroke(Stroke::new(1.0, P::border()))
+    theme::card(10)
         .inner_margin(Margin { left: 12, right: 12, top: 11, bottom: 10 })
         .show(ui, |ui| {
             ui.set_width(SIDE_W - 24.0);
@@ -1379,10 +1376,7 @@ fn rule(ui: &mut Ui, w: f32) {
 
 fn legend_card(ui: &mut Ui) {
     let pal = palette();
-    Frame::NONE
-        .fill(P::surface())
-        .corner_radius(CornerRadius::same(10))
-        .stroke(Stroke::new(1.0, P::border()))
+    theme::card(10)
         .inner_margin(Margin { left: 12, right: 12, top: 11, bottom: 10 })
         .show(ui, |ui| {
             ui.set_width(SIDE_W - 24.0);
@@ -1625,8 +1619,8 @@ fn tooltip(ctx: &egui::Context, st: &CacheView, tile: u32, at: Pos2, full: Rect)
             Frame::NONE
                 .fill(P::surface())
                 .corner_radius(CornerRadius::same(theme::card_radius()))
-                .stroke(Stroke::new(1.0, P::border_strong()))
-                .shadow(egui::Shadow { offset: [0, 8], blur: 22, spread: 0, color: P::shadow() })
+                .stroke(Stroke::new(1.0, P::edge_raised()))
+                .shadow(theme::card_shadow())
                 .inner_margin(Margin::symmetric(14, 11))
                 .show(ui, |ui| {
                     ui.set_width(W - 28.0);

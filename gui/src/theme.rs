@@ -552,6 +552,120 @@ impl P {
     pub fn toast_text() -> Color32 {
         pal().toast_text
     }
+
+    /// The 1px line around a **card**.
+    ///
+    /// Deliberately not [`P::border`]. `border` is a fixed grey, which is right for hairlines
+    /// *inside* a surface (table cells, separators) where they must not compete with the content.
+    /// A card's outer edge is different: it sits on a base that varies (`bg`, `panel`, another
+    /// card), so a fixed grey comes out too faint on one and too loud on the other — which is
+    /// exactly why the cards used to dissolve into the page.
+    ///
+    /// So the edge is **ink at a fixed opacity**: it mixes with whatever is underneath and is
+    /// visible by the same amount everywhere, on both themes.
+    pub fn edge() -> Color32 {
+        match mode() {
+            // 24% ink on paper: unmistakably a line, still quieter than text.
+            Mode::Light => Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x3D),
+            // 18% white on ink: the same "one visible step", without turning into a bright ring.
+            Mode::Dark => Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x2E),
+        }
+    }
+
+    /// The edge of a card that is **raised above** the page (dialogs, the history panel, the
+    /// sub-windows). One step louder than [`P::edge`], used together with [`card_shadow`].
+    pub fn edge_raised() -> Color32 {
+        match mode() {
+            Mode::Light => Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x59),
+            Mode::Dark => Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x47),
+        }
+    }
+
+    /// The veil drawn behind a modal dialog.
+    ///
+    /// egui's default is a flat 39% **black**, which on a warm paper base turns the whole window a
+    /// grey-green and drains the colour out of it — the page stops looking like paper and starts
+    /// looking like a screenshot of one. Tinted with the theme's own ink instead, the veil only
+    /// takes light away and leaves the hue alone, so the page still reads as paper behind glass.
+    pub fn scrim() -> Color32 {
+        match mode() {
+            Mode::Light => Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x38),
+            Mode::Dark => Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0x8C),
+        }
+    }
+}
+
+/// The shadow under a **raised card** — dialogs, the history panel, the floating sub-windows.
+///
+/// A card on the page gets [`P::edge`] and nothing else: it is printed *on* the sheet, so a shadow
+/// would be a lie. Only what actually floats above the page casts one, and the size of that shadow
+/// is how the UI says "this is on top" without a single extra line.
+pub fn card_shadow() -> egui::Shadow {
+    match mode() {
+        Mode::Light => egui::Shadow {
+            offset: [0, 4],
+            blur: 16,
+            spread: 0,
+            color: Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x24),
+        },
+        Mode::Dark => egui::Shadow {
+            offset: [0, 5],
+            blur: 20,
+            spread: 0,
+            color: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0x8C),
+        },
+    }
+}
+
+/// The shadow of a card lying **on** the page: a *contact* shadow, nearly all of it directly under
+/// the edge.
+///
+/// Not a drop shadow — nothing is floating, so it must not look lifted. What it does is darken the
+/// one pixel right under the bottom edge. On a warm paper base that is what turns the outline into a
+/// clean line; a grey border on its own keeps dissolving into the page, however dark it is made.
+fn contact_shadow() -> egui::Shadow {
+    match mode() {
+        Mode::Light => egui::Shadow {
+            offset: [0, 2],
+            blur: 6,
+            spread: 0,
+            color: Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x40),
+        },
+        Mode::Dark => egui::Shadow {
+            offset: [0, 2],
+            blur: 6,
+            spread: 0,
+            color: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0xA0),
+        },
+    }
+}
+
+/// A card that lies **on** the page: surface fill + a clear edge + a contact shadow.
+pub fn card(radius: u8) -> egui::Frame {
+    egui::Frame::NONE
+        .fill(P::surface())
+        .corner_radius(CornerRadius::same(radius))
+        .stroke(Stroke::new(1.0, P::edge()))
+        .shadow(contact_shadow())
+}
+
+/// A card that is **raised above** the page: brighter edge + shadow + the top light.
+pub fn raised(radius: u8) -> egui::Frame {
+    egui::Frame::NONE
+        .fill(P::surface())
+        .corner_radius(CornerRadius::same(radius))
+        .stroke(Stroke::new(1.0, P::edge_raised()))
+        .shadow(card_shadow())
+}
+
+/// A **well**: a block sunk *into* a card (code, quotes, inert insets).
+///
+/// No edge and no shadow on purpose — it is a change of depth inside one sheet, not a second sheet
+/// laid on top. Giving it a border is what made the transcript look like a stack of boxes.
+pub fn well(radius: u8) -> egui::Frame {
+    egui::Frame::NONE
+        .fill(P::code_bg())
+        .corner_radius(CornerRadius::same(radius))
 }
 
 // ─────────────────────────── Font loading ───────────────────────────
@@ -788,8 +902,13 @@ pub fn install_style(ctx: &egui::Context) {
     v.extreme_bg_color = P::code_bg();
     v.faint_bg_color = P::surface();
     v.code_bg_color = P::code_bg();
-    v.window_stroke = Stroke::new(1.0, P::border());
+    v.window_stroke = Stroke::new(1.0, P::edge_raised());
     v.window_corner_radius = CornerRadius::same(card_radius());
+    // Everything egui builds for itself (popups, combo boxes, tooltips, modal backdrops) is raised
+    // above the page, so it all uses the one shadow. Set here rather than at each call site: a
+    // hand-drawn dialog and a built-in one then look like the same kind of object.
+    v.window_shadow = card_shadow();
+    v.popup_shadow = card_shadow();
     v.hyperlink_color = P::ink();
     v.warn_fg_color = P::warn();
     v.error_fg_color = P::text();
@@ -814,14 +933,17 @@ pub fn install_style(ctx: &egui::Context) {
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::TRANSPARENT);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, P::text_dim());
 
+    // Hover is **one** language everywhere: the fill steps up to `surface_hi`, the text comes
+    // forward to full ink, and the outline steps to `edge` — it does not jump to a hard grey ring
+    // (that was what made a resting control look "activated" the moment the pointer touched it).
     v.widgets.hovered.bg_fill = P::surface_hi();
     v.widgets.hovered.weak_bg_fill = P::surface_hi();
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, P::border_strong());
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, P::edge());
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, P::text());
 
     v.widgets.active.bg_fill = P::surface_hi();
     v.widgets.active.weak_bg_fill = P::surface_hi();
-    v.widgets.active.bg_stroke = Stroke::new(1.0, P::ink_soft());
+    v.widgets.active.bg_stroke = Stroke::new(1.0, P::edge_raised());
     v.widgets.active.fg_stroke = Stroke::new(1.0, P::text());
 
     v.widgets.open.bg_fill = P::surface();
