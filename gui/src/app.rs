@@ -53,6 +53,8 @@ use crate::brand;
 use crate::bridge::{
     BootInfo, BootPaths, FromAgent, RuntimeView, SessionFlags, Snapshot, ToAgent, WorkplaceView,
 };
+use crate::cache;
+use crate::gwin;
 use crate::markdown;
 use crate::theme::{self, P};
 use crate::uistate;
@@ -343,6 +345,9 @@ pub struct App {
     /// The activity stream's shared state. It lives in its own window (`activity.rs`); the
     /// main window only writes into it.
     act: activity::Shared,
+    /// The cache-hit map's shared state — a second independent window (`cache.rs`), fed from the
+    /// same two sources as the activity stream: per-turn usage records, and a per-frame time base.
+    cache: cache::Shared,
     auth: Option<AuthCard>,
     auth_reply: Option<oneshot::Sender<AuthDecision>>,
     /// A multiple-choice question waiting on the user (asked via `ask_user`). `None` = none.
@@ -643,6 +648,7 @@ impl App {
             items: Vec::new(),
             live: None,
             act: activity::new_shared(),
+            cache: cache::new_shared(),
             auth: None,
             auth_reply: None,
             choice: None,
@@ -719,8 +725,18 @@ impl App {
     /// Called at the *top* of the frame, before [`App::pump`], so the events handled this frame
     /// read a clock that already reflects the state they are about to change.
     fn sync_clock(&mut self) {
-        let running = self.busy && !self.waiting_auth && self.choice_reply.is_none();
-        self.clock.set_running(running);
+        self.clock.set_running(self.running());
+    }
+
+    /// Whether anything is actually progressing: a turn in flight, not parked on a person.
+    ///
+    /// The three ways a turn stops progressing are all waits on the user, and all three must look
+    /// the same to anything that measures *time*: the agent clock (whose bars would otherwise grow
+    /// while nobody was running) and the cache map's front (which would otherwise paint the same
+    /// reading across a square that is waiting for a click). Kept in one place so a fourth such
+    /// wait, when it appears, has one obvious home.
+    fn running(&self) -> bool {
+        self.busy && !self.waiting_auth && self.choice_reply.is_none()
     }
 
     /// On the first frame, converge the window into the screen and place it explicitly.
@@ -922,6 +938,12 @@ impl App {
                     // If the endpoint reports no numbers, hide the whole block -- don't fob it off
                     // with 0s
                     if !rec.is_empty() {
+                        // The cache-hit window reads the same record, but only for what the record
+                        // alone can say: the lifetime totals and the fallback reading for endpoints
+                        // that report nothing per call. Its grid was already fed by `CallUsage`
+                        // above -- a turn's `usage` is a *sum* over its calls, so letting it
+                        // overwrite the grid would paint blocks the last request never sent.
+                        cache::lock(&self.cache).observe_turn(&rec);
                         // The breakdown goes right after this turn's reply (by now the turn has
                         // ended and the tail of `items` is exactly that), and drag the view to the
                         // bottom while we're at it -- nobody goes looking for a row that appeared
@@ -931,6 +953,12 @@ impl App {
                         self.force_follow = true;
                     }
                 }
+                FromAgent::CallUsage { usage, last_prompt } => {
+                    // One finished model call, mid-turn. This is what makes the cache map move: the
+                    // turn's aggregate only arrives once the whole turn is over, which for a tool
+                    // loop can be a dozen calls later.
+                    cache::lock(&self.cache).observe_call(&usage, last_prompt);
+                }
                 FromAgent::UsageLog(log) => {
                     // The whole ledger the agent read back from file after a conversation switch.
                     // The per-turn breakdowns have to go back into the transcript -- when an old
@@ -938,6 +966,22 @@ impl App {
                     // not heaped up at the top.
                     self.usage_log = log;
                     self.rebuild_usage_rows();
+                    // Rebuild the cache map from that ledger. The map is a history — one tile per
+                    // recorded round — so it is replayed whole rather than seeded with the last
+                    // line: opening a conversation with 30 turns should show 30 tiles, not one.
+                    // Only sums survive in the file, which is why a replayed tile stands for a
+                    // round and says so in its tooltip.
+                    let mut cv = cache::lock(&self.cache);
+                    cv.reset();
+                    cv.replay(&self.usage_log);
+                }
+                FromAgent::ContextMap(segs) => {
+                    // The section breakdown of the request just sent. Converted into the window's own
+                    // `Seg` here rather than over there: the message crosses from the core crate, and
+                    // the window's type belongs to the GUI crate.
+                    cache::lock(&self.cache).observe_context(
+                        segs.into_iter().map(|(label, tokens)| cache::Seg { label, tokens }).collect(),
+                    );
                 }
                 FromAgent::Reasoning(d) => {
                     if let Some(l) = self.live.as_mut() {
@@ -1390,6 +1434,10 @@ impl App {
         // agent side has read its ledger back too, and the `UsageLog` that follows will send
         // this conversation's records over.
         self.usage_log.clear();
+        // The cache map is swapped with the rest: it describes "the conversation I am in", and the
+        // ledger it is fed from has just been cleared. The window itself stays open (it is a lens on
+        // whatever conversation is current, not a property of one), and its position is left alone.
+        cache::lock(&self.cache).reset();
         // The activity stream is swapped too. It lives in the **same file** as the messages, so
         // "open this conversation" should show the timeline as it was then; a new conversation
         // clears it.
@@ -3537,6 +3585,22 @@ impl App {
         }
         ui.add_space(9.0);
         ui.label(RichText::new(aox::i18n::t("Observe the agent's inner loop")).color(P::text_faint()).size(13.0));
+
+        ui.add_space(20.0);
+
+        // The second entrance, drawn with the same vocabulary as the first: one kind of thing gets
+        // one drawing (see `activity_open_button`). Same lock discipline -- test first, lock again
+        // only to open.
+        let on = cache::lock(&self.cache).is_open();
+        if cache_open_button(ui, on).clicked() {
+            cache::open(ui.ctx(), &self.cache);
+        }
+        ui.add_space(9.0);
+        ui.label(
+            RichText::new(aox::i18n::t("See how much of the context the provider served from cache"))
+                .color(P::text_faint())
+                .size(13.0),
+        );
     }
 
     /// The "Appearance" column: three light/dark options (including follow system).
@@ -4102,6 +4166,101 @@ fn seed_demo(app: &mut App) {
         a.end_round(16.8);
         a.tick(16.8, aox::i18n::t("Ready"), false);
     }
+
+    // The cache-hit map gets the same treatment: `--demo` must show it too, because "what it looks
+    // like while it is working" is most of what a preview is for, and the window is worthless to
+    // judge from an empty grid.
+    //
+    // There is one clock now, so the demo cannot pre-fill an array — it has to **run the front**, and
+    // the front only walks while a turn is in flight. So the demo declares itself "in flight" for the
+    // length of this block: it is standing in for exactly the one situation that ever fills this map.
+    //
+    // Two hundred-odd readings, a shade over one lap, so the preview opens on a **full** square
+    // instead of one that stops a third of the way round. Each reading holds for one or two tiles, so
+    // the map has bands rather than a single dot in the corner.
+    //
+    // Deterministic rather than random (a fixed pattern, not a generator), so two launches of
+    // `--demo` show the same picture and a screenshot can be compared against the previous one.
+    //
+    // The last tile is written by the call below, so the frame lands on the current reading, and the
+    // final numbers are the ones a live window would show: a 31K context of which 24.4K came back
+    // from the cache, with the four sections adding up to exactly that context size.
+    //
+    // Fed through the **real** sequence rather than the shortcuts: sections, then the per-call
+    // figures, then the turn's ledger — the same three messages a live turn sends, in the same
+    // order. A preview that skipped a step would stop being evidence that the live path works.
+    {
+        use aox::llm::Usage;
+        let mut cv = cache::lock(&app.cache);
+        cv.gw.force_open();
+        cv.gw.busy = true;
+        for k in 0..200u32 {
+            let prompt = 6_000 + u64::from(k) * 140;
+            // The mix is a *warm* conversation, which is what a long one looks like: most calls land
+            // at 93% cached — a hit band with a thin brick strip, the case where the old picture
+            // showed nothing at all — a few at 55% (a message appended that the cached prefix could
+            // not absorb), and the odd 2% cold start.
+            let share = match k % 12 {
+                3 | 8 => 0.55,
+                5 => 0.02,
+                _ => 0.93,
+            };
+            let cached = (prompt as f64 * share) as u64;
+            cv.observe_call(
+                &Usage { prompt: Some(prompt), cached: Some(cached), ..Default::default() },
+                None,
+            );
+            // 0.1 s is the largest step `advance` accepts from one frame, and at 10.2 tiles a
+            // second it is one tile — so this is "the reading held for 98 ms".
+            cv.advance(0.1);
+            // Every fifth reading held twice as long: without a few wider bands the strip reads as
+            // noise instead of as something that stayed put.
+            if k % 5 == 0 {
+                cv.advance(0.1);
+            }
+        }
+        cv.observe_context(vec![
+            cache::Seg { label: "System prompt", tokens: 5_200 },
+            cache::Seg { label: "Tool definitions", tokens: 4_100 },
+            cache::Seg { label: "Conversation history", tokens: 20_100 },
+            cache::Seg { label: "Your input", tokens: 1_800 },
+        ]);
+        cv.observe_call(
+            &Usage {
+                prompt: Some(31_200),
+                completion: Some(940),
+                total: Some(32_140),
+                reasoning: Some(310),
+                cached: Some(24_400),
+                cache_miss: Some(6_800),
+            },
+            Some(31_200),
+        );
+        cv.observe_turn(&UsageRecord {
+            round: 3,
+            at: 0,
+            calls: 2,
+            usage: Usage {
+                prompt: Some(31_200),
+                completion: Some(940),
+                total: Some(32_140),
+                reasoning: Some(310),
+                cached: Some(24_400),
+                cache_miss: Some(6_800),
+            },
+            last_prompt: Some(31_200),
+            session_total: Some(74_600),
+            session_calls: 7,
+        });
+        // One step for the live reading, so the frame lands on **it**: the seeded loop ends on a 93%
+        // call, and a preview whose newest tile is a hit would show neither the 22%-missed strip nor
+        // the partial band the last call really produced.
+        cv.advance(0.1);
+        // The launch lands with the square all but full and the frame on the live reading. It then
+        // **stops**, because nothing is in flight in demo mode — the same rule a real window follows
+        // when the turn ends.
+        cv.gw.busy = false;
+    }
 }
 
 /// The main window's default size: computed from the monitor size, minus the borders and the
@@ -4198,11 +4357,18 @@ impl eframe::App for App {
         // right now" over every frame and re-declares that viewport (egui viewports are
         // declarative; one that isn't declared gets reclaimed).
         activity::lock(&self.act).tick(self.now(), &self.status, self.busy);
-        // Hand the stream window this window's native handle, once: it needs it to keep this window
-        // painting while a turn runs (the stream window takes the foreground when it opens, and a
-        // frozen pass loop here is a frozen timeline there — see `activity::poke_main`).
-        activity::remember_main_window(&self.act, frame);
+        // The cache-hit map is fed the same way: one `observe` per finished model call, plus the
+        // per-frame time base. It is handed `running`, not `busy`: the strip freezes whenever the
+        // next reading is blocked on a person (an idle window, a question waiting for a choice, a
+        // plugin waiting for a permission), and `running` is exactly that distinction — see
+        // `sync_clock`.
+        cache::lock(&self.cache).tick(self.now(), self.running());
+        // Hand the child windows this window's native handle, once: they need it to keep this
+        // window painting while a turn runs (a child takes the foreground when it opens, and a
+        // frozen pass loop here is a frozen chart there — see `gwin::poke_main`).
+        gwin::remember_main_window(frame);
         activity::sync(ctx, &self.act);
+        cache::sync(ctx, &self.cache);
         let frame = Frame::NONE.fill(P::bg());
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             let column_rect = ui.max_rect();
@@ -6661,6 +6827,72 @@ fn activity_open_button(ui: &mut Ui, on: bool) -> egui::Response {
     let g = painter.layout_no_wrap(aox::i18n::t("Open activity stream").to_string(), egui::FontId::proportional(14.5), fg);
     painter.galley(Pos2::new(rect.left() + 42.0, rect.center().y - g.size().y * 0.5), g, fg);
     resp
+}
+
+/// The "open cache hit map" button: the same card as [`activity_open_button`], with the grid as its
+/// mark.
+///
+/// Sharing the card is the point, not a shortcut: both rows open "a window that observes the agent",
+/// and giving the second one a different height, radius or hover treatment would make the column
+/// look assembled from two different programs. What differs is the glyph — the flow line is the
+/// activity stream's identity, 4×4 cells are this one's.
+///
+/// The mark is a miniature of the window itself (hit cells filled, the rest outlined), so the two
+/// read as the same object at two scales.
+fn cache_open_button(ui: &mut Ui, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(196.0, 42.0), Sense::click());
+    let hot = resp.hovered() && !on;
+    if hot {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let fg = if on { P::text_faint() } else { P::text() };
+
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(12),
+        if hot { P::surface_hi() } else { P::panel() },
+    );
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(12),
+        Stroke::new(1.0, P::border()),
+        egui::StrokeKind::Inside,
+    );
+    // Same 18px square, same 22-point inset as the flow line beside it.
+    let icon =
+        Rect::from_center_size(Pos2::new(rect.left() + 22.0, rect.center().y), Vec2::splat(18.0));
+    draw_grid_mark(painter, icon, fg);
+    let g = painter.layout_no_wrap(aox::i18n::t("Open cache hit map").to_string(), egui::FontId::proportional(14.5), fg);
+    painter.galley(Pos2::new(rect.left() + 42.0, rect.center().y - g.size().y * 0.5), g, fg);
+    resp
+}
+
+/// The 4×4 mark for the cache-hit button: ten cells filled, the rest outlined.
+///
+/// The count is not decoration — ten of sixteen is the "mostly cached" reading the window exists to
+/// make visible, and an all-filled or half-filled square would say nothing. It is drawn at 18 points,
+/// so 4×4 is the largest grid that still resolves; a literal 16×16 would be a smudge.
+fn draw_grid_mark(p: &egui::Painter, r: Rect, fg: Color32) {
+    const N: i32 = 4;
+    let gap = 2.0;
+    let cell = (r.width() - (N as f32 - 1.0) * gap) / N as f32;
+    for y in 0..N {
+        for x in 0..N {
+            let at = Pos2::new(r.left() + x as f32 * (cell + gap), r.top() + y as f32 * (cell + gap));
+            let cr = Rect::from_min_size(at, Vec2::splat(cell));
+            if y * N + x < 10 {
+                p.rect_filled(cr, CornerRadius::same(1), fg);
+            } else {
+                p.rect_stroke(
+                    cr,
+                    CornerRadius::same(1),
+                    Stroke::new(1.0, fg.gamma_multiply(0.45)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+    }
 }
 
 /// A "name + value" row (the "System" column is all rows like this).

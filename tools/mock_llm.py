@@ -28,6 +28,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8791
 
+# 上一轮请求的输入规模 —— 前缀缓存的真实语义就是「这一轮复用的是上一轮那整段前缀」。
+# 用它（而不是写死的数字）算 usage，缓存命中才会随着上下文变长而一直往前走；
+# 写死的 128/64 会让「缓存命中图」永远停在同一个位置，等于把这个窗口最该验的东西验掉了。
+LAST_PROMPT = [0]
+
 SCENARIO = os.environ.get("AOX_MOCK_SCENARIO", "").strip().lower()
 
 
@@ -147,12 +152,19 @@ class Handler(BaseHTTPRequestHandler):
         self._delta({}, finish=finish)
         # usage 要给全：界面上的 token 明细（输入/输出/合计/推理/缓存）全靠它。
         # cached + cache_miss = prompt，别写成对不上账的数。
+        #
+        # cached 取**上一轮**的 prompt：这就是前缀缓存真实的样子 —— 这一轮复用的是上一轮那整段
+        # 前缀，多出来的是这一轮新加的内容（工具结果、助手回复），必须重新算。输入规模按消息正文
+        # 的字符数估，和宿主自己的口径一致（4 个 ASCII 字符 ≈ 1 token）。
+        prompt = getattr(self, "_prompt", 128)
+        cached = min(LAST_PROMPT[0], prompt)
+        LAST_PROMPT[0] = prompt
         self._chunk({
             "choices": [],
-            "usage": {"prompt_tokens": 128, "completion_tokens": 256,
-                      "total_tokens": 384,
-                      "prompt_tokens_details": {"cached_tokens": 64},
-                      "prompt_cache_miss_tokens": 64,
+            "usage": {"prompt_tokens": prompt, "completion_tokens": 256,
+                      "total_tokens": prompt + 256,
+                      "prompt_tokens_details": {"cached_tokens": cached},
+                      "prompt_cache_miss_tokens": prompt - cached,
                       "completion_tokens_details": {"reasoning_tokens": 96}},
         })
         self.wfile.write(b"data: [DONE]\n\n")
@@ -190,6 +202,9 @@ class Handler(BaseHTTPRequestHandler):
             body = {}
         msgs = body.get("messages", [])
         tool_msgs = sum(1 for m in msgs if m.get("role") == "tool")
+        # 这一轮的输入规模：按整份请求正文估，宿主那套 token 明细才有真东西可显示。
+        chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in msgs)
+        self._prompt = max(1, chars // 4)
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")

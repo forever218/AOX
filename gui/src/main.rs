@@ -21,6 +21,8 @@ mod activity;
 mod app;
 mod brand;
 mod bridge;
+mod cache;
+mod gwin;
 mod markdown;
 mod syntax;
 mod svg;

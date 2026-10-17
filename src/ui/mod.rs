@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::history::UsageRecord;
-use crate::llm::StreamSink;
+use crate::llm::{StreamSink, Usage};
 
 /// Events flowing from the Agent to the UI. A GUI implementation can subscribe to this event stream
 /// and render directly.
@@ -136,6 +136,30 @@ pub trait Ui: Send {
     /// When the endpoint doesn't support usage, `rec.is_empty()` is true and the UI can simply skip
     /// this display.
     async fn turn_usage(&mut self, _rec: &UsageRecord) {}
+    /// The account for **one model call inside the current turn** — the same figures `turn_usage`
+    /// reports, but per call and arriving while the turn is still running.
+    ///
+    /// It is a separate callback rather than a field on `turn_usage` because the two answer different
+    /// questions. `turn_usage` gives the turn's aggregate (`UsageRecord::usage` is the **sum** over
+    /// every call the turn made) and lands once the turn is over; a live view — the cache-hit map is
+    /// the only user — needs "what is the context right now", which is the *last* call, and it needs
+    /// it before the turn ends. Deriving one from the other is impossible: the sum of the cache hits
+    /// over a turn's calls can easily exceed the size of its last request.
+    ///
+    /// `last_prompt` is the accumulator's current input size, offered as a fallback for endpoints
+    /// whose per-call `usage.prompt` is absent. The default implementation does nothing, so a front
+    /// end with no live view (the CLI) is unaffected.
+    async fn call_usage(&mut self, _usage: &Usage, _last_prompt: Option<u64>) {}
+    /// What the request **about to be sent** is made of: one entry per section, in body order, with
+    /// a rough token estimate for each.
+    ///
+    /// Called immediately before every model call — **before**, not after, because the point is to
+    /// attribute the reply's usage figures to the sections that produced them, and by the time the
+    /// reply arrives the request body is gone.
+    ///
+    /// Empty default: a UI with nothing to say about request composition (the CLI, the spinner)
+    /// simply does not implement it, and the cost of that is one function that isn't there.
+    async fn context_map(&mut self, _segs: &[(&'static str, u64)]) {}
     /// Update the in-progress status label (e.g. "Thinking", "Running fs_read").
     /// An empty default implementation; the GUI can map it to status-bar text.
     async fn set_status(&mut self, _label: &str) {}

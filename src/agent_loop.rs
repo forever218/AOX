@@ -211,6 +211,12 @@ impl AgentLoop for StandardLoop {
             }
             let schemas = req.tools;
 
+            // Show the UI what this request is made of (see `Ui::context_map`). Before the call and
+            // not after: the reply's usage figures get attributed to these sections, and once the
+            // reply is in, the body that produced it is no longer around to measure.
+            let sections = agent.context_sections(&schemas);
+            ui.context_map(&sections).await;
+
             ui.set_status(crate::i18n::t("Thinking")).await;
             // Hand the streaming receiver to the Provider: a thinking model's reasoning is echoed
             // in real time while waiting. This is written as its own statement (rather than
@@ -264,6 +270,12 @@ impl AgentLoop for StandardLoop {
             };
             // Accounting: when the endpoint gives no usage, each item is None and accrue skips quietly.
             agent.accrue_call(&reply.usage);
+
+            // Hand the same figures to the UI **per call**, not just per turn. The turn aggregate is
+            // reported much later (`Agent::finish_turn`), so without this a live view has nothing to
+            // show until the whole turn is over — which for a ten-round tool loop is a long silence.
+            // Read after `accrue_call` so the fallback `last_prompt` already carries this call.
+            ui.call_usage(&reply.usage, agent.turn_last_prompt()).await;
 
             // ── Hook point ② after reply.
             //    Deliberately placed **after** accounting: the tokens of a rejected call really were

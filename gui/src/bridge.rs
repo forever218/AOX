@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use aox::agent::Agent;
 use aox::history::UsageRecord;
-use aox::llm::{LlmProvider, StreamSink};
+use aox::llm::{LlmProvider, StreamSink, Usage};
 use aox::runtime::Runtime;
 use aox::ui::{AgentEvent, AuthDecision, ChoiceReply, Ui};
 
@@ -113,6 +113,17 @@ pub enum FromAgent {
     /// **Must be sent after `Switched`**: on receiving `Switched` the main thread clears the ledger;
     /// if the order were reversed, the just-restored data would be wiped by itself.
     UsageLog(Vec<UsageRecord>),
+    /// What the request about to be sent is made of: sections in body order, each with a rough token
+    /// estimate. Sent before every model call (see `Ui::context_map`), and used by the cache-hit
+    /// window to attribute blocks to the sections they came from.
+    ContextMap(Vec<(&'static str, u64)>),
+    /// One model call finished **inside** the current turn (see `Ui::call_usage`).
+    ///
+    /// Distinct from [`FromAgent::Usage`], which carries the turn's **aggregate** and only arrives
+    /// after the turn is over. This one is what lets the cache-hit map move while the model is still
+    /// working: `UsageRecord::usage` is a sum over calls, so a mid-turn update cannot be recovered
+    /// from it — the last call's figures have to be sent on their own.
+    CallUsage { usage: Usage, last_prompt: Option<u64> },
     /// A turn was aborted
     TurnAborted,
     /// Status-bar text (thinking / executing xx)
@@ -456,6 +467,15 @@ impl Ui for GuiUi {
 
     async fn turn_usage(&mut self, rec: &UsageRecord) {
         let _ = self.tx.send(FromAgent::Usage(Box::new(rec.clone())));
+    }
+
+    async fn context_map(&mut self, segs: &[(&'static str, u64)]) {
+        // A snapshot, not a borrow: the caller is mid-turn and will move on the moment this returns.
+        let _ = self.tx.send(FromAgent::ContextMap(segs.to_vec()));
+    }
+
+    async fn call_usage(&mut self, usage: &Usage, last_prompt: Option<u64>) {
+        let _ = self.tx.send(FromAgent::CallUsage { usage: usage.clone(), last_prompt });
     }
 
     async fn set_status(&mut self, label: &str) {

@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::attach;
 use crate::auth::AuthLevel;
 use crate::history::UsageRecord;
-use crate::llm::{LlmProvider, Usage};
+use crate::llm::{LlmProvider, TokenEstimate, Usage};
 use crate::message::Message;
 use crate::runtime::Runtime;
 use crate::tool::{ToolKind, ToolOutput};
@@ -231,6 +231,68 @@ impl Agent {
     /// Current conversation history length (used for rollback on interrupt).
     pub fn messages_len(&self) -> usize {
         self.messages.len()
+    }
+
+    /// Break the request **about to be sent** into sections, with a rough token estimate for each.
+    ///
+    /// Only the host can answer this: it owns the system prompt, the tool schemas and the message
+    /// list, while the endpoint sees just the assembled body and reports a single total for it. The
+    /// cache-hit window (`gui/cache.rs`) walks this list to attribute the real `prompt` / `cached`
+    /// figures back to the sections they came from.
+    ///
+    /// The estimate follows [`TokenEstimate`]'s rule (about 4 ASCII characters per token, 1 token
+    /// per CJK character). That is good enough for proportions and is **never quoted as a total** —
+    /// the exact number comes back from the provider and replaces it on screen.
+    ///
+    /// The order is the order the sections occupy in the request body, and it is load-bearing: a
+    /// prefix cache hit covers the earliest tokens first, so where a section sits decides how much
+    /// of the hit belongs to it.
+    pub fn context_sections(&self, schemas: &[Value]) -> Vec<(&'static str, u64)> {
+        fn est(s: &str) -> u64 {
+            let mut e = TokenEstimate::default();
+            e.add(s);
+            e.tokens().max(1)
+        }
+
+        let mut out: Vec<(&'static str, u64)> = Vec::new();
+        let mut rest: &[Message] = &self.messages;
+
+        // The system prompt is messages[0] whenever it is present (see `refresh_system_prompt`).
+        if rest.first().is_some_and(|m| m.role == "system") {
+            out.push(("System prompt", est(rest[0].text().unwrap_or_default())));
+            rest = &rest[1..];
+        }
+
+        // Tool schemas are a field of their own in the OpenAI wire format, so they are a section of
+        // their own here rather than part of the system prompt.
+        if !schemas.is_empty() {
+            out.push((
+                "Tool definitions",
+                schemas.iter().map(|s| est(&s.to_string())).sum::<u64>(),
+            ));
+        }
+
+        // The last user message is this turn's instruction; everything before it is history.
+        let (head, tail) = match rest.split_last() {
+            Some((last, head)) if last.role == "user" => (head, Some(last)),
+            _ => (rest, None),
+        };
+        if !head.is_empty() {
+            let mut n = 0u64;
+            for m in head {
+                n += est(m.text().unwrap_or_default());
+                // An assistant turn's tool calls travel in their own field, arguments included — for
+                // a `write_file` that JSON is most of the message.
+                for c in m.tool_calls.iter().flatten() {
+                    n += est(&c.function.arguments);
+                }
+            }
+            out.push(("Conversation history", n));
+        }
+        if let Some(last) = tail {
+            out.push(("Your input", est(last.text().unwrap_or_default())));
+        }
+        out
     }
 
     /// Per-turn usage records for the current conversation (so the UI can show "how much each turn cost").
@@ -532,6 +594,15 @@ impl Agent {
         if usage.prompt.is_some() {
             self.turn.last_prompt = usage.prompt;
         }
+    }
+
+    /// The input size of the most recent call in this turn, if the endpoint reported one.
+    ///
+    /// Only for [`Ui::call_usage`]'s fallback argument: an endpoint that reports `cached` but omits
+    /// `prompt` on an individual call would otherwise have a cache figure and nothing to measure it
+    /// against.
+    pub fn turn_last_prompt(&self) -> Option<u64> {
+        self.turn.last_prompt
     }
 
     /// Close out the turn: fold the books into the session totals, record into `usage_log`, and persist into the conversation file.
