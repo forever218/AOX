@@ -554,6 +554,7 @@ async fn main() -> Result<()> {
                     preview: "base_url = \"https://api.deepseek.com/v1\"".into(),
                     diff: None,
                     diff_detail: None,
+                    path: None,
                 });
                 ui.emit(AgentEvent::AssistantText(
                     crate::i18n::t("Demo finished: the tool-call trace above has been collapsed; type **/expand** to expand it.").into(),

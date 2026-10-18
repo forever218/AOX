@@ -93,6 +93,17 @@ pub struct ToolOutput {
     /// same reason the counts are computed here — both versions of the file exist for exactly one
     /// moment, and only this side can still see them.
     pub diff_detail: Option<String>,
+    /// The **file this call wrote**, when it was a file edit (`None` for everything else).
+    ///
+    /// The counts and the diff above say "how much changed" but never "of what"; the workspace view
+    /// (`gui/src/wsview.rs`) needs the *name* to put the change in a list and to open that file's
+    /// diff when the row is clicked. The tool already has the path in hand at the moment it computes
+    /// the diff, so carrying it costs one `Option` and saves the front end from re-parsing
+    /// `content` — which is prose written for the model, not a record.
+    ///
+    /// Absolute, and already through the workplace boundary (see `guard` in `hostfs`), so a front
+    /// end can read it directly without deciding again whether it is allowed to.
+    pub path: Option<std::path::PathBuf>,
 }
 
 impl ToolOutput {
@@ -104,6 +115,7 @@ impl ToolOutput {
             recycled: 0,
             diff: None,
             diff_detail: None,
+            path: None,
         }
     }
 
@@ -115,6 +127,7 @@ impl ToolOutput {
             recycled: 0,
             diff: None,
             diff_detail: None,
+            path: None,
         }
     }
 
@@ -139,6 +152,14 @@ impl ToolOutput {
     /// Carry the diff to draw when the row is unfolded. Chain it after `with_diff(..)`.
     pub fn with_diff_detail(mut self, detail: String) -> Self {
         self.diff_detail = Some(detail);
+        self
+    }
+
+    /// Name the file this call wrote. Chain it after `with_diff(..)` — a path without a diff is a
+    /// call that touched a file but changed nothing measurable, and the workspace view treats the
+    /// two separately (a row with no numbers, rather than a row claiming "+0 / −0").
+    pub fn with_path(mut self, path: std::path::PathBuf) -> Self {
+        self.path = Some(path);
         self
     }
 }

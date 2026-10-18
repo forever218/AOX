@@ -59,6 +59,7 @@ use crate::markdown;
 use crate::theme::{self, P};
 use crate::uistate;
 use crate::workplace_ui;
+use crate::wsview;
 
 // ─────────────────────────── data model ───────────────────────────
 
@@ -348,6 +349,10 @@ pub struct App {
     /// The cache-hit map's shared state — a second independent window (`cache.rs`), fed from the
     /// same two sources as the activity stream: per-turn usage records, and a per-frame time base.
     cache: cache::Shared,
+    /// The workspace view's shared state — a third independent window (`wsview.rs`). It is fed the
+    /// workspace root every frame and this turn's writes as the tool results arrive; the window
+    /// itself owns the tree, the file contents and the diff display.
+    wsview: wsview::Shared,
     auth: Option<AuthCard>,
     auth_reply: Option<oneshot::Sender<AuthDecision>>,
     /// A multiple-choice question waiting on the user (asked via `ask_user`). `None` = none.
@@ -648,6 +653,7 @@ impl App {
             live: None,
             act: activity::new_shared(),
             cache: cache::new_shared(),
+            wsview: wsview::new_shared(),
             auth: None,
             auth_reply: None,
             choice: None,
@@ -910,6 +916,10 @@ impl App {
                     // Defensive: a call still marked as "being written" from the previous turn would
                     // otherwise be adopted by a call of the same name in this one.
                     self.stream_calls.clear();
+                    // Last turn's writes stop being "this turn's". The workspace view lists what the
+                    // turn in flight is touching; the transcript already keeps every earlier edit,
+                    // with its own diff, where it happened.
+                    wsview::begin_turn(&self.wsview);
                 }
                 FromAgent::Status(s) => {
                     self.status = s.clone();
@@ -1445,6 +1455,10 @@ impl App {
         // ledger it is fed from has just been cleared. The window itself stays open (it is a lens on
         // whatever conversation is current, not a property of one), and its position is left alone.
         cache::lock(&self.cache).reset();
+        // The workspace view's edit ledger belongs to the conversation too: it lists what **this**
+        // conversation's current turn touched, and the turn count restarts here. The window stays
+        // open (it is a lens on the current workspace, not a property of one conversation).
+        wsview::reset(&self.wsview);
         // The activity stream is swapped too. It lives in the **same file** as the messages, so
         // "open this conversation" should show the timeline as it was then; a new conversation
         // clears it.
@@ -2276,7 +2290,14 @@ impl App {
                     activity::lock(&self.act).tool_note(&aox::tf!("Timeout limit {}s", timeout_secs));
                 }
             }
-            AgentEvent::ToolResult { name, is_error, preview, diff, diff_detail } => {
+            AgentEvent::ToolResult { name, is_error, preview, diff, diff_detail, path } => {
+                // A file write is also a row in the workspace view: that window answers "what did
+                // this turn touch", which is the one thing this event knows and the transcript can
+                // only say in prose. Recorded before the step is adopted, so the list and the
+                // "+N / −N" on the transcript row appear on the same frame.
+                if let Some(p) = path {
+                    wsview::note_edit(&self.wsview, p, diff, diff_detail.clone());
+                }
                 if let Some(l) = self.live.as_mut() {
                     if let Some(st) =
                         l.steps.iter_mut().rev().find(|s| s.name == name && s.result.is_none())
@@ -3636,6 +3657,12 @@ impl App {
         if cache_open_button(ui, on).clicked() {
             cache::open(ui.ctx(), &self.cache);
         }
+
+        ui.add_space(2.0);
+        let on = wsview::is_open(&self.wsview);
+        if wsview_open_button(ui, on).clicked() {
+            wsview::open(ui.ctx(), &self.wsview);
+        }
     }
 
     /// The "Appearance" column: three light/dark options (including follow system).
@@ -4294,6 +4321,48 @@ fn seed_demo(app: &mut App) {
         // when the turn ends.
         cv.gw.busy = false;
     }
+
+    // The workspace view is seeded too: a file browser previewed on an empty directory would prove
+    // nothing about the layout. The root is the **current directory** rather than the app root,
+    // because in demo mode the app root is `target/release` — which contains no source to browse —
+    // while the current directory is where `--demo` is normally launched from.
+    //
+    // The two edits are illustrative: the counts and the diff lines are written out here rather
+    // than produced by a turn, because in demo mode no turn ever ran. The **paths are real**, so the
+    // "File" half of the pane shows actual code from this repository.
+    {
+        let root = std::env::current_dir().unwrap_or_default();
+        wsview::force_open(&app.wsview);
+        wsview::set_root(&app.wsview, Some(root.clone()));
+        wsview::note_edit(
+            &app.wsview,
+            root.join("src").join("tool").join("hostfs.rs"),
+            Some((4, 2)),
+            Some(
+                "⋯\n     let existed = path.exists();\n-    let previous = if existed { std::fs::read_to_string(&path).ok() } else { None };\n+    // Read the previous version **before** overwriting it — this is the only moment both\n+    // versions are in hand.\n+    let previous = if existed { std::fs::read_to_string(&path).ok() } else { Some(String::new()) };\n     match std::fs::write(&path, content.as_bytes()) {\n⋯"
+                    .to_string(),
+            ),
+        );
+        wsview::note_edit(
+            &app.wsview,
+            root.join("gui").join("src").join("wsview.rs"),
+            Some((6, 0)),
+            Some(
+                "⋯\n     fn rebuild(&mut self) {\n         self.rows.clear();\n+        let Some(root) = self.root.clone() else {\n+            return;\n+        };\n+        let edited: BTreeSet<String> = self.files.iter().map(|f| key(&f.path)).collect();\n+        walk(&root, 0, &self.expanded, &edited, &mut self.rows);\n     }\n⋯"
+                    .to_string(),
+            ),
+        );
+        // Two directories unfolded, so the tree shows its shape instead of a single row.
+        wsview::expand(&app.wsview, root.join("src"));
+        wsview::expand(&app.wsview, root.join("gui").join("src"));
+        // Land on the diff: the window's whole point is "what did this turn change", and an empty
+        // right pane would demo the frame without demoing the feature.
+        wsview::select(
+            &app.wsview,
+            root.join("src").join("tool").join("hostfs.rs"),
+            wsview::Mode::Diff,
+        );
+    }
 }
 
 /// The main window's default size: computed from the monitor size, minus the borders and the
@@ -4407,6 +4476,13 @@ impl eframe::App for App {
         gwin::remember_main_window(frame);
         activity::sync(ctx, &self.act);
         cache::sync(ctx, &self.cache);
+        // The workspace view is fed the same way, and for the same reason: the window is a pure
+        // function of what it is handed. The root comes from the workplace receipt (it changes when
+        // the tier is switched), and `running` rather than `busy` for the dot — a turn waiting on a
+        // person is not editing anything, so the file being watched should stop being re-read.
+        wsview::set_root(&self.wsview, self.ws.view().and_then(|v| v.root.clone()));
+        wsview::tick(&self.wsview, self.running());
+        wsview::sync(ctx, &self.wsview);
         let frame = Frame::NONE.fill(P::bg());
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             let column_rect = ui.max_rect();
@@ -7120,11 +7196,13 @@ fn activity_open_button(ui: &mut Ui, on: bool) -> egui::Response {
     entry_row(ui, on, EntryMark::Flow, aox::i18n::t("Open activity stream"))
 }
 
-/// Which mark an entry row paints: the activity stream's flow line, or the cache map's grid.
+/// Which mark an entry row paints: the activity stream's flow line, the cache map's grid, or the
+/// workspace view's tree.
 #[derive(Clone, Copy)]
 enum EntryMark {
     Flow,
     Grid,
+    Tree,
 }
 
 /// One "opens a window" row on the settings page.
@@ -7153,6 +7231,7 @@ fn entry_row(ui: &mut Ui, on: bool, mark: EntryMark, label: &str) -> egui::Respo
     match mark {
         EntryMark::Flow => draw_flow_curve(painter, icon, fg),
         EntryMark::Grid => draw_grid_mark(painter, icon, fg),
+        EntryMark::Tree => draw_tree_mark(painter, icon, fg),
     }
     let g = painter.layout_no_wrap(label.to_string(), egui::FontId::proportional(15.0), fg);
     painter.galley(Pos2::new(rect.left() + 48.0, rect.center().y - g.size().y * 0.5), g, fg);
@@ -7177,6 +7256,39 @@ fn entry_row(ui: &mut Ui, on: bool, mark: EntryMark, label: &str) -> egui::Respo
 /// read as the same object at two scales.
 fn cache_open_button(ui: &mut Ui, on: bool) -> egui::Response {
     entry_row(ui, on, EntryMark::Grid, aox::i18n::t("Open cache hit map"))
+}
+
+/// The "open workspace view" button: the same card again, with a file tree as its mark.
+///
+/// Third of the trio, and deliberately the third: the flow line and the grid both observe the
+/// agent, whereas this one observes **the files it touched** — a different question, so a different
+/// glyph, but the same row, because all three open a window and the column should not start
+/// changing shape halfway down.
+fn wsview_open_button(ui: &mut Ui, on: bool) -> egui::Response {
+    entry_row(ui, on, EntryMark::Tree, aox::i18n::t("Open workspace view"))
+}
+
+/// The tree mark: a root, two branches, two leaves — the smallest shape that reads as "a directory
+/// of files" at 20 points. Drawn with the same 1.4px stroke as the other two marks so the three
+/// icons sit at the same weight.
+fn draw_tree_mark(p: &egui::Painter, r: Rect, fg: Color32) {
+    let st = Stroke::new(1.4, fg);
+    let x0 = r.left() + 2.5;
+    let cy = r.center().y;
+    // The trunk, and the two rows hanging off it.
+    let y1 = r.top() + 4.5;
+    let y2 = r.bottom() - 4.5;
+    p.line_segment([Pos2::new(x0, y1), Pos2::new(x0, y2)], st);
+    // Top branch: trunk -> elbow -> leaf
+    p.line_segment([Pos2::new(x0, y1 + 3.0), Pos2::new(x0 + 4.0, y1 + 3.0)], st);
+    p.circle_filled(Pos2::new(x0 + 7.0, y1 + 3.0), 1.9, fg);
+    // Bottom branch
+    p.line_segment([Pos2::new(x0, y2 - 3.0), Pos2::new(x0 + 4.0, y2 - 3.0)], st);
+    p.circle_filled(Pos2::new(x0 + 7.0, y2 - 3.0), 1.9, fg);
+    // A folder at the root end: a small open rectangle, which is what separates "a tree" from "a
+    // fork in the road".
+    let f = Rect::from_min_size(Pos2::new(x0 + 4.5, cy - 2.6), Vec2::new(8.0, 5.6));
+    p.rect_stroke(f, CornerRadius::same(1), Stroke::new(1.2, fg), egui::StrokeKind::Inside);
 }
 
 /// The 4×4 mark for the cache-hit button: ten cells filled, the rest outlined.

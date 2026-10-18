@@ -381,6 +381,7 @@ impl AgentLoop for StandardLoop {
                             preview: out.content.clone(),
                             diff: None,
                             diff_detail: None,
+                            path: None,
                         });
                         agent.push_message(Message::tool_result(&call.id, &name, out.content), Some(true));
                         continue;
@@ -402,6 +403,7 @@ impl AgentLoop for StandardLoop {
                             preview: out.content.clone(),
                             diff: None,
                             diff_detail: None,
+                            path: None,
                         });
                     agent.push_message(Message::tool_result(&call.id, &name, out.content), Some(true));
                     continue;
@@ -421,6 +423,10 @@ impl AgentLoop for StandardLoop {
                     preview: truncate(&output.content, 300),
                     diff: output.diff,
                     diff_detail: output.diff_detail,
+                    // The file this call wrote, when it was a file edit. Travels with the result so
+                    // the workspace view can list "what this turn touched" without re-deriving it
+                    // from prose.
+                    path: output.path,
                 });
                 // A delete lands in the **recycle bin**, and that is worth saying out loud: "it is
                 // not really gone" is the one thing a user has to know about a delete, and it is

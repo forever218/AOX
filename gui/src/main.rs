@@ -30,6 +30,7 @@ mod tex;
 mod theme;
 mod uistate;
 mod workplace_ui;
+mod wsview;
 
 use tokio::sync::mpsc;
 

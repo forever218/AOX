@@ -38,6 +38,10 @@ pub enum AgentEvent {
         preview: String,
         diff: Option<(usize, usize)>,
         diff_detail: Option<String>,
+        /// The file this call wrote, when it was a file edit (see `ToolOutput::path`). The
+        /// workspace view lists a turn's edits by this field and nothing else — `content` above is
+        /// prose for the model, so a front end must never try to recover the name from it.
+        path: Option<std::path::PathBuf>,
     },
     Info(String),
     Warn(String),

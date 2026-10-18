@@ -87,10 +87,11 @@ const RESIZE_CORNER: f32 = 12.0;
 // ───────────────────────────── Window ids ─────────────────────────────
 
 /// The window ids below are **poker slots**, not viewport ids: each is a bit in an atomic mask
-/// saying "this window needs the main window painting". Two is a hard ceiling on how many
-/// independent windows can matter here; the mask is 32 bits wide, so there is room.
+/// saying "this window needs the main window painting". Three are in use and the mask is 32 bits
+/// wide, so there is room.
 pub const WIN_ACTIVITY: u8 = 0;
 pub const WIN_CACHE: u8 = 1;
+pub const WIN_WSVIEW: u8 = 2;
 
 // ─────────────────────────── The shell state ───────────────────────────
 

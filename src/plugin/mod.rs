@@ -755,7 +755,7 @@ fn parse_tool_result(v: Value) -> crate::tool::ToolOutput {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    crate::tool::ToolOutput { content, is_error, attach, recycled: 0, diff: None, diff_detail: None }
+    crate::tool::ToolOutput { content, is_error, attach, recycled: 0, diff: None, diff_detail: None, path: None }
 }
 
 fn spawn_command(

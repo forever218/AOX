@@ -247,9 +247,14 @@ impl Tool for WriteFileTool {
                 match &previous {
                     Some(old) => {
                         let (added, removed) = line_diff(old, content);
-                        out.with_diff(added, removed).with_diff_detail(diff_text(old, content))
+                        out.with_diff(added, removed)
+                            .with_diff_detail(diff_text(old, content))
+                            .with_path(path)
                     }
-                    None => out,
+                    // A previous version that was not UTF-8 text: no diff is possible, but the file
+                    // **was** written — so it still carries its path, and the workspace view lists
+                    // it as a changed file with no numbers rather than hiding it.
+                    None => out.with_path(path),
                 }
             }
             Err(e) => ToolOutput::err(crate::tf!("failed to write {}: {}", path.display(), e)),
