@@ -234,6 +234,8 @@ pub struct BootInfo {
     /// noise nobody reads.
     pub config_layers: Vec<String>,
     pub model: String,
+    /// The model's context window, for the ring in the input box. `0` = not configured.
+    pub context_window: u64,
     pub provider_ready: bool,
     pub note: Option<String>,
     /// The paths and host info the "System" tab needs (see [`BootPaths`]).
@@ -549,10 +551,22 @@ async fn runtime_command(ui: &mut GuiUi, rt: &Arc<Runtime>, line: &str) {
     }
 }
 
+/// The configured context window, or `0` for "the config didn't say".
+///
+/// A tiny wrapper so the two call sites that have a `Runtime` in hand don't each repeat the
+/// `Option → 0` dance; the GUI turns `0` into its own default (see `DEFAULT_CONTEXT_WINDOW`).
+fn ctx_window(rt: &Arc<Runtime>) -> u64 {
+    rt.config.provider.context_window.map(u64::from).unwrap_or(0)
+}
+
 fn boot(
     tx: &mpsc::UnboundedSender<FromAgent>,
     config_path: &std::path::Path,
     model: &str,
+    // The model's context window (`[provider] context_window`), or 0 when unknown -- the ring in
+    // the input box needs a denominator, and "unknown" is the honest answer for a config that
+    // didn't say.
+    context_window: u64,
     ready: bool,
     note: Option<String>,
     store: Arc<dyn aox::store::Store>,
@@ -564,6 +578,7 @@ fn boot(
         config_path: config_path.display().to_string(),
         config_layers: layers,
         model: model.to_string(),
+        context_window,
         provider_ready: ready,
         note,
         paths,
@@ -824,6 +839,7 @@ async fn boot_and_run(
                 &tx,
                 &config_path,
                 "",
+                0,
                 false,
                 Some(format!("{e:#}")),
                 store,
@@ -879,6 +895,7 @@ async fn boot_and_run(
                 &tx,
                 &config_path,
                 &model,
+                ctx_window(&rt),
                 false,
                 Some(format!("{e:#}")),
                 rt.store.clone(),
@@ -901,7 +918,7 @@ async fn boot_and_run(
     // Hand the session to the UI **before** touching plugins. The history sidebar reads off the store
     // that `boot` carries, so restoring plugins first used to blank it for the whole wait — up to
     // `INIT_TIMEOUT` (20 s) per cold-or-broken plugin. This order is the point of the fix.
-    boot(&tx, &config_path, &model, true, None, rt.store.clone(), config_layers, paths);
+    boot(&tx, &config_path, &model, ctx_window(&rt), true, None, rt.store.clone(), config_layers, paths);
     send_history_current(&tx, &agent);
     // Now restore persisted plugins (the same path as the CLI). It is the one startup step that can
     // block, so it runs here — after the UI already has the session — and finishes before the driver

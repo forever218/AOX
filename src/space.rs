@@ -288,6 +288,28 @@ impl Registry {
         id
     }
 
+    /// Register a folder the user has **just chosen** (the directory picker's answer) as a
+    /// workspace. Returns the space's id when the registry actually changed, `None` when it did not.
+    ///
+    /// Two folders are deliberately left out:
+    ///
+    /// * **The app root.** [`Registry::workspace_roots`] always contains it, so it needs no row --
+    ///   and giving it one would be actively wrong: `group()` asks `find_root_space` *before* it
+    ///   asks `same_path(app_root)`, so a registered app root would pull every conversation that
+    ///   lands there "when nobody chose anything" out of `Default` and into a workspace of its own.
+    /// * **A folder already known.** [`Registry::add_workspace`] is idempotent, but re-saving the
+    ///   file for an edit that changes nothing is a write per click for no gain.
+    ///
+    /// A folder that was **removed** and is now picked again *is* adopted: it has no space row left
+    /// (`remove_workspace` drops it), so it reads as unknown here, and `add_workspace` clears the
+    /// `hidden` mark in the same stroke. That is the working undo the removal docs promise.
+    pub fn adopt_workspace(&mut self, root: &Path, app_root: &Path) -> Option<String> {
+        if same_path(root, app_root) || self.find_root_space(root).is_some() {
+            return None;
+        }
+        Some(self.add_workspace(root, None))
+    }
+
     /// Rename a workspace — **the label only**; the folder on disk is never touched.
     ///
     /// The registry has always kept the two apart (`Space::name` is what the tree shows, `root` is
@@ -703,6 +725,54 @@ mod tests {
         let groups = group(&app, &reg, vec![summary("a", Some("E:/rust22"), false)]);
         assert_eq!(groups.len(), 2);
         assert_eq!(ids(&groups[1]), vec!["a"]);
+    }
+
+    /// Picking a folder in the directory list is what **makes** it a workspace: the registry is
+    /// where `workspace_roots` is read from, so a root nobody wrote down is not scanned on the next
+    /// launch and both the group and its conversations vanish. `adopt_workspace` is that write.
+    ///
+    /// The two exclusions are the interesting part, and both are asserted here:
+    ///
+    /// * the app root is refused -- registering it would move every `Default` conversation into a
+    ///   new group, because `group()` asks `find_root_space` before `same_path(app_root)`;
+    /// * a known folder is a no-op -- otherwise every "switch to this workspace" click would rewrite
+    ///   the file.
+    #[test]
+    fn adopt_workspace_registers_a_picked_folder_but_not_the_app_root() {
+        let app = PathBuf::from("E:/app");
+        let mut reg = Registry::default();
+
+        assert_eq!(reg.adopt_workspace(&app, &app), None, "the app root is not a workspace");
+        assert!(reg.spaces.iter().all(|s| s.root.is_none()), "nothing was registered");
+
+        let picked = PathBuf::from("E:/rust22");
+        let id = reg.adopt_workspace(&picked, &app).expect("a picked folder is registered");
+        assert!(reg.workspace_roots(&app).iter().any(|r| same_path(r, &picked)));
+        // The group the new space will be drawn as, and the reason the caller can unfold it.
+        assert_eq!(reg.index_of(&id).map(|i| &reg.spaces[i]).and_then(|s| s.root.as_deref()),
+            Some(picked.as_path()));
+
+        assert_eq!(reg.adopt_workspace(&picked, &app), None, "already known, so no write");
+        assert_eq!(
+            reg.spaces.iter().filter(|s| s.root.is_some()).count(),
+            1,
+            "and no second row either"
+        );
+    }
+
+    /// A folder that was removed and is then picked again comes back **as itself**: same id (it is
+    /// derived from the root), and the `hidden` mark gone. This is the undo the removal docs promise.
+    #[test]
+    fn adopt_workspace_revives_a_removed_folder() {
+        let app = PathBuf::from("E:/app");
+        let mut reg = Registry::default();
+        let picked = PathBuf::from("E:/rust22");
+        let id = reg.add_workspace(&picked, Some("Rust".into()));
+        reg.remove_workspace(&picked);
+        assert!(reg.is_hidden(&picked));
+
+        assert_eq!(reg.adopt_workspace(&picked, &app), Some(id), "same workspace, same id");
+        assert!(!reg.is_hidden(&picked));
     }
 
     /// Case differences must not split one workspace into two groups on Windows; on Unix they are

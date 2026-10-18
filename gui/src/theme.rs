@@ -472,6 +472,29 @@ impl P {
     pub fn surface_hi() -> Color32 {
         pal().surface_hi
     }
+
+    /// The fill of a **row** under the pointer — one soft step above [`P::surface`].
+    ///
+    /// `surface_hi` is a 22-unit step: right for a button or a menu row, too loud for a column of
+    /// twenty list rows, where it turns the whole panel grey. This is the same idea at ~3% ink, so
+    /// a hovered row reads as *touched* without becoming a block of colour.
+    pub fn hover_fill() -> Color32 {
+        match mode() {
+            Mode::Light => Color32::from_rgb(0xF3, 0xF0, 0xE8),
+            Mode::Dark => Color32::from_rgb(0x26, 0x26, 0x21),
+        }
+    }
+
+    /// The fill of the **selected** row: one more step (~6% ink) on top of [`P::hover_fill`].
+    ///
+    /// Deliberately the only marker the current conversation gets (no dot, no bar): at rest the
+    /// list is plain text on paper, and the one row you are in is a shade darker than the rest.
+    pub fn active_fill() -> Color32 {
+        match mode() {
+            Mode::Light => Color32::from_rgb(0xEC, 0xE8, 0xDE),
+            Mode::Dark => Color32::from_rgb(0x2C, 0x2C, 0x26),
+        }
+    }
     pub fn border() -> Color32 {
         pal().border
     }

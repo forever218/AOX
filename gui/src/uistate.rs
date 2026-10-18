@@ -39,6 +39,11 @@ const VERSION: u32 = 1;
 /// explicit choice and falls back to the tree's default (drawn open iff it holds the conversation
 /// being chatted in). **Only explicit choices are written**, so that default stays defined in exactly
 /// one place (`App::group_is_open`) instead of being frozen into the file.
+///
+/// The drawer's own open/closed position is deliberately **not** here (user request, 2026-10-18):
+/// the sidebar always starts folded, every launch. It is a thing you open when you want it and put
+/// away when you are done, not a layout preference — remembering it meant that one launch where you
+/// left it open turned into "it is always there" for every launch after.
 #[derive(Debug, Default, Clone)]
 pub struct FoldState {
     /// Groups the user has explicitly unfolded.
@@ -49,6 +54,10 @@ pub struct FoldState {
 
 /// The on-disk shape. Both lists are sorted on write, so the file is stable across saves (an
 /// unchanged tree rewrites the same bytes rather than shuffling `HashSet` order into the diff).
+///
+/// Files written before 2026-10-18 also carry a `drawer` boolean. It is simply not declared here:
+/// serde ignores unknown fields by default, so an old file still loads and the stale field drops
+/// out on the next save. No version bump — the readable content did not change.
 #[derive(Debug, Serialize, Deserialize)]
 struct Wire {
     version: u32,
@@ -70,10 +79,7 @@ impl FoldState {
         if wire.version != VERSION {
             return Self::default();
         }
-        Self {
-            open: wire.open.into_iter().collect(),
-            closed: wire.closed.into_iter().collect(),
-        }
+        Self { open: wire.open.into_iter().collect(), closed: wire.closed.into_iter().collect() }
     }
 
     /// Write the fold state back, **atomically**. See the module docs for why a rename rather than a
@@ -122,6 +128,27 @@ mod tests {
         let back = FoldState::load(&dir);
         assert_eq!(back.open, fs.open);
         assert_eq!(back.closed, fs.closed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file written before the drawer stopped being persisted still loads, and the stale `drawer`
+    /// field is **dropped on the next save** rather than carried around. The sidebar itself is not
+    /// this file's business any more: it always starts folded (user request, 2026-10-18).
+    #[test]
+    fn a_legacy_file_with_a_drawer_field_still_reads_and_drops_it() {
+        let dir = temp_dir("legacydrawer");
+        std::fs::create_dir_all(dir.join(AOX_DIR)).unwrap();
+        std::fs::write(
+            dir.join(AOX_DIR).join(FILE_NAME),
+            br#"{"version":1,"open":["x"],"closed":["y"],"drawer":true}"#,
+        )
+        .unwrap();
+        let fs = FoldState::load(&dir);
+        assert_eq!(fs.open.len(), 1, "the rest of the file still reads");
+        assert_eq!(fs.closed.len(), 1);
+        fs.save(&dir).unwrap();
+        let text = std::fs::read_to_string(file_path(&dir)).unwrap();
+        assert!(!text.contains("drawer"), "the stale field is not written back: {text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

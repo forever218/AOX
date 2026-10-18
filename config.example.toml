@@ -29,6 +29,10 @@ temperature = 0.3
 # If an endpoint doesn't accept the stream / stream_options parameters, set false to fall back
 # to waiting for the complete response.
 stream = true
+# The model's context window, in tokens. **Display only**: the input box draws a small ring
+# showing how full the context is, and this is what "full" means. Nothing is truncated against
+# it. Leave it out and the GUI assumes 128000.
+# context_window = 128000
 
 [auth]
 # Meta tools (create_plugin / remove_plugin and other operations that change the system

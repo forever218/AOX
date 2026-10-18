@@ -19,11 +19,11 @@
 //! what the old top bar's `Margin::symmetric(20, 0)` + 36px hot zone worked out to (button
 //! centre y = 7 + 18 = 25 = half of the old bar's 50px height).
 //!
-//! **The left history column is no longer a `SidePanel` in the layout either**: it became an
-//! overlay that **slides down** from the top-left button (see [`App::history_overlay`]); and
-//! the "new conversation" "+" **slides out to the right from behind** the history button
-//! (hidden by default, see [`App::toolbar`]). The two share one progress value `hist_t` and
-//! one animation duration [`HIST_ANIM_SECS`].
+//! **The left column is a `SidePanel` again, but it is not the old one**: it is a **resident
+//! drawer** that takes part in the layout -- opening it pushes the transcript to the right, closing
+//! it gives the width back (see [`App::drawer`]). It is a place you work from, not a pop-up you
+//! dismiss, so it has no scrim, no "click outside to close", and its position survives a restart.
+//! The same `hist_t` progress value and [`HIST_ANIM_SECS`] drive its width.
 //!
 //! The activity stream is **not in the main window**: clicking that icon opens it in its own
 //! window (see `activity.rs`).
@@ -406,12 +406,18 @@ pub struct App {
     /// (the endpoint returns no usage), the whole block is hidden -- better nothing than a
     /// row of zeros pretending to be statistics.
     usage_log: Vec<UsageRecord>,
-    /// Whether the "Σ total tokens" panel is currently being pressed by the pointer.
+    /// Whether the "Σ total tokens" breakdown is unfolded above the input box.
     ///
-    /// `resp.hovered()` alone breaks the instant the pointer travels from the chip to the
-    /// panel (there is a gap between them) and the panel flashes away. Remembering a
-    /// cross-frame flag holds it steady.
-    usage_hover: bool,
+    /// A **click** toggle (the chip sits in the input card's bottom-right corner, where a
+    /// hover-opened panel would fire every time the pointer crossed the corner on its way to the
+    /// send button). It stays open until it is clicked again or something else is clicked.
+    usage_open: bool,
+    /// The model's context window in tokens -- the denominator of the ring in the input box.
+    ///
+    /// Comes from `[provider] context_window`; the fallback (128K) is only a sensible default for
+    /// the OpenAI-compatible endpoints this app targets, and it is what an unconfigured install
+    /// gets. See [`App::context_used`] for the numerator.
+    context_window: u64,
 
     model: String,
     config_path: String,
@@ -441,34 +447,19 @@ pub struct App {
     /// A switch request waiting on the agent's acknowledgement (the list is greyed out
     /// first so double-clicks can't bounce back and forth)
     switching: bool,
-    /// The on/off state of the "history" button at the top-left. It is the overlay's
-    /// target state.
+    /// The on/off state of the "history" button at the top-left. It is the drawer's
+    /// target state. **Not persisted**: every launch starts folded (see `uistate`).
     show_history: bool,
     /// Slide-out animation progress: `0` = fully collapsed, `1` = fully expanded.
     ///
-    /// `App::update` steps it toward `show_history` every frame, and `toolbar` /
-    /// `history_overlay` both derive their offsets from it. **Do not use the boolean
-    /// directly**: that gives you only "there" and "not there", with nowhere to stand for
-    /// the two-hundred-odd milliseconds in between, and the slide-out degrades into a jump
-    /// cut.
+    /// `App::update` steps it toward `show_history` every frame, and `toolbar` / `drawer` both
+    /// derive their geometry from it. **Do not use the boolean directly**: that gives you only
+    /// "there" and "not there", with nowhere to stand for the two-hundred-odd milliseconds in
+    /// between, and the push degrades into a jump cut.
     hist_t: f32,
-    /// The history overlay's actual height **on the previous frame**.
-    ///
-    /// The slide-in distance has to equal the panel's own height (the whole block slides in
-    /// from above), and that height is set by the content (how many records there are) --
-    /// which is only known once it has been drawn. So we remember one frame: this frame
-    /// uses it for the offset, and after drawing we record the new one.
-    hist_h: f32,
-    /// The rect of the top-left history button. It answers exactly one question: does this
-    /// click count as "outside the overlay"?
-    ///
-    /// Without it, the frame in which the button is clicked hits both the "button clicked"
-    /// and the "clicked outside" paths -- the opening action is cancelled by itself on the
-    /// spot, which shows up as "I clicked and nothing happened".
-    bar_hist_rect: Option<Rect>,
     /// The conversation list **grouped into workspaces**, newest group first.
     ///
-    /// Built once per [`App::refresh_history`] and read every frame the overlay is open: grouping
+    /// Built once per [`App::refresh_history`] and read every frame the drawer is open: grouping
     /// walks the whole flat list, and doing that per frame would re-sort and re-allocate eighty
     /// entries sixty times a second for a list that only changes when a turn ends.
     /// Empty until the first refresh (when `history` is empty too, so nothing draws it).
@@ -484,6 +475,14 @@ pub struct App {
     hist_open: HashSet<String>,
     /// Workspace groups the user has **explicitly folded** (see [`App::hist_open`]).
     hist_closed: HashSet<String>,
+    /// What is typed into the drawer's search field.
+    ///
+    /// Kept on `App` rather than in egui memory: the field is rebuilt from scratch every frame (the
+    /// drawer has no persistent widget state), and a query that lived in a temporary would be wiped
+    /// by the next frame's `TextEdit`. It is **not** persisted either -- a search is a momentary
+    /// question, and coming back to a list that is silently filtered by something typed yesterday
+    /// reads as "my conversations are gone".
+    hist_query: String,
     /// Whether the two sets above have been read from disk yet.
     ///
     /// Loaded **once**, lazily, on the first refresh that knows the app root — not on every refresh:
@@ -666,7 +665,8 @@ impl App {
             status: aox::i18n::t("Ready").into(),
             spin: 0.0,
             usage_log: Vec::new(),
-            usage_hover: false,
+            usage_open: false,
+            context_window: DEFAULT_CONTEXT_WINDOW,
             model: String::new(),
             config_path: String::new(),
             plugins: Vec::new(),
@@ -677,19 +677,15 @@ impl App {
             switching: false,
             show_history: false,
             hist_t: 0.0,
-            // Seed the panel height with "a window of a few records": the first frame has
-            // never been drawn, so there is no measured value, yet this frame's slide-in
-            // offset needs a number right now. Every later frame overwrites it with the
-            // real height.
-            hist_h: 320.0,
-            bar_hist_rect: None,
             hist_groups: Vec::new(),
             hist_open: HashSet::new(),
             hist_closed: HashSet::new(),
+            hist_query: String::new(),
             hist_fold_loaded: false,
             name_dialog: None,
-            // The history overlay starts collapsed: the full width goes to the transcript,
-            // and you click the top-left icon when you want it.
+            // The drawer starts collapsed on a fresh install: the full width goes to the transcript,
+            // and you click the top-left icon when you want it. From then on the position is read
+            // back from `.aox/ui.json` (see `refresh_history`).
             follow: true,
             force_follow: true,
             settings_open: false,
@@ -835,6 +831,13 @@ impl App {
                 FromAgent::Boot(b) => {
                     self.model = b.model.clone();
                     self.config_path = b.config_path.clone();
+                    // The ring's denominator. Zero would mean "not configured": fall back to the
+                    // default rather than dividing by it.
+                    self.context_window = if b.context_window > 0 {
+                        b.context_window
+                    } else {
+                        DEFAULT_CONTEXT_WINDOW
+                    };
                     // The UI-side history backend is shipped along by the bridge: the same
                     // implementation the agent thread uses.
                     self.store = Some(b.store.clone());
@@ -1091,6 +1094,10 @@ impl App {
         // Fold state, read **once** — the first refresh that knows the root (see
         // `App::hist_fold_loaded`). Doing it here rather than in the boot arm means the `--demo`
         // constructor, which sets up its own synthetic boot and then refreshes, is covered too.
+        //
+        // Only the folds come from the file. The drawer's own position is deliberately **not**
+        // remembered (user request, 2026-10-18): every launch starts folded, snapped rather than
+        // animated — a sidebar sliding open by itself on launch reads as a glitch, not as a welcome.
         if !self.hist_fold_loaded {
             if let Some(root) = root.as_deref() {
                 let fs = uistate::FoldState::load(root);
@@ -1117,9 +1124,9 @@ impl App {
                 items.insert(0, it);
             }
         }
-        // Group the (already newest-first) list into workspaces, for the overlay's tree.
+        // Group the (already newest-first) list into workspaces, for the drawer's tree.
         //
-        // Done here rather than in the overlay: the overlay redraws at frame rate, and grouping
+        // Done here rather than in the drawer: the drawer redraws at frame rate, and grouping
         // walks and re-sorts the whole list. There is a useful side effect of the pinning above --
         // `group` orders groups by their newest item's position in the list it is handed, so the
         // workspace holding the current conversation comes out first among the user's workspaces,
@@ -1461,27 +1468,39 @@ impl App {
         self.force_follow = true;
     }
 
-    /// The history overlay (a conversation switcher) that **slides down** from the top-left
-    /// button.
+    /// The workspace drawer: a **resident left column that pushes the transcript aside**.
     ///
-    /// It replaces what used to be a `SidePanel::left`: the content is lifted from the sidebar
-    /// (title / refresh / separator / list / empty state) while the shell changes from "a column
-    /// in the layout" to "a layer floating above the transcript".
+    /// It used to be a card floating over the transcript. That read as a pop-up, and a pop-up is
+    /// something you dismiss; this is a place you work from, so it takes part in the layout instead:
+    /// `SidePanel::left` shrinks the central column by exactly its width and gives it back when the
+    /// drawer is put away. Nothing is covered, no scrim is needed, and the transcript is never
+    /// drawn underneath a panel it cannot be read through.
     ///
-    /// # How the slide-out is done
+    /// # How the push is done
     ///
-    /// Two pieces bolted together -- **position** (the whole block travels from "target
-    /// position - its own height" to the target position) plus **clipping** (the visible region
-    /// pinned to the target position's top edge). With translation alone the panel would first
-    /// pop out **over the button's face** and then travel down; with clipping it grows out of
-    /// the button's bottom edge bit by bit.
+    /// The **panel width** is what animates, so the eased value *is* the push: at any frame the
+    /// transcript has given up exactly as much room as the drawer occupies. The content is laid out
+    /// to that same width rather than at a fixed 300, which means it squeezes on the way in exactly
+    /// like a sidebar being dragged wider — the alternative (fixed-width content riding the panel's
+    /// edge) would let the content's min-rect overflow the panel, and egui would then hand the
+    /// central column the *content's* width instead of the panel's, killing the animation.
     ///
-    /// `Ui::set_clip_rect` takes care of interaction along the way: the `interact_rect` egui
-    /// gives a widget is exactly `clip_rect ∩ rect`, so the clipped-away half can't be clicked.
-    /// Without it, the mouse sweeping over the "not grown out yet" region during the slide-out
-    /// would still hit a row and switch conversations out of nowhere.
-    fn history_overlay(&mut self, ctx: &egui::Context) {
+    /// The horizontal inset eases with the width for the same reason: a 12px margin inside a 3px
+    /// panel is a negative content rect.
+    ///
+    /// # Where the closing affordances went
+    ///
+    /// There is no "click outside" and no Esc-to-close any more. A resident column that disappears
+    /// because the pointer landed on the transcript is a column you stop trusting; the drawer's head
+    /// carries the one control that puts it away ([`sidebar_button`]), and Esc belongs to the
+    /// search box (it clears the query).
+    fn drawer(&mut self, ctx: &egui::Context) {
         if self.hist_t <= 0.0 {
+            // Fully closed: drop the query. It is done here rather than at each door that closes
+            // the drawer (the collapse button, a conversation switch) because there is exactly one
+            // state that means "not showing", and a stale filter would greet the next open with a
+            // list that looks like it lost its rows.
+            self.hist_query.clear();
             return;
         }
         let ease = ease_out_cubic(self.hist_t);
@@ -1490,64 +1509,48 @@ impl App {
         // clicker sees is the UI "hesitating before it jumps".
         let locked = self.busy || self.switching;
 
-        // Same left edge as the top-left button; top edge = the button's bottom edge + 8.
-        let x = BAR_LEFT;
-        let top = BAR_TOP + BAR_BTN + 8.0;
-        let w = HISTORY_W;
-        // How tall the panel is. The **content no longer decides this**: with grouping, a
-        // content-driven height made the panel jump between one and three workspaces' worth of rows
-        // every time a group was folded, which reads as "sometimes small, sometimes large". It now
-        // takes a stable share of the window and scrolls inside, so the frame around the list stays
-        // put and the list moves.
+        // ── geometry: a column that takes part in the layout ──
         //
+        // The eased width **is** the push: whatever the drawer takes, the transcript gives up, and
+        // both numbers come from the same expression. A panel narrower than its own margin would
+        // hand its content a negative rect, so the inset eases with it instead of being a constant.
+        let w = (HISTORY_W * ease).max(1.0);
+        let inset = (12.0 * ease).round() as i8;
+        let pw = (w - 2.0 * inset as f32).max(8.0);
         // The window's height comes from **the largest of two independent reports**, because they
         // can disagree: `content_rect` is what the rest of this file uses for coordinates, but on a
-        // window whose DPI the backend reports differently it can come back at a fraction of the real
-        // client area. Taking the max is safe in both directions: the values are only ever used to
-        // bound a height.
+        // window whose DPI the backend reports differently it can come back at a fraction of the
+        // real client area. Taking the max is safe in both directions: the value only ever bounds
+        // a height.
         //
-        // ⚠️ Compare **heights**, not `bottom()`s: `viewport().inner_rect` is in *screen* coordinates
-        // (its `min` is the window's position on the desktop), so its `bottom()` is where the window
-        // ends on the **monitor**, not how tall it is. Mixing the two made this 83px too generous on
-        // a window that happened to sit low on the screen.
+        // ⚠️ Compare **heights**, not `bottom()`s: `viewport().inner_rect` is in *screen*
+        // coordinates (its `min` is the window's position on the desktop), so its `bottom()` is
+        // where the window ends on the **monitor**, not how tall it is.
         let win_h = ctx.content_rect().height().max(
             ctx.input(|i| i.viewport().inner_rect.map_or(0.0, |r| r.height())),
         );
-        // 22px is left at the bottom for the corner radius and the shadow.
-        let avail_h = (win_h - top - 22.0).max(180.0);
-        // 80% of what is available, with a floor so a short list still looks like a panel rather
-        // than a stub, and never taller than the window allows.
-        let panel_h = (avail_h * 0.80).clamp(420.0_f32.min(avail_h), avail_h);
-        // Space left for the scrolling list: the panel minus the head (title + rule), the foot (the
-        // two rows) and the frame's bottom margin. `HIST_HEAD` covers the top margin and the head;
-        // `HIST_FOOT` covers the foot; the 12 is the bottom margin. All three are measured from the
-        // real layout rather than computed (egui's `item_spacing` sits between every allocated
-        // widget and this theme sets it to 10), so that the frame comes out this tall:
-        //     panel_h ≈ 12 + head + list_h + foot + 12
-        // measured 605.5 against a `panel_h` of 604.5 (2026-10-14).
-        let list_h = (panel_h - HIST_HEAD - HIST_FOOT - 12.0).max(120.0);
-        // The tallest the frame can come out: the list's allowance plus the head, the foot and the
-        // frame's two inner margins. The clip rect below is bounded by *this* rather than by
-        // `panel_h`: `panel_h` is only the target share of the window, and the moment the real
-        // layout came out taller than it (which it did -- see `HIST_FOOT`), the clip shaved the last
-        // slice off the panel and flat-cut both bottom corners.
-        let frame_max = list_h + HIST_HEAD + HIST_FOOT + 24.0;
-        let slide = -(1.0 - ease) * self.hist_h;
+        // What the scrolling list gets: the window, minus the head and the foot, minus the frame's
+        // bottom margin. Both constants are plain sums of what is drawn (see their docs), because
+        // the drawer places every gap by hand instead of letting `item_spacing` do it.
+        let list_h = (win_h - DRAWER_HEAD - DRAWER_FOOT - 12.0).max(120.0);
 
-        let mut want_refresh = false;
         let mut want_new_ws = false;
         let mut want_open_ws = false;
-        // Read once, for the foot row that opens `<app root>/workplace/`: the closure that draws the
-        // panel holds only `&self`, and "is there a root at all" is also what decides whether that row
-        // is clickable.
+        let mut want_new_conv = false;
+        let mut want_settings = false;
+        let mut want_close = false;
+        // Read once, for the foot row that opens `<app root>/workplace/`: "is there a root at all"
+        // is also what decides whether that row is clickable.
         let app_root = self.app_root();
+        // The search box's text, lower-cased **once**: `hist_tree` asks "does this row match" for
+        // every row it draws, and folding the case inside that loop would be the same work N times.
+        let query = self.hist_query.trim().to_lowercase();
         let mut open: Option<String> = None;
         // Group folds requested this frame. Collected rather than applied in place: the tree is
-        // drawn inside the `Area` closure, which only holds `&self`, so `&mut self` edits have to
-        // wait until after it returns (the same shape `open` already used for switching).
+        // drawn inside the `Area` closure, so `&mut self` edits have to wait until after it returns
+        // (the same shape `open` already used for switching).
         let mut toggles: Vec<String> = Vec::new();
-        // Row / header requests, collected for the same reason as `toggles`: a menu row's click
-        // arrives from inside the `Area` closure, where only `&self` is in hand. One slot per
+        // Row / header requests, collected for the same reason as `toggles`. One slot per
         // destination rather than one enum because each lands somewhere different afterwards (a
         // message to the agent / a registry edit / a shell open / a dialog), and a single click can
         // only ever produce one of them.
@@ -1567,178 +1570,183 @@ impl App {
         // in `move_conversation`, which has the drawn tree in hand.
         let mut move_conv: Option<(String, String)> = None;
 
-        let area = egui::Area::new(egui::Id::new("aox-history"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(Pos2::new(x, top + slide))
-            // Mid-slide the position is **above** the target (`top + slide` ends up over the
-            // button), and an Area pulls out-of-bounds positions back on screen by default --
-            // which flattens the offset on the spot and kills the animation. So the constraint is
-            // released here: the position is in charge.
-            .constrain_to(loose_rect())
-            .show(ctx, |ui| {
-                // The visible region is loosened a ring beyond the panel on each side, so the
-                // corner stroke and the shadow don't get cut into hard edges. The top bound doubles
-                // as the mask for the slide-in (the panel emerges from behind the button); the
-                // bottom one must never be tighter than the tallest frame the layout can produce,
-                // or the rounded corners get clipped off the bottom (2026-10-14).
-                ui.set_clip_rect(Rect::from_min_max(
-                    Pos2::new(x - 26.0, top - 2.0),
-                    Pos2::new(x + w + 26.0, top + frame_max + 30.0),
-                ));
+        let panel = egui::SidePanel::left("aox-drawer")
+            // Not resizable: the width is the animation's own output, and a drag handle would be
+            // fighting it for the same number.
+            .resizable(false)
+            .exact_width(w)
+            // The drawer's only chrome is the hairline drawn below. The built-in separator is the
+            // same line in a theme colour that is not this one, and it would also be drawn for a
+            // panel that is 3px wide mid-animation.
+            .show_separator_line(false)
+            .frame(
                 Frame::NONE
                     .fill(P::surface())
-                    .corner_radius(CornerRadius::same(12))
-                    .stroke(Stroke::new(1.0, P::edge_raised()))
-                    .shadow(theme::card_shadow())
-                    .inner_margin(Margin::symmetric(14, 12))
-                    .show(ui, |ui| {
-                        ui.set_width(w - 28.0);
-                        let pw = ui.available_width();
+                    .inner_margin(Margin { left: inset, right: inset, top: 12, bottom: 12 }),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(pw);
+                // Every gap in this panel is placed by hand. `item_spacing` is a theme-wide 10, and
+                // a column this dense cannot afford ten unaccounted pixels between every widget --
+                // it is also what lets `DRAWER_HEAD` / `DRAWER_FOOT` be exact sums instead of
+                // "measured, and re-measured whenever a row moves".
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
 
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(aox::i18n::t("History")).color(P::text_dim()).size(13.0));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if flat_button(ui, aox::i18n::t("Refresh")).clicked() {
-                                    want_refresh = true;
-                                }
-                            });
-                        });
-                        ui.add_space(7.0);
-                        // No rule under the title. The head is already set apart by the gap above
-                        // the list, and a hairline there drew a box around the title for no gain.
-                        ui.add_space(9.0);
-
-                        // Is there anything in the tree other than the two built-ins? A registered
-                        // workspace counts as "something" **even while it is empty** -- that is exactly
-                        // the state the "new workspace" button leaves behind -- so the friendly
-                        // first-run screen below is reserved for a genuinely empty install.
-                        let custom_group = self.hist_groups.iter().any(|g| g.builtin.is_none());
-
-                        // `auto_shrink([false, false])` is the load-bearing part: the scroll area
-                        // takes the height we decided instead of collapsing back onto its content,
-                        // which is what stops the panel resizing itself whenever a group is folded.
-                        //
-                        // `min_scrolled_height` is the *other* half, and it is not redundant. A
-                        // `ScrollArea` sizes itself from `ui.available_rect_before_wrap()`, and inside
-                        // an `Area` that is **the Area's own rect from the previous frame** (`Area::show`
-                        // builds its `Ui` with `max_rect = self.state.rect()`). So "take all available
-                        // space" quietly means "stay exactly as big as you were": the panel came out at
-                        // the Area's first-frame default (~400) no matter what `panel_h` said, and it
-                        // sat there. Forcing the inner height is what actually makes `panel_h` real.
-                        ScrollArea::vertical()
-                            .max_height(list_h)
-                            .min_scrolled_height(list_h)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                // The empty state is drawn **inside** the scroll area rather than
-                                // short-circuiting the panel. It has to be: "no conversations yet" is
-                                // not the same statement as "no workspaces yet", and returning early
-                                // here would hide the very group a workspace just created shows up as
-                                // -- and the button that made it, which sits below the list.
-                                if self.history.is_empty() && !custom_group {
-                                    ui.label(
-                                        RichText::new(
-                                            aox::i18n::t("No history yet.\nAfter your first message, the conversation is saved here automatically."),
-                                        )
-                                        .color(P::text_faint())
-                                        .size(13.0),
-                                    );
-                                    ui.add_space(10.0);
-                                    // A directory path can be long; use truncate so it closes itself
-                                    // off within the panel width instead of being cut by the panel
-                                    // boundary.
-                                    ui.add(
-                                        Label::new(
-                                            RichText::new(
-                                                self.store
-                                                    .as_ref()
-                                                    .map(|s| s.location().display().to_string())
-                                                    .unwrap_or_default(),
-                                            )
-                                            .color(P::text_faint())
-                                            .size(11.5),
-                                        )
-                                        .truncate(),
-                                    );
-                                } else {
-                                    self.hist_tree(
-                                        ui,
-                                        pw,
-                                        locked,
-                                        &mut open,
-                                        &mut toggles,
-                                        &mut recycle,
-                                        &mut forget_ws,
-                                        &mut reveal_ws,
-                                        &mut rename_ws,
-                                        &mut new_conv_ws,
-                                        &mut rename_conv,
-                                        &mut move_conv,
-                                    );
-                                }
-                            });
-
-                        // The foot: the one action the panel has that is not about a row. Below the
-                        // list rather than in the head, so the head stays a title bar and this reads
-                        // as a list-level verb -- and pinned outside the scroll area, so it cannot be
-                        // scrolled away by a workspace with eighty conversations in it.
-                        ui.add_space(8.0);
-                        // Same as the head: no rule above the foot. The gap does the separating,
-                        // and the two rows already read as a footer because they sit below the
-                        // list rather than beside it.
-                        ui.add_space(7.0);
-                        // "New workspace" only goes live when no turn is running: it hands this
-                        // conversation to a new root, which is a workspace switch like any other.
-                        if foot_row(ui, pw, !locked, FootIcon::Plus, aox::i18n::t("New workspace"))
-                            .clicked()
-                        {
-                            want_new_ws = true;
-                        }
-                        ui.add_space(2.0);
-                        // ...whereas opening the folder touches nothing at all, so this row stays
-                        // live during a turn. Disabled only when the app root is unknown -- which is
-                        // the one case with no folder to name and no path to hand the shell.
-                        if foot_row(
-                            ui,
-                            pw,
-                            app_root.is_some(),
-                            FootIcon::Folder,
-                            aox::i18n::t("Open workspace folder"),
-                        )
-                        .clicked()
-                        {
-                            want_open_ws = true;
+                // ── head: collapse, then settings at the far end ──
+                ui.horizontal(|ui| {
+                    // The **same** button that opened the drawer (see `sidebar_button`): one
+                    // control, two places, so it reads as a toggle instead of two unrelated icons.
+                    if sidebar_button(ui, true, false).clicked() {
+                        want_close = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if gear_button(ui).clicked() {
+                            want_settings = true;
                         }
                     });
-            });
-        let panel = area.response.rect;
-        // Record this frame's actual height -- that is next frame's slide-in distance (see the
-        // `hist_h` field). This is **not** gated on `hist_t`: the position offset doesn't affect
-        // the `rect`'s height, so recording it at any time is accurate.
-        self.hist_h = panel.height().max(96.0);
+                });
+                ui.add_space(10.0);
+                if new_chat_row(ui, pw, !locked).clicked() && !locked {
+                    want_new_conv = true;
+                }
+                ui.add_space(10.0);
+                search_row(ui, pw, &mut self.hist_query);
+                ui.add_space(18.0);
+                section_head(
+                    ui,
+                    pw,
+                    aox::i18n::t("Workspaces"),
+                    &aox::tf!("{}", self.hist_groups.len()),
+                );
+                ui.add_space(7.0);
 
-        // Clicking outside the panel, or pressing Esc, collapses it. The button's own click
-        // doesn't count as "outside" (see `bar_hist_rect`).
-        //
-        // **Unless a right-click menu is up.** A menu is drawn at the pointer, i.e. outside the
-        // panel's own rect, so without this a click on a menu row would be read as "clicked
-        // outside" and collapse the overlay out from under the menu being used. Esc belongs to the
-        // menu first for the same reason -- egui closes the popup itself.
-        let menu_open = egui::Popup::is_any_open(ctx);
-        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-        let clicked_outside = ctx.input(|i| {
-            i.pointer.any_pressed()
-                && i.pointer.interact_pos().is_some_and(|p| {
-                    !panel.contains(p) && !self.bar_hist_rect.is_some_and(|r| r.contains(p))
-                })
-        });
-        // The workspace dialog is drawn in its own modal, i.e. outside this panel's rect, so
-        // without the second check every click *inside the dialog* would read as "clicked outside"
-        // and collapse the panel that opened it -- and the workspace would appear in a panel the
-        // user is no longer looking at. (The same hazard as the right-click menus above, from a
-        // different direction: one is a popup that overlaps the panel, this is one that replaces it.)
-        if !menu_open && self.name_dialog.is_none() && (esc || clicked_outside) {
-            self.show_history = false;
+                // Is there anything in the tree other than the two built-ins? A registered
+                // workspace counts as "something" **even while it is empty** -- that is exactly
+                // the state the "new workspace" button leaves behind -- so the friendly
+                // first-run screen below is reserved for a genuinely empty install.
+                let custom_group = self.hist_groups.iter().any(|g| g.builtin.is_none());
+
+                // `auto_shrink([false, false])` is the load-bearing part: the scroll area
+                // takes the height we decided instead of collapsing back onto its content,
+                // which is what stops the panel resizing itself whenever a group is folded.
+                //
+                // `min_scrolled_height` is the *other* half, and it is not redundant: a
+                // `ScrollArea` sizes itself from `ui.available_rect_before_wrap()`, so
+                // "take all available space" is only as good as that number. Forcing the
+                // inner height is what actually makes `list_h` real.
+                ScrollArea::vertical()
+                    .max_height(list_h)
+                    .min_scrolled_height(list_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Rows sit 3 apart; the tree adds its own gaps between groups.
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        // The empty state is drawn **inside** the scroll area rather than
+                        // short-circuiting the panel. It has to be: "no conversations yet" is
+                        // not the same statement as "no workspaces yet", and returning early
+                        // here would hide the very group a workspace just created shows up as
+                        // -- and the button that made it, which sits below the list.
+                        if self.history.is_empty() && !custom_group {
+                            ui.label(
+                                RichText::new(
+                                    aox::i18n::t("No history yet.\nAfter your first message, the conversation is saved here automatically."),
+                                )
+                                .color(P::text_faint())
+                                .size(12.5),
+                            );
+                            ui.add_space(10.0);
+                            // A directory path can be long; use truncate so it closes itself
+                            // off within the panel width instead of being cut by the panel
+                            // boundary.
+                            ui.add(
+                                Label::new(
+                                    RichText::new(
+                                        self.store
+                                            .as_ref()
+                                            .map(|s| s.location().display().to_string())
+                                            .unwrap_or_default(),
+                                    )
+                                    .color(P::text_faint())
+                                    .size(11.0),
+                                )
+                                .truncate(),
+                            );
+                        } else if !query.is_empty()
+                            && !self.hist_groups.iter().any(|g| group_matches(g, &query))
+                        {
+                            // Said out loud rather than drawn as an empty column: with a
+                            // query in the box, "nothing here" and "the list is broken"
+                            // look identical otherwise.
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(aox::i18n::t("No matches"))
+                                    .color(P::text_faint())
+                                    .size(12.0),
+                            );
+                        } else {
+                            self.hist_tree(
+                                ui,
+                                pw,
+                                locked,
+                                &query,
+                                &mut open,
+                                &mut toggles,
+                                &mut recycle,
+                                &mut forget_ws,
+                                &mut reveal_ws,
+                                &mut rename_ws,
+                                &mut new_conv_ws,
+                                &mut rename_conv,
+                                &mut move_conv,
+                            );
+                        }
+                    });
+
+                // The foot: the actions that are not about a row. Pinned outside the
+                // scroll area, so they cannot be scrolled away by a workspace with eighty
+                // conversations in it.
+                ui.add_space(8.0);
+                let x0 = ui.cursor().left();
+                let y0 = ui.cursor().top();
+                ui.painter()
+                    .hline(x0..=(x0 + pw), y0, Stroke::new(1.0, P::border()));
+                ui.add_space(8.0);
+                // "New workspace" only goes live when no turn is running: it hands this
+                // conversation to a new root, which is a workspace switch like any other.
+                if foot_row(ui, pw, !locked, FootIcon::Plus, aox::i18n::t("New workspace"))
+                    .clicked()
+                {
+                    want_new_ws = true;
+                }
+                ui.add_space(2.0);
+                // ...whereas opening the folder touches nothing at all, so this row stays
+                // live during a turn. Disabled only when the app root is unknown -- which is
+                // the one case with no folder to name and no path to hand the shell.
+                if foot_row(
+                    ui,
+                    pw,
+                    app_root.is_some(),
+                    FootIcon::Folder,
+                    aox::i18n::t("Open workspace folder"),
+                )
+                .clicked()
+                {
+                    want_open_ws = true;
+                }
+            });
+        // The drawer's only chrome: one hairline down the full height, painted from the panel's own
+        // rect (so it lands on the moving edge for the whole animation) and **after** the content,
+        // so nothing can draw over it.
+        let r = panel.response.rect;
+        ctx.layer_painter(panel.response.layer_id)
+            .vline(r.right() - 0.5, r.top()..=r.bottom(), Stroke::new(1.0, P::border()));
+
+        // Esc belongs to the search box: with a query typed, "get me out of this" means "show me
+        // everything again". It deliberately does **not** close the drawer -- a resident column that
+        // vanishes on a stray Esc is a column you stop trusting, and the head has the one control
+        // that puts it away on purpose.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !self.hist_query.is_empty() {
+            self.hist_query.clear();
         }
 
         for id in toggles {
@@ -1798,17 +1806,28 @@ impl App {
                 reveal_in_file_manager(&dir);
             }
         }
-        if want_refresh {
-            self.refresh_history();
+        if want_new_conv {
+            // Same path the toolbar's "+" used to take. Refused while a turn runs for the same
+            // reason `new_chat_row` is drawn disabled then: the switch would only land after the
+            // turn, and the click would look like it did nothing.
+            self.new_conversation();
+        }
+        if want_settings {
+            self.settings_open = true;
+        }
+        if want_close {
+            // Not persisted: the drawer always starts folded (see the fold-state load in
+            // `refresh_history`). Closing it is not a preference, it is "done with it for now".
+            self.show_history = false;
         }
         if let Some(id) = open {
             self.switch_history(&id);
         }
     }
 
-    /// Draw the workspace-grouped conversation tree inside the overlay's scroll area.
+    /// Draw the workspace-grouped conversation tree inside the drawer's scroll area.
     ///
-    /// Takes `&self` -- the overlay's `Area` closure only holds an immutable borrow -- and hands
+    /// Takes `&self` -- the drawer's `SidePanel` closure only holds an immutable borrow -- and hands
     /// everything it wants to change back to the caller: `open` (switch to this conversation),
     /// `toggles` (fold / unfold this group), and the seven right-click requests `recycle` /
     /// `forget_ws` / `reveal_ws` / `rename_ws` / `new_conv_ws` / `rename_conv` / `move_conv` (delete
@@ -1826,6 +1845,7 @@ impl App {
         ui: &mut Ui,
         width: f32,
         locked: bool,
+        query: &str,
         open: &mut Option<String>,
         toggles: &mut Vec<String>,
         recycle: &mut Vec<PathBuf>,
@@ -1845,16 +1865,33 @@ impl App {
         }
 
         let cur = self.current_history.as_deref();
-        for (n, &gi) in order.iter().enumerate() {
+        // With a query in the box the tree is **flattened open**. Matching a conversation that sits
+        // inside a folded workspace and then showing nothing would be a filter that hides its own
+        // results; the fold state is left alone on disk, it just does not apply while filtering.
+        let filtering = !query.is_empty();
+        let mut drawn = 0usize;
+        for &gi in order.iter() {
             let g = &self.hist_groups[gi];
-            if n > 0 {
+            // A workspace whose **name** matches keeps all of its conversations (you searched for
+            // the place, not for a title); otherwise only the rows whose title matches survive.
+            let name_hit = !filtering || g.name.to_lowercase().contains(query);
+            let rows: Vec<&aox::history::Summary> = if name_hit {
+                g.items.iter().collect()
+            } else {
+                g.items.iter().filter(|s| s.title.to_lowercase().contains(query)).collect()
+            };
+            if filtering && !name_hit && rows.is_empty() {
+                continue;
+            }
+            if drawn > 0 {
                 // A breath between groups; without it the last row of one group sits flush against
                 // the next group's header and the whole thing reads as one undifferentiated list.
                 ui.add_space(3.0);
             }
-            let unfolded = self.group_is_open(&g.id);
-            let (head, plus) = history_group_header(ui, g, width);
-            if head.clicked() {
+            drawn += 1;
+            let unfolded = filtering || self.group_is_open(&g.id);
+            let (head, plus) = history_group_header(ui, g, width, rows.len(), unfolded);
+            if head.clicked() && !filtering {
                 toggles.push(g.id.clone());
             }
             // The header's own "＋" and its menu row say the same thing, so they feed the same slot.
@@ -1919,56 +1956,43 @@ impl App {
                 .filter(|x| x.id != g.id)
                 .map(|x| (x.id.clone(), x.name.clone()))
                 .collect();
-            for s in &g.items {
+            for s in rows {
                 let current = Some(s.id.as_str()) == cur;
-                let row = history_row(ui, s, current, locked, width, HIST_INDENT);
+                let (row, more) = history_row(ui, s, current, locked, width, HIST_INDENT);
                 if row.clicked() && !locked {
                     *open = Some(s.id.clone());
                 }
                 // A row's menu is offered **even while a turn runs**: deleting an old conversation
                 // touches nothing the running turn holds (the move happens on the agent thread).
                 // Only *switching* has to wait for the turn, and that is the `locked` gate above.
+                //
+                // Two doors onto **one** menu: the row's right-click, and the "⋯" that appears on
+                // hover. The contents live in `conversation_menu` rather than in a closure so both
+                // doors can hand it the same `&mut` slots (a closure could only be consumed once).
                 let path = s.path.clone();
                 let id = s.id.clone();
                 // What the dialog's field is pre-filled with. The **title**, not the id: the id is a
                 // timestamp, and "edit the timestamp" is not the thing anybody right-clicked.
                 let title = s.title.clone();
-                row.context_menu(|ui| {
-                    // Renaming is offered on **every** row, the current one included (unlike Delete
-                    // below): the current conversation is the one whose file the agent already has
-                    // open, and the append is exactly what makes the rename work there.
-                    if menu_item(ui, aox::i18n::t("Rename"), MENU_W, true, false).clicked() {
-                        *rename_conv = Some((id.clone(), title.clone()));
-                        ui.close();
-                    }
-                    // Move to → another group. A submenu rather than one flat row per group: the
-                    // target list grows with the user's workspaces, and a menu that keeps getting
-                    // taller is worse than one click deeper. Offered on every row including the
-                    // current one -- re-filing is a registry edit, so it touches neither the open file
-                    // nor the running turn. Hidden when there is only one group, so it is never a row
-                    // that opens onto nothing.
-                    if !move_targets.is_empty() {
-                        ui.menu_button(aox::i18n::t("Move to"), |ui| {
-                            for (tid, tname) in &move_targets {
-                                if menu_item(ui, tname, MENU_W, true, false).clicked() {
-                                    *move_conv = Some((id.clone(), tid.clone()));
-                                    ui.close();
-                                }
-                            }
-                        });
-                    }
-                    // The conversation being chatted in is refused rather than hidden: the agent has
-                    // it open and would keep appending to a file that is no longer there. The row
-                    // stays visible but greyed, with the reason on hover, so the menu looks the same
-                    // everywhere and the missing row is never a mystery.
-                    let del = menu_item(ui, aox::i18n::t("Delete"), MENU_W, !current, true);
-                    if current {
-                        del.on_hover_text(aox::i18n::t("Cannot delete the conversation you are in"));
-                    } else if del.clicked() {
-                        recycle.push(path.clone());
-                        ui.close();
-                    }
-                });
+                let mut menu = |ui: &mut Ui| {
+                    conversation_menu(
+                        ui,
+                        &id,
+                        &title,
+                        &path,
+                        current,
+                        &move_targets,
+                        rename_conv,
+                        move_conv,
+                        recycle,
+                    );
+                };
+                row.context_menu(&mut menu);
+                // The "⋯" only exists on a hovered (or current) row, so this popup can only ever be
+                // opened from a visible affordance -- but it is registered every frame regardless,
+                // because a popup that is only *created* on the frame of the click has no id to
+                // remember being open by.
+                egui::Popup::menu(&more).show(&mut menu);
             }
         }
     }
@@ -2714,225 +2738,215 @@ impl App {
     /// they don't smear into the transcript text behind them. Hover raises the backdrop one step
     /// (`surface_hi`), the same hover language as list rows and menu rows.
     ///
-    /// Two things differ from the old top bar:
-    /// - "New conversation" and "Settings" are **both hidden by default**, sliding out to the
-    ///   right from behind the history button along with the history overlay;
-    /// - status and tokens changed from "an empty spot on the left of the top bar" into a chip
-    ///   that travels with the buttons (with the bar gone they had to land somewhere, otherwise
-    ///   task progress and the token ledger would have nowhere to be seen).
+    /// One thing differs from the old top bar: "new conversation" and "settings" are not here at
+    /// all. Both live **inside** the drawer (its "new conversation" button and its head's gear),
+    /// which is the only place they can be reached from once the drawer owns this corner -- and
+    /// the drawer owns it whenever it is open.
+    ///
+    /// What is left is the history toggle (only while the drawer is shut) and the status / token
+    /// chip, which steps out of the drawer's column by its width.
     ///
     /// **The three on the top-right (activity stream / theme / about) have all been removed**
     /// (user request, 2026-10-05); each moved into the settings dialog: activity stream ->
     /// "Extra", theme -> "Appearance", about -> "About".
     fn toolbar(&mut self, ctx: &egui::Context) {
-        let mut want_new = false;
-        let mut want_settings = false;
         let mut toggle_hist = false;
         let ease = ease_out_cubic(self.hist_t);
-        let locked = self.busy || self.switching;
 
-        // ── the slide-out group: "+" innermost, "Settings" outermost ──
+        // ── top-left: the sidebar toggle, **only** while the drawer is shut ──
         //
-        // Each button gets its own `Area`: the slide-out clip has to cut at each button's own
-        // right edge, which a shared Area can't do. `x_end - slide` is the offset that brings it
-        // "out from behind the history button"; the **clip's left edge is pinned at its own end
-        // position**, so while the offset is short of complete only part of a button is exposed,
-        // which reads as "still behind".
-        if self.hist_t > 0.0 {
-            let slide = (BAR_BTN + 10.0) * (1.0 - ease);
-            for (id, slot, icon) in [
-                ("aox-bar-new", 0.0_f32, SlideIcon::Plus),
-                ("aox-bar-settings", 1.0_f32, SlideIcon::Gear),
-            ] {
-                // slot 0 = right next to the history button; slot 1 = one more to the right.
-                // 38 = the 36 button plus a 2px gap.
-                let x_end = BAR_LEFT + BAR_BTN + 2.0 + slot * (BAR_BTN + 2.0);
-                egui::Area::new(egui::Id::new(id))
-                    .order(egui::Order::Foreground)
-                    .fixed_pos(Pos2::new(x_end - slide, BAR_TOP))
-                    // Mid-slide the position overlaps the button to its left; don't let the Area
-                    // pull it back on screen.
-                    .constrain_to(loose_rect())
-                    .show(ctx, |ui| {
-                        ui.set_clip_rect(Rect::from_min_max(
-                            Pos2::new(x_end, BAR_TOP - 6.0),
-                            Pos2::new(x_end + BAR_BTN + 6.0, BAR_TOP + BAR_BTN + 6.0),
-                        ));
-                        match icon {
-                            SlideIcon::Plus => {
-                                if plus_icon(ui, locked).clicked() && !locked {
-                                    want_new = true;
-                                }
-                            }
-                            SlideIcon::Gear => {
-                                if gear_icon(ui).clicked() {
-                                    want_settings = true;
-                                }
-                            }
-                        }
-                    });
-            }
-        }
-
-        // ── top-left: the history button (position unchanged) + the status / token chip ──
-        egui::Area::new(egui::Id::new("aox-bar-left"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(Pos2::new(BAR_LEFT, BAR_TOP))
-            .constrain_to(loose_rect())
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if history_icon(ui, self.show_history).clicked() {
+        // 🚨 Exactly one widget in this Area, and nothing else. An interactable `Area` blocks the
+        // layers below it, and this one lives in the same corner the drawer's head does: the token
+        // chip used to sit in this row after an `add_space(HISTORY_W)`, so the Area's rect
+        // stretched right across the drawer head -- and the moment a conversation had a token
+        // count, both head buttons stopped answering the pointer. "Clicked the button and nothing
+        // happened" was this. The chip is now in the input box's corner (see `usage_chip`), which
+        // is where the user wanted the number anyway.
+        if self.hist_t <= 0.0 {
+            egui::Area::new(egui::Id::new("aox-bar-left"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(Pos2::new(BAR_LEFT, BAR_TOP))
+                .constrain_to(loose_rect())
+                .show(ctx, |ui| {
+                    if sidebar_button(ui, false, true).clicked() {
                         toggle_hist = true;
                     }
-                    // "+" and "Settings" live in two other `Area`s (each needs its own slide-out
-                    // clip), so room is made for them here: 38px each while expanded, nothing while
-                    // collapsed. That "pushes" the token chip to the right -- exactly the knock-on
-                    // effect you want from "buttons emerging from the left".
-                    //
-                    // 38 = the button's 36 plus the 2px gap between them. Without that stretch the
-                    // chip sits right on top of the button: they share a backdrop colour, so on real
-                    // hardware it looks like the button and the chip share one fill, and the button
-                    // appears not to have grown out at all (only a screenshot comparison caught it;
-                    // a glance by eye lets it through).
-                    ui.add_space(8.0 + 38.0 * 2.0 * ease);
-                    // With not a single token and no turn running, even the chip's shell shouldn't
-                    // appear (`token_chip` draws nothing then, and forcing a Frame around it would
-                    // leave an empty box).
-                    if self.busy || self.usage_sum().total.is_some() {
-                        Frame::NONE
-                            .fill(P::panel())
-                            .corner_radius(CornerRadius::same(10))
-                            .inner_margin(Margin::symmetric(12, 6))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    if self.busy {
-                                        ui.label(
-                                            RichText::new(&self.status).color(P::text()).size(14.0),
-                                        );
-                                        ui.add_space(7.0);
-                                        // Working time, same basis as every other readout (see
-                                        // [`Clock`]) -- otherwise the number here would keep
-                                        // climbing while the model sits waiting on the user.
-                                        let secs = self
-                                            .live
-                                            .as_ref()
-                                            .map_or(0.0, |l| (self.now() - l.turn_base).max(0.0));
-                                        ui.label(
-                                            RichText::new(format!("{secs:.1}s"))
-                                                .color(P::text_faint())
-                                                .size(13.5),
-                                        );
-                                        // The running total = completed turns (exact) + this turn
-                                        // (estimated). So the whole conversation's bill climbs during a
-                                        // turn instead of resetting each turn. The `~` is there because
-                                        // the second half is still an estimate; once the turn ends the
-                                        // exact total takes over.
-                                        let base = self.usage_sum().total.unwrap_or(0);
-                                        let est =
-                                            self.live.as_ref().map_or(0, |l| l.out.tokens());
-                                        let shown = base + est;
-                                        if shown > 0 {
-                                            ui.add_space(7.0);
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "Σ ~{} tok",
-                                                    thousands(shown)
-                                                ))
-                                                .color(P::text_faint())
-                                                .size(13.5),
-                                            );
-                                        }
-                                    } else {
-                                        // When idle only the total token count remains; hover for the
-                                        // breakdown
-                                        self.token_chip(ui, ctx);
-                                    }
-                                });
-                            });
-                    }
                 });
-            });
-        // Record the rect of this row of buttons: the history overlay needs it to rule out "the
-        // click landed on a button" (otherwise the button's toggle is cancelled on the spot by
-        // the overlay's own "click outside collapses it").
-        self.bar_hist_rect =
-            Some(Rect::from_min_size(Pos2::new(BAR_LEFT, BAR_TOP), Vec2::splat(BAR_BTN)));
+        }
+
+        // ── the running status: a readout, not a control ──
+        //
+        // `interactable(false)` is load-bearing. With the drawer open this plate sits just past
+        // its edge, and an interactable Area there would claim the pointer for every widget it
+        // happens to overlap. Nothing inside can be clicked, so there is nothing to lose by
+        // declaring it inert.
+        //
+        // It steps out of the drawer's column by exactly its width, on the same eased clock --
+        // otherwise the plate would jump across the moment the drawer finished opening.
+        if self.busy {
+            let x = BAR_LEFT + BAR_BTN + 8.0 + HISTORY_W * ease;
+            egui::Area::new(egui::Id::new("aox-bar-status"))
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .fixed_pos(Pos2::new(x, BAR_TOP))
+                .constrain_to(loose_rect())
+                .show(ctx, |ui| {
+                    Frame::NONE
+                        .fill(P::panel())
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&self.status).color(P::text()).size(14.0));
+                                ui.add_space(7.0);
+                                // Working time, same basis as every other readout (see [`Clock`])
+                                // -- otherwise the number here would keep climbing while the model
+                                // sits waiting on the user.
+                                let secs = self
+                                    .live
+                                    .as_ref()
+                                    .map_or(0.0, |l| (self.now() - l.turn_base).max(0.0));
+                                ui.label(
+                                    RichText::new(format!("{secs:.1}s"))
+                                        .color(P::text_faint())
+                                        .size(13.5),
+                                );
+                                // The running token count used to live here. It moved into the
+                                // input box with the rest of the usage readouts: one place for
+                                // "what has this conversation cost", and it is the place the
+                                // pointer already is when the number matters.
+                            });
+                        });
+                });
+        }
 
         if toggle_hist {
             self.show_history = !self.show_history;
             if self.show_history {
                 self.refresh_history();
             }
-        }
-        if want_new {
-            self.new_conversation();
-        }
-        if want_settings {
-            self.settings_open = true;
+            // Nothing is written here: the drawer is not a persisted preference (see
+            // `save_fold_state`), so opening it costs no disk write at all.
         }
     }
 
-    /// The "total tokens" chip: **hovering** expands the total, no click needed.
+    /// The token count in the input box's bottom-right corner: **click** to unfold the breakdown
+    /// above it.
     ///
-    /// Hover rather than click, because this number is a glance-at thing by nature: whoever wants
-    /// to check just moves the mouse over it, whereas a click would first require them to realise
-    /// "this is clickable".
-    fn token_chip(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        let Some(total) = self.usage_sum().total else { return };
-        let resp = ui.add(
-            Label::new(
-                RichText::new(format!("Σ {} tok", thousands(total)))
-                    .color(P::text_dim())
-                    .size(13.5),
-            )
-            .sense(Sense::hover()),
-        );
-        if resp.hovered() {
-            self.usage_hover = true;
-        }
-        if !self.usage_hover {
+    /// Click, not hover, and that is a direct consequence of the move: the chip now sits in the
+    /// corner the pointer crosses on its way to the send button, so a hover-opened panel would
+    /// flash open every time someone sent a message. The panel stays up until the chip is clicked
+    /// again, or until something else is clicked (see the dismiss test below).
+    ///
+    /// The number is **live**: completed turns are exact, the running turn is the stream's own
+    /// estimate, so the total climbs during a turn instead of sitting still until it ends. The
+    /// `~` marks the estimate half.
+    fn usage_chip(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let base = self.usage_sum().total.unwrap_or(0);
+        let est = self.live.as_ref().map_or(0, |l| l.out.tokens());
+        let shown = base + est;
+        // Nothing has been spent and nothing is being spent: no chip at all, rather than a
+        // "Σ 0 tok" that would read as a measurement.
+        if shown == 0 && !self.busy {
             return;
         }
-        // The panel sits 6px directly below the chip: as the pointer travels from chip to panel
-        // it is always over one of the two, so no frame falls through the gap and nothing
-        // flickers.
+        let text = if est > 0 {
+            format!("Σ ~{} tok", thousands(shown))
+        } else {
+            format!("Σ {} tok", thousands(shown))
+        };
+        // Drawn by hand rather than as a `Label`: the hover plate has to go **under** the text, and
+        // a widget's own paint has already happened by the time its response says "hovered". The
+        // same reason the drawer's icons allocate a rect and then paint into it.
         //
-        // ⚠️ **Do not convert coordinates here**: `Area::fixed_pos` and `ui.allocate_*` are both
-        // in **client-area local coordinates** (`Area::begin` uses `ctx.content_rect()` as the
+        // The width follows the number, which is why the ring is added *before* this in the
+        // right-to-left row: the chip grows to the left and the ring keeps its place in the corner.
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text.clone(), FontId::proportional(13.0), P::text_dim());
+        let (rect, resp) =
+            ui.allocate_exact_size(galley.size() + egui::vec2(12.0, 6.0), Sense::click());
+        let hov = pointer_if(ui, &resp);
+        let lit = hov || self.usage_open;
+        if lit {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(7), P::hover_fill());
+        }
+        let fg = if lit { P::ink() } else { P::text_dim() };
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text, FontId::proportional(13.0), fg);
+        ui.painter()
+            .galley(rect.min + egui::vec2(6.0, 3.0), galley, fg);
+        if resp.clicked() {
+            self.usage_open = !self.usage_open;
+        }
+        if !self.usage_open {
+            return;
+        }
+        // The panel unfolds **upwards**: the chip is in the window's bottom-right corner, so
+        // "below it" is off-screen. `pivot(LEFT_BOTTOM)` puts the panel's own bottom-left corner
+        // on the anchor, which is what makes it grow up instead of down.
+        //
+        // ⚠️ **Do not convert coordinates here**: `Area::fixed_pos` and `ui.allocate_*` are both in
+        // **client-area local coordinates** (`Area::begin` uses `ctx.content_rect()` as the
         // constraint). This once had a "viewport origin" term, `viewport().inner_rect.left_top()`,
-        // added -- that is **screen (monitor) coordinates**, a completely different system, and
-        // the conversion is meaningless; the result was the panel shifting wholesale with the
+        // added -- that is **screen (monitor) coordinates**, a completely different system, and the
+        // conversion is meaningless; the result was the panel shifting wholesale with the
         // window's position on the monitor (measured ~(154, 14) logical pixels off when the
         // window wasn't at (0,0)). The same mistake was made in `workplace_ui::menu` and has been
         // fixed there too.
-        let anchor = resp.rect.left_bottom() + egui::vec2(0.0, 6.0);
-        // Separate borrows: the closure writes hover state and reads the ledger
+        let anchor = resp.rect.left_top() - egui::vec2(0.0, 6.0);
         let log = &self.usage_log;
-        let hovering = &mut self.usage_hover;
-        egui::Area::new(egui::Id::new("aox-usage-panel"))
+        let panel_rect = egui::Area::new(egui::Id::new("aox-usage-panel"))
             .fixed_pos(anchor)
+            .pivot(Align2::LEFT_BOTTOM)
             .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let frame = Frame::popup(ui.style())
+            .show(&ctx, |ui| {
+                Frame::popup(ui.style())
                     .fill(P::surface())
                     .corner_radius(CornerRadius::same(12))
                     .stroke(Stroke::new(1.0, P::edge_raised()))
                     .inner_margin(Margin::symmetric(16, 13))
-                    .show(ui, |ui| usage_detail(ui, log));
-                *hovering = resp.hovered() || ui.rect_contains_pointer(frame.response.rect);
-            });
+                    .show(ui, |ui| usage_detail(ui, log))
+                    .response
+                    .rect
+            })
+            .inner;
+        // Dismissed by a click anywhere else. Tested after the panel has been drawn, so the click
+        // that opens it (which lands on the chip) can't immediately close it again.
+        let inside = resp.hovered() || panel_rect.contains(ui.ctx().pointer_hover_pos().unwrap_or_default());
+        if ctx.input(|i| i.pointer.any_click()) && !inside {
+            self.usage_open = false;
+        }
     }
 
-    /// The cumulative token count for the whole conversation (the number the Σ shows).
-    ///
-    /// Taken straight from `session_total` in the last record -- that is a running total written
-    /// at save time, so the whole ledger doesn't have to be recomputed each time.
     /// The **totals** across this conversation's turns (summed field by field).
     ///
-    /// Both the top bar and the expanded panel use it -- one number says "how much was spent",
-    /// the whole set says "where it went".
+    /// Both the corner chip and the expanded panel use it -- one number says "how much was
+    /// spent", the whole set says "where it went".
     fn usage_sum(&self) -> Usage {
         sum_usage(&self.usage_log)
+    }
+
+    /// How much of the model's context window this conversation currently occupies -- the ring's
+    /// numerator.
+    ///
+    /// `last_prompt` on the newest record is exactly that number: it is the size of the **last
+    /// request**, i.e. everything the model was handed (system prompt + the whole history + the new
+    /// message). The running turn's output is added on top, because it is about to become part of
+    /// the next request -- without it the ring would sit perfectly still while a long reply is
+    /// being written, which is the one moment someone is likely to be watching it.
+    fn context_used(&self) -> u64 {
+        let base = self
+            .usage_log
+            .iter()
+            .rev()
+            .find_map(|r| r.last_prompt)
+            .unwrap_or(0);
+        let live = self.live.as_ref().map_or(0, |l| l.out.tokens());
+        base + live
     }
 
     /// Put each turn's breakdown from the ledger back into the transcript, after that turn's AI
@@ -3222,6 +3236,46 @@ impl App {
         ui.add_space(16.0);
     }
 
+    /// Write a folder the user has just chosen into the registry, so it **survives a restart**.
+    ///
+    /// This is the missing half of the directory picker. `ToAgent::Workplace` only tells the agent
+    /// thread where the next conversation may write; it says nothing to the registry, and the
+    /// registry is what `workspace_roots` — and therefore the store's scan — is built from. So a
+    /// folder picked from the list switched the writes correctly and then **vanished on the next
+    /// launch**: the group was drawn from an `auto:` fallback for as long as a conversation lived
+    /// there, and the conversations themselves were never listed again because their directory was
+    /// never scanned.
+    ///
+    /// Called from [`App::send_ws`] rather than from the picker so that every door onto "switch to
+    /// this folder" — the tier menu, the full-access confirmation, the picker — passes through it.
+    /// The app root and folders already in the registry are refused there (see
+    /// [`aox::space::Registry::adopt_workspace`]), which is what keeps a repeat click from
+    /// rewriting the file and keeps `Default`'s conversations in `Default`.
+    fn adopt_workspace(&mut self, root: &Path) {
+        let Some(app_root) = self.app_root() else {
+            return;
+        };
+        let mut reg = aox::space::Registry::load(&app_root);
+        let Some(id) = reg.adopt_workspace(root, &app_root) else {
+            return;
+        };
+        if let Err(e) = reg.save(&app_root) {
+            // Same policy as every other registry write: logged, not surfaced. The conversation
+            // still goes where the user asked; what is lost is only "the folder is still there next
+            // launch", and a modal for that would interrupt the thing they were doing.
+            eprintln!("aox-gui: could not save the space registry: {e:#}");
+            return;
+        }
+        // The tree is rebuilt from the registry, so the group is on screen from this frame on --
+        // and unfolded, exactly as `create_workspace` leaves the group it makes. An empty new space
+        // is not drawn yet (`group()` drops a group with no conversations unless it is built-in), so
+        // this mostly matters for the frame the first conversation lands in it.
+        self.refresh_history();
+        self.hist_closed.remove(&id);
+        self.hist_open.insert(id);
+        self.save_fold_state();
+    }
+
     /// Send a request produced by the workplace button to the agent thread.
     ///
     /// The UI can't change tiers by itself: `Workplace` lives inside `Runtime`, and only the
@@ -3240,6 +3294,11 @@ impl App {
             };
             self.ws.set_view(WorkplaceView { mode: view_mode, root });
             return;
+        }
+        // A folder is a workspace only if the registry says so (see `adopt_workspace`); the agent
+        // message below moves the write boundary, and this is the other half of the same click.
+        if let Mode::Fixed(root) = &mode {
+            self.adopt_workspace(root);
         }
         let _ = self.tx.send(ToAgent::Workplace(mode));
     }
@@ -3357,7 +3416,8 @@ impl App {
                             }
                         });
 
-                        // Second row: the workplace button at the input box's **bottom-left**.
+                        // Second row: the workplace button at the bottom-left, the usage readouts
+                        // at the bottom-right.
                         //
                         // On its own row rather than squeezed into the previous one: it says "under
                         // what permissions this conversation runs", which is a different thing from
@@ -3368,9 +3428,20 @@ impl App {
                         // In demo mode it **can be clicked** (`self.demo || ...`): the list /
                         // confirmation / directory picker it opens are pure UI, so simulating them in
                         // place is enough to show the layout (see `send_ws`).
+                        //
+                        // The right-hand pair is the "what has this cost" corner: the token total
+                        // (click → the breakdown unfolds upwards) and the context ring next to it.
+                        // They moved here from the top bar because the top bar is where you look
+                        // when you want to **act**, and this is where the hand already is when you
+                        // want to **know**.
                         ui.add_space(3.0);
                         ui.horizontal(|ui| {
                             workplace_ui::button(ui, &mut self.ws, self.demo || !blocked);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                context_ring(ui, self.context_used(), self.context_window);
+                                ui.add_space(10.0);
+                                self.usage_chip(ui);
+                            });
                         });
                     });
             });
@@ -3900,7 +3971,7 @@ impl App {
 
 /// A stroke-drawn trash can, sized to sit at the left of a toast line.
 ///
-/// Hand-drawn like the other glyphs in this file (`history_icon` / `plus_icon` / `gear_icon`): the
+/// Hand-drawn like the other glyphs in this file (`sidebar_button` / `gear_button`): the
 /// project carries no icon font, and a dozen line segments on a 20×20 grid cost less than a dependency.
 fn trash_glyph(ui: &mut Ui, size: f32, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
@@ -3947,6 +4018,7 @@ fn seed_demo(app: &mut App) {
         // visible under --demo.
         config_layers: vec!["bundle:core".into(), "config.toml".into()],
         model: app.model.clone(),
+        context_window: DEFAULT_CONTEXT_WINDOW,
         provider_ready: true,
         note: None,
         // Demo mode gets a real path listing as well: the settings page's "System" column is
@@ -4310,10 +4382,15 @@ impl eframe::App for App {
             theme::sync_caption(frame);
         }
 
-        // The history overlay: once `hist_t` reaches zero it stops drawing itself, so **don't**
-        // additionally test `show_history` here -- the collapsing has to keep being drawn, and
-        // testing the toggle would make the panel vanish mid-way.
-        self.history_overlay(ctx);
+        // The drawer has to be declared **before** the central panel: a side panel is what tells the
+        // central column how much room is left, so declaring it afterwards would push nothing (the
+        // column would already have taken the whole window). It also means the drawer is drawn
+        // first, which is why nothing has to be layered on top of it.
+        //
+        // Once `hist_t` reaches zero it stops drawing itself, so **don't** additionally test
+        // `show_history` here -- the collapsing has to keep being drawn, and testing the toggle
+        // would make the panel vanish mid-way.
+        self.drawer(ctx);
         // The activity stream lives in its own window: the main window syncs "what is happening
         // right now" over every frame and re-declares that viewport (egui viewports are
         // declarative; one that isn't declared gets reclaimed).
@@ -4362,11 +4439,16 @@ impl eframe::App for App {
                 column_rect.min,
                 Pos2::new(column_rect.right(), column_rect.bottom()),
             );
+            // The anchor is measured from the **window's** centre, while the card has to sit on the
+            // column's centre -- and the column starts wherever the drawer ends. Half the drawer's
+            // width is exactly the difference, on the same eased clock the panel itself uses, so the
+            // card travels with the column instead of being clamped into it after the fact.
+            let drawer_w = HISTORY_W * ease_out_cubic(self.hist_t);
             egui::Area::new(egui::Id::new("aox-composer"))
                 .order(egui::Order::Foreground)
                 .movable(false)
                 .constrain_to(clip)
-                .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -18.0))
+                .anchor(Align2::CENTER_BOTTOM, Vec2::new(drawer_w * 0.5, -18.0))
                 .show(ctx, |ui| {
                     ui.set_width(column_rect.width());
                     self.composer(ui);
@@ -4457,76 +4539,59 @@ const HISTORY_LIST_LIMIT: usize = 80;
 // have no "container" to lean on, so they are pinned explicitly here -- the positions are lifted
 // from the pre-removal result, pixel for pixel unchanged.
 
-/// Side length of a button's hot zone (the same number as `d` in the three icon functions).
-const BAR_BTN: f32 = 36.0;
+/// The context window assumed when `[provider] context_window` is not set.
+///
+/// Only a denominator for the ring — nothing is truncated at this number, so a wrong value costs a
+/// misleading percentage and nothing else. 128K is the floor of what the endpoints this app targets
+/// advertise; a provider with a smaller window should say so in `config.toml`.
+const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 /// Distance from the button row to the window's **left** edge.
 const BAR_LEFT: f32 = 20.0;
-/// Distance from the button row to the window's top edge. `7 + 18 = 25`, exactly half of the old
-/// 50px top bar -- the buttons' centre line coincides exactly with the pre-removal one.
+/// The top-left button's hot zone (and the drawer head's, which shares the same drawing).
+///
+/// 32 rather than the 36 this used to be: the drawer's head icons are 32 so that the whole row
+/// lines up with the "new conversation" row below it, and one number for both places is the point
+/// of [`sidebar_button`] — the floating button and the in-panel one have to look like the same
+/// control.
+const BAR_BTN: f32 = 32.0;
+/// Distance from the button row to the window's top edge. `7 + 16 = 23` keeps the button's centre
+/// on the same line the old 50px top bar put it on, within a pixel.
 const BAR_TOP: f32 = 7.0;
-/// Width of the history overlay.
+/// Width of the history drawer.
 ///
-/// 400 rather than the old 300: each conversation row now spends an indent on being nested under
-/// its group header, and titles are elided against what is left, so the old width started cutting
-/// titles that used to fit.
-const HISTORY_W: f32 = 400.0;
-/// Left inset of a conversation row under its group header.
+/// 300: the drawer is a **full-height column**, not a card with a list in it, so it is sized like a
+/// sidebar (a share of the window, not "as wide as the titles happen to need"). Conversation titles
+/// are elided against what is left -- at this width that is ~24 Han characters, and the row's
+/// second line already carries the time and the message count.
+const HISTORY_W: f32 = 300.0;
+/// Left inset of a conversation row under its workspace row.
 ///
-/// Chosen so a nested row starts under the header's name (just right of the folder), and so the
-/// hairline `history_row` draws lines up with the folder above it.
-const HIST_INDENT: f32 = 18.0;
+/// 14 rather than the old 18: the row no longer leads with a dot (the nesting is read from the
+/// indent plus the folder above it), so it only has to clear the workspace row's icon column.
+const HIST_INDENT: f32 = 14.0;
 /// Width of a right-click menu's rows.
 ///
 /// Fixed rather than "as wide as the longest label": the two menus (a conversation's and a
 /// workspace's) would otherwise come out different widths, and a menu that resizes itself when the
 /// pointer crosses rows reads as the UI twitching under the hand.
 const MENU_W: f32 = 178.0;
-/// Height of the "above the list" part of the history overlay (padding + title row + separator).
+/// Height of the drawer's head: icon row, "new conversation", search, section title.
 ///
-/// Used to work out how tall the list may be at most. **Measured, not computed**: the panel's real
-/// height is decided by its content, and this is the number that makes the two agree -- so a drift
-/// here shows up as the panel being a few pixels off its share of the window, not as a broken
-/// layout. It is not a clean sum because egui adds `item_spacing` around every allocated widget and
-/// this theme sets that to 10 (see `theme.rs`); measured 80 with the title row at 31.
+/// **Exact, not measured**: the drawer zeroes `item_spacing` and places every gap by hand (see
+/// [`App::drawer`]), so this is a plain sum -- 12 (top margin) + 32 (icon row) + 10 + 40 (new
+/// conversation) + 10 + 34 (search) + 18 + 16 (section title) + 7. If one of those gaps is edited
+/// below, this number has to follow, or the list gets the wrong allowance.
+const DRAWER_HEAD: f32 = 179.0;
+/// Height of the drawer's foot: the rule above it plus its two rows.
 ///
-/// ⚠️ The bottom of the clip rect is derived from this and [`HIST_FOOT`] (see `history_overlay`), so
-/// the two must stay in step with what is actually drawn.
-const HIST_HEAD: f32 = 80.0;
-/// Height of the "below the list" part of the history overlay (separator + spacing + the two rows).
+/// 8 (gap) + 1 (rule) + 8 + 32 + 2 + 32. Same rule as [`DRAWER_HEAD`]: a plain sum of what is drawn.
+const DRAWER_FOOT: f32 = 83.0;
+/// How long the drawer takes to take its width / give it back (seconds).
 ///
-/// Subtracted from the list's allowance, the same way [`HIST_HEAD`] is: the foot is pinned outside
-/// the scroll area, so if it were not accounted for here the list would just be drawn 40-odd pixels
-/// too tall and the panel would grow past the share of the window it was given.
-///
-/// Two rows since 2026-10-14 ("New workspace", then "Open workspace folder"): 8 + 28 + 2 + 28 of
-/// explicit spacing and rows, plus the `item_spacing` egui keeps around each of them -- 104 measured
-/// at this theme's 10, which is why the number is not the 74 it looks like it should be. Landing
-/// this 36px short of the truth is what let the panel come out taller than `panel_h` and had the
-/// clip rect shave the bottom corners off (2026-10-14).
-///
-/// The panel's own height does not move with it -- `panel_h` is still the share of the window it was
-/// given, so this comes out of the list, not out of the panel.
-const HIST_FOOT: f32 = 104.0;
-/// The slide-out / collapse animation duration (seconds).
-///
-/// 0.24 is the "you can see it moving, but you don't have to wait" setting: shorter falls back to
-/// an instant jump, longer feels like the UI is hesitating after the click.
-const HIST_ANIM_SECS: f32 = 0.24;
-
-/// The two buttons in the slide-out group -- these are the only ones that need the "emerge from
-/// behind the history button" clipping.
-///
-/// An enum rather than two nearly identical `Area` blocks: the two buttons' offsets, clipping and
-/// padding have to match pixel for pixel, and with two copies any future change to one of them
-/// leaves the two misaligned (an error that is very hard to spot by reading the code -- only a
-/// screenshot comparison shows it).
-#[derive(Clone, Copy)]
-enum SlideIcon {
-    /// New conversation
-    Plus,
-    /// Settings
-    Gear,
-}
+/// Shorter than the 0.24 this used to be: the drawer now **pushes** the transcript, so every frame
+/// of the animation is a frame in which the text re-wraps. 0.18 still reads as motion and gets the
+/// reflow over with before the eye starts following the words.
+const HIST_ANIM_SECS: f32 = 0.18;
 
 /// Ease-out curve (cubic ease-out): quick off the mark, slow to settle.
 ///
@@ -4551,89 +4616,106 @@ fn loose_rect() -> Rect {
     Rect::from_min_max(Pos2::new(-10_000.0, -10_000.0), Pos2::new(10_000.0, 10_000.0))
 }
 
-/// The history button: a vertical rule on the left (standing for the sidebar) plus three short
-/// horizontal lines.
+/// The sidebar toggle — **one control in two places**: the button floating at the window's
+/// top-left while the drawer is shut, and the same button in the drawer's head while it is open.
 ///
-/// Drawn the same way as the two other top-bar icons (36px hot zone, single-colour stroke, hover
-/// recolour).
-fn history_icon(ui: &mut Ui, on: bool) -> egui::Response {
-    let d = 36.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
+/// Sharing the drawing is the point. The two used to be different glyphs (a rule with three lines
+/// floating over the transcript, a panel outline inside the panel) at different sizes with
+/// different resting backdrops, so "the thing that opens the sidebar" and "the thing that closes
+/// it" didn't look related at all — the user's complaint. Now: same 32px hot zone, same panel
+/// outline with the divider down its left edge, same 1.3px stroke, same hover language.
+///
+/// The only thing that still differs is the **resting backdrop**, and it has to: the floating copy
+/// sits straight on the transcript text and is illegible without a plate under it, while the one
+/// in the drawer's head already sits on the drawer's own surface, where a plate would be a second
+/// box drawn on a box.
+fn sidebar_button(ui: &mut Ui, open: bool, floating: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BAR_BTN), Sense::click());
     let hov = pointer_if(ui, &resp);
     let fg = if hov {
         P::ink()
-    } else if on {
-        P::text()
+    } else if open {
+        P::text_dim()
     } else {
         P::text_faint()
     };
 
     let painter = ui.painter();
-    // A backdrop is laid down even in the resting state (= the old top bar's fill): with the bar
-    // gone the buttons float straight on the transcript text, and without that backdrop the icons
-    // would smear into the body text. Hover raises it one step, the same language as list rows and
-    // menu rows.
-    painter.rect_filled(
-        rect,
-        CornerRadius::same(10),
-        if hov { P::surface_hi() } else { P::panel() },
-    );
-    let r = rect.shrink(10.0);
-    // One short vertical line on the left = the sidebar itself
-    painter.line_segment(
-        [Pos2::new(r.left() + 0.8, r.top()), Pos2::new(r.left() + 0.8, r.bottom())],
-        Stroke::new(1.6, fg),
-    );
-    // Three horizontal lines on the right = the list entries
-    for i in 0..3 {
-        let y = r.top() + r.height() * (0.16 + 0.34 * i as f32);
-        painter.line_segment(
-            [Pos2::new(r.left() + 4.6, y), Pos2::new(r.right(), y)],
-            Stroke::new(1.6, fg),
+    if floating || hov {
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(9),
+            if hov { P::surface_hi() } else { P::panel() },
         );
     }
-    resp.on_hover_text(if on { aox::i18n::t("Hide history") } else { aox::i18n::t("Show history") })
-}
-
-/// The "new conversation" button: a "+".
-///
-/// Drawn the same way as the history icon next to it (36px hot zone, single-colour stroke, hover
-/// recolour); side by side the two read as "browse a thread / start a thread". While a turn is
-/// running it is dimmed and ignores clicks -- switching conversations then would only take effect
-/// after the turn, and the clicker would just think the UI had frozen.
-fn plus_icon(ui: &mut Ui, locked: bool) -> egui::Response {
-    let d = 36.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
-    let hov = pointer_if(ui, &resp) && !locked;
-    let fg = if locked {
-        P::text_faint()
-    } else if hov {
-        P::ink()
+    // The glyph: a panel with a divider down its left edge — "there is a column over there".
+    let r = Rect::from_center_size(rect.center(), Vec2::new(14.0, 12.0));
+    painter.rect_stroke(
+        r,
+        CornerRadius::same(2),
+        Stroke::new(1.3, fg),
+        egui::StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [Pos2::new(r.left() + 4.6, r.top()), Pos2::new(r.left() + 4.6, r.bottom())],
+        Stroke::new(1.3, fg),
+    );
+    resp.on_hover_text(if open {
+        aox::i18n::t("Hide history")
     } else {
-        P::text_dim()
-    };
-
-    let painter = ui.painter();
-    painter.rect_filled(
-        rect,
-        CornerRadius::same(10),
-        if hov { P::surface_hi() } else { P::panel() },
-    );
-    let r = rect.shrink(13.0);
-    let c = r.center();
-    painter.line_segment(
-        [Pos2::new(c.x, r.top()), Pos2::new(c.x, r.bottom())],
-        Stroke::new(1.6, fg),
-    );
-    painter.line_segment(
-        [Pos2::new(r.left(), c.y), Pos2::new(r.right(), c.y)],
-        Stroke::new(1.6, fg),
-    );
-    if locked {
-        return resp.on_hover_text(aox::i18n::t("A task is running; start a new conversation later"));
-    }
-    resp.on_hover_text(aox::i18n::t("New conversation"))
+        aox::i18n::t("Show history")
+    })
 }
+
+/// The context gauge: a ring that fills as the conversation eats the model's context window.
+///
+/// `used / limit` is the whole reading, and it is deliberately tiny and unlabelled — it answers
+/// "am I about to run out of room" at a glance, and the exact figures are one hover away. Colour is
+/// the only alarm, and it borrows the three-band language the cache-hit map already taught this UI:
+/// quiet ink below 75%, amber past it, brick past 92%.
+///
+/// Drawn as a hand-built polyline rather than a real arc: egui has no arc primitive, and at 16px a
+/// 40-segment `PathShape` is pixel-identical to one. Zero arc → no fill at all, so a fresh
+/// conversation shows the empty track and nothing else.
+fn context_ring(ui: &mut Ui, used: u64, limit: u64) -> egui::Response {
+    let d = 16.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::hover());
+    let c = rect.center();
+    let r = d * 0.5 - 1.3;
+    let p = ui.painter();
+    p.circle_stroke(c, r, Stroke::new(2.0, P::border()));
+    let frac = if limit == 0 {
+        0.0
+    } else {
+        (used as f32 / limit as f32).clamp(0.0, 1.0)
+    };
+    if frac > 0.0 {
+        let col = if frac >= 0.92 {
+            P::danger()
+        } else if frac >= 0.75 {
+            P::warn()
+        } else {
+            P::text_dim()
+        };
+        let n = ((frac * 40.0).ceil() as usize).max(2);
+        let start = -std::f32::consts::FRAC_PI_2; // 12 o'clock, clockwise from there
+        let pts: Vec<Pos2> = (0..=n)
+            .map(|i| {
+                let a = start + std::f32::consts::TAU * frac * (i as f32 / n as f32);
+                Pos2::new(c.x + r * a.cos(), c.y + r * a.sin())
+            })
+            .collect();
+        p.add(egui::Shape::line(pts, Stroke::new(2.0, col)));
+    }
+    let left = limit.saturating_sub(used);
+    resp.on_hover_text(aox::tf!(
+        "Context: {} of {} used, {} left",
+        thousands(used),
+        thousands(limit),
+        thousands(left)
+    ))
+}
+
 
 /// A single line of text, closed off by **pixels**: anything past `max_w` is elided.
 ///
@@ -4658,22 +4740,26 @@ fn elide(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<e
     ui.painter().layout_job(job)
 }
 
-/// One workspace group header in the history overlay: a folder, the name, and how many
-/// conversations are in it. The whole row is the click target for folding / unfolding.
+/// One workspace row in the drawer: a folder, the name, how many conversations are in it, and a
+/// disclosure chevron on the right. The whole row is the click target for folding / unfolding.
+///
 /// The count is drawn whether or not the group is folded: `list()` scans every workspace in one go
 /// (see the store's multi-directory layout), so the number is already in hand -- a "not counted yet"
-/// placeholder would be a promise the panel has no reason to break.
+/// placeholder would be a promise the panel has no reason to break. While a search is running it is
+/// the number of **matches**, not of conversations, because that is what is under the row.
 ///
 /// Returns the row's own response (the fold toggle) plus whether the hovered "＋" was clicked. Two
 /// answers rather than one because they are two different gestures on one rect: the "＋" is a
 /// **child** click target nested inside the row, and it has to be the one that wins the pointer or
 /// "new conversation here" would also fold the group the user is pointing at.
-fn history_group_header(ui: &mut Ui, g: &aox::space::Group, width: f32) -> (egui::Response, bool) {
+fn history_group_header(
+    ui: &mut Ui,
+    g: &aox::space::Group,
+    width: f32,
+    count: usize,
+    open: bool,
+) -> (egui::Response, bool) {
     let w = (width - 6.0).max(60.0);
-    // 34 rather than 30 (user request, 2026-10-14): the header carries a folder, a name, a "＋" and
-    // a count on one line, and at 30 it read as a *row* -- the same weight as the conversations under
-    // it, which are 46 tall. A couple more pixels gives the header the extra air that says "this one
-    // is a heading over the list", which is what its bold name was already trying to say alone.
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
     // Pointer over the row -- asked of the **rect**, not `resp.hovered()`. The "＋" below is a child
     // interact target nested inside this rect, so on the frames the pointer is on it the row is no
@@ -4684,45 +4770,64 @@ fn history_group_header(ui: &mut Ui, g: &aox::space::Group, width: f32) -> (egui
     let hov = ui.rect_contains_pointer(rect);
     if hov {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        ui.painter().rect_filled(rect, CornerRadius::same(7), P::surface());
+        ui.painter().rect_filled(rect, CornerRadius::same(8), P::hover_fill());
     }
     let fg = if hov { P::text() } else { P::text_dim() };
     let cy = rect.center().y;
     let icon_x = rect.left() + 11.0;
 
-    let count = aox::tf!("{}", g.items.len());
-    let count_w = 26.0;
-    // Far enough right that the name clears the folder instead of sitting on its corner.
-    let name_x = icon_x + 12.0;
-    // The "＋" gutter is **always** taken off the name's width, whether or not the glyph is being
-    // drawn right now. If the width only shrank on hover, the name and the count would both jump a
-    // few pixels sideways the instant the pointer arrived -- the one thing a hover affordance must
-    // never do, since it moves the ground out from under the click that is about to happen.
+    let count = aox::tf!("{}", count);
+    // Three gutters on the right, always taken off the name's width whether or not the glyphs are
+    // drawn right now: the "＋" (hover only), the count, and the chevron. If the width only shrank
+    // on hover, the name would jump sideways the instant the pointer arrived -- the one thing a
+    // hover affordance must never do, since it moves the ground out from under the click that is
+    // about to happen.
+    let chev_w = 20.0;
+    let count_w = 22.0;
     let plus_w = 22.0;
-    let name_w = (rect.right() - 8.0 - count_w - plus_w - name_x).max(24.0);
+    // Far enough right that the name clears the folder instead of sitting on its corner.
+    let name_x = icon_x + 15.0;
+    let name_w = (rect.right() - 6.0 - chev_w - count_w - plus_w - name_x).max(24.0);
     // Bold marks the header as a heading rather than a row (same treatment as markdown titles and
     // the activity stream's headings).
     let name = elide(ui, &g.name, theme::bold_font(12.5), fg, name_w);
-    let cnt = elide(ui, &count, theme::body_font(11.5), P::text_faint(), count_w);
+    let cnt = elide(ui, &count, theme::body_font(11.0), P::text_faint(), count_w);
 
     let painter = ui.painter();
-    // A folder, where this used to be a disclosure triangle (user request, 2026-10-14). The triangle
-    // was the only thing saying folded-or-not; that signal is the rows underneath now -- and the
-    // count on the right says how many to expect -- while what the folder adds is the one thing a
+    // A folder, where this used to be a disclosure triangle. What it adds is the one thing a
     // header could never show: that this row is a *directory*, which is also what tells a workspace
     // apart from a conversation at a glance. Same 13x11 box the workplace picker's rows use, so the
-    // two trees draw the same folder.
+    // two trees draw the same folder. The folded-or-not signal is the chevron on the right.
     workplace_ui::paint_folder(
         painter,
         Rect::from_center_size(Pos2::new(icon_x, cy), Vec2::new(13.0, 11.0)),
         fg,
     );
     painter.galley(Pos2::new(name_x, cy - name.size().y * 0.5), name, fg);
-    painter.galley(
-        Pos2::new(rect.right() - 8.0 - cnt.size().x, cy - cnt.size().y * 0.5),
-        cnt,
-        P::text_faint(),
-    );
+    let cnt_x = rect.right() - 6.0 - chev_w - cnt.size().x;
+    painter.galley(Pos2::new(cnt_x, cy - cnt.size().y * 0.5), cnt, P::text_faint());
+
+    // ── the chevron ──
+    // Points down when the group is open, right when it is folded. Drawn as two strokes rather than
+    // a glyph: a font's "v" changes shape with whichever face the build picked, and this one has to
+    // sit on the same optical centre as the folder.
+    let chev_x = rect.right() - 6.0 - chev_w * 0.5;
+    let s = 3.6;
+    let stroke = Stroke::new(1.4, if hov { P::text_dim() } else { P::text_faint() });
+    let chev = if open {
+        vec![
+            Pos2::new(chev_x - s, cy - s * 0.5),
+            Pos2::new(chev_x, cy + s * 0.6),
+            Pos2::new(chev_x + s, cy - s * 0.5),
+        ]
+    } else {
+        vec![
+            Pos2::new(chev_x - s * 0.5, cy - s),
+            Pos2::new(chev_x + s * 0.6, cy),
+            Pos2::new(chev_x - s * 0.5, cy + s),
+        ]
+    };
+    painter.add(egui::Shape::line(chev, stroke));
 
     // ── the "＋": new conversation *in this workspace* ──
     //
@@ -4732,19 +4837,21 @@ fn history_group_header(ui: &mut Ui, g: &aox::space::Group, width: f32) -> (egui
     // hidden at rest -- at rest the header is a *label*, and five of them at once wearing a "＋"
     // would turn a list of workspaces into a row of buttons.
     //
-    // It sits **before the count** (user request, 2026-10-14) rather than at the far right: the count
-    // is the row's own data and it should not be pushed around by a control, and "＋ 3" reads as
-    // "add one to these three", which is exactly what the click does.
+    // It sits **before the count** rather than at the far right: the count is the row's own data and
+    // it should not be pushed around by a control, and "＋ 3" reads as "add one to these three",
+    // which is exactly what the click does.
     let mut plus_clicked = false;
     if g.root.is_some() && hov {
-        let plus_rect =
-            Rect::from_center_size(Pos2::new(rect.right() - 8.0 - count_w - plus_w * 0.5, cy), Vec2::splat(20.0));
+        let plus_rect = Rect::from_center_size(
+            Pos2::new(rect.right() - 6.0 - chev_w - count_w - plus_w * 0.5, cy),
+            Vec2::splat(20.0),
+        );
         let click = ui.interact(plus_rect, resp.id.with("new-conv"), Sense::click());
         let on = pointer_if(ui, &click);
         if on {
-            // The same raised fill the toolbar's buttons use, so a second hoverable thing inside a
-            // hovered row is still readable as "this, specifically, is the target".
-            ui.painter().rect_filled(plus_rect, CornerRadius::same(6), P::surface_hi());
+            // One more step than the row's own fill, so a second hoverable thing inside a hovered
+            // row is still readable as "this, specifically, is the target".
+            ui.painter().rect_filled(plus_rect, CornerRadius::same(6), P::active_fill());
         }
         let pfg = if on { P::ink() } else { P::text_dim() };
         let s = 3.8;
@@ -5161,6 +5268,240 @@ fn check_conv_title(raw: &str) -> Result<String, String> {
     Ok(title.to_string())
 }
 
+/// The settings button in the drawer's head: same 32px hot zone and same hover language as
+/// [`sidebar_button`] (they sit side by side, and two different box sizes on one row is exactly the
+/// kind of thing that reads as sloppy), **no backdrop at rest** — the drawer's own surface is the
+/// backdrop.
+fn gear_button(ui: &mut Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BAR_BTN), Sense::click());
+    let hov = pointer_if(ui, &resp);
+    if hov {
+        ui.painter().rect_filled(rect, CornerRadius::same(9), P::hover_fill());
+    }
+    let fg = if hov { P::ink() } else { P::text_dim() };
+    draw_gear(ui.painter(), rect.center(), 7.8, 5.5, 1.3, fg);
+    resp.on_hover_text(aox::i18n::t("Settings"))
+}
+
+/// The gear, drawn as a closed polyline of teeth plus a centre hole.
+///
+/// One drawing for both sizes (the drawer head and the settings dialog's rows): two copies
+/// would drift apart the first time either is touched, and the difference is only three numbers.
+fn draw_gear(
+    painter: &egui::Painter,
+    c: Pos2,
+    r_out: f32,
+    r_in: f32,
+    width: f32,
+    fg: Color32,
+) {
+    const TEETH: usize = 8;
+    // The circle is divided into TEETH segments, and each one holds four points:
+    // "tip -> valley -> valley -> tip".
+    let step = std::f32::consts::TAU / TEETH as f32;
+    let tooth = step * 0.22; // the tooth tip's share of the angle (the rest is the valley)
+    let mut pts: Vec<Pos2> = Vec::with_capacity(TEETH * 4 + 1);
+    for k in 0..TEETH {
+        let a0 = step * k as f32;
+        for (ang, r) in [
+            (a0 - tooth, r_in),
+            (a0, r_out),
+            (a0 + tooth, r_out),
+            (a0 + tooth * 2.0, r_in),
+        ] {
+            let (s, co) = ang.sin_cos();
+            pts.push(Pos2::new(c.x + co * r, c.y + s * r));
+        }
+    }
+    pts.push(pts[0]); // close the loop
+    painter.add(egui::Shape::line(pts, Stroke::new(width, fg)));
+    // The centre hole -- with it, it looks like a gear; without it, it's an eight-pointed star
+    painter.circle_stroke(c, r_out * 0.26, Stroke::new(width, fg));
+}
+
+/// The drawer's one **button**: full width, 40 high, an outline rather than a filled block.
+///
+/// A reversed (ink) block would shout louder than anything else in the drawer, and "new
+/// conversation" is the one action here that is also reachable from the keyboard — so it is drawn
+/// as the quietest thing that still reads as pressable. `enabled == false` (a turn is running)
+/// keeps the shape and only dims it: a button that disappears mid-turn is worse than one that says
+/// "not now".
+fn new_chat_row(ui: &mut Ui, width: f32, enabled: bool) -> egui::Response {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 40.0), sense);
+    let hov = pointer_if(ui, &resp) && enabled;
+    let p = ui.painter();
+    p.rect_filled(
+        rect,
+        CornerRadius::same(9),
+        if hov { P::active_fill() } else { P::hover_fill() },
+    );
+    p.rect_stroke(
+        rect,
+        CornerRadius::same(9),
+        Stroke::new(1.0, P::border()),
+        egui::StrokeKind::Inside,
+    );
+    let fg = if enabled { P::text() } else { P::text_faint() };
+    let cy = rect.center().y;
+    let cx = rect.left() + 16.0;
+    let s = 4.2;
+    p.line_segment([Pos2::new(cx - s, cy), Pos2::new(cx + s, cy)], Stroke::new(1.5, fg));
+    p.line_segment([Pos2::new(cx, cy - s), Pos2::new(cx, cy + s)], Stroke::new(1.5, fg));
+    let label = p.layout_no_wrap(
+        aox::i18n::t("New conversation").to_string(),
+        theme::body_font(13.0),
+        Color32::PLACEHOLDER,
+    );
+    p.galley(Pos2::new(rect.left() + 32.0, cy - label.size().y * 0.5), label, fg);
+    // The shortcut hint is drawn, not wired: there is no global key handler for it yet, and a hint
+    // for a key that does nothing is exactly the kind of small lie that makes a UI feel unreliable.
+    // It is here because the row is the drawer's one action and the reference puts it in this
+    // corner; the binding lands with the rest of the keyboard work.
+    let hint = p.layout_no_wrap(
+        "Ctrl K".to_string(),
+        theme::body_font(10.5),
+        Color32::PLACEHOLDER,
+    );
+    p.galley(
+        Pos2::new(rect.right() - 12.0 - hint.size().x, cy - hint.size().y * 0.5),
+        hint,
+        P::text_faint(),
+    );
+    resp
+}
+
+/// The drawer's search field: a sunken well with a magnifier, filled in place.
+///
+/// The `TextEdit` is placed **inside** an already-allocated rect (`ui.put`) rather than laid out,
+/// so the well, the glyph and the field share one box; `frame(false)` keeps the widget from drawing
+/// a second background inside the first. Focus is read from memory *before* the field is put down,
+/// so the border is right on the frame the click lands rather than one frame later.
+fn search_row(ui: &mut Ui, width: f32, query: &mut String) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 34.0), Sense::hover());
+    let id = egui::Id::new("aox-hist-search");
+    let focused = ui.memory(|m| m.has_focus(id));
+    let p = ui.painter();
+    // `bg`, not `code_bg`: on the drawer's `surface` this is the same one-step sunken well the
+    // reference has, and it is already a token that exists in both themes.
+    p.rect_filled(rect, CornerRadius::same(9), P::bg());
+    if focused {
+        p.rect_stroke(
+            rect,
+            CornerRadius::same(9),
+            Stroke::new(1.0, P::border_strong()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let c = Pos2::new(rect.left() + 15.0, rect.center().y);
+    p.circle_stroke(
+        Pos2::new(c.x - 1.0, c.y - 1.0),
+        4.2,
+        Stroke::new(1.4, P::text_faint()),
+    );
+    p.line_segment(
+        [Pos2::new(c.x + 2.0, c.y + 2.0), Pos2::new(c.x + 5.2, c.y + 5.2)],
+        Stroke::new(1.4, P::text_faint()),
+    );
+    let inner = Rect::from_min_max(
+        Pos2::new(rect.left() + 28.0, rect.top() + 7.0),
+        Pos2::new(rect.right() - 8.0, rect.bottom() - 7.0),
+    );
+    ui.put(
+        inner,
+        egui::TextEdit::singleline(query)
+            .id(id)
+            .frame(false)
+            .margin(Margin::ZERO)
+            .hint_text(aox::i18n::t("Search workspaces"))
+            .font(theme::body_font(12.0))
+            .desired_width(inner.width()),
+    );
+}
+
+/// A section title: small, faint, **letter-spaced**, with an optional count on the right.
+///
+/// The tracking is drawn by hand (one glyph at a time) because `RichText` has no letter-spacing and
+/// this is the one place in the panel where the spacing *is* the design: at 10px, three Han
+/// characters set solid read as a stray word, and the same three with 1.3px between them read as a
+/// label over a list.
+fn section_head(ui: &mut Ui, width: f32, label: &str, count: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 16.0), Sense::hover());
+    let p = ui.painter();
+    let font = theme::body_font(10.0);
+    let cy = rect.center().y;
+    let mut x = rect.left() + 2.0;
+    for ch in label.chars() {
+        let g = p.layout_no_wrap(ch.to_string(), font.clone(), Color32::PLACEHOLDER);
+        p.galley(Pos2::new(x, cy - g.size().y * 0.5), g.clone(), P::text_faint());
+        x += g.size().x + 1.3;
+    }
+    let c = p.layout_no_wrap(count.to_string(), font, Color32::PLACEHOLDER);
+    p.galley(
+        Pos2::new(rect.right() - 2.0 - c.size().x, cy - c.size().y * 0.5),
+        c,
+        P::text_faint(),
+    );
+}
+
+/// Does this workspace survive the current search? A workspace matches by **name** (which keeps all
+/// of its conversations) or by having at least one conversation whose title matches.
+fn group_matches(g: &aox::space::Group, query: &str) -> bool {
+    g.name.to_lowercase().contains(query)
+        || g.items.iter().any(|s| s.title.to_lowercase().contains(query))
+}
+
+/// The contents of a conversation's menu — shared by the row's right-click and its "⋯" button.
+///
+/// A free function rather than a closure: the two doors would otherwise each need their own copy of
+/// the body, and the slots they write to are `&mut` borrows that a single closure could only hand
+/// out once.
+fn conversation_menu(
+    ui: &mut Ui,
+    id: &str,
+    title: &str,
+    path: &Path,
+    current: bool,
+    move_targets: &[(String, String)],
+    rename_conv: &mut Option<(String, String)>,
+    move_conv: &mut Option<(String, String)>,
+    recycle: &mut Vec<PathBuf>,
+) {
+    // Renaming is offered on **every** row, the current one included (unlike Delete below): the
+    // current conversation is the one whose file the agent already has open, and the append is
+    // exactly what makes the rename work there.
+    if menu_item(ui, aox::i18n::t("Rename"), MENU_W, true, false).clicked() {
+        *rename_conv = Some((id.to_string(), title.to_string()));
+        ui.close();
+    }
+    // Move to → another group. A submenu rather than one flat row per group: the target list grows
+    // with the user's workspaces, and a menu that keeps getting taller is worse than one click
+    // deeper. Offered on every row including the current one -- re-filing is a registry edit, so it
+    // touches neither the open file nor the running turn. Hidden when there is only one group, so it
+    // is never a row that opens onto nothing.
+    if !move_targets.is_empty() {
+        ui.menu_button(aox::i18n::t("Move to"), |ui| {
+            for (tid, tname) in move_targets {
+                if menu_item(ui, tname, MENU_W, true, false).clicked() {
+                    *move_conv = Some((id.to_string(), tid.clone()));
+                    ui.close();
+                }
+            }
+        });
+    }
+    // The conversation being chatted in is refused rather than hidden: the agent has it open and
+    // would keep appending to a file that is no longer there. The row stays visible but greyed, with
+    // the reason on hover, so the menu looks the same everywhere and the missing row is never a
+    // mystery.
+    let del = menu_item(ui, aox::i18n::t("Delete"), MENU_W, !current, true);
+    if current {
+        del.on_hover_text(aox::i18n::t("Cannot delete the conversation you are in"));
+    } else if del.clicked() {
+        recycle.push(path.to_path_buf());
+        ui.close();
+    }
+}
+
 /// Which glyph a history-panel foot row leads with.
 enum FootIcon {
     /// A hand-drawn plus: "make one".
@@ -5182,11 +5523,12 @@ enum FootIcon {
 /// not depend on whether a turn happens to be running.
 fn foot_row(ui: &mut Ui, width: f32, enabled: bool, icon: FootIcon, label: &str) -> egui::Response {
     let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new((width - 6.0).max(60.0), 28.0), sense);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new((width - 6.0).max(60.0), 32.0), sense);
     let hov = pointer_if(ui, &resp) && enabled;
     if hov {
-        // Same reason as `history_row`: `surface` would vanish into the card this row sits on.
-        ui.painter().rect_filled(rect, CornerRadius::same(10), P::surface_hi());
+        // The same one-step fill the list rows use, so the foot reads as part of the same list
+        // rather than as a second kind of control.
+        ui.painter().rect_filled(rect, CornerRadius::same(8), P::hover_fill());
     }
     let fg = if !enabled {
         P::text_faint()
@@ -5275,12 +5617,20 @@ fn reveal_in_file_manager(dir: &Path) {
     }
 }
 
-/// One history conversation row in the sidebar: title + "last activity · message count".
+/// One conversation row in the drawer: title on the first line, "last activity · message count" on
+/// the second, and a "⋯" on the right once the pointer is on it.
 ///
-/// `current` = the one being chatted in right now (a filled dot on the right); `locked` = a switch
-/// request is in flight or a turn is running, in which case clicks are refused and the whole row
-/// is dimmed one step. `indent` shifts the text right so the row sits nested under its group header
-/// (the hover fill still spans the full width, so the clickable strip doesn't shrink with the depth).
+/// `current` = the one being chatted in right now. It is marked by **fill only** — no dot, no left
+/// bar: at rest the list is plain text on paper, and the row you are in is one shade darker than the
+/// rest, which is the same signal a hover gives. `locked` = a switch request is in flight or a turn
+/// is running, in which case clicks are refused and the whole row is dimmed one step. `indent`
+/// shifts the text right so the row sits nested under its workspace row (the fill still spans the
+/// full width, so the clickable strip doesn't shrink with the depth).
+///
+/// Returns the row's response plus the "⋯" child response — the second is the anchor for the row's
+/// menu (`Popup::menu`), so the same menu can be opened by right-clicking the row or by clicking the
+/// glyph. It is only a *click* target while the glyph is drawn; the rest of the time it senses hover,
+/// so it can never swallow a click meant for the row.
 fn history_row(
     ui: &mut Ui,
     s: &aox::history::Summary,
@@ -5288,24 +5638,30 @@ fn history_row(
     locked: bool,
     width: f32,
     indent: f32,
-) -> egui::Response {
+) -> (egui::Response, egui::Response) {
     let w = (width - 6.0).max(60.0); // leave room for the scroll bar
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 46.0), Sense::click());
-    let hov = pointer_if(ui, &resp) && !locked;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 48.0), Sense::click());
+    // Asked of the rect rather than of `resp`: the "⋯" below is a child interact target, and on the
+    // frames the pointer is over it the row is no longer the *hovered widget* -- which would make
+    // the fill (and, since the glyph is only drawn while the row reads as hovered, the glyph with
+    // it) flicker off. Same reasoning as the workspace row.
+    let hov = !locked && ui.rect_contains_pointer(rect);
     if hov {
-        // `surface_hi`, not `surface`: this row already sits **on** a surface card, so filling it
-        // with the card's own colour would be a hover that does nothing.
-        ui.painter().rect_filled(rect, CornerRadius::same(10), P::surface_hi());
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    // A hairline down the left of every nested row. Consecutive rows abut, so it becomes one
-    // continuous line running under the group header -- without it an indented row reads as "a row
-    // with a gap on the left" rather than "a child of the group above". Drawn **after** the hover
-    // fill, otherwise the fill paints over it.
-    ui.painter().vline(
-        rect.left() + 11.0,
-        rect.top()..=rect.bottom(),
-        Stroke::new(1.0, P::border()),
-    );
+    // The current row is filled **whether or not** it is hovered; a hovered row that is not the
+    // current one gets the lighter step. Both are one fill, no border, no marker.
+    let fill = if current {
+        Some(P::active_fill())
+    } else if hov {
+        Some(P::hover_fill())
+    } else {
+        None
+    };
+    if let Some(fill) = fill {
+        ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
+    }
+
     let x = rect.left() + 10.0 + indent;
     let title_color = if locked {
         P::text_faint()
@@ -5314,33 +5670,58 @@ fn history_row(
     } else {
         P::text_dim()
     };
-    // The text's right bound is set 10px to the left of the dot: neither the "current" dot on the
-    // right nor the safety margin eats into the title's width, so both lines close off at the same
-    // width and the title can never draw outside this row.
-    let dot_x = rect.right() - 10.0;
-    let max_w = (dot_x - 10.0 - x).max(24.0);
-    let title = elide(ui, &s.title, theme::body_font(14.0), title_color, max_w);
+    // The "⋯" gutter is always taken off the title's width, so the title does not reflow the moment
+    // the pointer arrives and the glyph appears.
+    let more_w = 22.0;
+    let max_w = (rect.right() - 6.0 - more_w - x).max(24.0);
+    let title = elide(ui, &s.title, theme::body_font(13.5), title_color, max_w);
     let sub = elide(
         ui,
         &aox::tf!("{} · {} msgs", s.time, s.messages),
-        theme::body_font(12.0),
+        theme::body_font(10.5),
         P::text_faint(),
         max_w,
     );
     let painter = ui.painter();
     // A galley is positioned by its top-left, so half its own height is subtracted here to get the
-    // previous "vertically centred" placement
-    painter.galley(Pos2::new(x, rect.top() + 15.0 - title.size().y * 0.5), title, title_color);
-    painter.galley(Pos2::new(x, rect.top() + 32.0 - sub.size().y * 0.5), sub, P::text_faint());
-    if current {
-        // The current conversation is marked with a filled dot, which doesn't eat into the title's
-        // width
-        painter.circle_filled(Pos2::new(dot_x, rect.top() + 15.0), 3.2, P::ink_soft());
+    // "vertically centred on its line" placement. Two lines at 15 and 32 in a 48-high row: the block
+    // reads as centred without either line touching the fill's edge.
+    painter.galley(Pos2::new(x, rect.top() + 16.0 - title.size().y * 0.5), title, title_color);
+    painter.galley(Pos2::new(x, rect.top() + 33.0 - sub.size().y * 0.5), sub, P::text_faint());
+
+    // ── the "⋯" ──
+    // Drawn on hover and on the current row, and never at rest: twenty rows each wearing three dots
+    // would read as a column of buttons rather than a list of titles. Three 2px dots, hand-drawn --
+    // a font's "…" sits on the baseline and would be off-centre against the title's optical middle.
+    let show_more = hov || current;
+    let more_rect = Rect::from_center_size(
+        Pos2::new(rect.right() - 6.0 - more_w * 0.5, rect.top() + 16.0),
+        Vec2::splat(20.0),
+    );
+    let more = ui.interact(
+        more_rect,
+        resp.id.with("more"),
+        if show_more { Sense::click() } else { Sense::hover() },
+    );
+    if show_more {
+        let on = pointer_if(ui, &more);
+        if on {
+            ui.painter().rect_filled(more_rect, CornerRadius::same(6), P::active_fill());
+        }
+        let p = ui.painter();
+        let fg = if on { P::text() } else { P::text_faint() };
+        for dx in [-3.0_f32, 0.0, 3.0] {
+            p.circle_filled(Pos2::new(more_rect.center().x + dx, more_rect.center().y), 1.0, fg);
+        }
     }
+
     if locked {
-        return resp.on_hover_text(format!("{}\n{}", s.title, s.id));
+        return (resp.on_hover_text(format!("{}\n{}", s.title, s.id)), more);
     }
-    resp.on_hover_text(aox::tf!("{}\n{}\nClick to switch to this conversation", s.title, s.id))
+    (
+        resp.on_hover_text(aox::tf!("{}\n{}\nClick to switch to this conversation", s.title, s.id)),
+        more,
+    )
 }
 
 /// Flatten the history messages read from disk into the transcript's turn-by-turn records.
@@ -5457,58 +5838,6 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
     }
     flush(&mut out, &mut pending);
     out
-}
-
-/// Settings: a gear (36px hot zone, single-colour stroke, hover recolour -- the same drawing as
-/// history / "+").
-///
-/// The gear is drawn as **an 8-tooth polygon plus a hole in the middle**, not as "a circle plus
-/// eight spokes": the latter is exactly how [`theme_toggle`] draws a sun, and shrunk into 36px the
-/// two would read as the same shape (both being "a circle + eight lines"). Drawing the teeth as
-/// **a polyline** gives them an outline and keeps the two instantly distinguishable.
-///
-/// The tooth profile is computed by hand: alternate points on the tips and the valleys, closing
-/// the loop. 8 teeth x 4 points = 32 points.
-fn gear_icon(ui: &mut Ui) -> egui::Response {
-    let d = 36.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::click());
-    let hov = pointer_if(ui, &resp);
-    let fg = if hov { P::ink() } else { P::text_dim() };
-
-    let painter = ui.painter();
-    painter.rect_filled(
-        rect,
-        CornerRadius::same(10),
-        if hov { P::surface_hi() } else { P::panel() },
-    );
-
-    const TEETH: usize = 8;
-    let c = rect.center();
-    let r_out = 9.6_f32;
-    let r_in = 6.9_f32;
-    // The circle is divided into TEETH segments, and each one holds four points:
-    // "tip -> valley -> valley -> tip".
-    let step = std::f32::consts::TAU / TEETH as f32;
-    let tooth = step * 0.22; // the tooth tip's share of the angle (the rest is the valley)
-    let mut pts: Vec<Pos2> = Vec::with_capacity(TEETH * 4);
-    for k in 0..TEETH {
-        let a0 = step * k as f32;
-        for (ang, r) in [
-            (a0 - tooth, r_in),
-            (a0, r_out),
-            (a0 + tooth, r_out),
-            (a0 + tooth * 2.0, r_in),
-        ] {
-            let (s, co) = ang.sin_cos();
-            pts.push(Pos2::new(c.x + co * r, c.y + s * r));
-        }
-    }
-    pts.push(pts[0]); // close the loop
-    painter.add(egui::Shape::line(pts, Stroke::new(1.5, fg)));
-    // The centre hole -- with it, it looks like a gear; without it, it's an eight-pointed star
-    painter.circle_stroke(c, 2.5, Stroke::new(1.5, fg));
-
-    resp.on_hover_text(aox::i18n::t("Settings"))
 }
 
 /// That S-shaped flow line meaning "information flows from here to there".

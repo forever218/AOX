@@ -793,3 +793,7 @@
 "Tool definitions" = "工具定义"
 "Conversation history" = "历史对话"
 "Your input" = "当前输入"
+"Workspaces" = "工作区"
+"Search workspaces" = "搜索工作区"
+"No matches" = "没有匹配项"
+"Context: {} of {} used, {} left" = "上下文：已用 {} / {}，剩余 {}"

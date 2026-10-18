@@ -79,6 +79,17 @@ pub struct ProviderConfig {
     /// not accept stream / stream_options, set it false to fall back to waiting for the full response.
     #[serde(default = "default_true")]
     pub stream: bool,
+    /// The model's context window, in tokens.
+    ///
+    /// **Only a display denominator**: the GUI draws a small ring showing "how full is the
+    /// context", and that needs to know what "full" means. Nothing in the agent truncates or
+    /// budgets against this number — sending too much is the endpoint's call to make, and it
+    /// already answers with a clear error.
+    ///
+    /// Absent means "unknown", and the GUI falls back to its own default rather than drawing a
+    /// ring that is always 0%.
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 fn default_true() -> bool {
@@ -790,6 +801,7 @@ impl Config {
                 max_tokens: None,
                 temperature: None,
                 stream: false,
+                context_window: None,
             },
             auth: AuthConfig::default(),
             agent: AgentConfig::default(),
