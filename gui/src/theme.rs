@@ -473,6 +473,18 @@ impl P {
         pal().surface_hi
     }
 
+    /// The fill of a **plate floating on the content** — see `gwin::float_plate`.
+    ///
+    /// [`P::surface`] at ~80% opacity. The window's top row no longer sits on a bar: it sits on the
+    /// first screen's background image, and a plate has to do both jobs at once — let the picture
+    /// through (an opaque chip would read as a bar of its own, which is exactly what was removed)
+    /// and still give the glyph a defined edge (fully transparent leaves the icon swimming).
+    pub fn float_fill() -> Color32 {
+        let s = Self::surface();
+        let a = if mode() == Mode::Dark { 214 } else { 205 };
+        Color32::from_rgba_unmultiplied(s.r(), s.g(), s.b(), a)
+    }
+
     /// The fill of a **row** under the pointer — one soft step above [`P::surface`].
     ///
     /// `surface_hi` is a 22-unit step: right for a button or a menu row, too loud for a column of
@@ -1161,6 +1173,39 @@ pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
 
 #[cfg(not(windows))]
 pub fn sync_caption(_handle: &dyn raw_window_handle::HasWindowHandle) {}
+
+/// Let the system round this window's corners **and keep its shadow**.
+///
+/// The main window got this for free from its native caption; going undecorated (`with_decorations
+/// (false)`, 2026-10-18) throws it away with the rest of the frame — square corners, no shadow.
+/// DWM puts both back, and the radius then matches every other window in the app by construction.
+///
+/// The independent windows do the same thing by **title lookup** (`gwin::set_round_corners`): they
+/// are built by a viewport callback that never sees a window handle. The root window has its handle
+/// in hand (`eframe::Frame`), so no lookup here.
+///
+/// Win10 doesn't know the attribute — the call fails and the corners stay square, which is the
+/// same thing Windows does for any other window there.
+#[cfg(windows)]
+pub fn round_corners(handle: &dyn raw_window_handle::HasWindowHandle) {
+    use raw_window_handle::RawWindowHandle;
+
+    let Ok(h) = handle.window_handle() else { return };
+    let RawWindowHandle::Win32(w) = h.as_raw() else {
+        return;
+    };
+    // Failure is harmless (old systems don't support it), so the return value is dropped.
+    let round = DWMWCP_ROUND;
+    dwm_set_attribute(
+        w.hwnd.get(),
+        DWMWA_CORNER_PREFERENCE,
+        std::ptr::addr_of!(round).cast(),
+        std::mem::size_of::<i32>() as u32,
+    );
+}
+
+#[cfg(not(windows))]
+pub fn round_corners(_handle: &dyn raw_window_handle::HasWindowHandle) {}
 
 #[cfg(test)]
 mod tests {

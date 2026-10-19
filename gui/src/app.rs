@@ -1617,6 +1617,21 @@ impl App {
                         if gear_button(ui).clicked() {
                             want_settings = true;
                         }
+                        // The empty gap between the two icons is the window's drag handle. The
+                        // title bar (`App::titlebar`) starts at this column's right edge, so
+                        // without this the top-left corner of the window would be the one patch
+                        // you cannot move it by — and it reads as the bar, so it has to behave
+                        // like the bar: drag to move, double-click to maximize.
+                        let gap = ui.available_rect_before_wrap();
+                        let resp =
+                            ui.interact(gap, ui.id().with("head-drag"), Sense::click_and_drag());
+                        if resp.drag_started() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        if resp.double_clicked() {
+                            let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maxed));
+                        }
                     });
                 });
                 ui.add_space(10.0);
@@ -1747,6 +1762,14 @@ impl App {
                 {
                     want_open_ws = true;
                 }
+
+                // Resize hot-zones for the parts of the window's border that live in this column:
+                // the whole left edge and the bottom-left corner (the drawer is a full-height
+                // column, and the top row is an `Area` that stops at this column's right edge).
+                // `ui.interact` is clipped to the panel's rect, so this call and the two in
+                // `titlebar` / the central panel add up to exactly the eight zones -- see
+                // `titlebar`.
+                gwin::resize_handles(ui, ctx, ctx.content_rect());
             });
         // The drawer's only chrome: one hairline down the full height, painted from the panel's own
         // rect (so it lands on the moving edge for the whole animation) and **after** the content,
@@ -2748,106 +2771,192 @@ impl App {
 
     // ─────────────────────────── painting ───────────────────────────
 
-    /// The row of buttons floating above the transcript -- the old top bar (the panel itself
-    /// was removed on 2026-10-04).
+    /// The window's top row: four controls that **float on the content**, not on a bar.
     ///
-    /// The positions are lifted pixel for pixel from what the old top bar worked out to:
-    /// `(20, 7)` at the top-left, 20 in from the right as well, with a 36px hot zone, so the
-    /// button centre is y = 25 = the midline of the old 50px bar.
+    /// # Why the bar is ours
     ///
-    /// Each button carries its own backdrop ([`P::panel`], which is the old top bar's fill), so
-    /// they don't smear into the transcript text behind them. Hover raises the backdrop one step
-    /// (`surface_hi`), the same hover language as list rows and menu rows.
+    /// Until 2026-10-18 the top of this window was two strips stacked on each other: the native
+    /// caption (empty since 2026-10-04 — no title, only the system buttons, dyed to `P::bg()` so it
+    /// read as background) and, inside the content area, a row of floating controls. Both were
+    /// background-coloured, neither was quite "the window bar", and the independent windows
+    /// (`activity`, `cache`, `wsview`) meanwhile drew a better shape: a bar that is *part of* the
+    /// window rather than a strip above it.
     ///
-    /// One thing differs from the old top bar: "new conversation" and "settings" are not here at
-    /// all. Both live **inside** the drawer (its "new conversation" button and its head's gear),
-    /// which is the only place they can be reached from once the drawer owns this corner -- and
-    /// the drawer owns it whenever it is open.
+    /// So the caption is gone (`with_decorations(false)` in `main.rs`) and the row is drawn here,
+    /// to the same measurements as [`gwin::header`]: same 32x28 buttons, same hover language, same
+    /// drag and double-click-to-maximize, same 1px outline ([`gwin::outline`]) and same DWM rounded
+    /// corners (`theme::round_corners`). The one thing it does **not** carry is the pin: the main
+    /// window is not something you keep on top of anything.
     ///
-    /// What is left is the history toggle (only while the drawer is shut) and the status / token
-    /// chip, which steps out of the drawer's column by its width.
+    /// # Why it is an `Area` and not a panel
     ///
-    /// **The three on the top-right (activity stream / theme / about) have all been removed**
-    /// (user request, 2026-10-05); each moved into the settings dialog: activity stream ->
-    /// "Extra", theme -> "Appearance", about -> "About".
-    fn toolbar(&mut self, ctx: &egui::Context) {
-        let mut toggle_hist = false;
-        let ease = ease_out_cubic(self.hist_t);
+    /// A `TopBottomPanel` reserves a full-width strip and paints it. On the plain background that is
+    /// invisible; on the **first screen's background image** it cuts the picture off 52 points down,
+    /// and the image then reads as "content under a bar" instead of as the window's own paper. An
+    /// `Area` on the `Foreground` layer reserves nothing: the picture runs to the top edge and the
+    /// four controls sit on small translucent plates ([`gwin::float_plate`]) that hold their own
+    /// against any photograph.
+    ///
+    /// Nothing is covered by that: the transcript already starts 76 points down (see
+    /// [`App::transcript`]), so the plates never sit on a line of text — which is also why the whole
+    /// strip can stay the drag handle.
+    ///
+    /// # What is on it
+    ///
+    /// - Left: the drawer toggle, **only while the drawer is shut** — the drawer's head carries the
+    ///   same control while it is open ([`sidebar_button`]: one drawing, two places).
+    /// - Then a status pill (dot + text), **only while a turn runs**. It is a pill rather than bare
+    ///   text because it now sits on a picture, and text alone would be unreadable on some of them.
+    /// - Right: minimize / maximize / close, on one plate.
+    ///
+    /// No title **on screen**. The caption lost its "AOX" on 2026-10-04 — the user wanted the top
+    /// edge to be the window's own edge, not a label — and putting the name back would reopen
+    /// exactly that. The *system* title is "AOX" (see `main.rs`): the window is undecorated, so it
+    /// is never painted, but it is what the taskbar and Alt-Tab call this window.
+    ///
+    /// "New conversation" and "settings" are still **not** here: both live inside the drawer, the
+    /// only place they can be reached from once the drawer owns that corner.
+    fn titlebar(&mut self, ctx: &egui::Context) {
+        let mut toggle = false;
+        let full = ctx.content_rect();
+        // The row starts where the drawer ends — on the same eased clock the panel itself runs on,
+        // so it travels with the column instead of jumping when the animation lands. While the
+        // drawer is shut the offset is zero and the row spans the window.
+        let bar_x = HISTORY_W * ease_out_cubic(self.hist_t);
+        let strip = Rect::from_min_max(
+            Pos2::new(full.left() + bar_x, full.top()),
+            Pos2::new(full.right(), full.top() + TITLEBAR_H),
+        );
+        // Mid-animation the column can be a few points wide; a row that cannot hold two plates is
+        // not worth drawing (and would paint its plates off the right edge).
+        if strip.width() < 4.0 * PLATE {
+            return;
+        }
 
-        // ── top-left: the sidebar toggle, **only** while the drawer is shut ──
-        //
-        // 🚨 Exactly one widget in this Area, and nothing else. An interactable `Area` blocks the
-        // layers below it, and this one lives in the same corner the drawer's head does: the token
-        // chip used to sit in this row after an `add_space(HISTORY_W)`, so the Area's rect
-        // stretched right across the drawer head -- and the moment a conversation had a token
-        // count, both head buttons stopped answering the pointer. "Clicked the button and nothing
-        // happened" was this. The chip is now in the input box's corner (see `usage_chip`), which
-        // is where the user wanted the number anyway.
-        if self.hist_t <= 0.0 {
-            egui::Area::new(egui::Id::new("aox-bar-left"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(Pos2::new(BAR_LEFT, BAR_TOP))
-                .constrain_to(loose_rect())
-                .show(ctx, |ui| {
-                    if sidebar_button(ui, false, true).clicked() {
-                        toggle_hist = true;
+        egui::Area::new(egui::Id::new("aox-titlebar"))
+            .order(egui::Order::Foreground)
+            .movable(false)
+            .fixed_pos(strip.min)
+            .show(ctx, |ui| {
+                // Everything this ui *touches* must stay inside the strip, input included. The
+                // eight resize zones are computed from the window rect, and this layer wins the hit
+                // test over the panels below it — unclipped, its two zones would claim the whole
+                // left edge and the whole bottom edge as well.
+                ui.set_clip_rect(strip);
+                // The whole strip is the window's drag handle. The plates are declared after it,
+                // and later-declared widgets win the hit test, so they still answer the pointer.
+                let (rect, resp) = ui.allocate_exact_size(strip.size(), Sense::click_and_drag());
+                // `StartDrag` has to go out on the **very frame** of the press, or the window lags
+                // behind the pointer for the whole drag.
+                if resp.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                // Double-clicking a title bar maximizes — the system did that for us until the
+                // caption went away. (It is also why this strip senses clicks, not just drags.)
+                if resp.double_clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maxed));
+                }
+
+                // ── left: the drawer toggle, only while the drawer is shut ──
+                if self.hist_t <= 0.0 {
+                    let plate = Rect::from_center_size(
+                        Pos2::new(rect.left() + TITLEBAR_INSET + PLATE * 0.5, rect.center().y),
+                        Vec2::splat(PLATE),
+                    );
+                    gwin::float_plate(ui.painter(), plate, gwin::FLOAT_R, false);
+                    // A child ui rather than `ui.scope_builder`: the strip has already been
+                    // allocated in full, and a scope would allocate its own button a second time —
+                    // below the strip, outside the Area.
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(plate.shrink(1.0)));
+                    // `floating = false`: the plate is the background now, and the button's own
+                    // hover fill (a step above the plate) is the whole hover language here.
+                    if sidebar_button(&mut child, false, false).clicked() {
+                        toggle = true;
                     }
-                });
-        }
+                }
 
-        // ── the running status: a readout, not a control ──
-        //
-        // `interactable(false)` is load-bearing. With the drawer open this plate sits just past
-        // its edge, and an interactable Area there would claim the pointer for every widget it
-        // happens to overlap. Nothing inside can be clicked, so there is nothing to lose by
-        // declaring it inert.
-        //
-        // It steps out of the drawer's column by exactly its width, on the same eased clock --
-        // otherwise the plate would jump across the moment the drawer finished opening.
-        if self.busy {
-            let x = BAR_LEFT + BAR_BTN + 8.0 + HISTORY_W * ease;
-            egui::Area::new(egui::Id::new("aox-bar-status"))
-                .order(egui::Order::Foreground)
-                .interactable(false)
-                .fixed_pos(Pos2::new(x, BAR_TOP))
-                .constrain_to(loose_rect())
-                .show(ctx, |ui| {
-                    Frame::NONE
-                        .fill(P::panel())
-                        .corner_radius(CornerRadius::same(10))
-                        .inner_margin(Margin::symmetric(12, 6))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(&self.status).color(P::text()).size(14.0));
-                                ui.add_space(7.0);
-                                // Working time, same basis as every other readout (see [`Clock`])
-                                // -- otherwise the number here would keep climbing while the model
-                                // sits waiting on the user.
-                                let secs = self
-                                    .live
-                                    .as_ref()
-                                    .map_or(0.0, |l| (self.now() - l.turn_base).max(0.0));
-                                ui.label(
-                                    RichText::new(format!("{secs:.1}s"))
-                                        .color(P::text_faint())
-                                        .size(13.5),
-                                );
-                                // The running token count used to live here. It moved into the
-                                // input box with the rest of the usage readouts: one place for
-                                // "what has this conversation cost", and it is the place the
-                                // pointer already is when the number matters.
-                            });
-                        });
-                });
-        }
+                // ── the running status: a readout, not a control ──
+                if self.busy {
+                    // Working time, same basis as every other readout (see [`Clock`]) -- otherwise
+                    // the number here would keep climbing while the model sits waiting on the user.
+                    let secs = self
+                        .live
+                        .as_ref()
+                        .map_or(0.0, |l| (self.now() - l.turn_base).max(0.0));
+                    let galley = ui.painter().layout_no_wrap(
+                        format!("{} · {:.1}s", self.status, secs),
+                        FontId::proportional(13.0),
+                        P::text_dim(),
+                    );
+                    let pill = Rect::from_min_size(
+                        Pos2::new(rect.left() + STATUS_X, rect.center().y - STATUS_H * 0.5),
+                        Vec2::new(STATUS_PAD * 2.0 + STATUS_DOT_GAP + galley.size().x, STATUS_H),
+                    );
+                    gwin::float_plate(ui.painter(), pill, 9, false);
+                    let pulse = ((self.spin * 2.0) as i32) % 2 == 0;
+                    let dot = Pos2::new(pill.left() + STATUS_PAD + 4.0, pill.center().y);
+                    ui.painter().circle_filled(
+                        dot,
+                        4.0,
+                        if pulse { P::ink() } else { P::ink_soft() },
+                    );
+                    ui.painter().galley(
+                        Pos2::new(dot.x + STATUS_DOT_GAP, pill.center().y - galley.size().y * 0.5),
+                        galley,
+                        P::text_dim(),
+                    );
+                }
 
-        if toggle_hist {
+                // ── right: minimize / maximize / close, one plate each ──
+                //
+                // Laid out right-to-left exactly as [`gwin::header`] does it, so the two windows
+                // put their buttons in the same places. **Three plates, not one**: a single plate
+                // holding all three reads as a toolbar of segmented buttons, which is a heavier
+                // object than this row is -- each of these is one button, and at this size the
+                // separate chips are also easier to hit.
+                let plate_at = |cx: f32| {
+                    Rect::from_center_size(Pos2::new(cx, rect.center().y), Vec2::splat(PLATE))
+                };
+                let mut cx = rect.right() - TITLEBAR_INSET - PLATE * 0.5;
+                let close = plate_at(cx);
+                gwin::float_plate(ui.painter(), close, gwin::FLOAT_R, false);
+                if gwin::win_button(ui, close.shrink(1.0), "close", gwin::Glyph::Close) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                cx -= PLATE + WBTN_GAP;
+                let max = plate_at(cx);
+                gwin::float_plate(ui.painter(), max, gwin::FLOAT_R, false);
+                if gwin::win_button(ui, max.shrink(1.0), "max", gwin::Glyph::Max { on: maxed }) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maxed));
+                }
+                cx -= PLATE + WBTN_GAP;
+                let min = plate_at(cx);
+                gwin::float_plate(ui.painter(), min, gwin::FLOAT_R, false);
+                if gwin::win_button(ui, min.shrink(1.0), "min", gwin::Glyph::Min) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+
+                // Resize hot-zones: the top edge and the two upper corners live in this ui's clip
+                // rect. The drawer and the central column call this too, with the same full-window
+                // rect — each `ui.interact` is clipped to its own ui, so the three calls together
+                // cover all eight zones.
+                gwin::resize_handles(ui, ctx, full);
+            });
+
+        if toggle {
             self.show_history = !self.show_history;
             if self.show_history {
                 self.refresh_history();
             }
             // Nothing is written here: the drawer is not a persisted preference (see
             // `save_fold_state`), so opening it costs no disk write at all.
+            //
+            // The drawer has already been drawn by the time this row runs (it is declared first),
+            // so the flip needs one more pass to show — and an idle window doesn't repaint on its
+            // own. One request is enough: from the next pass on, the drawer's own animation keeps
+            // the frames coming.
+            ctx.request_repaint();
         }
     }
 
@@ -4443,12 +4552,13 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        self.toolbar(ctx);
-
         if self.native_theme != Some(theme::mode()) {
             self.native_theme = Some(theme::mode());
             theme::sync_native_theme(ctx);
             theme::sync_caption(frame);
+            // The caption used to hand us rounded corners for free; with it gone the system has to
+            // be asked, or the window goes square (and loses its shadow with the corners).
+            theme::round_corners(frame);
         }
 
         // The drawer has to be declared **before** the central panel: a side panel is what tells the
@@ -4459,7 +4569,16 @@ impl eframe::App for App {
         // Once `hist_t` reaches zero it stops drawing itself, so **don't** additionally test
         // `show_history` here -- the collapsing has to keep being drawn, and testing the toggle
         // would make the panel vanish mid-way.
+        //
+        // **Before the title bar too** (2026-10-18). A `TopBottomPanel` declared first would take a
+        // full-width strip off the top, and the drawer would start 52 points down -- the column's
+        // top edge visibly cut off by a bar that is the same colour as the background, which is
+        // exactly what the user saw. Declared first, the drawer keeps the window's full height and
+        // the bar only spans the column to its right; the two together still read as one row.
         self.drawer(ctx);
+        // The bar is declared after the drawer, so it owns the top strip of what is left of the
+        // window -- the drawer's own head is the left end of the same row.
+        self.titlebar(ctx);
         // The activity stream lives in its own window: the main window syncs "what is happening
         // right now" over every frame and re-declares that viewport (egui viewports are
         // declarative; one that isn't declared gets reclaimed).
@@ -4529,6 +4648,12 @@ impl eframe::App for App {
                     ui.set_width(column_rect.width());
                     self.composer(ui);
                 });
+
+            // The last of the three calls that together bury the eight border hot-zones: this one
+            // owns the right edge, the bottom edge and the two right-hand corners. Declared after
+            // everything else in the column so it beats the transcript and the scrollbar at the
+            // outermost few pixels.
+            gwin::resize_handles(ui, ctx, ctx.content_rect());
         });
 
         // The workplace's three overlays: the three-way pop-up list, the full-access
@@ -4553,6 +4678,19 @@ impl eframe::App for App {
         // happened, and being hidden behind a card that is asking a question would lose exactly the
         // moment it was needed.
         self.toast_overlay(ctx);
+
+        // The window has no system frame any more, so the 1px seam against the desktop is ours to
+        // draw — the same stroke the independent windows use (`gwin::outline`). It has to come
+        // **after** every panel: the central panel's fill would otherwise cover the left and top
+        // edges, and it has to be a layer of its own because each panel clips its own painting.
+        let full = ctx.content_rect();
+        gwin::outline_painter(
+            &ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Debug,
+                egui::Id::new("aox-window-frame"),
+            )),
+            full,
+        );
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -4607,13 +4745,12 @@ const COMPOSER_RESERVE: f32 = 118.0;
 /// go further back, both `/history` and the `history/` directory are there.
 const HISTORY_LIST_LIMIT: usize = 80;
 
-// ────────────── geometry of the floating button row and the history overlay ──────────────
+// ────────────── geometry of the title bar and the history drawer ──────────────
 //
 // These numbers used to be scattered across two places: the buttons' landing spots lived in
 // `top_bar`'s `exact_height(50)` + `Margin::symmetric(20, 0)`, and the history column's width
 // lived in `SidePanel::default_width(266)`. With both the top bar and the side column removed they
-// have no "container" to lean on, so they are pinned explicitly here -- the positions are lifted
-// from the pre-removal result, pixel for pixel unchanged.
+// have no "container" to lean on, so they are pinned explicitly here.
 
 /// The context window assumed when `[provider] context_window` is not set.
 ///
@@ -4621,8 +4758,6 @@ const HISTORY_LIST_LIMIT: usize = 80;
 /// misleading percentage and nothing else. 128K is the floor of what the endpoints this app targets
 /// advertise; a provider with a smaller window should say so in `config.toml`.
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
-/// Distance from the button row to the window's **left** edge.
-const BAR_LEFT: f32 = 20.0;
 /// The top-left button's hot zone (and the drawer head's, which shares the same drawing).
 ///
 /// 32 rather than the 36 this used to be: the drawer's head icons are 32 so that the whole row
@@ -4630,9 +4765,33 @@ const BAR_LEFT: f32 = 20.0;
 /// of [`sidebar_button`] — the floating button and the in-panel one have to look like the same
 /// control.
 const BAR_BTN: f32 = 32.0;
-/// Distance from the button row to the window's top edge. `7 + 16 = 23` keeps the button's centre
-/// on the same line the old 50px top bar put it on, within a pixel.
-const BAR_TOP: f32 = 7.0;
+/// Height of the top row's strip — the band that drags the window and holds the plates.
+///
+/// It is **not** a reserved panel: nothing is cut out of the column, the background image simply
+/// runs underneath. 52 keeps the row on the same line the old bar had, and the transcript's own
+/// 76-point top padding (see [`App::transcript`]) is what keeps text out of it.
+const TITLEBAR_H: f32 = 52.0;
+/// Distance from the strip's edge to its first plate — the same 10 [`gwin::header`] leaves at the
+/// far right, so the two windows are framed by the same margin.
+const TITLEBAR_INSET: f32 = 10.0;
+/// The square plate a single button floats on: [`BAR_BTN`] plus one point of breathing on each
+/// side, so the button's hover fill never touches the plate's hairline.
+const PLATE: f32 = 34.0;
+/// Gap between two **separate** floating window buttons: wide enough that they read as three
+/// buttons rather than as one segmented strip, narrow enough that they still belong together.
+const WBTN_GAP: f32 = 6.0;
+/// Left edge of the status pill, measured from the strip's left edge.
+///
+/// Fixed rather than "after whatever was drawn before": the pill is drawn whether or not the drawer
+/// toggle occupies the slot before it, so opening the drawer can't make the readout jump.
+const STATUS_X: f32 = 52.0;
+/// Height of the status pill — [`PLATE`] minus 6, so a readout is visibly lighter than a control.
+const STATUS_H: f32 = 28.0;
+/// Breathing room inside the status pill.
+const STATUS_PAD: f32 = 12.0;
+/// From the busy dot's centre to the status text's left edge — the same 9 [`gwin::header`] leaves
+/// between its dot and its title.
+const STATUS_DOT_GAP: f32 = 9.0;
 /// Width of the history drawer.
 ///
 /// 300: the drawer is a **full-height column**, not a card with a list in it, so it is sized like a
@@ -4679,21 +4838,8 @@ fn ease_out_cubic(t: f32) -> f32 {
     1.0 - u * u * u
 }
 
-/// A constraint rect that is "much bigger than the window": for the `Area`s that need to slide
-/// outside it.
-///
-/// An `Area` pulls its position back inside the constraint rect by default, which flattens the
-/// slide-out offset on the spot, so those places have to release it. **But don't use
-/// `Rect::EVERYTHING`** -- it is ±infinity inside, and as soon as it takes part in something like
-/// anchor alignment the position becomes NaN or infinite and the Area disappears entirely (the
-/// top-right button row ran into this once). Hand it a finite, roomy box: same effect, and no
-/// absurd numbers come out of it.
-fn loose_rect() -> Rect {
-    Rect::from_min_max(Pos2::new(-10_000.0, -10_000.0), Pos2::new(10_000.0, 10_000.0))
-}
-
-/// The sidebar toggle — **one control in two places**: the button floating at the window's
-/// top-left while the drawer is shut, and the same button in the drawer's head while it is open.
+/// The sidebar toggle — **one control in two places**: the button in the window's title bar while
+/// the drawer is shut, and the same button in the drawer's head while it is open.
 ///
 /// Sharing the drawing is the point. The two used to be different glyphs (a rule with three lines
 /// floating over the transcript, a panel outline inside the panel) at different sizes with

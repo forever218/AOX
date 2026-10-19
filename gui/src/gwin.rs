@@ -435,9 +435,15 @@ pub fn resize_handles(ui: &mut Ui, ctx: &egui::Context, full: Rect) {
     let zones = resize_zones(full);
     // The cursor must change on **hover** (without waiting for press), otherwise the user has no
     // idea this is draggable.
+    //
+    // Gated on what this `ui` can actually reach: `interact` clips its rect to the ui's clip rect,
+    // so a zone that lies mostly outside it is dead — and promising a resize cursor over a dead
+    // zone is worse than showing the arrow. (The main window splits the eight zones over three
+    // uis, each clipped to its own panel.)
+    let clip = ui.clip_rect();
     let hover = ctx.input(|i| i.pointer.hover_pos());
     if let Some(p) = hover {
-        if let Some((_, _, d)) = zones.iter().find(|(_, r, _)| r.contains(p)) {
+        if let Some((_, _, d)) = zones.iter().find(|(_, r, _)| r.intersect(clip).contains(p)) {
             ctx.set_cursor_icon(resize_cursor(*d));
         }
     }
@@ -493,10 +499,44 @@ fn resize_cursor(d: ResizeDirection) -> CursorIcon {
 /// DWM, and drawing square corners here would leave the corner few pixels of border clipped,
 /// producing a square break in the corner.
 pub fn outline(ui: &Ui, full: Rect) {
-    ui.painter().rect_stroke(
+    outline_painter(ui.painter(), full);
+}
+
+/// [`outline`] without a `Ui`, for a caller that has to paint the frame **after** its own panels
+/// have finished (the main window: the central panel's fill would cover a stroke drawn earlier).
+pub fn outline_painter(painter: &egui::Painter, full: Rect) {
+    painter.rect_stroke(
         full.shrink(0.5),
         CornerRadius::same(CORNER_RADIUS),
         Stroke::new(1.0, P::border_strong()),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// Corner radius of a [`float_plate`] — one step rounder than a button's 8, because the plate is
+/// the outer shape and has to look like it, not like a button that happens to be big.
+pub const FLOAT_R: u8 = 10;
+
+/// The plate under a control that floats **directly on the content** instead of on a bar.
+///
+/// The main window has no title bar strip any more (see `App::titlebar`): the first screen's
+/// background image runs all the way to the top edge, so the four controls have to hold their own
+/// against a photograph. A **translucent** surface plus the raised hairline is exactly the pair the
+/// hover state already uses — which is the point: at rest a plate looks like a hovered button, so
+/// "these are controls" is read from the same language as everywhere else in the app.
+///
+/// `hot` paints the solid hover fill (used by the one plate that is a single button); a plate that
+/// holds several buttons stays at rest and lets each of them hover on its own.
+pub fn float_plate(painter: &egui::Painter, r: Rect, radius: u8, hot: bool) {
+    painter.rect_filled(
+        r,
+        CornerRadius::same(radius),
+        if hot { P::surface_hi() } else { P::float_fill() },
+    );
+    painter.rect_stroke(
+        r,
+        CornerRadius::same(radius),
+        Stroke::new(1.0, P::edge_raised()),
         egui::StrokeKind::Inside,
     );
 }
@@ -621,6 +661,13 @@ pub fn header(ui: &mut Ui, ctx: &egui::Context, gw: &mut Gwin, title: &str, info
     if resp.drag_started() {
         ctx.send_viewport_cmd(ViewportCommand::StartDrag);
     }
+    // Double-clicking a title bar maximizes: the system used to do it for us, and it is the one
+    // gesture people try without being taught. (It is also why this bar senses clicks as well as
+    // drags — egui only reports `double_clicked` on a widget that senses clicks.)
+    let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+    if resp.double_clicked() {
+        ctx.send_viewport_cmd(ViewportCommand::Maximized(!maxed));
+    }
 
     // Left: breathing dot + title + current state
     let pulse = ((gw.spin * 2.0) as i32) % 2 == 0;
@@ -673,7 +720,6 @@ pub fn header(ui: &mut Ui, ctx: &egui::Context, gw: &mut Gwin, title: &str, info
     x -= BW + GAP;
     // The maximized state must be asked for actively — this window is self-managed now, and nobody
     // remembers whether it is maximized for us.
-    let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
     if win_button(ui, btn(x), "max", Glyph::Max { on: maxed }) {
         ctx.send_viewport_cmd(ViewportCommand::Maximized(!maxed));
     }

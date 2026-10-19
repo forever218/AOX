@@ -88,18 +88,29 @@ fn main() -> eframe::Result<()> {
         Some(bridge::spawn(from_agent_tx, to_agent_rx, flags.clone()))
     };
 
-    // Leave the title empty (user request, 2026-10-04): the native title bar no longer says "AOX",
-    // so it holds only the system buttons — the same base color as the main UI, so no "bar" is
-    // discernible.
+    // **No system decorations** (2026-10-18): the caption used to be a *second* top strip — an
+    // empty, `P::bg()`-dyed native bar holding only the system buttons, sitting above a floating
+    // row of our own controls inside the content area. Two bars, both the colour of the background,
+    // neither quite "the window bar". Now the main window draws its own bar exactly the way the
+    // independent windows do (`gwin`): drag, minimize / maximize / close, 1px outline, DWM rounded
+    // corners — all rebuilt in `App::titlebar`. See the note there for the full story.
+    //
+    // The **system title** is "AOX" even though the bar shows no label: the window is undecorated,
+    // so the string is never drawn anywhere — it is what the taskbar, Alt-Tab, the window list and
+    // any accessibility tool call this window by, and an empty title there left the main window as
+    // the one nameless entry next to "AOX Activity Stream" / "AOX Workspace". (The on-screen bar
+    // still carries no "AOX": that part of the 2026-10-04 request is unchanged — the bar *is* the
+    // app's top edge, not a label.)
     //
     // The icon must be **given explicit pixels** (`brand::window_icon` has the full story): without
     // it eframe installs its own "e", and the route of "pass an empty icon and let Windows use the
-    // exe resource" doesn't work either (winit installs the empty icon for real, and the title bar
-    // paints a system generic icon).
+    // exe resource" doesn't work either (winit installs the empty icon for real, and the taskbar /
+    // Alt-Tab would paint a system generic icon).
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("")
+            .with_title("AOX")
             .with_icon(brand::window_icon())
+            .with_decorations(false)
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([1000.0, 640.0]),
         ..Default::default()
