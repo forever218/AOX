@@ -202,7 +202,14 @@ impl AgentLoop for StandardLoop {
             //    **not** `&mut messages`: the only write path for messages is `push_message` (which
             //    also writes the file), and handing out a bare Vec makes "in memory but not in the
             //    history file" a certainty within a minute.
-            let mut req = hook::Request { tools: rt.tool_schemas().await, inject: Vec::new() };
+            //    ⚠️ The list is **scoped**, not the whole registry (`tool::scope`): once the registry
+            //    is longer than `[tools] inline_max`, plugin tools stay out until they are discovered.
+            //    Gating happens **before** the hook so a hook can still add to the list; gating after
+            //    it would silently drop whatever the hook added.
+            let mut req = hook::Request {
+                tools: rt.tool_schemas_scoped(agent.tool_scope()).await,
+                inject: Vec::new(),
+            };
             if let Verdict::Reject(why) = rt.hooks.before_request(&rt, &mut req).await {
                 bail!(crate::tf!("this round's request was blocked by a host hook: {}", why));
             }
@@ -211,10 +218,20 @@ impl AgentLoop for StandardLoop {
             }
             let schemas = req.tools;
 
+            // ── Context compaction (see `crate::compact`) ──
+            //    Judged here rather than once per turn: every round pushes tool results into the
+            //    context, so "was it too big" has to be asked again before every call.
+            //    `None` means "nothing to do" and the request goes out exactly as `agent.messages()`
+            //    says — the byte-stability that keeps the prompt cache warm.
+            let view = crate::compact::prepare(agent, ui, &schemas).await;
+            let body: &[Message] = view.as_deref().unwrap_or_else(|| agent.messages());
+
             // Show the UI what this request is made of (see `Ui::context_map`). Before the call and
             // not after: the reply's usage figures get attributed to these sections, and once the
             // reply is in, the body that produced it is no longer around to measure.
-            let sections = agent.context_sections(&schemas);
+            // Measured on `body`, not on the full history: after compaction they differ, and a map
+            // that describes a request nobody sent is worse than no map.
+            let sections = agent.context_sections(body, &schemas);
             ui.context_map(&sections).await;
 
             ui.set_status(crate::i18n::t("Thinking")).await;
@@ -224,7 +241,7 @@ impl AgentLoop for StandardLoop {
             // otherwise the `&mut agent` that `push_message` needs below would conflict.
             let chat = {
                 let sink = ui.stream_sink();
-                agent.llm().chat(agent.messages(), &schemas, sink.as_deref()).await
+                agent.llm().chat(body, &schemas, sink.as_deref()).await
             };
             let reply = match chat {
                 Ok(r) => r,
@@ -417,6 +434,19 @@ impl AgentLoop for StandardLoop {
                 if let Verdict::Reject(why) = rt.hooks.after_tool(&rt, &name, &mut output).await {
                     output = ToolOutput::err(why);
                 }
+                // ── Evidence for the task checkpoint ──
+                // Read **before** `output.path` is moved into the event below. Only a tool that really
+                // wrote a file fills this field, so `modified_files` stays host-verified: the model
+                // cannot claim a file it did not touch. A no-op when this conversation has no
+                // checkpoint (see `crate::task`), and after `after_tool` so a blocked result — whose
+                // `path` was just dropped — is not recorded.
+                if let Some(p) = &output.path {
+                    agent.note_modified_file(p);
+                }
+                // ── What this tool really said ──
+                // Kept for `verify`'s `output_contains`: the check may only cite text a tool produced,
+                // never text the model remembers. Taken before `content` is moved into the message.
+                agent.note_tool_output(&output.content);
                 ui.emit(AgentEvent::ToolResult {
                     name: name.clone(),
                     is_error: output.is_error,

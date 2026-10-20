@@ -10,6 +10,13 @@ use super::{Tool, ToolKind, ToolOutput};
 use crate::plugin;
 use crate::runtime::Runtime;
 
+/// Plugin-building tool names, exported because the **agent** has to recognise them by name: after a
+/// successful `create_plugin` / `update_plugin` the plugin's tools are advertised immediately
+/// (`Agent::authorize_and_execute` calls `Scope::enable` on each), which requires matching the call
+/// that just happened. One constant per name keeps that check from drifting away from `name()`.
+pub const CREATE_TOOL: &str = "create_plugin";
+pub const UPDATE_TOOL: &str = "update_plugin";
+
 pub fn meta_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(CreatePluginTool),
@@ -26,7 +33,7 @@ struct CreatePluginTool;
 #[async_trait]
 impl Tool for CreatePluginTool {
     fn name(&self) -> &str {
-        "create_plugin"
+        CREATE_TOOL
     }
     fn kind(&self) -> ToolKind {
         ToolKind::Meta
@@ -78,7 +85,7 @@ struct UpdatePluginTool;
 #[async_trait]
 impl Tool for UpdatePluginTool {
     fn name(&self) -> &str {
-        "update_plugin"
+        UPDATE_TOOL
     }
     fn kind(&self) -> ToolKind {
         ToolKind::Meta

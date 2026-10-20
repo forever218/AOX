@@ -71,6 +71,42 @@ pub struct Agent {
     /// this is what lets [`Agent::refresh_system_prompt`] rebuild the prompt **only when it actually
     /// changed** — otherwise the model keeps believing it is still in the previous directory.
     prompt_ws: PathBuf,
+    /// The current task checkpoint (`crate::task`), when this conversation has one.
+    ///
+    /// `None` is the normal state for a one-off question or a single-file edit: the host never invents
+    /// a checkpoint, so "no checkpoint" costs nothing at all.
+    task: Option<crate::task::TaskState>,
+    /// The checkpoint **as last written to the file**, for "write only when it really changed".
+    ///
+    /// Without it every turn would append a `kind:"task"` row (the state is rebuilt/compared each
+    /// turn), and a long conversation would accumulate hundreds of identical records. `None` = nothing
+    /// persisted yet in this conversation's current incarnation.
+    task_saved: Option<crate::task::TaskState>,
+    /// The last compacted request body (`crate::compact`), with its watermark.
+    ///
+    /// A **cache, not state**: `messages` stays the full conversation and remains what gets written
+    /// to disk. It exists so one turn's tool loop, which calls the model many times over the same
+    /// message list, does not re-summarize the same prefix on every round.
+    view_cache: Option<crate::compact::ViewCache>,
+    /// Whether the "cannot get under the budget by folding history" warning has already been shown
+    /// for this conversation. It is a **config** problem (the budget is below the fixed part), so
+    /// repeating it on every round would be noise, and there is nothing the user can do from here
+    /// except change the config or start a new conversation.
+    compact_warned: bool,
+    /// Which tools this conversation is **advertising** (see [`crate::tool::scope`]).
+    /// Per conversation, not per runtime: the runtime's registry is shared by every conversation and
+    /// every UI, whereas "which of those tools I have discovered" is part of what this conversation
+    /// knows. Reset when the conversation changes; never persisted — it is a projection, the same
+    /// kind of thing as `view_cache`, and a resumed conversation can ask `find_tools` again.
+    tool_scope: crate::tool::scope::Scope,
+    /// The **tail of the last tool result** the host saw, kept for `verify`'s `output_contains`.
+    ///
+    /// The whole point of that check is "the text came from a tool, not from the model", so the host
+    /// has to keep a copy of what it actually received. Only the tail is kept: test summaries and
+    /// exit statuses live there, and a full copy of every result would double the memory this
+    /// conversation already costs. Cleared with the conversation, never persisted (it is a buffer,
+    /// not state — after a resume there is nothing to check anyway).
+    last_output: Option<String>,
 }
 
 /// The workspace root that should appear in the system prompt.
@@ -93,6 +129,10 @@ impl Agent {
         // Remember which workspace that prompt names, so `refresh_system_prompt` can tell when it
         // has gone stale (see the `prompt_ws` field docs).
         let prompt_ws = prompt_workspace_root(&rt);
+        // Built before `rt` is moved into `Self` below. The scope starts from `[tools]` only; the
+        // "is the list too long to send whole" decision is made per request against the live
+        // registry size (see `Runtime::tool_schemas_scoped`), so nothing here can go stale.
+        let tool_scope = crate::tool::scope::Scope::from_config(&rt.config.tools);
         Self {
             llm,
             rt,
@@ -105,6 +145,12 @@ impl Agent {
             workplace_logged: None,
             turn: TurnAcc::default(),
             prompt_ws,
+            task: None,
+            task_saved: None,
+            view_cache: None,
+            compact_warned: false,
+            tool_scope,
+            last_output: None,
         }
     }
 
@@ -240,6 +286,10 @@ impl Agent {
     /// cache-hit window (`gui/cache.rs`) walks this list to attribute the real `prompt` / `cached`
     /// figures back to the sections they came from.
     ///
+    /// `msgs` is the **body actually going out**, not necessarily `self.messages`: once the context is
+    /// compacted (`crate::compact`) the request is a projection of the conversation, and measuring the
+    /// full history here would draw a gauge that describes a request nobody sent.
+    ///
     /// The estimate follows [`TokenEstimate`]'s rule (about 4 ASCII characters per token, 1 token
     /// per CJK character). That is good enough for proportions and is **never quoted as a total** —
     /// the exact number comes back from the provider and replaces it on screen.
@@ -247,7 +297,7 @@ impl Agent {
     /// The order is the order the sections occupy in the request body, and it is load-bearing: a
     /// prefix cache hit covers the earliest tokens first, so where a section sits decides how much
     /// of the hit belongs to it.
-    pub fn context_sections(&self, schemas: &[Value]) -> Vec<(&'static str, u64)> {
+    pub fn context_sections(&self, msgs: &[Message], schemas: &[Value]) -> Vec<(&'static str, u64)> {
         fn est(s: &str) -> u64 {
             let mut e = TokenEstimate::default();
             e.add(s);
@@ -255,7 +305,7 @@ impl Agent {
         }
 
         let mut out: Vec<(&'static str, u64)> = Vec::new();
-        let mut rest: &[Message] = &self.messages;
+        let mut rest: &[Message] = msgs;
 
         // The system prompt is messages[0] whenever it is present (see `refresh_system_prompt`).
         if rest.first().is_some_and(|m| m.role == "system") {
@@ -364,6 +414,33 @@ impl Agent {
             }
             None => None,
         };
+        // The task checkpoint travels with the conversation (see `crate::task`). A file written before
+        // checkpoints existed simply has no such row, and an unreadable one degrades to `None` — this
+        // line must never be able to fail a resume.
+        self.task = self.rt.store.load_task(id).and_then(|v| crate::task::TaskState::from_value(&v));
+        // Aligned to the file's state, so "nothing changed" really writes nothing this turn.
+        self.task_saved = self.task.clone();
+        // A different conversation means a different message list; any compacted view belongs to the
+        // old one. Cheap to drop, and the first request will rebuild it if it is needed.
+        self.view_cache = None;
+        self.compact_warned = false;
+        // A different conversation means a different set of tools "already discovered". The config's
+        // pinned names survive (`Scope::reset` only clears what this conversation turned on).
+        self.tool_scope.reset();
+        // The output buffer belongs to the conversation that produced it; evidence about "what the
+        // last tool said" is meaningless after switching away. A check that needs it will simply ask
+        // for a fresh run.
+        self.last_output = None;
+        if let Some(st) = &self.task {
+            // ⚠️ **Memory-only** — see `push_ephemeral`. It is regenerated on every resume, so writing
+            // it into the file would append the same paragraph once per open.
+            let note = crate::tf!(
+                "{} a task checkpoint was restored for this conversation. It says where the work stood when it was written — not what the files look like now.\n\n{}",
+                crate::history::HOST_PREFIX,
+                st.context_block()
+            );
+            self.push_ephemeral(Message::user(note));
+        }
         Ok(items.len())
     }
 
@@ -417,6 +494,17 @@ impl Agent {
         // The new conversation's file isn't created yet; the persisted record is filled in by `persist_workplace` on the first message;
         // here we clear "already persisted" first, so we don't compare against the last conversation's record and miss writing that first message.
         self.workplace_logged = None;
+        // A checkpoint belongs to the conversation it was recorded in. Carrying it into the next one
+        // would tell the model it is still working on the previous task — the exact confusion this
+        // feature exists to prevent.
+        self.task = None;
+        self.task_saved = None;
+        self.view_cache = None;
+        self.compact_warned = false;
+        self.last_output = None;
+        // A different conversation means a different set of tools "already discovered". The config's
+        // pinned names survive (`Scope::reset` only clears what this conversation turned on).
+        self.tool_scope.reset();
     }
 
     /// Drop everything from `len` onward, in memory **and** on disk.
@@ -552,6 +640,10 @@ impl Agent {
         // Take the `Arc` out first: `run` needs `&mut self`, so we can't borrow `loop_impl` from `self` anymore.
         let lp = self.rt.loop_impl.clone();
         let result = lp.run(self, ui).await;
+        // Persist the checkpoint **before** the turn is closed out, and on both success and failure:
+        // "the task died halfway" is precisely the moment the next `resume` needs to know where it got
+        // to. Writes only when something actually changed (see `persist_task`).
+        self.persist_task();
         ui.turn_end().await;
         // Report usage after the waiting animation stops (see `Ui::turn_usage`'s docs).
         // Report it even on error: the tokens were genuinely spent; we can't pretend they weren't just because the task failed.
@@ -633,6 +725,197 @@ impl Agent {
         Some(rec)
     }
 
+    // ───────── Task checkpoint (`crate::task`) ─────────
+
+    /// Which tools this conversation is advertising (see [`crate::tool::scope`]).
+    ///
+    /// Read by the loop once per round, right before the request is assembled: the advertised list
+    /// changes only when the registry grows (a plugin was installed) or the model discovered
+    /// something, so re-deciding per round costs a lock and buys correctness.
+    pub fn tool_scope(&self) -> &crate::tool::scope::Scope {
+        &self.tool_scope
+    }
+
+    /// The current checkpoint, for a front end that wants to show "what this task is about" — and
+    /// for the compaction step, which hands it to the summarizer as facts not to lose.
+    pub fn task(&self) -> Option<&crate::task::TaskState> {
+        self.task.as_ref()
+    }
+
+    /// The last compacted request body, if one is cached (see `crate::compact`).
+    pub fn view_cache(&self) -> Option<&crate::compact::ViewCache> {
+        self.view_cache.as_ref()
+    }
+
+    /// Replace the compacted view. Only `crate::compact` calls this: the cache is keyed by the message
+    /// list it was built from, and a caller that sets it by hand would be asserting a key it cannot know.
+    pub fn set_view_cache(&mut self, cache: Option<crate::compact::ViewCache>) {
+        self.view_cache = cache;
+    }
+
+    /// Whether the "folding cannot help" warning was already shown for this conversation.
+    pub fn compact_warned(&self) -> bool {
+        self.compact_warned
+    }
+
+    /// Mark that warning as shown (see [`Agent::compact_warned`]).
+    pub fn set_compact_warned(&mut self, warned: bool) {
+        self.compact_warned = warned;
+    }
+
+    /// Record a file this turn **really changed**, from the tool result that changed it.
+    ///
+    /// Host-side and unconditional by design: `modified_files` is evidence, so it is taken from
+    /// `ToolOutput::path` (only a tool that actually wrote a file fills it) rather than from anything
+    /// the model says. With no checkpoint the call is a no-op — a one-off edit must not create state.
+    pub fn note_modified_file(&mut self, path: &std::path::Path) {
+        let Some(st) = self.task.as_mut() else { return };
+        st.note_modified(&path.to_string_lossy());
+    }
+
+    /// Keep the tail of the last tool result, for `verify`'s `output_contains`.
+    ///
+    /// Deliberately **not** gated on a checkpoint existing: the buffer is also what makes "run the
+    /// command, then check its output" work for a task that has not been checkpointed yet, and it
+    /// costs one small string. The cap keeps a 20 KB tool result from being mirrored in memory — the
+    /// part worth checking (a summary, an exit status) is at the end.
+    pub fn note_tool_output(&mut self, content: &str) {
+        const TAIL: usize = 8192;
+        let n = content.chars().count();
+        let tail: String = if n <= TAIL {
+            content.to_string()
+        } else {
+            content.chars().skip(n - TAIL).collect()
+        };
+        self.last_output = Some(tail);
+    }
+
+    /// Body of the `verify` tool (intercepted in [`Agent::authorize_and_execute`], same story as
+    /// `task_state`: the evidence belongs to this conversation's checkpoint).
+    ///
+    /// The check itself runs in `crate::tool::verify` — this function only supplies the two things
+    /// the check cannot know by itself (the last tool output, and the workspace epoch it should be
+    /// stamped with) and records the outcome.
+    fn verify_tool(&mut self, args: Value) -> ToolOutput {
+        // Read the buffer **before** borrowing the task: two disjoint fields, so no clone is needed.
+        let last = self.last_output.as_deref();
+        let Some(task) = self.task.as_mut() else {
+            return ToolOutput::err(crate::i18n::t(
+                "this conversation has no task checkpoint, so there is nothing to attach evidence to. Record one first: task_state {goal, acceptance: [...]}, then verify each acceptance item with its 1-based criterion.",
+            ));
+        };
+        let mut check = match crate::tool::verify::run(&args, last, task.epoch) {
+            Ok(c) => c,
+            // "Could not run" is strictly different from "ran and failed": the model has to fix the
+            // arguments (or produce some output first), not the workspace.
+            Err(e) => return ToolOutput::err(crate::tf!("the check did not run: {}", e)),
+        };
+        // The criterion has to point at a real item **before** anything is recorded. An off-by-one
+        // here would otherwise produce evidence that can never justify `done` — the model would
+        // believe it had proof, and the gate would keep saying "never checked".
+        let total = task.acceptance.len();
+        if total == 0 {
+            return ToolOutput::err(crate::i18n::t(
+                "this checkpoint has no acceptance criteria yet, so a check cannot prove anything. Add them with task_state {acceptance: [...]} first.",
+            ));
+        }
+        if check.criterion > total {
+            return ToolOutput::err(crate::tf!(
+                "criterion {} is out of range: this checkpoint has {} acceptance item(s), so the range is 1..={}. Nothing was recorded.",
+                check.criterion,
+                total,
+                total
+            ));
+        }
+        // The host's copy of what the check claims to prove — echoed back below and kept in the row.
+        check.claim = crate::task::clamp(&task.acceptance[check.criterion - 1], crate::task::DETAIL_MAX);
+        let (criterion, kind, ok) = (check.criterion, check.kind.clone(), check.ok);
+        let detail = check.detail.clone();
+        let target = check.target.clone();
+        let claim = crate::task::clamp(&check.claim, 80);
+        task.record(check);
+        let covered = task.covered();
+
+        let verdict = if ok {
+            crate::i18n::t("PASS").to_string()
+        } else {
+            crate::i18n::t("FAIL").to_string()
+        };
+        let mut out = crate::tf!(
+            "check recorded for acceptance #{} \"{}\": {} ({}) — {}\n  {}\n  => evidence {} of {}",
+            criterion,
+            claim,
+            verdict,
+            kind,
+            target,
+            detail,
+            covered,
+            total
+        );
+        out.push_str(if ok {
+            crate::i18n::t(
+                "\nThe host does not judge whether this check proves that criterion — compare the echoed text above with what you actually checked. If they differ, run the check that matches.\nEvidence is now attached to the checkpoint. It expires the moment a file is written, so run all checks after your last edit, then ask for status \"done\".",
+            )
+        } else {
+            crate::i18n::t(
+                "\nA failed check does not stop you, but it does block \"done\": fix the cause and run the check again — a later pass supersedes this failure.",
+            )
+        });
+        ToolOutput::ok(out)
+    }
+
+    /// Append the checkpoint to the conversation file, **only when it differs** from what is already
+    /// recorded there.
+    ///
+    /// Called at the end of a turn (and by the compaction step before it elides history). Not per tool
+    /// call: a checkpoint row is a few hundred bytes to a few KB, and rewriting it after every edit
+    /// would be the "constant disk churn" this feature is supposed to avoid.
+    pub fn persist_task(&mut self) {
+        let Some(st) = &self.task else { return };
+        if self.task_saved.as_ref() == Some(st) {
+            return;
+        }
+        if let Some(log) = self.log.as_mut() {
+            log.append_task(&st.to_value());
+            // Marked saved only after a real write: with no open conversation file there is nowhere to
+            // put it, and the next turn should try again rather than silently drop it.
+            self.task_saved = Some(st.clone());
+        }
+    }
+
+    /// Body of the `task_state` tool (intercepted in [`Agent::authorize_and_execute`], the same way
+    /// `ask_user` is — a checkpoint hangs off this conversation, not off the tool registry).
+    ///
+    /// Rejections are **total**: a bad patch changes nothing. A checkpoint that is half-updated is
+    /// worse than an old one, because the next resume would read a state that never existed.
+    fn task_tool(&mut self, args: Value) -> ToolOutput {
+        let applied = crate::task::Patch::from_json(&args)
+            .and_then(|p| crate::task::apply(self.task.clone(), &p));
+        match applied {
+            Ok(st) => {
+                let out = crate::tf!(
+                    "checkpoint saved ({}). This is what a restored session will see:\n{}",
+                    st.task_id,
+                    st.context_block()
+                );
+                self.task = Some(st);
+                ToolOutput::ok(out)
+            }
+            Err(e) => ToolOutput::err(crate::tf!("no checkpoint change was made: {}", e)),
+        }
+    }
+
+    /// Push a message into the in-memory context **without** writing it to the conversation file.
+    ///
+    /// Exactly one family of messages uses this: host hints that are **regenerated** — today, the task
+    /// checkpoint injected by `resume`. Writing it would append the same paragraph once per open, and
+    /// rewriting the file just to avoid that duplicate is worse. The system prompt at index 0 is
+    /// already memory-only, so the precedent exists; anything the user or the model actually *says*
+    /// still goes through [`Agent::push_message`].
+    fn push_ephemeral(&mut self, msg: Message) {
+        self.messages.push(msg);
+    }
+
     /// Authorize → run one tool call. A controlled primitive for `AgentLoop`: it bundles the whole "ask policy, ask user, record allowlist, execute and catch timeouts" into a single entry point, so the loop needn't — and shouldn't — assemble it itself.
     pub async fn authorize_and_execute(&mut self, ui: &mut dyn Ui, name: &str, args: Value) -> ToolOutput {
         let kind = self.rt.tool_kind(name).await.unwrap_or(ToolKind::Meta);
@@ -693,11 +976,48 @@ impl Agent {
             if name == crate::tool::ask::ASK_TOOL {
                 return crate::tool::ask::interact(args, ui).await;
             }
+            // `task_state`: same interception story as `ask_user` — the checkpoint belongs to this
+            // conversation, so `Tool::call` (which only sees `Runtime`) could not record it. Placed
+            // after authorization like everything else: being a host tool is not a bypass.
+            if name == crate::tool::task::TASK_TOOL {
+                return self.task_tool(args);
+            }
+            // `find_tools`: third interception, same story — "make a hidden tool visible" changes
+            // this **conversation's** scope, and `Tool::call` only ever sees `&Runtime`. Placed after
+            // authorization like the other two: being a host tool is not a bypass. It is also the only
+            // one of the three that **writes to `self`**: everything else here is a read of runtime state.
+            if name == crate::tool::discover::FIND_TOOL {
+                let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                return crate::tool::discover::search(&self.rt, &mut self.tool_scope, query).await;
+            }
+            // `verify`: fourth interception, same story. The evidence has to be stamped with this
+            // conversation's workspace epoch and recorded on **its** checkpoint — neither is visible
+            // to `Tool::call`, which only ever sees `&Runtime`. Also after authorization: "it only
+            // reads files" is not a reason to skip the policy.
+            if name == crate::tool::verify::VERIFY_TOOL {
+                return self.verify_tool(args);
+            }
             ui.emit(AgentEvent::ToolRunning {
                 name: name.to_string(),
                 timeout_secs: self.rt.config.agent.tool_timeout_secs,
             });
-            self.rt.execute(name, args).await
+            // A plugin that has just been built gets its tools **advertised immediately**: the model
+            // is one step away from calling them, and making it run `find_tools` for the thing it
+            // wrote itself would be a round trip that buys nothing. `args` moves into `execute`, so
+            // the plugin name is read out first. A failed build adds nothing — there is no plugin.
+            let built = if name == crate::tool::meta::CREATE_TOOL || name == crate::tool::meta::UPDATE_TOOL
+            {
+                args.get("name").and_then(|v| v.as_str()).map(str::to_owned)
+            } else {
+                None
+            };
+            let out = self.rt.execute(name, args).await;
+            if let Some(plugin) = built.filter(|_| !out.is_error) {
+                for t in self.rt.plugin_tool_names(&plugin).await {
+                    self.tool_scope.enable(&t);
+                }
+            }
+            out
         } else {
             // "Blocked by config" and "the user refused on the spot" are two different things, and the wording to the model must differ:
             // the former is a host-hardcoded rule (`[auth]`'s deny, which since stage 4 supports `fs_*` wildcards),
@@ -1061,6 +1381,214 @@ mod tests {
         assert_eq!(a.interrupt_rollback_point(mark), mark, "the floor holds");
         a.rollback_interrupted_turn(mark);
         assert_eq!(a.messages_len(), mark);
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // ───────── Task checkpoint (`crate::task`, `task_state`) ─────────
+
+    /// The whole point of a checkpoint is **surviving a session**: write it, drop the agent, build a
+    /// new one on the same conversation, and the state must come back — while `modified_files` only
+    /// ever carries what a real tool result reported.
+    #[tokio::test]
+    async fn a_checkpoint_travels_with_the_conversation() {
+        let ws = std::env::temp_dir().join("aox-task-checkpoint");
+        let _ = std::fs::remove_dir_all(&ws);
+        let mut a = agent_with(&ws, "t", crate::workplace::Access::Read).await;
+
+        // A conversation must exist before a checkpoint has anywhere to live.
+        let id = {
+            let log = a.rt.store.create(None, None).unwrap();
+            log.id().to_string()
+        };
+        a.resume(&id).unwrap();
+        assert!(a.task().is_none(), "a conversation written before the feature has no checkpoint");
+
+        // The first update needs a goal; evidence is **not** accepted from the model.
+        let bad = a.task_tool(json!({"modified_files": ["fake.rs"]}));
+        assert!(bad.is_error, "the model must not be able to declare its own evidence");
+        assert!(a.task().is_none(), "a rejected patch changes nothing");
+
+        let out = a.task_tool(json!({
+            "goal": "add task checkpoints",
+            "constraints": ["keep the jsonl format"],
+            "next_steps": ["write the tool"],
+        }));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(a.task().unwrap().goal, "add task checkpoints");
+
+        // Host-side evidence: comes from a tool result, and is a no-op when no checkpoint exists.
+        a.note_modified_file(std::path::Path::new(r"E:\rustapp\src\task.rs"));
+        a.persist_task();
+        let saved = a.rt.store.load_task(&id).expect("the checkpoint must be on disk");
+        assert_eq!(
+            crate::task::TaskState::from_value(&saved).unwrap().modified_files,
+            vec![r"E:\rustapp\src\task.rs".to_string()]
+        );
+
+        // Rewriting the same state again must not add a second row.
+        let rows = |ws: &std::path::Path| {
+            let mut n = 0;
+            if let Ok(rd) = std::fs::read_dir(ws.join("history")) {
+                for e in rd.flatten() {
+                    if let Ok(s) = std::fs::read_to_string(e.path()) {
+                        n += s.lines().filter(|l| l.contains("\"kind\":\"task\"")).count();
+                    }
+                }
+            }
+            n
+        };
+        let before = rows(&ws);
+        a.persist_task();
+        assert_eq!(rows(&ws), before, "an unchanged checkpoint must not be written again");
+
+        // New process, same conversation: the state comes back, and the restore note is memory-only.
+        let msgs_before = a.rt.store.load(&id).unwrap().len();
+        drop(a);
+        let mut b = agent_with(&ws, "t", crate::workplace::Access::Read).await;
+        b.resume(&id).unwrap();
+        let st = b.task().expect("the checkpoint must be restored");
+        assert_eq!(st.goal, "add task checkpoints");
+        assert!(b.messages().last().unwrap().flat_text().contains("add task checkpoints"), "the restore note must reach the model");
+        assert_eq!(
+            b.rt.store.load(&id).unwrap().len(),
+            msgs_before,
+            "the restore note is regenerated on every resume, so it must not be written into the file"
+        );
+
+        // A reset starts a different task and drops the old progress — but keeps the evidence rules.
+        let out = b.task_tool(json!({"reset": true, "goal": "something else"}));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(b.task().unwrap().goal, "something else");
+        assert!(!b.task().unwrap().task_id.is_empty());
+
+        b.new_conversation();
+        assert!(b.task().is_none(), "a new conversation must not inherit the previous task");
+        assert!(b.task_saved.is_none());
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// The closing loop of the stage: `done` is a **decision the host makes from evidence**, not a
+    /// value the model writes. Three things are pinned here in the order they matter:
+    /// ① no evidence → refused; ② a real check → accepted; ③ a write afterwards → refused again until
+    /// re-checked.
+    #[tokio::test]
+    async fn done_is_a_decision_made_from_evidence() {
+        let ws = std::env::temp_dir().join("aox-verify-gate");
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::create_dir_all(&ws);
+        let mut a = agent_with(&ws, "t", crate::workplace::Access::Read).await;
+        let proof = ws.join("proof.txt");
+
+        a.task_tool(json!({
+            "goal": "prove the gate works",
+            "acceptance": ["proof.txt exists"],
+            "completed": ["wrote the checkpoint"],
+        }));
+
+        // ① Nothing has been checked yet — the reply must say how to fix it, not just "no".
+        let refused = a.task_tool(json!({"status": "done"}));
+        assert!(refused.is_error, "done without evidence must be refused");
+        assert!(refused.content.contains("verify"), "the refusal must name the fix: {}", refused.content);
+        assert_eq!(a.task().unwrap().status, crate::task::Status::Open);
+
+        // ② A real check against a real file.
+        std::fs::write(&proof, "ok\n").unwrap();
+        let out = a.verify_tool(json!({
+            "check": "path_exists",
+            "criterion": 1,
+            "path": proof.to_string_lossy(),
+        }));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(a.task().unwrap().covered(), 1, "{}", out.content);
+
+        let accepted = a.task_tool(json!({"status": "done"}));
+        assert!(!accepted.is_error, "{}", accepted.content);
+        assert_eq!(a.task().unwrap().status, crate::task::Status::Done);
+
+        // ③ The workspace moves on → the old evidence is no longer proof.
+        a.note_modified_file(&proof);
+        assert_eq!(a.task().unwrap().status, crate::task::Status::Open, "a write reopens the task");
+        let refused = a.task_tool(json!({"status": "done"}));
+        assert!(refused.is_error, "stale evidence must not pass");
+        assert!(refused.content.contains("stale"), "{}", refused.content);
+
+        let out = a.verify_tool(json!({
+            "check": "file_contains",
+            "criterion": 1,
+            "path": proof.to_string_lossy(),
+            "text": "ok",
+        }));
+        assert!(!out.is_error && a.task().unwrap().gate().is_ok(), "{}", out.content);
+        // The criterion text comes back with the evidence: this is what lets the model notice that it
+        // checked something other than what the criterion says.
+        assert!(
+            out.content.contains("proof.txt exists"),
+            "the reply must echo the criterion it claims to prove: {}",
+            out.content
+        );
+        assert_eq!(a.task().unwrap().checks.last().unwrap().claim, "proof.txt exists");
+
+        // No checkpoint at all: `verify` says so instead of pretending a record exists.
+        a.new_conversation();
+        let out = a.verify_tool(json!({"check": "path_exists", "criterion": 1, "path": proof.to_string_lossy()}));
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("task_state"), "{}", out.content);
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// An off-by-one on `criterion` must be caught **before** recording: evidence that can never
+    /// justify `done` is worse than no evidence, because the model would believe it had proof.
+    #[tokio::test]
+    async fn a_criterion_out_of_range_records_nothing() {
+        let ws = std::env::temp_dir().join("aox-verify-range");
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::create_dir_all(&ws);
+        let proof = ws.join("p.txt");
+        std::fs::write(&proof, "x").unwrap();
+        let mut a = agent_with(&ws, "t", crate::workplace::Access::Read).await;
+
+        a.task_tool(json!({"goal": "g", "acceptance": ["one"], "completed": ["c"]}));
+        let out = a.verify_tool(json!({"check": "path_exists", "criterion": 2, "path": proof.to_string_lossy()}));
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("1..=1"), "{}", out.content);
+        assert!(a.task().unwrap().checks.is_empty(), "a rejected criterion must record nothing");
+
+        // No acceptance at all: the same refusal, with the fix named.
+        a.new_conversation();
+        a.task_tool(json!({"goal": "g", "completed": ["c"]}));
+        let out = a.verify_tool(json!({"check": "path_exists", "criterion": 1, "path": proof.to_string_lossy()}));
+        assert!(out.is_error && out.content.contains("acceptance"), "{}", out.content);
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// `output_contains` is the command-level degraded path: the host can't run the tests, but it can
+    /// insist the text came from a tool. Pinned here because the buffer's lifetime is what makes it
+    /// trustworthy.
+    #[tokio::test]
+    async fn output_evidence_only_comes_from_what_a_tool_said() {
+        let ws = std::env::temp_dir().join("aox-verify-output");
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::create_dir_all(&ws);
+        let mut a = agent_with(&ws, "t", crate::workplace::Access::Read).await;
+
+        a.task_tool(json!({"goal": "g", "acceptance": ["tests pass"], "completed": ["ran them"]}));
+        let out = a.verify_tool(json!({"check": "output_contains", "criterion": 1, "text": "ok"}));
+        assert!(out.is_error, "with no tool output there is nothing to check: {}", out.content);
+
+        a.note_tool_output("... test result: ok. 299 passed; 0 failed ...");
+        let out = a.verify_tool(json!({"check": "output_contains", "criterion": 1, "text": "299 passed"}));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(a.task().unwrap().covered(), 1);
+
+        // A different conversation must not inherit the buffer ("the last output" is per conversation).
+        a.new_conversation();
+        a.task_tool(json!({"goal": "g", "acceptance": ["tests pass"], "completed": ["ran them"]}));
+        let out = a.verify_tool(json!({"check": "output_contains", "criterion": 1, "text": "299 passed"}));
+        assert!(out.is_error, "the buffer belongs to the conversation that produced it: {}", out.content);
 
         let _ = std::fs::remove_dir_all(&ws);
     }

@@ -2,6 +2,7 @@ mod agent;
 mod agent_loop;
 mod attach;
 mod auth;
+mod compact;
 mod config;
 mod history;
 mod hook;
@@ -23,6 +24,10 @@ mod selftest;
 #[allow(dead_code)]
 mod space;
 mod store;
+// Task checkpoints (`src/task.rs`): the CLI has no surface that shows one, but the agent writes and
+// restores them regardless — "the task was interrupted, continue it" is exactly as true in a
+// terminal as it is in the GUI.
+mod task;
 mod tool;
 mod ui;
 mod workplace;
@@ -356,6 +361,24 @@ async fn main() -> Result<()> {
     // to type (see `tool::ask`). It's special-cased by the Agent; registering it here
     // is to **make it visible in the model's tools list** — nobody calls an invisible tool.
     for t in ask::ask_tools() {
+        rt.register(t).await?;
+    }
+    // Tool discovery (`src/tool/discover.rs`). Registered for the same reason as `task_state`: the
+    // model has to **see** the entry point, while the call itself is intercepted by the Agent (it
+    // changes which tools this conversation advertises, and `Tool::call` only sees `Runtime`).
+    for t in tool::discover::find_tools() {
+        rt.register(t).await?;
+    }
+    // Task checkpoints (`src/tool/task.rs`). Registered only so the model can **see** it in the tool
+    // list — the call itself is intercepted by `Agent::authorize_and_execute`, because a checkpoint
+    // belongs to a conversation and `Tool::call` only sees `Runtime`.
+    for t in tool::task::task_tools() {
+        rt.register(t).await?;
+    }
+    // Verification (`src/tool/verify.rs`). Registered for the same reason as `task_state`: the model
+    // has to see the entry point, while the call is intercepted by the Agent (evidence belongs to a
+    // conversation's checkpoint, and `Tool::call` only sees `Runtime`).
+    for t in tool::verify::verify_tools() {
         rt.register(t).await?;
     }
 

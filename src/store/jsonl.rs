@@ -216,6 +216,15 @@ fn usage_line(rec: &UsageRecord) -> Value {
     v
 }
 
+/// One task-checkpoint row. The payload is nested under `task` (like `act`) because the checkpoint
+/// carries its own `version` field and its own vocabulary — keeping the row type at the top level
+/// means a reader can tell "which kind of row is this" without knowing anything about the payload.
+///
+/// Shape decided by [`crate::task::TaskState::to_value`]; the store only adds the row type.
+fn task_line(task: &Value) -> Value {
+    json!({ "kind": "task", "task": task })
+}
+
 /// One workplace row. The fields are decided by [`crate::workplace::Record::to_value`] — that side
 /// handles "don't write absent fields" (the `full` tier has no root); here we only add the row type.
 fn workplace_line(rec: &crate::workplace::Record) -> Value {
@@ -240,7 +249,11 @@ fn title_line(title: Option<&str>) -> Value {
 /// The row types we write out. Any other row (another file mistakenly dropped into `history/`, a line
 /// broken by hand-editing) is rejected outright — which is also the cheapest evidence that "this file
 /// is ours".
-const ROW_KINDS: [&str; 6] = ["meta", "message", "act", "usage", "workplace", "title"];
+///
+/// ⚠️ Adding a kind here is only half the work: [`JsonlSession::rewrite`] pulls each non-message kind
+/// out and writes it back, so a kind missing from there would be **silently erased by the first
+/// interrupt rollback**. `task` was added to both places together.
+const ROW_KINDS: [&str; 7] = ["meta", "message", "act", "usage", "workplace", "title", "task"];
 
 /// Parse one line; if it's recognized, return its object.
 fn parse_row(line: &str) -> Option<Value> {
@@ -449,6 +462,12 @@ impl Store for JsonlStore {
         self.find(id).map(|p| load_workplaces(&p)).unwrap_or_default().pop()
     }
 
+    fn load_task(&self, id: &str) -> Option<Value> {
+        // "The last one" = the checkpoint as it currently stands; earlier rows are the same task at
+        // earlier moments, which nobody reads.
+        self.find(id).map(|p| load_tasks(&p)).unwrap_or_default().pop()
+    }
+
     fn remove(&self, key: &str) -> Result<Summary> {
         // Deletion used to be scattered in `main.rs` (a direct `std::fs::remove_file`) — folding it
         // into the backend, otherwise switching backends (say a library holding all conversations)
@@ -576,6 +595,12 @@ impl Session for JsonlSession {
         let _ = write_line_to(&mut self.file, &title_line(title));
     }
 
+    /// Append one task checkpoint. Same silent-on-failure rule as everything else here: losing the
+    /// newest checkpoint costs one "where was I", it must not break the conversation in progress.
+    fn append_task(&mut self, task: &Value) {
+        let _ = write_line_to(&mut self.file, &task_line(task));
+    }
+
     /// Rewrite the whole file with the given message list.
     ///
     /// Used for "interruption rollback": the in-memory messages were discarded, so the file must return to
@@ -583,11 +608,16 @@ impl Session for JsonlSession {
     /// (when resuming this conversation later, such a record would get the request rejected outright).
     ///
     /// The activity stream (`kind:"act"`), token usage (`kind:"usage"`), workplace
-    /// (`kind:"workplace"`) and the rename (`kind:"title"`) are not part of the message stream, so
-    /// **they must be pulled out first and written back verbatim**: a rollback only loses messages,
-    /// and there is no reason to also wipe the timeline's "process that already happened", the ledger
-    /// already recorded, "which plot this conversation was working in" -- or what the user decided to
-    /// call it.
+    /// (`kind:"workplace"`), the rename (`kind:"title"`) and the task checkpoint (`kind:"task"`) are
+    /// not part of the message stream, so **they must be pulled out first and written back
+    /// verbatim**: a rollback only loses messages, and there is no reason to also wipe the timeline's
+    /// "process that already happened", the ledger already recorded, "which plot this conversation
+    /// was working in", what the user decided to call it — or the checkpoint that says what the task
+    /// was even about.
+    ///
+    /// The checkpoint is the one exception to "verbatim": only the **last** row is written back.
+    /// Earlier rows are the same task at earlier moments and nothing reads them, so carrying them
+    /// through a rollback would just re-inflate the file with history nobody will ever look at.
     ///
     /// Implementation-wise we **must not** call `set_len` directly on the append handle: on Windows a handle
     /// opened for append has no truncate permission and returns `os error 5 (access denied)`; moreover
@@ -599,6 +629,7 @@ impl Session for JsonlSession {
         let usages = load_usage(&self.path);
         let workplaces = load_workplaces(&self.path);
         let titles = load_titles(&self.path);
+        let task = load_tasks(&self.path).pop();
         let Ok(mut f) =
             OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)
         else {
@@ -625,6 +656,11 @@ impl Session for JsonlSession {
         }
         for rec in &workplaces {
             if write_line_to(&mut f, &workplace_line(rec)).is_err() {
+                return;
+            }
+        }
+        if let Some(t) = &task {
+            if write_line_to(&mut f, &task_line(t)).is_err() {
                 return;
             }
         }
@@ -891,6 +927,32 @@ fn load_workplaces(path: &Path) -> Vec<crate::workplace::Record> {
         }
         let Some(rec) = crate::workplace::Record::from_value(&v) else { continue };
         out.push(rec);
+    }
+    out
+}
+
+/// Read all `kind:"task"` payloads in a file, in write order — the caller takes the last one (the
+/// checkpoint as it currently stands).
+///
+/// The payload is handed back **unparsed**: whether it is a valid checkpoint, and what a checkpoint
+/// even looks like, is `crate::task`'s business. That keeps the store from growing a second opinion
+/// about the schema.
+fn load_tasks(path: &Path) -> Vec<Value> {
+    let Ok(file) = File::open(path) else { return Vec::new() };
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Some(v) = parse_row(t) else { continue };
+        if !is_kind(&v, "task") {
+            continue;
+        }
+        if let Some(payload) = v.get("task") {
+            out.push(payload.clone());
+        }
     }
     out
 }
@@ -1462,6 +1524,49 @@ mod tests {
         assert_eq!(back.mode, "full");
         assert_eq!(back.own.as_ref(), Some(&own), "an interruption rollback should only lose messages");
         assert_eq!(s.load(&id).unwrap().len(), 1, "messages were indeed rolled back to 1");
+    }
+
+    /// A checkpoint is a **conversation record**, not a sidecar file: it must survive an interruption
+    /// rollback (messages vanish; the checkpoint stays) and only the **last** row is carried through —
+    /// earlier rows are the same task at earlier moments and nothing ever reads them.
+    #[test]
+    fn task_checkpoint_keeps_the_last_one_across_rewrite() {
+        use crate::task::TaskState;
+
+        let d = Tmp::new("task");
+        let s = d.store();
+        let mut log = s.create(None, None).unwrap();
+        let id = log.id().to_string();
+
+        assert!(s.load_task(&id).is_none(), "no checkpoint yet must read as None, not as an error");
+
+        let st = TaskState::new("add task checkpoints");
+        log.append_task(&st.to_value());
+        let mut st2 = st.clone();
+        st2.completed = vec!["host side".into()];
+        st2.modified_files = vec![r"E:\rustapp\src\task.rs".into()];
+        log.append_task(&st2.to_value());
+        log.append(&Message::user("a message that the rollback will drop"), None);
+        drop(log);
+
+        let got = TaskState::from_value(&s.load_task(&id).expect("the last row wins")).unwrap();
+        assert_eq!(got.goal, "add task checkpoints");
+        assert_eq!(got.completed, vec!["host side"], "the last row is the current state");
+
+        // Interruption rollback: messages go back, the checkpoint must not.
+        let mut log = s.open(&id).unwrap();
+        log.rewrite(&[Message::system("sys"), Message::user("only this line is left")]);
+        drop(log);
+        let back = TaskState::from_value(&s.load_task(&id).expect("a rollback must not lose the checkpoint"))
+            .unwrap();
+        assert_eq!(back.modified_files, st2.modified_files, "evidence must survive a rollback");
+        assert_eq!(s.load(&id).unwrap().len(), 1, "messages were rolled back to 1");
+
+        // …and the rewrite kept exactly one task row, not two (see `JsonlSession::rewrite`).
+        let path = s.find(&id).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let rows = raw.lines().filter(|l| l.contains("\"kind\":\"task\"")).count();
+        assert_eq!(rows, 1, "only the last checkpoint row is written back:\n{raw}");
     }
 
     /// If the endpoint omits one item, reading it back should give `None` — it must not become 0.

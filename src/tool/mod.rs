@@ -1,6 +1,12 @@
 pub mod ask;
+pub mod discover;
+pub mod edit;
+pub mod fingerprint;
 pub mod hostfs;
 pub mod meta;
+pub mod scope;
+pub mod task;
+pub mod verify;
 
 use std::sync::Arc;
 
@@ -17,8 +23,13 @@ use crate::runtime::Runtime;
 /// Both sides referring to the same constant rules out the nastiest kind of drift — rename
 /// a tool and the boundary check silently stops applying (the tool still works, it just has
 /// no boundary any more).
-pub(crate) const HOST_FILE_TOOLS: [&str; 5] =
-    ["read_file", "write_file", "list_dir", "remove", "attach_file"];
+///
+/// ⚠️ **Append only.** Entries are addressed by index ([`READ_ONLY_TOOLS`], and every
+/// `HOST_FILE_TOOLS[n]` in `hostfs` / `edit` / the tests), so inserting a name in the middle
+/// silently re-points the read/write split at a different tool. `edit_file` was appended as
+/// index 5 for exactly that reason.
+pub(crate) const HOST_FILE_TOOLS: [&str; 6] =
+    ["read_file", "write_file", "list_dir", "remove", "attach_file", "edit_file"];
 
 /// Which entries in that table are **read-only** (by index) — reads are unrestricted, only
 /// writes and deletes go through the workplace boundary (the 2026-10-04 semantics).
@@ -27,6 +38,9 @@ pub(crate) const HOST_FILE_TOOLS: [&str; 5] =
 /// exactly **one** statement of record: `attach_file` counts as a read (attaching only hands
 /// the file over, nothing is written). Adding a read-only tool later means changing this line
 /// and nothing else — the `if` below cannot fall out of sync.
+///
+/// `edit_file` is deliberately **absent**: it rewrites bytes on disk, so it is a write, and the
+/// workspace boundary must judge it exactly as it judges `write_file`.
 const READ_ONLY_TOOLS: [usize; 3] = [0 /* read_file */, 2 /* list_dir */, 4 /* attach_file */];
 
 /// The **access intent** of a host file tool: read-only (read a file / list a directory /
@@ -229,4 +243,26 @@ pub trait Tool: Send + Sync {
     }
 
     async fn call(&self, args: Value, rt: &Arc<Runtime>) -> ToolOutput;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How many host tools every doc comment in the repo quotes.
+    ///
+    /// Pinned against the **actual constructors** because the number has already drifted once: the
+    /// docs said "12" long after `find_tools` made it 13, and nothing failed — a doc number nobody
+    /// executes is a comment, not a fact. Adding a host tool now breaks this test first.
+    #[test]
+    fn the_quoted_host_tool_count_matches_reality() {
+        const DOCUMENTED: usize = 14;
+        let n = meta::meta_tools().len()
+            + hostfs::host_file_tools().len()
+            + ask::ask_tools().len()
+            + discover::find_tools().len()
+            + task::task_tools().len()
+            + verify::verify_tools().len();
+        assert_eq!(n, DOCUMENTED, "update every doc that quotes the host tool count");
+    }
 }

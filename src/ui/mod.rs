@@ -72,6 +72,22 @@ pub enum AgentEvent {
     /// Emitted only when the count is non-zero, so "no event" means "nothing was deleted" — a
     /// front end never has to decide whether a zero is worth mentioning.
     Recycled(usize),
+    /// The host is **compacting the context right now** (it is about to ask the model for a summary
+    /// of the oldest turns, which takes a round trip).
+    ///
+    /// This is the one event whose whole purpose is "show something is happening": a graphical front
+    /// end draws an animation, the CLI leaves it to its existing spinner. `used` / `budget` are the
+    /// rough token figures that triggered it, so a front end can show "21.4k of 24k" without knowing
+    /// anything about the compaction policy.
+    ContextCompacting { used: u64, budget: u64 },
+    /// The context was compacted; the request that follows is the smaller one.
+    ///
+    /// `before` / `after` are estimates, `folded` counts the messages that went into a summary (0 when
+    /// only tool results were stubbed, which is the cheap path) and `elided` counts the stubs. A front
+    /// end uses `after` to put its context gauge back at the new (small) reading immediately, instead
+    /// of waiting for the next request's usage to come back — otherwise the gauge sits pinned at
+    /// "full" through the very moment the problem was solved.
+    ContextCompacted { before: u64, after: u64, folded: usize, elided: usize },
 }
 
 /// The outcome of an authorisation prompt

@@ -118,6 +118,21 @@ pub struct Runtime {
     pub spaces: std::sync::RwLock<crate::space::Registry>,
 }
 
+/// One tool as the **discovery search** sees it (see `crate::tool::discover`).
+///
+/// A borrowed-free snapshot rather than a reference into the registry: the search is `async` and
+/// must not hold the tools lock while it formats a result the model will read.
+pub struct ToolEntry {
+    pub name: String,
+    /// `true` when the tool belongs to a plugin — the only kind that may be held back from the
+    /// request (see `crate::tool::scope` for why the line is drawn there).
+    pub plugin: bool,
+    pub description: String,
+    /// The whole `{"type":"function","function":{…}}` object: the search prints `function.parameters`
+    /// so the model can call the tool on the very next round, without a second lookup.
+    pub schema: serde_json::Value,
+}
+
 impl Runtime {
     /// Assemble the runtime. It returns `Result` so that "a wrong storage backend name"
     /// errors **at startup** (an unrecognized `[store] backend` value fails outright
@@ -270,12 +285,80 @@ impl Runtime {
 
     /// Regenerated every round — a plugin tool the model just injected is visible in the
     /// very next round.
+    /// ⚠️ **The request path no longer calls this** — `AgentLoop` asks for
+    /// [`Runtime::tool_schemas_scoped`]. What remains here is the **unscoped baseline** (every
+    /// registered tool), which the scoping tests compare against to prove that `inline_max = 0` is
+    /// byte-identical to the behaviour before the feature existed.
+    #[allow(dead_code)]
     pub async fn tool_schemas(&self) -> Vec<serde_json::Value> {
         let tools = self.tools.read().await;
         let mut v: Vec<_> = tools.values().map(|t| t.schema()).collect();
         v.sort_by(|a, b| {
             a["function"]["name"].as_str().unwrap_or("").cmp(b["function"]["name"].as_str().unwrap_or(""))
         });
+        v
+    }
+
+    /// The same list as [`Runtime::tool_schemas`], minus the tools this conversation is not
+    /// advertising right now (see `crate::tool::scope`).
+    ///
+    /// ⚠️ **Hiding is advertising only.** Name resolution — `execute`, `tool_kind`, `tool_access`,
+    /// `caps_for` — always goes through the registry, so a tool that is hidden here still runs if
+    /// the model calls it. That is deliberate: hiding must not create a new failure mode.
+    ///
+    /// The decision is re-made on **every** call from the live registry size, so "a plugin was
+    /// installed / removed" needs no bookkeeping: the next round lands on the right side of the
+    /// threshold on its own.
+    pub async fn tool_schemas_scoped(&self, scope: &crate::tool::scope::Scope) -> Vec<serde_json::Value> {
+        let tools = self.tools.read().await;
+        let hide = scope.hides(tools.len());
+        let mut v: Vec<_> = tools
+            .values()
+            .filter(|t| {
+                !hide || scope.advertises(t.name(), matches!(t.kind(), ToolKind::Plugin(_)))
+            })
+            .map(|t| t.schema())
+            .collect();
+        v.sort_by(|a, b| {
+            a["function"]["name"].as_str().unwrap_or("").cmp(b["function"]["name"].as_str().unwrap_or(""))
+        });
+        v
+    }
+
+    /// A snapshot of the registry for the tool-discovery search: name, whether it belongs to a
+    /// plugin, and the full schema (which carries the description the search matches against).
+    ///
+    /// Sorted by name so the same query always renders in the same order — the output goes into the
+    /// context, and an arbitrary order would make the prompt cache miss for no reason.
+    pub async fn tool_entries(&self) -> Vec<ToolEntry> {
+        let tools = self.tools.read().await;
+        let mut v: Vec<ToolEntry> = tools
+            .values()
+            .map(|t| ToolEntry {
+                name: t.name().to_string(),
+                plugin: matches!(t.kind(), ToolKind::Plugin(_)),
+                description: t.description().to_string(),
+                schema: t.schema(),
+            })
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
+    /// Every tool registered by one plugin (by plugin name). Empty when the plugin isn't installed.
+    ///
+    /// Used right after `create_plugin` / `update_plugin`: a tool the model just built has to be
+    /// **visible in the next request** — making it search for its own creation first would be a
+    /// pointless round trip, and it is exactly the moment the model is most likely to give up on
+    /// the idea of using it.
+    pub async fn plugin_tool_names(&self, plugin: &str) -> Vec<String> {
+        let tools = self.tools.read().await;
+        let mut v: Vec<String> = tools
+            .values()
+            .filter(|t| matches!(t.kind(), ToolKind::Plugin(p) if p == plugin))
+            .map(|t| t.name().to_string())
+            .collect();
+        v.sort();
         v
     }
 

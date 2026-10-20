@@ -326,6 +326,24 @@ impl CliUi {
             // after a few seconds", so a permanent line per delete would end up as clutter — and
             // the tool result printed just above already names the path.
             AgentEvent::Recycled(n) => self.push_note('i', crate::recycle::notice(n)),
+            // Compaction: the label is what the spinner shows while the summary call is in flight,
+            // and the finished line goes into the process notes (visible with `/expand`).
+            AgentEvent::ContextCompacting { used, budget } => {
+                self.set_label(&crate::tf!("compacting the context (~{} of {} tokens)", used, budget));
+            }
+            AgentEvent::ContextCompacted { before, after, folded, elided } => {
+                self.push_note(
+                    'i',
+                    crate::tf!(
+                        "context compacted: ~{} → ~{} tokens ({} messages folded, {} tool results stubbed)",
+                        before,
+                        after,
+                        folded,
+                        elided
+                    ),
+                );
+                self.set_label(crate::i18n::t("Thinking"));
+            }
             // An image produced by a tool: the terminal has nowhere to draw it. **Silently dropping
             // it** is deliberate — the accompanying message already lists the filenames (see
             // `attach`'s path list), and adding a "there's an image but it can't be shown" line
@@ -442,6 +460,24 @@ impl Ui for CliUi {
                 s::dim(&crate::recycle::notice(n))
             ),
             AgentEvent::Images(_) => {}
+            // Compaction is host housekeeping, but it is the one step that can pause the turn for a
+            // whole round trip, so the terminal says it out loud rather than looking stuck.
+            AgentEvent::ContextCompacting { used, budget } => println!(
+                "{} {}",
+                s::cyan("·"),
+                s::dim(&crate::tf!("compacting the context (~{} of {} tokens)", used, budget))
+            ),
+            AgentEvent::ContextCompacted { before, after, folded, elided } => println!(
+                "{} {}",
+                s::cyan("·"),
+                s::dim(&crate::tf!(
+                    "context compacted: ~{} → ~{} tokens ({} messages folded, {} tool results stubbed)",
+                    before,
+                    after,
+                    folded,
+                    elided
+                ))
+            ),
         }
     }
 

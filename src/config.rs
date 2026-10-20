@@ -44,6 +44,14 @@ pub struct Config {
     /// how long a plugin process exists at all**.
     #[serde(default)]
     pub plugins: PluginsConfig,
+    /// The `[tools]` section of `config.toml` (which tool schemas are advertised, see
+    /// [`ToolsConfig`]).
+    ///
+    /// A fourth, again distinct, "how much": `[sandbox]` limits how a plugin process runs,
+    /// `[workplace]` limits which files may be touched, `[plugins]` limits how long a process lives,
+    /// and **this one limits what the model is told exists**.
+    #[serde(default)]
+    pub tools: ToolsConfig,
     /// The `[workplace]` section of `config.toml` (the model's file boundary, see `src/workplace.rs`).
     ///
     /// Two layers apart from `[sandbox]`: this one governs "which files may be touched", not
@@ -156,16 +164,76 @@ pub struct AgentConfig {
     pub rules_file: Option<String>,
     pub tool_timeout_secs: u64,
     pub max_result_chars: usize,
+    /// The **input** token budget for one request; `> 0` turns compaction on and overrides everything
+    /// else. Use it when the window is known to be smaller than `context_window` says (or when only
+    /// part of the window is usable).
+    ///
+    /// 0 = "derive it from `[provider] context_window × compact_ratio`", and when that is absent too,
+    /// compaction stays **off** — an unknown window is not guessed at (see `crate::compact`).
+    pub context_budget_tokens: u64,
+    /// How much of the model's context window may be used for input, before the reply's reserve is
+    /// taken off. Only read when `context_budget_tokens == 0` and `context_window` is set.
+    pub compact_ratio: f32,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { rules_file: Some("RULES.md".into()), tool_timeout_secs: 60, max_result_chars: 20000 }
+        Self {
+            rules_file: Some("RULES.md".into()),
+            tool_timeout_secs: 60,
+            max_result_chars: 20000,
+            context_budget_tokens: 0,
+            compact_ratio: 0.8,
+        }
     }
 }
 
+/// The `[tools]` section: **how much of the tool registry is advertised to the model**.
+///
+/// Two different questions live here, and they are deliberately kept apart instead of being merged
+/// into one "on/off":
+///
+/// - `inline_max` answers "is the list still small enough to send whole?" A registry at or under it
+///   is sent **exactly as before** — every tool, every round, byte-identical request. That is the
+///   zero-drift default: a light install sees no change at all.
+/// - `enabled` answers "which tools must be visible no matter what", for the case where the user runs
+///   a plugin they always want at hand.
+///
+/// The line for "may be held back" is **not a name list** but the tool's own
+/// [`crate::tool::ToolKind`]: the host's own tools (`Meta` / `Host`) are always advertised, and only
+/// `Plugin(_)` tools can be hidden. A model-built plugin therefore can never displace the host's own
+/// vocabulary — see [`crate::tool::scope`] for the rule and the reasoning.
+///
+/// ⚠️ Hiding is **advertising only**, not execution: `Runtime::execute` (and `Agent`'s
+/// `authorize_and_execute`) resolve a name against the registry, not against this list, so a tool
+/// the model remembers but cannot see still runs. Hidden ≠ unavailable.
 #[derive(Debug, Clone, Deserialize)]
+// Same as above: a section that sets only one key leaves the other at its default.
+#[serde(default)]
+pub struct ToolsConfig {
+    /// Registry size at or below which the whole list is sent (old behaviour). `0` = never hide
+    /// plugin tools, ever — the permanent escape hatch.
+    ///
+    /// The default (24) is picked so that the 14 host tools plus a handful of plugins stay fully
+    /// inline: discovery costs a round trip, and paying it to save a few hundred tokens is a bad
+    /// trade. It starts paying when a registry holds dozens of tools.
+    pub inline_max: usize,
+    /// Tools that stay visible regardless of `inline_max` (plugin tools included). Names must match
+    /// the registry exactly; unknown names are ignored, so deleting a plugin does not leave a broken
+    /// config behind.
+    pub enabled: Vec<String>,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        // ⚠️ 0 would be a legitimate value here, but **not** a good default: it means "always inline",
+        // which is exactly what this section exists to escape once a registry grows.
+        Self { inline_max: 24, enabled: Vec::new() }
+    }
+}
+
 // Same as above: when `[runtimes]` sets only `python`, `node` / `rustc` take their code defaults.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RuntimesConfig {
     /// When the value is a **bare command** (`python` / `node` / `rustc`), the host tries in order:
@@ -813,6 +881,7 @@ impl Config {
             loop_config: LoopConfig::default(),
             sandbox: SandboxConfig::default(),
             plugins: PluginsConfig::default(),
+            tools: ToolsConfig::default(),
             workplace: WorkplaceConfig::default(),
             theme: ThemeConfig::default(),
         }

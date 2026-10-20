@@ -33,11 +33,21 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{host_tool_access, Tool, ToolKind, ToolOutput, HOST_FILE_TOOLS};
+use super::edit::EditFileTool;
+use super::fingerprint;
+use super::host_tool_access;
+use super::Tool;
+use super::ToolKind;
+use super::ToolOutput;
+use super::HOST_FILE_TOOLS;
 use crate::runtime::Runtime;
 use crate::workplace::PATH_ARG;
 
-/// The five host file tools.
+/// The host file tools.
+///
+/// `edit_file` is last because [`HOST_FILE_TOOLS`] is addressed by index (see the warning there);
+/// putting a new tool at the end leaves every existing index — and therefore the read/write split —
+/// exactly where it was.
 pub fn host_file_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadFileTool),
@@ -45,6 +55,7 @@ pub fn host_file_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(ListDirTool),
         Arc::new(RemoveTool),
         Arc::new(AttachFileTool),
+        Arc::new(EditFileTool),
     ]
 }
 
@@ -55,9 +66,9 @@ const READ_LIMIT: usize = 200_000;
 /// Entry cap when listing a directory, for the same reason.
 const LIST_LIMIT: usize = 300;
 
-/// Check a `path` argument for a **write to disk** (write / remove), and unify
+/// Check a `path` argument for a **write to disk** (write / remove / edit), and unify
 /// "out of bounds" into the contract text handed to the model.
-fn guard(rt: &Arc<Runtime>, raw: &str) -> Result<std::path::PathBuf, ToolOutput> {
+pub(crate) fn guard(rt: &Arc<Runtime>, raw: &str) -> Result<std::path::PathBuf, ToolOutput> {
     rt.workplace.check(raw).map_err(|r| ToolOutput::err(r.model_text()))
 }
 
@@ -76,7 +87,7 @@ fn guard_read(rt: &Arc<Runtime>, raw: &str) -> std::path::PathBuf {
 }
 
 /// Fetch the required `path` argument.
-fn path_arg(args: &Value) -> Result<&str, ToolOutput> {
+pub(crate) fn path_arg(args: &Value) -> Result<&str, ToolOutput> {
     args.get(PATH_ARG)
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
@@ -103,13 +114,15 @@ impl Tool for ReadFileTool {
         host_tool_access(self.name())
     }
     fn description(&self) -> &str {
-        crate::i18n::t("Read a text file and return its content (provided by the host). Reads are not restricted by the workspace — any file on the device can be read.")
+        crate::i18n::t("Read a text file and return its content (provided by the host). Reads are not restricted by the workspace — any file on the device can be read. For a large file, pass start_line / max_lines to read just one slice (the file is streamed, never loaded whole); the header line carries the file's hash, which edit_file accepts as expected_hash.")
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 PATH_ARG: {"type": "string", "description": crate::i18n::t("Path of the file to read (absolute; reads are not restricted by the workspace)")},
+                "start_line": {"type": "integer", "description": crate::i18n::t("1-based line to start at (omit to start from the beginning). Passing this or max_lines switches to a line-numbered slice.")},
+                "max_lines": {"type": "integer", "description": crate::i18n::t("How many lines to return at most (omit to read to the end, still subject to max_bytes)")},
                 "max_bytes": {"type": "integer", "description": crate::i18n::t("Maximum bytes to read; default 200000")}
             },
             "required": [PATH_ARG]
@@ -130,37 +143,251 @@ impl Tool for ReadFileTool {
                 path.display()
             ));
         }
+
+        // ── Parameters: a range is the **optional second shape**; without one this is the same
+        //    whole-file read as before ──
         let limit = args
             .get("max_bytes")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize)
             .unwrap_or(READ_LIMIT)
             .min(READ_LIMIT);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
+        let start_line = match args.get("start_line").and_then(|v| v.as_u64()) {
+            Some(0) => {
+                return ToolOutput::err(crate::i18n::t(
+                    "start_line is 1-based: line 1 is the first line of the file (0 is not a valid line number)",
+                ))
+            }
+            Some(n) => Some(n as usize),
+            None => None,
+        };
+        let max_lines = match args.get("max_lines").and_then(|v| v.as_u64()) {
+            Some(0) => {
+                return ToolOutput::err(crate::i18n::t(
+                    "max_lines must be at least 1; omit it to read to the end of the file",
+                ))
+            }
+            Some(n) => Some(n as usize),
+            None => None,
+        };
+        let ranged = start_line.is_some() || max_lines.is_some();
+
+        let size = match std::fs::metadata(&path) {
+            Ok(m) => m.len(),
             Err(e) => return ToolOutput::err(crate::tf!("failed to read {}: {}", path.display(), e)),
         };
-        if bytes.iter().take(8192).any(|b| *b == 0) {
-            return ToolOutput::err(crate::tf!(
-                "{} looks like a binary file (contains NUL bytes); this tool reads text only.",
-                path.display()
+        // Binary pre-check: only the first 8 KB, the same test as before — it just no longer
+        // requires pulling the whole file into memory.
+        match looks_binary(&path) {
+            Ok(true) => {
+                return ToolOutput::err(crate::tf!(
+                    "{} looks like a binary file (contains NUL bytes); this tool reads text only.",
+                    path.display()
+                ))
+            }
+            Ok(false) => {}
+            Err(e) => return ToolOutput::err(crate::tf!("failed to read {}: {}", path.display(), e)),
+        }
+
+        // The fingerprint is taken **before** reading: it describes *this version of the file*, and
+        // the slice being read is only one window into it.
+        let hash = fingerprint::of_file(&path).unwrap_or_else(|| fingerprint::unknown().to_string());
+
+        let start = start_line.unwrap_or(1);
+        let cap = max_lines;
+        let slice = match read_slice(&path, start, cap, limit, ranged) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+
+        // ── Header line ──
+        // A whole-file read keeps its old shape (path + byte count) plus two new fields; a slice
+        // spells out the range and how to continue, so the model knows to resume from `start_line`
+        // instead of starting over.
+        let mut out = crate::tf!("{} ({} bytes, hash {})\n", path.display(), size, hash);
+        if ranged {
+            if slice.last == 0 {
+                out.push_str(&crate::tf!("lines {}-{}: no lines in this range\n", start, start));
+            } else {
+                out.push_str(&crate::tf!("lines {}-{}", slice.first, slice.last));
+                if slice.has_more {
+                    out.push_str(&crate::tf!(
+                        " (more lines follow — call again with start_line={})",
+                        slice.last + 1
+                    ));
+                } else {
+                    out.push_str(crate::i18n::t(" (end of file)"));
+                }
+                out.push('\n');
+            }
+        }
+        if slice.byte_capped {
+            if ranged {
+                out.push_str(&crate::tf!(
+                    "⚠️ stopped at the {} byte cap; the text below is not the whole range — continue with start_line={}.\n",
+                    limit,
+                    slice.last.max(start)
+                ));
+            } else {
+                out.push_str(&crate::tf!(
+                    "⚠️ the file is larger than the {} byte cap; **the text below is only its first {} bytes**, not the whole file. Pass start_line / max_lines to read a specific slice.\n",
+                    limit,
+                    limit
+                ));
+            }
+        }
+        out.push_str(&slice.body);
+        if slice.invalid_utf8 {
+            out.push_str(crate::i18n::t(
+                "\n⚠️ some bytes in this range are not valid UTF-8 and were shown as U+FFFD; the file on disk is unchanged. edit_file refuses such files.",
             ));
         }
-        let truncated = bytes.len() > limit;
-        // Truncation may land in the middle of a multi-byte character, so use
-        // lossy instead of failing outright with from_utf8
-        let body = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]).into_owned();
-        let mut out = crate::tf!("{} ({} bytes)\n", path.display(), bytes.len());
-        if truncated {
-            out.push_str(&crate::tf!(
-                "⚠️ the file exceeds {} bytes; **the text below is only the first {} bytes**, not the whole file.\n",
-                limit,
-                limit
-            ));
-        }
-        out.push_str(&body);
         ToolOutput::ok(out)
     }
+}
+
+/// Is the first 8 KB of the file free of NUL bytes?
+///
+/// Only the head is inspected — the same rule the whole-file version used, kept deliberately: a NUL
+/// deep inside a file is usually legitimate data (a length prefix, a padded field), whereas a NUL in
+/// the first block means "this was never text".
+fn looks_binary(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = [0u8; 8192];
+    let n = f.read(&mut buf)?;
+    Ok(buf[..n].contains(&0))
+}
+
+/// One slice of a text file, already decoded for display.
+struct Slice {
+    body: String,
+    first: usize,
+    last: usize,
+    has_more: bool,
+    /// The byte cap stopped us before the requested range was finished.
+    byte_capped: bool,
+    invalid_utf8: bool,
+}
+
+/// Read lines `[start, start+cap)` **by streaming** — memory never exceeds one line plus the byte cap.
+///
+/// This is the whole point of the range form: a 200 MB log can be read at line 180 000 without ever
+/// materialising the file. The full-file form goes through the same code with `start = 1`, `cap = None`,
+/// which is also what removes the old "read the entire file, then cut the output" behaviour.
+///
+/// `numbered` only controls the display (line numbers are added in range mode); the reader is the same.
+fn read_slice(
+    path: &std::path::Path,
+    start: usize,
+    cap: Option<usize>,
+    max_bytes: usize,
+    numbered: bool,
+) -> Result<Slice, ToolOutput> {
+    use std::io::{BufRead, BufReader};
+
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return Err(ToolOutput::err(crate::tf!("failed to read {}: {}", path.display(), e))),
+    };
+    let mut r = BufReader::new(f);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut body = String::new();
+    let mut line_no = 0usize;
+    let mut emitted = 0usize;
+    let mut bytes = 0usize;
+    let mut slice = Slice {
+        body: String::new(),
+        first: 0,
+        last: 0,
+        has_more: false,
+        byte_capped: false,
+        invalid_utf8: false,
+    };
+
+    loop {
+        buf.clear();
+        let n = match r.read_until(b'\n', &mut buf) {
+            Ok(n) => n,
+            Err(e) => return Err(ToolOutput::err(crate::tf!("failed to read {}: {}", path.display(), e))),
+        };
+        if n == 0 {
+            break; // EOF
+        }
+        line_no += 1;
+        if line_no < start {
+            continue; // skipping the prefix does not even decode it
+        }
+        if let Some(cap) = cap {
+            if emitted >= cap {
+                slice.has_more = true; // one line past the range => there really is more
+                break;
+            }
+        }
+        let allow = max_bytes.saturating_sub(bytes);
+        if allow == 0 {
+            slice.has_more = true;
+            slice.byte_capped = true;
+            break;
+        }
+        let take = n.min(allow);
+        let chunk = &buf[..take];
+        if std::str::from_utf8(chunk).is_err() {
+            slice.invalid_utf8 = true;
+        }
+        // Truncation can land in the middle of a multi-byte character => lossy, rather than failing
+        // the whole call.
+        let mut text = String::from_utf8_lossy(chunk).into_owned();
+        let complete = take == n;
+        if complete {
+            if text.ends_with('\n') {
+                text.pop();
+                // `\r` is stripped only in the line-numbered view: there it is part of the line
+                // terminator and would just show up as a stray control character. The plain form
+                // must stay **byte-for-byte** what is on disk (a CRLF file must read back as CRLF),
+                // so the `\r` is kept and the `\n` pushed back below restores the pair.
+                if numbered && text.ends_with('\r') {
+                    text.pop();
+                }
+            }
+        }
+        if numbered {
+            body.push_str(&format!("{:>6}\t", line_no));
+        }
+        body.push_str(&text);
+        body.push('\n');
+        bytes += take;
+        emitted += 1;
+        if slice.first == 0 {
+            slice.first = line_no;
+        }
+        slice.last = line_no;
+        if !complete {
+            // The byte budget ran out mid-line: the content is still given, but the line is marked
+            // incomplete.
+            slice.has_more = true;
+            slice.byte_capped = true;
+            break;
+        }
+    }
+
+    // start_line past the end: say how many lines the file actually has, rather than returning an
+    // empty string that makes the model believe the file is empty.
+    if slice.first == 0 && start > 1 {
+        return Err(ToolOutput::err(crate::tf!(
+            "start_line {} is past the end of {}: the file has only {} line(s).",
+            start,
+            path.display(),
+            line_no
+        )));
+    }
+    if slice.first == 0 && line_no > 0 {
+        // start = 1 and not a single line came out: only possible with a zero byte budget, which is
+        // handled above — this is just the backstop.
+        slice.has_more = true;
+    }
+    slice.body = body;
+    Ok(slice)
 }
 
 // ---------------------------------------------------------------- write_file
@@ -183,7 +410,7 @@ impl Tool for WriteFileTool {
         host_tool_access(self.name())
     }
     fn description(&self) -> &str {
-        crate::i18n::t("Write a string into a text file (overwrite; provided by the host; subject to the workspace). The path must be an absolute path inside the workspace; parent directories are created automatically by default.")
+        crate::i18n::t("Write a string into a text file (overwrite; provided by the host; subject to the workspace). The path must be an absolute path inside the workspace; parent directories are created automatically by default. For changing part of an existing file, use edit_file instead: an overwrite rewrites every unchanged line too, so any drift in them lands on disk as well.")
     }
     fn parameters(&self) -> Value {
         json!({
@@ -274,7 +501,7 @@ const DIFF_MAX_LINES: usize = 2000;
 /// instead of `O(n·m)`. Past `DIFF_MAX_LINES` the table is skipped entirely and a blunt line-by-line
 /// comparison is used — it never *under*-reports a change, which is the direction that matters for a
 /// number a human reads at a glance.
-fn line_diff(old: &str, new: &str) -> (usize, usize) {
+pub(crate) fn line_diff(old: &str, new: &str) -> (usize, usize) {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
 
@@ -331,7 +558,7 @@ const ELISION: &str = "⋯";
 /// changed middles are small enough to hold a table; past [`DIFF_TABLE_CELLS`] the two middles are
 /// drawn as one block of removals followed by one block of additions. That fallback degrades the
 /// *interleaving*, never the information — and a file written from scratch is all additions anyway.
-fn diff_text(old: &str, new: &str) -> String {
+pub(crate) fn diff_text(old: &str, new: &str) -> String {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
 
@@ -797,13 +1024,13 @@ mod tests {
         let rt = rt_with_ws(&d).await;
         let f = d.join("sub").join("a.txt");
 
-        let w = rt.execute(HOST_FILE_TOOLS[1], json!({PATH_ARG: f.to_string_lossy(), "content": "你好\n"})).await;
+        let w = rt.execute(HOST_FILE_TOOLS[1], json!({PATH_ARG: f.to_string_lossy(), "content": "héllo\n"})).await;
         assert!(!w.is_error, "{}", w.content);
         assert!(f.exists(), "the parent directory should be created automatically");
 
         let r = rt.execute(HOST_FILE_TOOLS[0], json!({PATH_ARG: f.to_string_lossy()})).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("你好"), "the content should read back: {}", r.content);
+        assert!(r.content.contains("héllo"), "the content should read back: {}", r.content);
     }
 
     /// An out-of-bounds **write** must be blocked, and the copy handed to the
@@ -841,12 +1068,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out_dir);
         std::fs::create_dir_all(&out_dir).unwrap();
         let f = out_dir.join("note.txt");
-        std::fs::write(&f, "外面的内容").unwrap();
+        std::fs::write(&f, "outside content").unwrap();
 
         // Read: allowed
         let r = rt.execute(HOST_FILE_TOOLS[0], json!({PATH_ARG: f.to_string_lossy()})).await;
         assert!(!r.is_error, "reading a file outside the workspace must be allowed (new semantics): {}", r.content);
-        assert!(r.content.contains("外面的内容"), "{}", r.content);
+        assert!(r.content.contains("outside content"), "{}", r.content);
 
         // List directory: equally allowed
         let l = rt.execute(HOST_FILE_TOOLS[2], json!({PATH_ARG: out_dir.to_string_lossy()})).await;
@@ -900,5 +1127,213 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("folder/"), "directories should carry a trailing /: {}", out.content);
         assert!(out.content.contains("a.txt"), "{}", out.content);
+    }
+
+    // ───────────────────────── range reads ─────────────────────────
+
+    /// Pull the fingerprint out of a read_file header — the exact string a model would copy into
+    /// `expected_hash`. Parsing it here (rather than recomputing it) is the point: it proves the
+    /// value printed is the value edit_file accepts.
+    fn hash_in(content: &str) -> String {
+        let head = content.lines().next().unwrap_or_default();
+        let at = head.find("hash ").expect("the header must carry a hash");
+        head[at + 5..].chars().take(16).collect()
+    }
+
+    fn numbered(n: usize) -> String {
+        (1..=n).map(|i| format!("line{i}\n")).collect()
+    }
+
+    #[tokio::test]
+    async fn a_range_read_returns_only_that_slice_with_line_numbers() {
+        let d = tmp("range");
+        std::fs::write(d.join("log.txt"), numbered(10)).unwrap();
+        let rt = rt_with_ws(&d).await;
+
+        let out = rt
+            .execute(
+                HOST_FILE_TOOLS[0],
+                json!({PATH_ARG: d.join("log.txt").to_string_lossy(), "start_line": 3, "max_lines": 2}),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("lines 3-4"), "{}", out.content);
+        assert!(out.content.contains("more lines follow"), "{}", out.content);
+        assert!(out.content.contains("start_line=5"), "the next call should be spelled out: {}", out.content);
+        // Exactly these two lines: neither the lines before them nor the ones after may appear
+        assert!(out.content.contains("line3"), "{}", out.content);
+        assert!(out.content.contains("line4"), "{}", out.content);
+        assert!(!out.content.contains("line2\n"), "{}", out.content);
+        assert!(!out.content.contains("line5"), "{}", out.content);
+        // Line numbers are 1-based and form their own column
+        assert!(out.content.contains("     3\tline3"), "{:?}", out.content);
+    }
+
+    #[tokio::test]
+    async fn the_last_range_says_it_reached_the_end() {
+        let d = tmp("range-end");
+        std::fs::write(d.join("f.txt"), numbered(5)).unwrap();
+        let rt = rt_with_ws(&d).await;
+        let out = rt
+            .execute(
+                HOST_FILE_TOOLS[0],
+                json!({PATH_ARG: d.join("f.txt").to_string_lossy(), "start_line": 4}),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("lines 4-5"), "{}", out.content);
+        assert!(out.content.contains("end of file"), "{}", out.content);
+        assert!(!out.content.contains("more lines follow"), "{}", out.content);
+    }
+
+    /// start_line out of range: it must say how many lines the file has. An empty string is the
+    /// worst kind of "looks like it worked".
+    #[tokio::test]
+    async fn a_start_line_past_the_end_is_an_error_with_the_real_length() {
+        let d = tmp("range-past");
+        std::fs::write(d.join("f.txt"), numbered(3)).unwrap();
+        let rt = rt_with_ws(&d).await;
+        let out = rt
+            .execute(
+                HOST_FILE_TOOLS[0],
+                json!({PATH_ARG: d.join("f.txt").to_string_lossy(), "start_line": 9}),
+            )
+            .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("only 3 line"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn zero_valued_range_arguments_are_rejected() {
+        let d = tmp("range-zero");
+        std::fs::write(d.join("f.txt"), "a\nb\n").unwrap();
+        let rt = rt_with_ws(&d).await;
+        for args in [
+            json!({PATH_ARG: d.join("f.txt").to_string_lossy(), "start_line": 0}),
+            json!({PATH_ARG: d.join("f.txt").to_string_lossy(), "max_lines": 0}),
+        ] {
+            let out = rt.execute(HOST_FILE_TOOLS[0], args.clone()).await;
+            assert!(out.is_error, "{args} should be rejected: {}", out.content);
+        }
+    }
+
+    /// No range = the old behaviour: the whole content, no line-number column, header gains only
+    /// `hash`.
+    #[tokio::test]
+    async fn the_plain_read_keeps_its_old_shape() {
+        let d = tmp("plain");
+        std::fs::write(d.join("f.txt"), "alpha\nbeta\n").unwrap();
+        let rt = rt_with_ws(&d).await;
+        let out = rt
+            .execute(HOST_FILE_TOOLS[0], json!({PATH_ARG: d.join("f.txt").to_string_lossy()}))
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("(11 bytes, hash "), "{}", out.content);
+        assert!(!out.content.contains("     1\t"), "no line-number column in the plain form: {}", out.content);
+        assert!(out.content.ends_with("alpha\nbeta\n"), "{:?}", out.content);
+    }
+
+    /// The hash in the header must be **exactly** what `edit_file` accepts as `expected_hash` — the
+    /// only contract between the two tools. Let the algorithm or the formatting differ and every edit
+    /// the model makes with a hash gets rejected as "the file changed".
+    #[tokio::test]
+    async fn the_hash_printed_by_read_is_accepted_by_edit() {
+        let d = tmp("hash-loop");
+        let f = d.join("f.txt");
+        std::fs::write(&f, "before\n").unwrap();
+        let rt = rt_with_ws(&d).await;
+
+        let read = rt.execute(HOST_FILE_TOOLS[0], json!({PATH_ARG: f.to_string_lossy()})).await;
+        let hash = hash_in(&read.content);
+        let edit = rt
+            .execute(
+                HOST_FILE_TOOLS[5],
+                json!({
+                    PATH_ARG: f.to_string_lossy(),
+                    "edits": [{"old_text": "before", "new_text": "after"}],
+                    "expected_hash": hash,
+                }),
+            )
+            .await;
+        assert!(!edit.is_error, "the printed hash must be accepted verbatim: {}", edit.content);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "after\n");
+    }
+
+    /// CRLF files: the line-number column must not drag `\r` into the content, and a whole-file
+    /// read must return the body byte-for-byte.
+    #[tokio::test]
+    async fn crlf_files_read_cleanly_in_both_forms() {
+        let d = tmp("crlf");
+        let f = d.join("win.txt");
+        std::fs::write(&f, "a\r\nb\r\nc\r\n").unwrap();
+        let rt = rt_with_ws(&d).await;
+
+        let ranged = rt
+            .execute(
+                HOST_FILE_TOOLS[0],
+                json!({PATH_ARG: f.to_string_lossy(), "start_line": 2, "max_lines": 1}),
+            )
+            .await;
+        assert!(!ranged.is_error, "{}", ranged.content);
+        assert!(ranged.content.contains("     2\tb\n"), "{:?}", ranged.content);
+        assert!(!ranged.content.contains('\r'), "{:?}", ranged.content);
+
+        let plain = rt.execute(HOST_FILE_TOOLS[0], json!({PATH_ARG: f.to_string_lossy()})).await;
+        assert!(plain.content.ends_with("a\r\nb\r\nc\r\n"), "{:?}", plain.content);
+    }
+
+    /// The byte budget ran out mid-line: the content is given, and the line is marked incomplete
+    /// with more to follow.
+    #[tokio::test]
+    async fn the_byte_cap_reports_a_partial_stop() {
+        let d = tmp("bytecap");
+        std::fs::write(d.join("f.txt"), numbered(40)).unwrap();
+        let rt = rt_with_ws(&d).await;
+        let out = rt
+            .execute(
+                HOST_FILE_TOOLS[0],
+                json!({PATH_ARG: d.join("f.txt").to_string_lossy(), "max_bytes": 100}),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("byte cap"), "{}", out.content);
+        assert!(out.content.contains("not the whole file"), "{}", out.content);
+        assert!(out.content.len() < 400, "the cap must actually bound the payload: {}", out.content.len());
+    }
+
+    // ───────────────────────── the index table ─────────────────────────
+
+    /// `HOST_FILE_TOOLS` is addressed **by index** (the read/write split, and every `[n]` above), so
+    /// the list and the table have to agree position by position. A future tool inserted in the middle
+    /// would silently point the read-only exemption at some other tool; this fails instead.
+    #[test]
+    fn the_tool_list_matches_the_name_table_in_order() {
+        let tools = host_file_tools();
+        assert_eq!(tools.len(), HOST_FILE_TOOLS.len());
+        for (i, t) in tools.iter().enumerate() {
+            assert_eq!(t.name(), HOST_FILE_TOOLS[i], "index {i} drifted out of the table");
+        }
+        // The new tool is a write: it must be judged by the workspace boundary exactly as write_file is.
+        assert_eq!(host_tool_access("edit_file"), crate::workplace::Access::Write);
+        assert_eq!(host_tool_access("read_file"), crate::workplace::Access::Read);
+    }
+
+    /// The schema the model actually receives has to name the two required parameters — a tool whose
+    /// schema forgot `edits` would be called with `{}` and fail every time.
+    #[test]
+    fn the_edit_schema_requires_path_and_edits() {
+        let tools = host_file_tools();
+        let edit = tools.iter().find(|t| t.name() == "edit_file").expect("edit_file must be registered");
+        let params = edit.parameters();
+        let required: Vec<&str> = params["required"]
+            .as_array()
+            .expect("required must be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required.contains(&PATH_ARG), "{required:?}");
+        assert!(required.contains(&"edits"), "{required:?}");
+        assert_eq!(params["properties"]["edits"]["type"], "array");
+        assert_eq!(params["properties"]["edits"]["items"]["type"], "object");
     }
 }

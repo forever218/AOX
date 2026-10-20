@@ -423,6 +423,19 @@ pub struct App {
     /// the OpenAI-compatible endpoints this app targets, and it is what an unconfigured install
     /// gets. See [`App::context_used`] for the numerator.
     context_window: u64,
+    /// When the host is compacting the context right now (the instant the event arrived), so the
+    /// input box can show "compacting…" with an animation instead of a gauge that is pinned at full.
+    ///
+    /// A `std::time::Instant` rather than `self.clock`: the animation has to keep moving even in
+    /// `--demo`, where the simulated clock only advances while something is "running".
+    compacting: Option<std::time::Instant>,
+    /// The ring's numerator right after a compaction (`ContextCompacted::after`).
+    ///
+    /// The real figure only comes back with the **next** request's usage, which is a whole model
+    /// round trip away — and that round trip is exactly what the user is watching for, so leaving the
+    /// gauge sitting at "full" (or red) for those seconds reads as "it didn't work". Cleared as soon
+    /// as a real number arrives (a turn's `Usage`, or a new turn starting).
+    ctx_reset: Option<u64>,
 
     model: String,
     config_path: String,
@@ -582,10 +595,11 @@ const WRITE_FILE_TOOL: &str = "write_file";
 
 /// Tools whose row **names the file it works on**.
 ///
-/// Only the file writer for now (user request, 2026-10-11: "also show the file being edited"). Adding
-/// a read or a delete here is a one-line change the day the same is wanted for them — nothing else
-/// keys off this list.
-const SUBJECT_TOOLS: &[&str] = &[WRITE_FILE_TOOL];
+/// The two file writers — `write_file` (whole-file) and `edit_file` (in-place snippets) — both take a
+/// `path` and both produce a diff, so both rows should say which file they are about. Adding a read or
+/// a delete here is a one-line change the day the same is wanted for them; nothing else keys off this
+/// list.
+const SUBJECT_TOOLS: &[&str] = &[WRITE_FILE_TOOL, "edit_file"];
 
 /// Height cap of the unfolded diff panel. A peephole into the edit, not a second editor — the point
 /// is "which lines moved", and the panel scrolls for the rest.
@@ -673,6 +687,8 @@ impl App {
             usage_log: Vec::new(),
             usage_open: false,
             context_window: DEFAULT_CONTEXT_WINDOW,
+            compacting: None,
+            ctx_reset: None,
             model: String::new(),
             config_path: String::new(),
             plugins: Vec::new(),
@@ -913,6 +929,11 @@ impl App {
                     });
                     self.busy = true;
                     self.status = aox::i18n::t("Thinking").into();
+                    // A new turn rewrites the context from scratch: whatever the last compaction
+                    // left on the gauge is no longer the reading anyone needs (and if the previous
+                    // turn died mid-compaction, the "compacting…" hint must not survive it either).
+                    self.ctx_reset = None;
+                    self.compacting = None;
                     // Defensive: a call still marked as "being written" from the previous turn would
                     // otherwise be adopted by a call of the same name in this one.
                     self.stream_calls.clear();
@@ -963,6 +984,8 @@ impl App {
                         // out of nowhere.
                         self.items.push(Item::Usage(usage_line(&rec)));
                         self.usage_log.push(*rec);
+                        // A real reading is in: the post-compaction placeholder has done its job.
+                        self.ctx_reset = None;
                         self.force_follow = true;
                     }
                 }
@@ -978,6 +1001,10 @@ impl App {
                     // conversation is opened, each turn's bill should be stuck back where it was,
                     // not heaped up at the top.
                     self.usage_log = log;
+                    // The gauge belongs to the conversation on screen; a switch replaces the reading
+                    // wholesale, and a leftover override from the previous one would be a lie.
+                    self.ctx_reset = None;
+                    self.compacting = None;
                     self.rebuild_usage_rows();
                     // Rebuild the cache map from that ledger. The map is a history — one tile per
                     // recorded round — so it is replayed whole rather than seeded with the last
@@ -2377,6 +2404,34 @@ impl App {
                     self.refresh_history();
                 }
             }
+            // ── Context compaction (`aox::compact`) ──
+            // Two events, because the user sees two different things: while the summary call is in
+            // flight the input box shows "compacting…" (the one moment the turn genuinely pauses),
+            // and when it lands the gauge drops to the new figure instead of staying pinned at full
+            // until the next request comes back.
+            AgentEvent::ContextCompacting { used, budget } => {
+                self.compacting = Some(std::time::Instant::now());
+                self.note_act(
+                    ActKind::Info,
+                    aox::i18n::t("Context"),
+                    &aox::tf!("compacting ~{} of {} tokens", used, budget),
+                );
+            }
+            AgentEvent::ContextCompacted { before, after, folded, elided } => {
+                self.compacting = None;
+                self.ctx_reset = Some(after);
+                self.note_act(
+                    ActKind::Info,
+                    aox::i18n::t("Context"),
+                    &aox::tf!(
+                        "compacted ~{} → ~{} tokens ({} messages folded, {} tool results stubbed)",
+                        before,
+                        after,
+                        folded,
+                        elided
+                    ),
+                );
+            }
             AgentEvent::Images(paths) => {
                 // Images produced by a tool: **drawn right here**.
                 //
@@ -2400,6 +2455,8 @@ impl App {
     /// A turn ends: collapse the process into one row, then paste the final answer beneath it.
     fn finish_turn(&mut self, aborted: bool) {
         self.busy = false;
+        // An aborted turn can be aborted *during* a compaction; the hint must not outlive the turn.
+        self.compacting = None;
         self.waiting_auth = false;
         self.auth = None;
         self.auth_reply = None;
@@ -3069,13 +3126,20 @@ impl App {
     /// the next request -- without it the ring would sit perfectly still while a long reply is
     /// being written, which is the one moment someone is likely to be watching it.
     fn context_used(&self) -> u64 {
+        let live = self.live.as_ref().map_or(0, |l| l.out.tokens());
+        // Right after a compaction the true figure is only known locally (the compacted request's
+        // size); the endpoint's own number arrives with the next call. Showing the stale "full"
+        // reading in between is exactly the moment the user is watching, so the reset wins until a
+        // real number lands (see `ctx_reset`).
+        if let Some(after) = self.ctx_reset {
+            return after + live;
+        }
         let base = self
             .usage_log
             .iter()
             .rev()
             .find_map(|r| r.last_prompt)
             .unwrap_or(0);
-        let live = self.live.as_ref().map_or(0, |l| l.out.tokens());
         base + live
     }
 
@@ -3568,7 +3632,25 @@ impl App {
                         ui.horizontal(|ui| {
                             workplace_ui::button(ui, &mut self.ws, self.demo || !blocked);
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                context_ring(ui, self.context_used(), self.context_window);
+                                // While the host is folding old turns into a summary, the gauge has no
+                                // honest reading (the numbers only come back a round trip later), so
+                                // the ring becomes the spinner and a line of text says why. That is
+                                // the **only** moment the input box stops looking idle while a turn
+                                // is still running.
+                                let spin = self.compacting.map(|t| t.elapsed().as_secs_f32());
+                                context_ring(ui, self.context_used(), self.context_window, spin);
+                                if spin.is_some() {
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new(aox::i18n::t("Compacting context…"))
+                                            .size(11.0)
+                                            .color(P::text_dim()),
+                                    );
+                                    // Nothing else in this row animates, so the repaint has to be
+                                    // asked for by hand; without it the arc would jump only when the
+                                    // pointer moves.
+                                    ui.ctx().request_repaint();
+                                }
                                 ui.add_space(10.0);
                                 self.usage_chip(ui);
                             });
@@ -4493,6 +4575,10 @@ pub(crate) fn default_window_size(mon: Vec2, chrome: Vec2) -> Vec2 {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // First statement of the first frame: the appearance install that `App::new` could not do
+        // yet (the system theme only becomes readable inside a pass). Idempotent, free after the
+        // first call. See `theme::settle`.
+        theme::settle(ctx);
         self.fit_window(ctx);
         // Before `pump`: the clock's run/stop state has to be settled from the *current* flags
         // before this frame's events are timestamped, so nothing records a moment that belongs to
@@ -4899,13 +4985,34 @@ fn sidebar_button(ui: &mut Ui, open: bool, floating: bool) -> egui::Response {
 /// Drawn as a hand-built polyline rather than a real arc: egui has no arc primitive, and at 16px a
 /// 40-segment `PathShape` is pixel-identical to one. Zero arc → no fill at all, so a fresh
 /// conversation shows the empty track and nothing else.
-fn context_ring(ui: &mut Ui, used: u64, limit: u64) -> egui::Response {
+///
+/// `spin` is `Some(seconds since the compaction started)` while the host is folding history into a
+/// summary. In that state the ring **stops being a reading**: the numbers will only be known after
+/// the next request, so filling it with the old (full) value would say "still full" at the exact
+/// moment the problem is being solved. Instead a short arc travels around the track — the one
+/// animation this row has, and the honest shape for "working, no measurement yet".
+fn context_ring(ui: &mut Ui, used: u64, limit: u64, spin: Option<f32>) -> egui::Response {
     let d = 16.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(d), Sense::hover());
     let c = rect.center();
     let r = d * 0.5 - 1.3;
     let p = ui.painter();
     p.circle_stroke(c, r, Stroke::new(2.0, P::border()));
+    if let Some(t) = spin {
+        // One turn per second, a 90° tail: slow enough to read as "working", fast enough that a
+        // one-second summary does not look frozen.
+        let sweep = std::f32::consts::FRAC_PI_2;
+        let a0 = -std::f32::consts::FRAC_PI_2 + t * std::f32::consts::TAU;
+        let n = 10usize;
+        let pts: Vec<Pos2> = (0..=n)
+            .map(|i| {
+                let a = a0 + sweep * (i as f32 / n as f32);
+                Pos2::new(c.x + r * a.cos(), c.y + r * a.sin())
+            })
+            .collect();
+        p.add(egui::Shape::line(pts, Stroke::new(2.0, P::text_dim())));
+        return resp.on_hover_text(aox::i18n::t("Compacting the context…"));
+    }
     let frac = if limit == 0 {
         0.0
     } else {

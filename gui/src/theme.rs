@@ -923,10 +923,14 @@ fn widget(v: &mut Visuals, f: impl Fn(&mut egui::style::WidgetVisuals)) {
     f(&mut v.widgets.open);
 }
 
-/// Make the whole app read as "no border noise, low contrast, speaking only through lightness".
-/// Just call this function again after switching themes (fonts need not be reinstalled).
-pub fn install_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+/// Build the one [`egui::style::Style`] that both of egui's theme slots will carry.
+///
+/// Built **once**, for the current [`mode`] — not once per mode. The colour accessors this uses
+/// ([`P::edge`], [`P::edge_raised`], [`P::surface`], …) read the `mode` atomic themselves, so a
+/// second build for the other mode would mean threading a `Mode` through a dozen colour helpers —
+/// for a slot that can never be read (see [`install_style`], which pins the active one to `mode`).
+fn build_style() -> egui::style::Style {
+    let mut style = egui::style::Style::default();
 
     let mut v = match mode() {
         Mode::Light => Visuals::light(),
@@ -1014,7 +1018,63 @@ pub fn install_style(ctx: &egui::Context) {
     style.text_styles.insert(TextStyle::Monospace, mono_font(mono_size()));
     style.text_styles.insert(TextStyle::Heading, bold_font(heading_size()));
 
-    ctx.set_style(style);
+    style
+}
+
+/// Install the app style into **both** of egui's theme slots, and pin the active slot to [`mode`].
+///
+/// Make the whole app read as "no border noise, low contrast, speaking only through lightness".
+/// Call it again after switching themes (fonts need not be reinstalled).
+///
+/// # Why both slots
+///
+/// egui 0.33 keeps two styles — `Options::dark_style` / `light_style` — and `Context::set_style`
+/// writes **only the one `Options::theme()` currently selects**. Which one that is depends on
+/// `theme_preference` (default `System`) plus the *system* theme, i.e. on something this crate does
+/// not control; the other slot silently keeps egui's built-in defaults. That is exactly the bug
+/// this function now prevents: a freshly started window rendered its composer at egui's 13px body
+/// size, painted text selection in `Selection::light()`'s bright blue, and in dark mode drew
+/// near-black text on a dark card — because `App::new` ran the install while
+/// `Context::system_theme()` was still `None` (it is only copied in from the frame's input at
+/// `begin_pass`), so the custom style landed in `dark_style` while the first frame then activated
+/// `light_style`. Switching the theme in settings only "cured" it by re-running this function once
+/// the system theme had settled.
+///
+/// Writing the same style to both slots means no theme flip can ever fall back to the built-ins;
+/// pinning the active slot to [`mode`] means it stops depending on the OS round-trip at all.
+pub fn install_style(ctx: &egui::Context) {
+    let style = Arc::new(build_style());
+    ctx.set_style_of(egui::Theme::Light, style.clone());
+    ctx.set_style_of(egui::Theme::Dark, style);
+    ctx.set_theme(match mode() {
+        Mode::Light => egui::ThemePreference::Light,
+        Mode::Dark => egui::ThemePreference::Dark,
+    });
+}
+
+/// Whether the appearance install still owes its first run (armed by [`apply`], paid by [`settle`]).
+static SETTLE_PENDING: AtomicBool = AtomicBool::new(true);
+
+/// Pay the first-frame debt: install style + native theme **here**, not in `App::new`.
+///
+/// [`apply`] runs inside `App::new`, before any pass has started, so `Context::system_theme()` is
+/// still `None` there — eframe only copies it in from the frame's input at `begin_pass`. Anything
+/// decided at that point is a guess (the fallback is dark), and a "follow system" start on a light
+/// desktop would begin one mode off. Deferring to the first `update` — called before a single
+/// widget is painted — means the first frame drawn is already the right one, and the window never
+/// receives a native theme command for a mode it is not about to show.
+///
+/// Costs nothing after the first call: the flag is swapped, not read.
+pub fn settle(ctx: &egui::Context) {
+    if !SETTLE_PENDING.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    // "Follow system" can only be resolved now. Explicit light/dark were already exact in `apply`.
+    if pref() == Pref::System {
+        set_mode(effective(Pref::System, ctx.system_theme()));
+    }
+    install_style(ctx);
+    sync_native_theme(ctx);
 }
 
 /// One-time assembly: merge the appearance overrides from config onto the built-in theme.
@@ -1040,8 +1100,11 @@ pub fn apply(ctx: &egui::Context, cfg: &ThemeConfig) {
     let _ = FONTS.set(cfg.fonts.clone());
 
     install_fonts(ctx);
-    install_style(ctx);
-    sync_native_theme(ctx);
+    // Style and native theme wait for the **first frame** (see [`settle`]): right here
+    // `Context::system_theme()` is still `None`, so a "follow system" start would have to guess —
+    // and guess wrong on a light desktop. Fonts, on the other hand, are mode-independent and must
+    // be in place before the first glyph is laid out, so they are installed now.
+    SETTLE_PENDING.store(true, Ordering::Relaxed);
 }
 
 /// Make the OS window decorations (title bar, border) follow the app theme.
@@ -1249,6 +1312,56 @@ mod tests {
         for p in Pref::ALL {
             assert_eq!(parse_pref(p.key()), Some(p), "{p:?} must read back after persisting");
         }
+    }
+
+    /// Both of egui's style slots must carry the app's style, and the active one must be pinned to
+    /// [`mode`] instead of being decided by the system theme.
+    ///
+    /// This is the regression guard for a startup bug that only showed up in *some* system/app theme
+    /// combinations: `Context::set_style` writes one slot (the active one), so the other kept egui's
+    /// built-ins — 13px composer text, bright-blue selection, near-black text in dark mode. Asserting
+    /// on **both** slots is the point: checking only the active one would have passed even while the
+    /// bug was live.
+    #[test]
+    fn both_style_slots_carry_the_app_style() {
+        let ctx = egui::Context::default();
+        install_style(&ctx);
+
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let s = ctx.style_of(theme);
+            assert_eq!(s.visuals.override_text_color, Some(P::text()), "{theme:?}: text colour fell back to egui's");
+            assert_eq!(
+                s.text_styles[&TextStyle::Body].size,
+                body_size(),
+                "{theme:?}: body size is not the app's (egui's default is 13.0)"
+            );
+            assert_eq!(
+                s.visuals.selection.bg_fill,
+                P::ink().gamma_multiply(0.20),
+                "{theme:?}: selection kept egui's blue instead of the ink wash"
+            );
+        }
+
+        let want = match mode() {
+            Mode::Light => egui::Theme::Light,
+            Mode::Dark => egui::Theme::Dark,
+        };
+        assert_eq!(ctx.theme(), want, "the active slot must follow `mode`, not the system theme");
+    }
+
+    /// `settle` is the first-frame half of `apply`: it must pay the debt exactly once.
+    #[test]
+    fn settle_pays_the_install_debt_exactly_once() {
+        // Process-global, but the only other writer is `apply`, which the tests never run.
+        SETTLE_PENDING.store(true, Ordering::Relaxed);
+        let ctx = egui::Context::default();
+        settle(&ctx);
+        assert!(!SETTLE_PENDING.load(Ordering::Relaxed), "the debt must be cleared, or every frame re-installs");
+        assert_eq!(
+            ctx.style_of(egui::Theme::Dark).visuals.override_text_color,
+            Some(P::text()),
+            "settle must actually install the style"
+        );
     }
 }
 

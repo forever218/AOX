@@ -871,6 +871,20 @@ async fn boot_and_run(
     for t in aox::tool::ask::ask_tools() {
         rt.register(t).await?;
     }
+    // Tool discovery (`aox::tool::discover`). Same story as the CLI: visible to the model, executed by
+    // the agent loop (it changes the conversation's advertised tool set, which `Tool::call` can't reach).
+    for t in aox::tool::discover::find_tools() {
+        rt.register(t).await?;
+    }
+    // Task checkpoints (`aox::task`). Same story as the CLI: registration makes it visible to the
+    // model, execution is intercepted by the agent loop.
+    for t in aox::tool::task::task_tools() {
+        rt.register(t).await?;
+    }
+    // Verification (`aox::tool::verify`). Same story: visible to the model, executed by the agent loop.
+    for t in aox::tool::verify::verify_tools() {
+        rt.register(t).await?;
+    }
 
     let mut ui = GuiUi { tx: tx.clone(), rx };
 

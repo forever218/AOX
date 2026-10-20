@@ -13,7 +13,7 @@
 [provider]
 # OpenAI-compatible endpoint (DeepSeek / Kimi / OpenAI / vLLM / Ollama all work)
 base_url = "https://api.deepseek.com"
-model = "deepseek-chat"
+model = "deepseek-flash"
 # Pick one: write the key directly, or name an environment variable
 api_key = "sk-..."
 # api_key_env = "DEEPSEEK_API_KEY"
@@ -21,7 +21,7 @@ api_key = "sk-..."
 # ⚠️ A reasoning model's "reasoning tokens" count against this budget too, so a value that is
 #    too small yields an empty body text, which shows up as "the task broke off for no reason".
 #    DeepSeek caps it at 384K (393216) server-side; exceeding that gets a flat 400.
-max_tokens = 300000
+max_tokens = 32000
 temperature = 0.3
 # Whether to request as an SSE stream (default true).
 # With this on, a reasoning model's chain of thought scrolls live while you wait (and
@@ -32,7 +32,7 @@ stream = true
 # The model's context window, in tokens. **Display only**: the input box draws a small ring
 # showing how full the context is, and this is what "full" means. Nothing is truncated against
 # it. Leave it out and the GUI assumes 128000.
-# context_window = 128000
+ context_window = 600000
 
 [auth]
 # Meta tools (create_plugin / remove_plugin and other operations that change the system
@@ -59,6 +59,15 @@ rules_file = "RULES.md"
 tool_timeout_secs = 120
 # Maximum number of characters of a tool result sent back to the model (truncated past this)
 max_result_chars = 20000
+# Token budget for ONE request. When the conversation outgrows it, the host folds the oldest turns
+# into a summary *for the request only* — the conversation file keeps every message.
+#   0 (default) = derive it from [provider] context_window x compact_ratio, and if context_window is
+#                 not set either, compaction stays off (an unknown window is never guessed at).
+#   > 0         = use this as the input budget directly.
+context_budget_tokens = 0
+# How much of context_window may be used for input; the reply's max_tokens is then reserved on top.
+# Clamped to 0.3..1.0.
+compact_ratio = 0.8
 
 [prompt]
 # The system prompt is assembled from several "segments"; this is how you override them on
@@ -258,6 +267,28 @@ max_resident = 0
 # use" at the start of every request, so under lazy loading they would be started, closed and
 # started again each round. List them here and they are started at boot like they used to be.
 # eager = ["my_component"]
+
+[tools]
+# How many registered tools the model is shown at once.
+#
+# At or below this number the whole registry is sent with every request -- byte-identical to the
+# behaviour before this section existed. The default (24) covers the 14 host tools plus a handful of
+# plugins, so a light install never notices this section at all. 0 = never hold anything back.
+#
+# Above it, **plugin** tools are left out of the request until the model calls find_tools (tools of a
+# plugin it has just built appear immediately, no lookup needed). The host's own tools are always
+# listed: the line is drawn by the tool's kind, not by a hand-written name list, so adding a host
+# tool later can never accidentally make it invisible.
+#
+# Why bother: every schema is paid for on every request, and a long list also lowers the chance the
+# model picks the right tool at all. Hiding is **advertising only** -- a hidden tool still runs when
+# called by name, so this can never turn a working plugin into a broken one.
+inline_max = 24
+
+# Tools that stay listed no matter what, plugin tools included. Useful when you always want one
+# plugin at hand and would rather not spend a lookup on it. Unknown names are ignored, so deleting a
+# plugin does not leave a broken config behind.
+# enabled = ["fs_ls", "sysinfo_pro_overview"]
 
 [workplace]
 # Which files the model may touch ("take file capability back from the model"). Note that this

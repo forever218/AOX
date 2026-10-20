@@ -80,7 +80,9 @@ pub enum Verdict {
 
 /// The part of the request that `before_request` can see and change.
 pub struct Request {
-    /// The tool schema list sent to the model this round (default = `Runtime::tool_schemas()`).
+    /// The tool schema list sent to the model this round: the loop fills it from
+    /// `Runtime::tool_schemas_scoped` (already gated by `[tools] inline_max`), **before** this hook
+    /// runs, so a hook can only add to or narrow the list further.
     /// A hook may replace it wholesale — e.g. pulling a few tools out of this round by policy.
     pub tools: Vec<Value>,
     /// Messages the hook asks to **append**. The loop enqueues them via `Agent::push_message`

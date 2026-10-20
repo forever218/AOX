@@ -73,6 +73,18 @@ pub trait Session: Send {
     /// is silenced in `src/main.rs`, so the reason sits next to the thing it is about.
     #[allow(dead_code)]
     fn append_title(&mut self, title: Option<&str>);
+    /// Append a **task checkpoint** (`kind:"task"`), the long-running task's goal / constraints /
+    /// progress / next steps (see `crate::task`).
+    ///
+    /// It travels with the conversation for the same reason the workplace record does: it belongs to
+    /// this conversation, so deleting or pruning the conversation takes it along and leaves no orphan
+    /// file. Written as an **append** rather than patching an earlier row — the file only ever grows,
+    /// and a reader takes the last one.
+    ///
+    /// The payload is a plain JSON value: the store writes what it is given and does not know the
+    /// task schema, exactly like [`Session::append_act`]. That keeps "how a checkpoint is shaped" in
+    /// one module (`crate::task`) instead of two.
+    fn append_task(&mut self, task: &Value);
     /// Rewrite the whole file with the given message list (interrupt rollback);
     /// the activity stream and usage are preserved as-is.
     fn rewrite(&mut self, msgs: &[Message]);
@@ -142,6 +154,12 @@ pub trait Store: Send + Sync {
     /// the current state alone — if we don't know which plot that conversation
     /// used, we should not guess on the user's behalf.
     fn load_workplace(&self, id: &str) -> Option<crate::workplace::Record>;
+    /// Read this conversation's **last** task checkpoint (`kind:"task"`), as the raw payload.
+    ///
+    /// `None` covers both "this conversation never had one" (a one-off question, or a file written
+    /// before checkpoints existed) and "the row is unreadable" — the caller parses it and degrades to
+    /// "no checkpoint" either way, because a broken checkpoint must never block a conversation.
+    fn load_task(&self, id: &str) -> Option<Value>;
     /// Delete a conversation and return the entry that was removed.
     fn remove(&self, key: &str) -> Result<Summary>;
     /// Keep only the newest `keep` conversations (`0` = no limit) and return the
