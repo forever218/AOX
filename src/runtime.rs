@@ -414,7 +414,15 @@ impl Runtime {
         // Fallback timeout: plugin tools already have a tool_timeout_secs timeout +
         // restart-and-retry internally; add 30 seconds of headroom here to guard against a
         // permanent block on any path.
-        let timeout = Duration::from_secs(self.config.agent.tool_timeout_secs + 30);
+        //
+        // A tool may ask for a **longer** leash than the flat rule allows (the shell tools do: a
+        // build can legitimately take minutes) — see `Tool::timeout_hint`. Without it the outer
+        // guard would fire first and report "the tool timed out" while the tool's own, more precise
+        // timeout never ran.
+        let timeout = match tool.timeout_hint(&args) {
+            Some(d) => d + Duration::from_secs(10),
+            None => Duration::from_secs(self.config.agent.tool_timeout_secs + 30),
+        };
         match tokio::time::timeout(timeout, tool.call(args, self)).await {
             Ok(out) => out,
             Err(_) => ToolOutput::err(crate::tf!("tool {} timed out ({} s)", name, timeout.as_secs())),

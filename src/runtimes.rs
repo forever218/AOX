@@ -3,13 +3,22 @@
 //! ## 1. Interpreter resolution (three tiers, shared by CLI / GUI / selftest)
 //!
 //! 1. `config.toml`'s `[runtimes]` has an **explicit path** → use it directly, no guessing;
-//! 2. The field is a **bare command** (`python` / `node` / `rustc`) and a built-in runtime
-//!    exists under the app directory `<app_root>/runtime/<lang>/<exe>` → use the built-in one;
-//! 3. Neither → keep the bare command and leave it to `PATH`.
+//! 2. The field is a **bare command** (`python` / `node` / `rustc`) and that command **resolves on
+//!    `PATH`** → use the system interpreter. This tier exists because a complete install (pip, venv,
+//!    headers, full stdlib) is a better tool than the embeddable runtime this project can ship;
+//!    Windows' "app execution alias" (0 bytes, reparse point, opens the Store) does not count — see
+//!    [`usable`];
+//! 3. Still a bare command, and a built-in runtime exists under `<app_root>/runtime/<lang>/<exe>` →
+//!    use the built-in one.
+//! 4. Neither → keep the bare command and let the spawn fail with the OS's own words.
 //!
-//! Tier 2 is the fulcrum of this design: **dropping a runtime into the app directory makes it
-//! take effect automatically**, with no config change needed, and we write nothing into the
-//! system `PATH` or the user's environment variables (non-invasive, gone on uninstall).
+//! `[runtimes] prefer = "builtin"` swaps tiers 2 and 3 for machines whose `PATH` interpreter is broken
+//! in a way no file check can see. An explicit path always wins over both.
+//!
+//! Tier 3 is what makes "drop a runtime into the app directory and it works" true, with no config change
+//! and with **nothing written into the system `PATH`** or the user's environment (non-invasive, gone on
+//! uninstall). Both [`resolve`] and [`status`] go through [`pick`], so what the settings page reports and
+//! what actually gets spawned cannot drift apart.
 //!
 //! ## 2. Installation
 //!
@@ -167,23 +176,45 @@ pub fn builtin_exe(root: &Path, lang: Lang) -> Option<PathBuf> {
 }
 
 /// Look up an executable in `PATH` — the standard library has no `which`, so here are a dozen lines.
-fn find_in_path(cmd: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
+fn find_in_path(cmd: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
     // On Windows, search a common subset of PATHEXT; other platforms have only the bare name.
     let exts: &[&str] = if cfg!(windows) {
         &["", ".exe", ".cmd", ".bat", ".com"]
     } else {
         &[""]
     };
-    for dir in std::env::split_paths(&path) {
+    for dir in std::env::split_paths(path) {
         for ext in exts {
             let cand = dir.join(format!("{cmd}{ext}"));
-            if cand.is_file() {
+            if cand.is_file() && usable(&cand) {
                 return Some(cand);
             }
         }
     }
     None
+}
+
+/// Can this `PATH` candidate actually be run?
+///
+/// The case that matters on Windows is the **app execution alias**:
+/// `%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe` exists on any machine with the Store app
+/// installed, is **0 bytes**, and opens the Microsoft Store instead of starting Python. Preferring
+/// `PATH` without this check would trade "always the bundled runtime" for "sometimes a Store window".
+///
+/// ⚠️ **Links are followed, not rejected.** The first version refused anything with
+/// `FILE_ATTRIBUTE_REPARSE_POINT`, which is wrong: on this very machine `~\.cargo\bin\rustc.exe` is a
+/// 10-byte **symbolic link** to the rustup shim, and a symlinked interpreter is normal (rustup, scoop and
+/// chocolatey all do it). The decisive question is whether the *target* has data, so `metadata` — which
+/// follows links — is used, and only a zero-byte or unreadable result is refused. `stat` only: [`resolve`]
+/// runs on the startup path and must not start a process to answer this.
+fn usable(cand: &Path) -> bool {
+    // Normalise first: a `PATH` entry may perfectly well be written with forward slashes, and the
+    // comparison must not depend on which separator this particular string happens to use.
+    let lowered = cand.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+    if lowered.contains("\\windowsapps\\") {
+        return false;
+    }
+    matches!(std::fs::metadata(cand), Ok(m) if m.is_file() && m.len() > 0)
 }
 
 fn cfg_get(cfg: &RuntimesConfig, lang: Lang) -> String {
@@ -202,18 +233,62 @@ fn cfg_set(cfg: &mut RuntimesConfig, lang: Lang, v: String) {
     }
 }
 
-/// The three-tier resolution, rewriting `cfg` in place.
+/// One resolution decision, for one language.
 ///
-/// The built-in runtime only overrides when "the config value is a bare command" — a path the
-/// user wrote explicitly is always respected.
+/// `resolve` and `status` **share this** on purpose. They used to carry the same order written out
+/// twice — and both had it as "bundled first", which is how a settings page ends up faithfully
+/// reporting a policy nobody wanted. Two readers, one function.
+#[derive(Debug, Clone)]
+struct Pick {
+    /// The value to actually use: the raw bare command when `PATH` provides it, the bundled
+    /// executable when it does not, the user's own path when they wrote one.
+    command: String,
+    origin: Origin,
+}
+
+/// Decide where a language's interpreter comes from.
+///
+/// Order: **explicit path** → `PATH` (only a usable candidate) → **bundled** → unchanged (missing).
+/// `prefer = "builtin"` drops the `PATH` step, for machines whose system interpreter is broken in a way
+/// that cannot be seen by looking at the file.
+fn pick(root: &Path, lang: Lang, raw: &str, prefer_system: bool, path: &std::ffi::OsStr) -> Pick {
+    let raw = raw.trim();
+    if !is_bare(raw) {
+        // A user-written path is never substituted; it is only reported as missing when it is absent.
+        let ok = Path::new(raw).is_file();
+        return Pick {
+            command: raw.to_string(),
+            origin: if ok { Origin::Config } else { Origin::Missing },
+        };
+    }
+    if prefer_system && find_in_path(raw, path).is_some() {
+        // The bare command already resolves; rewriting it to an absolute path would only make the
+        // config harder to read and would pin a `PATH` that the user may change later.
+        return Pick { command: raw.to_string(), origin: Origin::Path };
+    }
+    match builtin_exe(root, lang) {
+        Some(exe) => Pick { command: exe.display().to_string(), origin: Origin::Builtin },
+        None => Pick { command: raw.to_string(), origin: Origin::Missing },
+    }
+}
+
+/// `prefer = "system"` (the default) unless the config explicitly says `builtin`.
+fn prefers_system(cfg: &RuntimesConfig) -> bool {
+    !cfg.prefer.trim().eq_ignore_ascii_case("builtin")
+}
+
+/// Rewrite `cfg` in place so that a bare command becomes whatever will actually be executed.
+///
+/// Only a **bundled** pick rewrites the value: a `PATH` hit already works as the bare command it is, and
+/// an explicit path must never be touched (see [`pick`]).
 pub fn resolve(cfg: &mut RuntimesConfig, root: &Path) {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let prefer_system = prefers_system(cfg);
     for lang in Lang::ALL {
-        let cur = cfg_get(cfg, lang);
-        if !is_bare(&cur) {
-            continue;
-        }
-        if let Some(exe) = builtin_exe(root, lang) {
-            cfg_set(cfg, lang, exe.display().to_string());
+        let raw = cfg_get(cfg, lang);
+        let p = pick(root, lang, &raw, prefer_system, &path);
+        if p.origin == Origin::Builtin {
+            cfg_set(cfg, lang, p.command);
         }
     }
 }
@@ -226,26 +301,13 @@ pub fn resolve(cfg: &mut RuntimesConfig, root: &Path) {
 /// app directory`; passing the resolved snapshot would mislabel every built-in runtime as the
 /// former.
 pub fn status(root: &Path, cfg: &RuntimesConfig) -> Vec<Status> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let prefer_system = prefers_system(cfg);
     Lang::ALL
         .into_iter()
         .map(|lang| {
-            let raw = cfg_get(cfg, lang);
-            let raw = raw.trim().to_string();
-            if !is_bare(&raw) {
-                let ok = Path::new(&raw).is_file();
-                return Status {
-                    lang,
-                    command: raw,
-                    origin: if ok { Origin::Config } else { Origin::Missing },
-                };
-            }
-            if let Some(exe) = builtin_exe(root, lang) {
-                return Status { lang, command: exe.display().to_string(), origin: Origin::Builtin };
-            }
-            if find_in_path(&raw).is_some() {
-                return Status { lang, command: raw, origin: Origin::Path };
-            }
-            Status { lang, command: raw, origin: Origin::Missing }
+            let p = pick(root, lang, &cfg_get(cfg, lang), prefer_system, &path);
+            Status { lang, command: p.command, origin: p.origin }
         })
         .collect()
 }
@@ -647,5 +709,142 @@ pub async fn install(
             ))
         }
         other => bail!(crate::tf!("{} does not support auto-install", other.key())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch tree that cleans itself up.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("aox-rt-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+
+        /// Write a file with two bytes of content — i.e. *not* the zero-byte execution alias.
+        fn file(&self, rel: &str) -> PathBuf {
+            let p = self.0.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, b"MZ").unwrap();
+            p
+        }
+
+        fn dir(&self, rel: &str) -> PathBuf {
+            let p = self.0.join(rel);
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn app_with_bundled_python(s: &Scratch) -> PathBuf {
+        let root = s.dir("app");
+        let exe = builtin_dir(&root, Lang::Python).join(Lang::Python.exe());
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"MZ").unwrap();
+        root
+    }
+
+    /// The bug this module was fixed for: a complete system interpreter must win over the embeddable
+    /// runtime, and the *settings page* must agree with what gets spawned — both read `pick`.
+    #[test]
+    fn path_wins_over_the_bundled_runtime() {
+        let s = Scratch::new("path-first");
+        let root = app_with_bundled_python(&s);
+        let bin = s.dir("bin");
+        s.file("bin/python.exe");
+
+        let p = pick(&root, Lang::Python, "python", true, bin.as_os_str());
+        assert_eq!(p.origin, Origin::Path);
+        // A `PATH` hit keeps the bare command: rewriting it would pin a `PATH` the user may change.
+        assert_eq!(p.command, "python");
+    }
+
+    #[test]
+    fn the_bundled_runtime_is_the_fallback() {
+        let s = Scratch::new("fallback");
+        let root = app_with_bundled_python(&s);
+        let empty = s.dir("empty");
+
+        let p = pick(&root, Lang::Python, "python", true, empty.as_os_str());
+        assert_eq!(p.origin, Origin::Builtin);
+        assert!(p.command.ends_with(Lang::Python.exe()), "{}", p.command);
+    }
+
+    #[test]
+    fn prefer_builtin_skips_path() {
+        let s = Scratch::new("prefer-builtin");
+        let root = app_with_bundled_python(&s);
+        let bin = s.dir("bin");
+        s.file("bin/python.exe");
+
+        let p = pick(&root, Lang::Python, "python", false, bin.as_os_str());
+        assert_eq!(p.origin, Origin::Builtin, "prefer = \"builtin\" must ignore PATH");
+    }
+
+    #[test]
+    fn an_explicit_path_is_never_substituted() {
+        let s = Scratch::new("explicit");
+        let root = app_with_bundled_python(&s);
+        let bin = s.dir("bin");
+        s.file("bin/python.exe");
+        let mine = s.file("custom/python.exe");
+
+        let p = pick(&root, Lang::Python, mine.to_str().unwrap(), true, bin.as_os_str());
+        assert_eq!(p.origin, Origin::Config);
+        assert_eq!(p.command, mine.to_str().unwrap());
+    }
+
+    /// Both halves of the alias guard: zero bytes, and the `WindowsApps` path even with content.
+    #[test]
+    fn the_store_alias_is_not_a_python() {
+        let s = Scratch::new("alias");
+        let zero = s.0.join("bin/python.exe");
+        std::fs::create_dir_all(zero.parent().unwrap()).unwrap();
+        std::fs::write(&zero, b"").unwrap();
+        assert!(!usable(&zero), "a zero-byte candidate is a shim");
+
+        let alias = s.file("WindowsApps/python.exe");
+        assert!(!usable(&alias), "anything under WindowsApps is the Store alias");
+    }
+
+    #[test]
+    fn an_alias_does_not_count_as_a_path_hit() {
+        let s = Scratch::new("alias-hit");
+        let root = app_with_bundled_python(&s);
+        let bin = s.dir("bin");
+        let zero = bin.join("python.exe");
+        std::fs::write(&zero, b"").unwrap();
+
+        let p = pick(&root, Lang::Python, "python", true, bin.as_os_str());
+        assert_eq!(
+            p.origin,
+            Origin::Builtin,
+            "a shim on PATH must fall through to the bundled runtime, not win"
+        );
+    }
+
+    #[test]
+    fn missing_everywhere_keeps_the_bare_command() {
+        let s = Scratch::new("missing");
+        let root = s.dir("app");
+        let empty = s.dir("empty");
+
+        let p = pick(&root, Lang::Python, "python", true, empty.as_os_str());
+        assert_eq!(p.origin, Origin::Missing);
+        assert_eq!(p.command, "python", "the bare command is kept so the OS can explain the failure");
     }
 }

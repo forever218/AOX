@@ -52,6 +52,13 @@ pub trait Policy: Send + Sync {
     fn level_for(&self, kind: &ToolKind, tool_name: &str, caps: &[String]) -> AuthLevel;
 }
 
+/// The host's **command-line** tools — the names `[auth] shell` governs.
+///
+/// A name list rather than "every `ToolKind::Host` tool": `read_file` / `write_file` are host tools
+/// too, and putting a command line and a file write behind one switch would be wrong in both
+/// directions (someone who tightens the shell should not suddenly be prompted on every read).
+const SHELL_TOOLS: [&str; 2] = [crate::tool::shell::SHELL_TOOL, crate::tool::bash::BASH_TOOL];
+
 /// The policy decided by `config.toml [auth]`: overrides win (by tool name, then
 /// by plugin name), otherwise the tool's category default applies.
 ///
@@ -66,6 +73,10 @@ pub trait Policy: Send + Sync {
 pub struct ConfigPolicy {
     meta: AuthLevel,
     plugin: AuthLevel,
+    /// The **command-line** tools' own tier (`[auth] shell`). Separate from `plugin` because what it
+    /// gates is not "a tool that does one job" but "arbitrary programs, plus the ability to read
+    /// every file the user can read". See [`SHELL_TOOLS`].
+    shell: AuthLevel,
     overrides: HashMap<String, AuthLevel>,
     /// The overrides carrying a `*` (stored as the prefix with `*` stripped),
     /// sorted by prefix **longest first** — the more specific one hits first:
@@ -94,6 +105,7 @@ impl ConfigPolicy {
         Self {
             meta: AuthLevel::parse(&cfg.meta_tools),
             plugin: AuthLevel::parse(&cfg.plugin_tools),
+            shell: AuthLevel::parse(&cfg.shell),
             overrides,
             wildcards,
         }
@@ -156,6 +168,9 @@ impl Policy for ConfigPolicy {
         //    step ① will hit first.
         match kind {
             ToolKind::Meta => self.meta,
+            // The command line gets its own tier: it is neither "modify the host" nor "one designed
+            // job". `[auth.overrides] shell = "auto"` (step ①) still wins over this.
+            ToolKind::Host if SHELL_TOOLS.contains(&tool_name) => self.shell,
             ToolKind::Host | ToolKind::Plugin(_) => self.plugin,
         }
     }
@@ -169,6 +184,7 @@ mod tests {
         AuthConfig {
             meta_tools: "ask".into(),
             plugin_tools: "deny".into(),
+            shell: "ask".into(),
             overrides: [
                 ("create_plugin".to_string(), "auto".to_string()),
                 ("myplugin".to_string(), "ask".to_string()),
@@ -229,6 +245,7 @@ mod tests {
         AuthConfig {
             meta_tools: "ask".into(),
             plugin_tools: "auto".into(),
+            shell: "ask".into(),
             overrides: pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect(),
         }
     }

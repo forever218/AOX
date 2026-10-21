@@ -3,8 +3,8 @@
 #
 #   1) cargo build --release --workspace  —— 同时产出 aox.exe 与 aox-gui.exe
 #   2) Inno Setup 把 installer/aox.iss 与 installer/aox-gui.iss 各编译两遍：
-#        不带定义  -> dist/AOX[-GUI]-Setup-<版本>.exe               （主包，不捆绑运行时）
-#        带定义    -> dist/AOX[-GUI]-Setup-<版本>-with-python.exe   （装完即用，离线可用）
+#        不带定义  -> dist/AOX[-GUI]-Setup-<版本>.exe               （主包，只带 bash 侧载）
+#        带定义    -> dist/AOX[-GUI]-Setup-<版本>-with-python.exe   （再带 python，装完即用）
 #   3) 顺便把运行时组件包复制到 dist/（已经是上游压好的 zip，零成本）
 #
 # 用法：
@@ -15,7 +15,13 @@
 #   bash tools/build_installer.sh all with-python      # 只要两个捆绑变体
 #   bash tools/build_installer.sh pack                 # 只产出运行时组件包（不打安装包）
 #
-# 关于运行时：主包**不捆绑**任何运行时（保持 3 MB 级体积）。需要 python 能力时有三条路，
+# 关于 runtime 目录：
+#   **所有**变体都装 runtime\bash（busybox-w32，~637 KB，单文件）。理由：`bash` 工具不需要 python，
+#   而没有 Git for Windows 的机器否则只能退回 `shell`；宿主的探测顺序是「系统 bash > 侧载 bash >
+#   shell」，所以这个侧载只是兜底，不会抢用户自己那份。只有 -with-python 变体额外装 runtime/python。
+#   这两条都在 installer/*.iss 的 [Files] 里，本脚本只负责把源文件准备好（见下面的 preflight）。
+#
+# 关于 python 运行时：主包**不捆绑** python（保持 3 MB 级体积）。需要 python 能力时有三条路，
 # 都靠宿主的三档解释器解析（config 显式路径 > 应用目录内置 > PATH）落地：
 #   1. 发行时附上 dist/aox-python-runtime.zip，用户放到 exe 同目录后执行
 #      /runtime install python —— 全程离线；
@@ -115,6 +121,14 @@ if [ "$TARGET" = "pack" ]; then
   make_pack
   exit 0
 fi
+
+# ---- 0. 侧载必须先在位 ----
+# runtime\bash 现在进了**每一个**安装包的 [Files]，所以缺文件必须在编译前就报出来，
+# 而不是等 ISCC 报 "Source file does not exist"。
+for f in runtime/bash/busybox.exe runtime/bash/README.md; do
+  [ -f "$f" ] || { echo "缺少 $f：所有安装包都带 runtime/bash，先把它放回去"; exit 1; }
+done
+echo "==> bash 侧载: runtime/bash/busybox.exe（$(du -h runtime/bash/busybox.exe | cut -f1)）"
 
 # ---- 1. 编译 release
 # 必须带 --workspace：根 crate 的 default-members 只有 ["."]，

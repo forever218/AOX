@@ -13,8 +13,8 @@
 ;  <Git install dir>/DAppVersion=0.1.0), and ISCC then counts it as a second script
 ;  filename and reports "You may not specify more than one script filename."
 ;  Outputs:
-;      dist\AOX-Setup-<version>.exe                 (main package, no runtime bundled, ~3 MB)
-;      dist\AOX-Setup-<version>-with-python.exe     (bundled variant, ~11.5 MB)
+;      dist\AOX-Setup-<version>.exe                 (main package, bash sidecar only, ~3.6 MB)
+;      dist\AOX-Setup-<version>-with-python.exe     (bundled variant, ~12.2 MB)
 ;
 ;  Design notes:
 ;    * Installs for the **current user only** (PrivilegesRequired=lowest), into
@@ -28,9 +28,11 @@
 ;      has accumulated, the latter is the user's conversation record.
 ;    * history/ isn't pre-created either: the directory is made by the program on the first
 ;      real conversation, so a session that only runs /help leaves no empty file behind.
-;    * The main package carries no runtime at all; when python is needed the user can run
-;      /runtime install python to provision it on demand (offline archive or download), or
-;      use the -with-python variant above and get everything in one go.
+;    * **Every** variant ships runtime\\bash (busybox-w32, ~637 KB): the `bash` tool needs no
+;      python, and a machine without Git for Windows would otherwise fall back to `shell` alone.
+;    * No variant ships the Python runtime except -with-python; when python is needed the user can
+;      run /runtime install python to provision it on demand (offline archive or download), or use
+;      the -with-python variant above and get everything in one go.
 ; ============================================================================
 
 #define AppName        "AOX"
@@ -124,6 +126,13 @@ Source: "{#ProjectRoot}\assets\aox.ico";               DestDir: "{app}"; Flags: 
 Source: "{#ProjectRoot}\config.example.toml";          DestDir: "{app}"; Flags: ignoreversion
 Source: "{#ProjectRoot}\README.md";                    DestDir: "{app}"; Flags: ignoreversion isreadme
 Source: "{#ProjectRoot}\LICENSE";                      DestDir: "{app}"; Flags: ignoreversion
+; ── every variant: the bash sidecar ────────────────────────────────────────────────────────────────
+; busybox-w32 (~637 KB, one file, no DLLs) gives the model a POSIX shell on machines that have no Git
+; for Windows. It is shipped in **all** variants — the `bash` tool is useful without python, and the
+; host picks it last (a real bash, if installed, always wins: see src/shell/bash.rs). Its build id and
+; the GPLv2 obligations are recorded in runtime\bash\README.md, which travels with it.
+Source: "{#ProjectRoot}\runtime\bash\*"; DestDir: "{app}\runtime\bash"; \
+    Flags: ignoreversion recursesubdirs createallsubdirs
 #ifdef BUNDLE_PYTHON
 ; Bundled variant: the Python runtime goes straight into the application directory. The host
 ; discovers <app root>\runtime\python\python.exe on startup (tier 2 of the three-tier
@@ -140,8 +149,8 @@ Source: "{#ProjectRoot}\runtime\python\*"; DestDir: "{app}\runtime\python"; \
 ; removed on uninstall; whereas plugins\ is capability the model accumulated and history\ is
 ; the user's conversation record -- both are user data and must be kept (see the design notes
 ; at the top of this file). Neither directory is listed here, so Inno won't touch them.
-; That directory only exists in the bundled build, or once the user has run
-; /runtime install themselves.
+; It exists in every build now (it holds the bash sidecar) and in the bundled build additionally
+; holds python; everything in it is re-provisionable, so removing it on uninstall is right.
 Type: filesandordirs; Name: "{app}\runtime"
 
 [Icons]

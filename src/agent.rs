@@ -936,7 +936,7 @@ impl Agent {
         // ⚠️ Since 2026-10-05 the config default is the restricted tier (`default`), so this short-circuit only applies to users
         // who **explicitly** chose full access — don't justify the short-circuit with "most users go through here" anymore.
         let access = self.rt.tool_access(name).await;
-        if let Some(reject) = self.workplace_reject(&kind, access, &args) {
+        if let Some(reject) = self.workplace_reject(&kind, access, name, &args) {
             ui.emit(AgentEvent::Warn(reject.user_text()));
             return ToolOutput::err(reject_text(&kind, &reject));
         }
@@ -1059,6 +1059,7 @@ impl Agent {
         &self,
         kind: &ToolKind,
         access: crate::workplace::Access,
+        name: &str,
         args: &Value,
     ) -> Option<crate::workplace::Reject> {
         // The `full` tier: **allow everything**. Placed before the `match` so we don't even run
@@ -1069,6 +1070,18 @@ impl Agent {
         match kind {
             ToolKind::Meta => None,
             ToolKind::Host => {
+                // The shell tools carry their directory in `cwd`, not in `path` — and a missing
+                // `path` here makes the generic branch below return `None` through `?`, i.e. **allow
+                // the call**. That is why they are handled first and explicitly: "no parameter" must
+                // never quietly mean "no boundary".
+                if name == crate::tool::shell::SHELL_TOOL {
+                    let raw = args.get("cwd").and_then(|v| v.as_str())?;
+                    return self
+                        .rt
+                        .workplace
+                        .check_access(raw, crate::workplace::Access::Write)
+                        .err();
+                }
                 let raw = args.get(crate::workplace::PATH_ARG).and_then(|v| v.as_str())?;
                 self.rt.workplace.check_access(raw, access).err()
             }
@@ -1226,7 +1239,7 @@ mod tests {
         let access = a_read.rt().tool_access("fake_scan").await;
         assert_eq!(access, Access::Read, "`tool_access` must surface the intent declared by the tool");
         assert!(
-            a_read.workplace_reject(&kind, access, &args).is_none(),
+            a_read.workplace_reject(&kind, access, "fake_scan", &args).is_none(),
             "a read-only tool accessing a path outside the workspace must be allowed — this is that \"plugin reads are opened up too\" requirement"
         );
 
@@ -1235,17 +1248,17 @@ mod tests {
         let access = a_write.rt().tool_access("fake_scan").await;
         assert_eq!(access, Access::Write, "undeclared means it writes to disk; that is the default tier");
         let rej = a_write
-            .workplace_reject(&kind, access, &args)
+            .workplace_reject(&kind, access, "fake_scan", &args)
             .expect("a plugin tool that does not declare read-only must be intercepted with an outside path");
         assert!(rej.model_text().contains("permission boundary"), "{}", rej.model_text());
 
         // The host file-tool path wasn't affected by this change: the same out-of-workplace path is still blocked (writing tier)
         let host_write = a_write
-            .workplace_reject(&ToolKind::Host, Access::Write, &args)
+            .workplace_reject(&ToolKind::Host, Access::Write, "write_file", &args)
             .expect("a host write tool with an outside path must be intercepted");
         assert!(host_write.model_text().contains("permission boundary"));
         // And the read tier is still allowed — consistent with the "reads unrestricted" rule set on 2026-10-04
-        assert!(a_write.workplace_reject(&ToolKind::Host, Access::Read, &args).is_none());
+        assert!(a_write.workplace_reject(&ToolKind::Host, Access::Read, "read_file", &args).is_none());
 
         let _ = std::fs::remove_dir_all(&ws);
     }

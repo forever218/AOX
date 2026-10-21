@@ -36,6 +36,14 @@ pub struct Config {
     /// The `[sandbox]` section of `config.toml` (the plugin child-process fence, see `src/sandbox.rs`).
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// The `[shell]` section of `config.toml` (the built-in command line, see `src/tool/shell.rs`).
+    ///
+    /// A fifth, again distinct, "how much": `[sandbox]` limits how a plugin process runs,
+    /// `[workplace]` limits which files may be touched, `[plugins]` limits how long a process lives,
+    /// `[tools]` limits what the model is told exists, and **this one grants a capability the model
+    /// did not have before** — a command line, confined to the workspace by the host's command check.
+    #[serde(default)]
+    pub shell: ShellConfig,
     /// The `[plugins]` section of `config.toml` (lazy loading of plugin subprocesses, see
     /// `src/plugin/mod.rs`).
     ///
@@ -145,13 +153,25 @@ pub struct AuthConfig {
     pub meta_tools: String,
     /// ask | auto | deny
     pub plugin_tools: String,
+    /// ask | auto | deny — the **shell tools** (`shell`, and `bash` once it lands) only.
+    ///
+    /// Its own key rather than riding `plugin_tools`, because it is a different kind of capability:
+    /// a plugin tool does one designed job, whereas a command line runs arbitrary programs (and can
+    /// read every file the user can read). Default `ask`, which after one "allow for this session"
+    /// stops nagging — see the authorisation policy in `src/auth.rs`.
+    pub shell: String,
     #[serde(default)]
     pub overrides: HashMap<String, String>,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
-        Self { meta_tools: "ask".into(), plugin_tools: "auto".into(), overrides: HashMap::new() }
+        Self {
+            meta_tools: "ask".into(),
+            plugin_tools: "auto".into(),
+            shell: "ask".into(),
+            overrides: HashMap::new(),
+        }
     }
 }
 
@@ -237,11 +257,25 @@ impl Default for ToolsConfig {
 #[serde(default)]
 pub struct RuntimesConfig {
     /// When the value is a **bare command** (`python` / `node` / `rustc`), the host tries in order:
-    /// "runtime bundled in the app directory `<app_root>/runtime/<lang>/<exe>`" → "PATH";
+    /// **`PATH`** → "runtime bundled in the app directory `<app_root>/runtime/<lang>/<exe>`";
     /// when it is a **full path** it is used directly, with no substitution.
+    ///
+    /// `PATH` comes first because a complete interpreter (with pip, venv, headers and the full stdlib) is
+    /// better than the embeddable runtime this project can ship — see [`prefer`](RuntimesConfig::prefer)
+    /// for the way out. A `PATH` candidate is only accepted when it is a real file: the Windows "app
+    /// execution alias" (`%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe`, 0 bytes, a reparse point
+    /// that opens the Microsoft Store) is skipped.
     pub python: String,
     pub node: String,
     pub rustc: String,
+    /// Which side wins when both exist: `system` (default) or `builtin`.
+    ///
+    /// `system` = `PATH` first, bundled runtime as the fallback. `builtin` = ignore `PATH` for bare
+    /// commands and use `<app_root>/runtime/<lang>/` whenever it is installed — the escape hatch for
+    /// machines whose `PATH` python is broken in a way that is not detectable by looking at the file.
+    /// An explicit path in `python` / `node` / `rustc` always wins over both.
+    #[serde(default = "default_prefer")]
+    pub prefer: String,
     /// Override the Python runtime download source (default: the official CPython embeddable package, see `runtimes::DEFAULT_PYTHON_URL`).
     #[serde(default)]
     pub python_url: Option<String>,
@@ -250,12 +284,18 @@ pub struct RuntimesConfig {
     pub python_sha256: Option<String>,
 }
 
+/// `prefer` defaults to the system interpreter; see [`RuntimesConfig::prefer`].
+fn default_prefer() -> String {
+    "system".to_string()
+}
+
 impl Default for RuntimesConfig {
     fn default() -> Self {
         Self {
             python: "python".into(),
             node: "node".into(),
             rustc: "rustc".into(),
+            prefer: default_prefer(),
             python_url: None,
             python_sha256: None,
         }
@@ -485,6 +525,107 @@ impl SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self { enabled: true, max_processes: 8, max_memory_mb: 0, ui_limits: true }
+    }
+}
+
+/// The built-in **shell tools** (`config.toml`'s `[shell]`, see `src/tool/shell.rs`).
+///
+/// This section governs a capability none of the others do: `[sandbox]` limits how a *plugin*
+/// process runs, `[workplace]` says which files may be touched, and **this one hands the model a
+/// command line** — together with the one boundary that makes doing so defensible.
+///
+/// # The boundary, in one paragraph
+///
+/// The command runs at **Low integrity** (Mandatory Integrity Control, `src/shell/lowil.rs`) and the
+/// workspace is labelled Low, so `no-write-up` turns "write outside the workspace" into a **kernel
+/// refusal** instead of a convention the model has to respect. Reads are deliberately untouched —
+/// the same read/write asymmetry as [`crate::workplace::Access`]. The command scan in
+/// `tool::shell` is a **guard rail** (it produces a readable refusal before a command half-runs),
+/// never the boundary itself.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ShellConfig {
+    /// Master switch. `false` = the tools are never registered, so the model never sees them.
+    pub enabled: bool,
+    /// Which command line the model should reach for **first**: `bash` (default) or `cmd`.
+    ///
+    /// This is an **instruction, not a fallback**. The host can never "try bash, then cmd": a command
+    /// has side effects, so running one twice to find out which shell accepts it would be a disaster
+    /// (`del`, `git commit`, `cargo build`). What the key changes is the wording the model reads —
+    /// [`crate::prompt`] orders its paragraph around it, and `/shell` plus the settings row report it.
+    ///
+    /// `cmd` needs no new tool name: it is already `shell`'s default dialect
+    /// (`Dialect::default_for_platform`), so `prefer = "cmd"` is honest about a door that already
+    /// exists. Measured on Windows 11 26200: `cmd /D /S /C exit` ≈ 87 ms, `git-bash -c exit` ≈ 270 ms,
+    /// busybox `sh -c exit` ≈ 28 ms. `bash` stays the default anyway: a shell with `$(…)`, `&&` and
+    /// sed/grep/find/awk is worth the ~180 ms on anything longer than a one-word command, and a wrong
+    /// guess costs a whole model round trip — far more than 180 ms.
+    #[serde(default = "default_shell_prefer")]
+    pub prefer: String,
+    // NOTE: there is deliberately **no** `boundary` switch. A kernel-enforced boundary (low-integrity
+    // child + labelled workspace) was implemented three ways and measured not to hold on Windows 11
+    // 26200 — see `docs/SHELL.md`. The only layer is the host's command scan, and pretending otherwise
+    // through a config key would be the worst kind of option: one that reads as protection.
+    /// Where the `bash` tool's shell comes from: `auto` (default) | `off` | an absolute path.
+    ///
+    /// `auto` looks, in order, at `<app root>\runtime\bash\` (see `bash_pack`), the usual Git for
+    /// Windows install locations, and finally `bash.exe` on PATH — skipping anything under
+    /// `\Microsoft\WindowsApps\`, which is the WSL launcher and a different file system. Detection only
+    /// stats files; a candidate is validated with `uname -s` on the first call.
+    pub bash: String,
+    /// Whether `<app root>\runtime\bash\bash.exe` (or `busybox.exe`) is considered by `auto`.
+    ///
+    /// A sidecar rather than something embedded in the exe: the binary stays small, and the pack can be
+    /// shipped or skipped independently. `off` ignores it.
+    pub bash_pack: String,
+    /// Default per-call timeout, in seconds. A call may ask for more via its own `timeout_secs`.
+    pub timeout_secs: u64,
+    /// Hard ceiling for `timeout_secs`. A model that asks for an hour waits an hour otherwise,
+    /// while holding one tool slot the whole time.
+    pub max_timeout_secs: u64,
+    /// How much of a command's output to keep (stdout and stderr counted separately), in bytes.
+    ///
+    /// Beyond it the **head and the tail** are kept and the elided middle is reported with its
+    /// size: build logs put the failure at the end and often the reason at the start, so keeping one
+    /// end only would throw away half the answer.
+    pub max_output_bytes: usize,
+    /// Process allowance for **one call** (a Job Object per call, the same mechanism as plugins).
+    ///
+    /// This one is a correctness need rather than hardening: a timeout has to kill the whole tree
+    /// (`cargo` → `rustc` × N), so the fence is created regardless of `[sandbox] enabled`.
+    /// `0` = the command may not spawn anything at all.
+    pub max_processes: u32,
+    /// Point build caches at the workspace (`CARGO_HOME`, `NPM_CONFIG_CACHE`, `PIP_CACHE_DIR`,
+    /// `TMP`/`TEMP`) instead of the user profile.
+    ///
+    /// Not a nicety: a Low-integrity process **cannot write** `%USERPROFILE%\.cargo` (Medium), so
+    /// with this off `cargo build` inside the workspace fails with "access denied" on its own cache
+    /// — a failure that looks like the boundary being broken. The price is one cold cache per
+    /// workspace.
+    pub env_cache: bool,
+    /// Report which workspace files changed during the call (a bounded mtime scan afterwards).
+    pub track_changes: bool,
+}
+
+/// `prefer` defaults to bash; see [`ShellConfig::prefer`].
+fn default_shell_prefer() -> String {
+    "bash".to_string()
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prefer: default_shell_prefer(),
+            bash: "auto".into(),
+            bash_pack: "runtime".into(),
+            timeout_secs: 120,
+            max_timeout_secs: 600,
+            max_output_bytes: 128 * 1024,
+            max_processes: 16,
+            env_cache: true,
+            track_changes: true,
+        }
     }
 }
 
@@ -880,6 +1021,7 @@ impl Config {
             hook: HookConfig::default(),
             loop_config: LoopConfig::default(),
             sandbox: SandboxConfig::default(),
+            shell: ShellConfig::default(),
             plugins: PluginsConfig::default(),
             tools: ToolsConfig::default(),
             workplace: WorkplaceConfig::default(),

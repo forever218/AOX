@@ -16,6 +16,10 @@ mod runtime;
 mod runtimes;
 mod sandbox;
 mod selftest;
+// The built-in command line (`shell`): the executor, the low-integrity helper entry, and the
+// integrity-level primitives. Declared here as well as in `lib.rs` because this bin compiles its
+// own copy of every module (see the trap note in TRAPS.md).
+mod shell;
 // Silenced **here** rather than in `space.rs`, because the two targets genuinely differ: the space
 // registry's tree-building half (`group`, `Group`, the writers) exists for the GUI's history panel,
 // and this CLI links the module only to call `Registry::load` / `workspace_roots` when it sets up
@@ -239,6 +243,13 @@ fn history_command(agent: &mut Agent, line: &str, store: &dyn store::Store) -> R
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ---- hidden shell-helper entry: **must be first** ----
+    // The host spawns itself with `--aox-shell-exec` to run one command (see `src/shell/helper.rs`:
+    // lowering an integrity level only works from inside the process that owns the token). Nothing
+    // else may run before this — the helper must not touch the terminal, the config or the plugins.
+    if let Some(code) = shell::helper::run_if_requested() {
+        std::process::exit(code);
+    }
     let args: Vec<String> = std::env::args().collect();
     ui::style::init(); // Probe terminal capabilities: enable ANSI colours + UTF-8
 
@@ -380,6 +391,20 @@ async fn main() -> Result<()> {
     // conversation's checkpoint, and `Tool::call` only sees `Runtime`).
     for t in tool::verify::verify_tools() {
         rt.register(t).await?;
+    }
+    // The built-in command line (`src/tool/shell.rs`). Registered like the file tools: the host owns
+    // both the schema and the execution, so "the working directory must be inside the workspace" is
+    // not a convention the model may skip. `[shell] enabled = false` leaves it unregistered, which is
+    // the difference between "not advertised" and "advertised then refused".
+    if rt.config.shell.enabled {
+        for t in tool::shell::shell_tools() {
+            rt.register(t).await?;
+        }
+        // The POSIX shell. Registered **only when a real bash was found**: a tool that can only fail
+        // would cost the model a round trip to learn what `[shell] bash` already knows.
+        for t in tool::bash::bash_tools(&rt) {
+            rt.register(t).await?;
+        }
     }
 
     let mut ui = CliUi::new();
@@ -605,6 +630,7 @@ async fn main() -> Result<()> {
                 Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
             },
             "/config" => ui.emit(AgentEvent::Info(layer_summary.clone())),
+            "/shell" => ui.emit(AgentEvent::Info(tool::shell::report(&rt))),
             "/new" => {
                 // The same path as the "+" button on the GUI top bar. The old
                 // conversation needs no save action — it has been appended to all
@@ -654,6 +680,10 @@ async fn main() -> Result<()> {
                     (
                         "/sandbox",
                         crate::i18n::t("Show the fence around plugin subprocesses (config.toml's [sandbox]: process / memory / UI limits; it also spells out what it does not cover)"),
+                    ),
+                    (
+                        "/shell",
+                        crate::i18n::t("Show the built-in command line: dialects, boundary, limits (config.toml's [shell])"),
                     ),
                     (
                         "/workplace",

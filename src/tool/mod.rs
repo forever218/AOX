@@ -1,10 +1,12 @@
 pub mod ask;
+pub mod bash;
 pub mod discover;
 pub mod edit;
 pub mod fingerprint;
 pub mod hostfs;
 pub mod meta;
 pub mod scope;
+pub mod shell;
 pub mod task;
 pub mod verify;
 
@@ -242,6 +244,20 @@ pub trait Tool: Send + Sync {
         })
     }
 
+    /// How long this call expects to take, when the tool can tell from its arguments.
+    ///
+    /// Only the **shell** tools answer this. `Runtime::execute` wraps every call in
+    /// `[agent] tool_timeout_secs + 30 s`; a command that asked for 300 s would be cut off at 90 s
+    /// by that *outer* guard, before its own timeout could ever fire — and the error would blame
+    /// "the tool", while the process tree was left to the Job's kill-on-close. A hint here is how
+    /// the outer guard learns to stay out of the way.
+    ///
+    /// Default `None`: a tool that finishes in milliseconds should not be given a longer leash just
+    /// because some other tool needs one.
+    fn timeout_hint(&self, _args: &Value) -> Option<std::time::Duration> {
+        None
+    }
+
     async fn call(&self, args: Value, rt: &Arc<Runtime>) -> ToolOutput;
 }
 
@@ -256,13 +272,14 @@ mod tests {
     /// executes is a comment, not a fact. Adding a host tool now breaks this test first.
     #[test]
     fn the_quoted_host_tool_count_matches_reality() {
-        const DOCUMENTED: usize = 14;
+        const DOCUMENTED: usize = 15;
         let n = meta::meta_tools().len()
             + hostfs::host_file_tools().len()
             + ask::ask_tools().len()
             + discover::find_tools().len()
             + task::task_tools().len()
-            + verify::verify_tools().len();
+            + verify::verify_tools().len()
+            + shell::shell_tools().len();
         assert_eq!(n, DOCUMENTED, "update every doc that quotes the host tool count");
     }
 }

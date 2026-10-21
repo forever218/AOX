@@ -680,6 +680,7 @@ mod tests {
             python: "__none__.exe".into(),
             node: "__none__.exe".into(),
             rustc: "__none__.exe".into(),
+            prefer: "system".into(),
             python_url: None,
             python_sha256: None,
         };
@@ -889,6 +890,7 @@ mod tests {
             python: "__none__.exe".into(),
             node: "__none__.exe".into(),
             rustc: "__none__.exe".into(),
+            prefer: "system".into(),
             python_url: None,
             python_sha256: None,
         };

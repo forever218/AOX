@@ -86,6 +86,19 @@ impl Sandbox {
         self.cfg.enabled
     }
 
+    /// A fence for **one shell call**: process allowance + kill-on-close, no UI limits.
+    ///
+    /// Deliberately independent of `[sandbox] enabled`: killing the whole tree when a command times
+    /// out is a *correctness* requirement of the shell tool (a `cargo build` is a tree, not a
+    /// process), not a hardening switch the user may turn off. UI limits are dropped because a
+    /// command line may legitimately start a GUI program (`start`, `explorer`) and Job UI
+    /// restrictions would break it in ways that look like a random failure.
+    pub fn for_shell(max_processes: u32) -> Self {
+        Self {
+            cfg: SandboxConfig { enabled: true, max_processes, max_memory_mb: 0, ui_limits: false },
+        }
+    }
+
     /// The **additional** creation flags for the subprocess: with the fence on,
     /// require "freeze first".
     ///
@@ -162,6 +175,26 @@ impl Fence {
             (true, _) => crate::i18n::t("fence ✓").to_string(),
             (false, Some(r)) => crate::tf!("fence ✗ ({})", r),
             (false, None) => crate::i18n::t("fence ✗").to_string(),
+        }
+    }
+
+    /// Kill **every process in this fence**, now.
+    ///
+    /// This is how a timed-out shell call dies. Killing the child we hold a handle to would leave
+    /// its own children alive (`cargo` → several `rustc`): they are in the Job, but
+    /// `KILL_ON_JOB_CLOSE` only fires when the Job handle is dropped, which happens whenever the
+    /// struct happens to go out of scope — long after the tool call has returned its error.
+    /// `TerminateJobObject` takes the whole tree in one call, which is what "the command timed out"
+    /// has to mean.
+    pub fn terminate(&self) {
+        #[cfg(windows)]
+        {
+            if self.job != 0 {
+                // SAFETY: `job` is a live handle owned by this struct (closed exactly once, in Drop).
+                unsafe {
+                    windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1)
+                };
+            }
         }
     }
 }

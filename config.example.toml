@@ -358,17 +358,51 @@ keep = 200
 # be writing into jsonl, which is the hardest kind of problem to find).
 backend = "jsonl"
 
+[shell]
+# ── the built-in command line (the `bash` / `shell` tools) ───────────────────────
+#
+# Which tool the model is told to reach for **first**. This is wording, not a fallback: the host
+# never runs a command twice to find out which shell accepts it (a command has side effects), so
+# what it changes is the instruction in the system prompt, the `/shell` report, and the
+# "Command line" row in Settings -> System.
+#   "bash" (default) = bash first — pipes, globs, $(…), &&, sed/grep/find/awk: one call does the
+#                      whole job, and a wrong guess costs a whole model round trip.
+#   "cmd"            = cmd.exe first — starts ~3x faster (~87 ms vs ~270 ms) and takes C:\ paths
+#                      and /flag arguments verbatim. `cmd` is already the `shell` tool's default
+#                      dialect, so this adds no tool name and no schema to the request.
+prefer = "bash"
+
+enabled = true            # false = neither tool is registered; the model never sees them
+bash = "auto"             # auto | off | an absolute path to bash.exe
+bash_pack = "runtime"     # whether <app root>\runtime\bash\ is considered by `auto`
+timeout_secs = 120        # per call; a call may ask for more via its own timeout_secs
+max_timeout_secs = 600    # hard ceiling
+max_output_bytes = 131072 # per stream; beyond it the head and the tail are kept
+max_processes = 16        # one Job Object per call; 0 = the command may not spawn anything
+env_cache = true          # point CARGO_HOME / npm / pip / TMP into <workspace>\.aox
+track_changes = true      # report which workspace files the call changed
+# There is deliberately no `boundary` switch: the only layer is the host's command scan, and
+# docs/SHELL.md records why a kernel-enforced version was measured not to hold.
+
 [runtimes]
 # Plugin runtime commands (the python plugin / node plugin / rust plugin compiler).
 #
 # Values may be written two ways, with different meanings:
-#   * a bare command (as below) -> the host searches "runtime bundled in the app directory,
-#     then PATH", in that order. The bundled runtime means <app root>/runtime/python/python.exe;
-#     unpacking a runtime there takes effect with no change to this line. Use
+#   * a bare command (as below) -> the host searches "PATH, then the runtime bundled in the app
+#     directory", in that order: a complete system install has pip, venv and the full stdlib, so it
+#     beats the embeddable runtime. The bundled runtime means <app root>/runtime/python/python.exe
+#     and is the fallback; unpacking one there takes effect with no change to this line. Use
 #     `/runtime install python` to provision it automatically (~10 MB).
+#     A PATH candidate that is only a Windows "app execution alias" (0 bytes, opens the Store) is
+#     skipped — path / runtime 段 no longer silently wins on such machines.
 #   * a full path (e.g. 'C:\Python313\python.exe') -> taken as-is, never displaced by the
 #     bundled runtime. With backslashes in the path, prefer a TOML literal string (single
 #     quotes) so things like \n aren't read as escapes.
+# "system" (default) = PATH first, bundled runtime as the fallback.
+# "builtin" = ignore PATH for bare commands and use the bundled runtime whenever it is installed;
+#             the escape hatch for a system interpreter that is broken in a way no file check can see.
+prefer = "system"
+
 python = "python"
 node = "node"
 rustc = "rustc"

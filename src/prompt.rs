@@ -310,6 +310,83 @@ fn env_section(rt: &Runtime) -> String {
     // Otherwise it would repeatedly create doomed python plugins on a bare machine and
     // burn the whole round.
     s.push_str(&crate::runtimes::prompt_section(&rt.root, &rt.config.runtimes));
+    // The command line. Its own paragraph (not folded into the block above) because the boundary
+    // rules here are the ones a model is most likely to get wrong — retrying a refused write, or
+    // assuming reads are blocked too.
+    if rt.config.shell.enabled {
+        let bash = crate::tool::bash::available(rt);
+        let prefer_bash = crate::shell::prefers_bash(&rt.config.shell);
+
+        s.push_str(&t("\n\n# Command line (`bash` and `shell`)\n"));
+        // The order *is* the whole of `[shell] prefer`: one line states it together with the reason,
+        // and each tool then gets one bullet written order-neutrally. Two small literals instead of two
+        // whole paragraphs, so the ordering is data rather than duplicated prose.
+        //
+        // It cannot be anything more than wording: a command has side effects, so the host must never
+        // run one twice to see which shell accepts it. That is why this reads as advice, not fallback.
+        match (&bash, prefer_bash) {
+            (Some(_), true) => s.push_str(&t(
+                "- Preferred order: **bash, then `shell` (cmd.exe), then PowerShell.** bash can do a \
+                 whole job in one call — pipes, globs, `$(…)`, `&&`, sed/grep/find/awk. `cmd` starts \
+                 ~3× faster (≈87 ms vs ≈270 ms) and takes `C:\\` paths and `/flag` arguments verbatim, \
+                 so use it for one short native command or a cmd builtin, not for a pipeline.\n",
+            )),
+            (Some(_), false) => s.push_str(&t(
+                "- Preferred order: **`shell` (cmd.exe), then bash, then PowerShell.** cmd starts ~3× \
+                 faster (≈87 ms vs ≈270 ms) and takes `C:\\` paths and `/flag` arguments verbatim; bash \
+                 is what to reach for when the job needs pipes, globs, sed/grep/find, or several steps \
+                 in one script.\n",
+            )),
+            (None, _) => s.push_str(&t(
+                "- `bash` is not installed on this machine, so `shell` (cmd.exe) is your command line: \
+                 `dir`, `type`, `where`, builtins, and any `.exe`. (`[shell] bash` in config.toml, or a \
+                 Git for Windows install, would add bash.)\n",
+            )),
+        }
+        let bash_bullet = bash.as_ref().map(|b| {
+            crate::tf!(
+                "- **`bash`** ({} on this machine) — pipes, globs, `$(…)`, `&&`, sed/grep/find/awk, \
+                 loops: several steps in one call. `$AOX_WORKSPACE` is the workspace Windows-style and \
+                 `$AOX_WORKSPACE_U` the same path with forward slashes (`E:/dir`) — use the second one \
+                 inside the script, it is the form every bash flavour understands.\n",
+                b.flavour
+            )
+        });
+        let cmd_bullet = t(
+            "- **`shell`** — cmd.exe unless you pass `shell`, and the Windows-native things belong \
+             here: `dir`, `type`, `where`, `copy`, a cmd builtin, or anything taking `C:\\` paths or \
+             `/flag` arguments that bash would rewrite. Pass `shell: \"powershell\"` only for the .NET \
+             object model, JSON or COM (it needs ~1.1 s just to start); `shell: \"git\"` runs a plain \
+             git subcommand with no shell in between.\n",
+        );
+        if prefer_bash {
+            if let Some(b) = &bash_bullet {
+                s.push_str(b);
+            }
+            s.push_str(cmd_bullet);
+        } else {
+            s.push_str(cmd_bullet);
+            if let Some(b) = &bash_bullet {
+                s.push_str(b);
+            }
+        }
+        s.push_str(&t(
+            "- Everything runs **inside your workspace**: `cwd` must be an absolute directory inside \
+             it (it defaults to the workspace root), so a relative path in the command lands inside \
+             too. Leaving the workspace with `cd` is refused.\n\
+             - **Writes and deletes outside the workspace are refused**: the host checks the command \
+             before it runs, so keep those targets inside the workspace. **Reading anywhere is \
+             allowed**, including outside the workspace. So `type C:\\logs\\x.log` works while \
+             `> C:\\logs\\x.log` does not.\n\
+             - A refusal is the workspace boundary, not a broken command: report it to the user \
+             instead of retrying or rephrasing it.\n\
+             - Every call returns the exit code, the elapsed time, stdout/stderr (long output keeps its \
+             head and tail) and the boundary it actually got. Read `stderr` before concluding a \
+             command failed for your own reason.\n\
+             - Prefer one command that pipes and chains over several round trips: each call costs a \
+             request.",
+        ));
+    }
     s
 }
 
@@ -482,6 +559,11 @@ mod tests {
     use crate::config::{Config, PromptConfig, PromptSegmentConfig, RuntimesConfig};
 
     fn rt_with(prompt: PromptConfig) -> std::sync::Arc<Runtime> {
+        rt_tuned(prompt, "bash")
+    }
+
+    /// The same, with `[shell] prefer` under the test's control.
+    fn rt_tuned(prompt: PromptConfig, shell_prefer: &str) -> std::sync::Arc<Runtime> {
         let mut cfg = Config::dummy();
         // Make the env segment's content stable: skip the three-tier resolution and just
     // give a non-existent command name.
@@ -489,12 +571,49 @@ mod tests {
             python: "__none__.exe".into(),
             node: "__none__.exe".into(),
             rustc: "__none__.exe".into(),
+            prefer: "system".into(),
             python_url: None,
             python_sha256: None,
         };
+        cfg.shell.prefer = shell_prefer.to_string();
         cfg.prompt = prompt;
         let root = std::env::temp_dir().join("aox-prompt-test");
         Runtime::new(cfg, root.clone(), root.join("plugins")).expect("test runtime should not fail on the storage backend")
+    }
+
+    /// `[shell] prefer` moves **one line** and one bullet order — nothing else in the section.
+    ///
+    /// That is the whole reason the section is assembled from per-sentence literals instead of two
+    /// finished paragraphs: the ordering is data, so it can be flipped in one place and checked the
+    /// same way. It stays advice to the model either way; the host would never run a command twice to
+    /// see which shell accepts it.
+    #[test]
+    fn the_command_line_order_follows_the_config() {
+        let bash_first = rt_tuned(PromptConfig::default(), "bash");
+        let cmd_first = rt_tuned(PromptConfig::default(), "cmd");
+        let (b, c) = (env_section(&bash_first), env_section(&cmd_first));
+        assert_ne!(b, c, "prefer must change the wording");
+
+        if crate::tool::bash::available(&bash_first).is_none() {
+            // No bash on this machine: there is no order to flip, and both settings must agree on
+            // saying so rather than promising a tool that is not there.
+            assert_eq!(b, c, "without bash the order cannot differ");
+            return;
+        }
+        let at = |s: &str, marker: &str| s.find(marker).unwrap_or_else(|| panic!("{marker} missing"));
+        assert!(at(&b, "- **`bash`** (") < at(&b, "- **`shell`** —"), "bash must come first:\n{b}");
+        assert!(at(&c, "- **`shell`** —") < at(&c, "- **`bash`** ("), "cmd must come first:\n{c}");
+        // The order line itself has to name the same first tool as the bullets below it.
+        assert!(b.contains("Preferred order: **bash,"), "the order line must agree with the bullets:\n{b}");
+        assert!(c.contains("Preferred order: **`shell` (cmd.exe),"), "the order line must agree:\n{c}");
+        // `--nocapture` prints both paragraphs: the assertions above only pin the *order*, and the
+        // wording is the part a person has to read once.
+        for (tag, s) in [("bash", &b), ("cmd", &c)] {
+            if let Some(i) = s.find("# Command line") {
+                let end = s[i..].find("\n\n#").map_or(s.len(), |j| i + j);
+                println!("--- prefer={tag} ---\n{}", &s[i..end]);
+            }
+        }
     }
 
     /// Splitting must be lossless: reassembling verbatim must equal the original string.

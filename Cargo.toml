@@ -55,6 +55,9 @@ windows-sys = { version = "0.59", features = [
     # decoder that ships with the system rather than packing one into the binary (`image` is
     # about +300-500 KB; `png` about +100 KB and only understands PNG).
     "Win32_Graphics_GdiPlus",
+    # Decoding a command's output (`src/shell/mod.rs`): `cmd` writes the ANSI code page, so a strict
+    # UTF-8 decode would turn a Chinese error message into `��` and the model would read noise.
+    "Win32_Globalization",
     # The embedded image asset (the empty-state illustration) lives in memory with no file path,
     # so it has to be wrapped in an IStream before GDI+ can take it (`SHCreateMemStream`, in
     # Win32_UI_Shell). The same feature also carries `SHFileOperationW`, which `src/recycle.rs`

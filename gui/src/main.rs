@@ -68,6 +68,13 @@ fn load_theme(args: &[String]) -> aox::config::ThemeConfig {
 }
 
 fn main() -> eframe::Result<()> {
+    // ---- hidden shell-helper entry: **must be first** ----
+    // The GUI is a `windows`-subsystem binary, so it is the one the agent's commands run through when
+    // the user started the GUI rather than the CLI. The helper is the same code either way
+    // (`aox::shell::helper`): lower this process's token, start the command, pass the exit code back.
+    if let Some(code) = aox::shell::helper::run_if_requested() {
+        std::process::exit(code);
+    }
     let args: Vec<String> = std::env::args().collect();
     let demo = args.iter().any(|a| a == "--demo");
     let prompt = aox::paths::arg_value(&args, "--prompt");

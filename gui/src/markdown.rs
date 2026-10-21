@@ -310,10 +310,25 @@ fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool
         } else {
             color
         };
+        // An inline-code chip needs its **own** line height, and a top valign.
+        //
+        // The background is painted from the glyph's box, whose height *is* the format's line height —
+        // so requesting the body's 1.5× leading gave the chip 21 pt while its ink is only 13, with the
+        // ink sitting 2.06 pt below the box top: 2 pt of air above, 6 below ("the background hangs
+        // under the text"). A chip of `2 × (2.06 + 13/2) ≈ 17.1 pt` centres the ink instead, and
+        // `Align::TOP` keeps the box top where the body text's is — so the baseline does not move and
+        // a code span still sits level with the CJK around it. `1.32 ×` the mono size tracks that
+        // ratio at every size; `markdown::tests` measures the result rather than trusting the algebra.
+        let line_height = if sp.code {
+            Some((size - 1.0) * 1.32)
+        } else {
+            Some(size * LEADING)
+        };
         let fmt = TextFormat {
             font_id: font,
             color: col,
-            line_height: Some(size * LEADING),
+            line_height,
+            valign: if sp.code { egui::Align::TOP } else { egui::Align::BOTTOM },
             italics: sp.italic,
             background: if sp.code { P::code_chip() } else { Color32::TRANSPARENT },
             // Links get an underline: in body text they're the same color as ordinary text, so
@@ -775,11 +790,90 @@ mod tests {
     use super::*;
     use egui::{pos2, vec2, Rect};
 
+    /// The chip's geometry, in points: `(above, below, baseline_delta)`.
+    ///
+    /// - `above` / `below` — the ink's clearance to the chip background's top and bottom edge. The
+    ///   background is painted from `Glyph::logical_rect()`, whose height is the **format's** line
+    ///   height — so a format asking for 1.5× leading gets a 1.5×-tall chip while the ink keeps only
+    ///   its own ascent/descent. That asymmetry is what "the background hangs below the text" looks
+    ///   like; this measures it instead of leaving it to the eye.
+    /// - `baseline_delta` — how far the code's baseline sits from the body text's baseline on the
+    ///   same line. Trimming the chip must not drag the text with it: epaint puts a glyph at
+    ///   `ascent + valign.to_factor() * (max_row_height - line_height)`, so a **shorter** line height
+    ///   is only free because `Align::TOP` makes that term zero — with the default `BOTTOM` the code
+    ///   would drop by the whole trim.
+    ///
+    /// The code span is located by its characters (a glyph does not expose which section it came from),
+    /// and the words used below carry both an ascender and a descender so the ink is not short.
+    fn chip_geometry(md: &str, code: &str) -> (f32, f32, f32) {
+        let ctx = egui::Context::default();
+        // The app's own fonts, so this measures the metric the user actually sees (the fallback font
+        // has different ascent/descent and would calibrate the wrong thing).
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(Default::default(), |_| {});
+        let job = job_of(&inline(md), 14.0, egui::Color32::BLACK, 800.0, false);
+        let galley = ctx.fonts_mut(|f| f.layout_job(job));
+
+        let want: Vec<char> = code.chars().collect();
+        let glyphs: Vec<&egui::epaint::text::Glyph> =
+            galley.rows.iter().flat_map(|r| r.row.glyphs.iter()).collect();
+        for (start, w) in glyphs.windows(want.len()).enumerate() {
+            if !w.iter().map(|g| g.chr).eq(want.iter().copied()) {
+                continue;
+            }
+            let mut above = f32::INFINITY;
+            let mut below = f32::INFINITY;
+            for g in w {
+                if g.uv_rect.size.y <= 0.0 {
+                    continue;
+                }
+                let rect = g.logical_rect();
+                let ink_top = g.pos.y + g.uv_rect.offset.y;
+                above = above.min(ink_top - rect.top());
+                below = below.min(rect.bottom() - (ink_top + g.uv_rect.size.y));
+            }
+            // Any glyph on the same row that is **not** part of the code run is body text; `pos.y` is
+            // the baseline. The padding spaces share the code's format, so they are excluded by index.
+            let last = start + want.len();
+            let body = glyphs
+                .iter()
+                .enumerate()
+                .filter(|(i, g)| (*i < start || *i >= last) && g.uv_rect.size.y > 0.0)
+                .map(|(_, g)| g.pos.y)
+                .next();
+            let baseline_delta = body.map_or(f32::NAN, |b| w[0].pos.y - b);
+            return (above, below, baseline_delta);
+        }
+        (f32::NAN, f32::NAN, f32::NAN)
+    }
+
+    #[test]
+    fn the_inline_code_chip_is_centred_on_its_ink() {
+        // The exact line from the screenshot that started this: CJK body text, one inline code span.
+        let (above, below, baseline) = chip_geometry("避免 `dllimport` 冲突", "dllimport");
+        println!("chip: above={above:.2} below={below:.2} baseline_delta={baseline:.2}");
+        assert!(
+            (above - below).abs() <= 1.5,
+            "the chip is lopsided: {above:.2} above the ink, {below:.2} below it"
+        );
+        assert!(
+            baseline.abs() <= 1.0,
+            "the code text sits {baseline:.2} pt off the body baseline"
+        );
+    }
+
     /// Replays the column skeleton of `App::transcript`, measuring:
     /// - the available width the Ui reports when entering Markdown
     /// - the width the content actually occupies after rendering (beyond the column it gets clipped by the ScrollArea)
     fn probe(window_w: f32, md: &str) -> (f32, f32, f32) {
         let ctx = egui::Context::default();
+        // Fonts are **per-Context**, but the "is bold available" flags in `theme` are process-global —
+        // so a Context that skips this silently depends on whichever sibling test ran first: with the
+        // flag left false it lays out in the fallback family, and once anything else has installed
+        // fonts it asks for `aox-strong`, which this Context has never bound, and panics. Installing
+        // here makes the measurement order-independent *and* faithful: it is what the app does.
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(Default::default(), |_| {});
         let mut avail = 0.0f32;
         let mut used = 0.0f32;
         let mut inner_w = 0.0f32;

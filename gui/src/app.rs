@@ -3878,27 +3878,39 @@ impl App {
     fn tab_system(&self, ui: &mut Ui) {
         let p = self.boot.as_ref().map(|b| b.paths.clone()).unwrap_or_default();
 
-        kv_row(ui, aox::i18n::t("System info"), &p.host);
+        // Every row is **collected** before anything is drawn: the name column has to be as wide as
+        // the widest name in it (see `kv_key_w`), and that cannot be known while drawing row by row.
+        let mut rows: Vec<(&str, String, Color32)> = Vec::new();
+
+        rows.push((aox::i18n::t("System info"), p.host.clone(), P::text_faint()));
+
+        // Which command-line tool the model reaches for first. Above the language runtimes on purpose:
+        // those are for *plugins*, this is for the model's own hands. The value names the flavour
+        // (`git-bash` vs `busybox`), because that is the difference between a full bash and an ash —
+        // and the exact executable, because "which one did it pick" is the next question.
+        if !p.command_line.is_empty() {
+            rows.push((aox::i18n::t("Command line"), p.command_line.clone(), P::text_faint()));
+        }
 
         // Runtime environment: **bundled or system PATH** -- one row per language, with the
-        // source written straight into brackets.
+        // source written straight into brackets. Only the first row carries the name; the rest are
+        // continuations and simply get the same (measured) column.
         // No ✓/✗ drawn: those two glyphs aren't guaranteed to exist in the hand-picked font (the
         // two in the call stream are hand-drawn), and the word "not found" already states the
         // conclusion clearly.
         for (i, it) in self.runtimes.items.iter().enumerate() {
-            kv_row_colored(
-                ui,
+            rows.push((
                 if i == 0 { aox::i18n::t("Runtime environment") } else { "" },
-                &format!("{}  {}  [{}]", it.lang, it.command, it.origin),
+                format!("{}  {}  [{}]", it.lang, it.command, it.origin),
                 if it.ok { P::text_faint() } else { P::warn() },
-            );
+            ));
         }
 
         if !self.model.is_empty() {
-            kv_row(ui, aox::i18n::t("Model in use"), &self.model);
+            rows.push((aox::i18n::t("Model in use"), self.model.clone(), P::text_faint()));
         }
         if !p.config.is_empty() {
-            kv_row(ui, aox::i18n::t("Config file"), &p.config);
+            rows.push((aox::i18n::t("Config file"), p.config.clone(), P::text_faint()));
         }
         // Which layers this config is merged from: `core -> patch -> config.toml`.
         //
@@ -3917,17 +3929,17 @@ impl App {
             })
             .unwrap_or_default();
         if layers.len() > 1 {
-            kv_row(ui, aox::i18n::t("Config layers"), &layers.join(" → "));
+            rows.push((aox::i18n::t("Config layers"), layers.join(" → "), P::text_faint()));
         }
         if !p.root.is_empty() {
-            kv_row(ui, aox::i18n::t("App root"), &p.root);
+            rows.push((aox::i18n::t("App root"), p.root.clone(), P::text_faint()));
         }
-        kv_row(ui, aox::i18n::t("Workspace"), &self.workplace_line());
+        rows.push((aox::i18n::t("Workspace"), self.workplace_line(), P::text_faint()));
         if !p.history.is_empty() {
-            kv_row(ui, aox::i18n::t("History"), &p.history);
+            rows.push((aox::i18n::t("History"), p.history.clone(), P::text_faint()));
         }
         if !p.plugins.is_empty() {
-            kv_row(ui, aox::i18n::t("Plugins directory"), &p.plugins);
+            rows.push((aox::i18n::t("Plugins directory"), p.plugins.clone(), P::text_faint()));
         }
         if !p.runtime.is_empty() {
             // "if it's bundled" -- whether the directory is there tells you at a glance whether
@@ -3937,7 +3949,17 @@ impl App {
             } else {
                 aox::i18n::t(" (built-in runtime not installed)")
             };
-            kv_row(ui, aox::i18n::t("Runtime directory"), &format!("{}{note}", p.runtime));
+            rows.push((
+                aox::i18n::t("Runtime directory"),
+                format!("{}{note}", p.runtime),
+                P::text_faint(),
+            ));
+        }
+
+        let keys: Vec<&str> = rows.iter().map(|r| r.0).collect();
+        let key_w = kv_key_w(ui, &keys);
+        for (k, v, c) in &rows {
+            kv_row(ui, key_w, k, v, *c);
         }
 
         // When there is no Python on this machine, offer a one-click install. It used to live in
@@ -4034,8 +4056,12 @@ impl App {
             });
 
         ui.add_space(16.0);
-        link_row(ui, aox::i18n::t("Author's blog"), "https://2am.top");
-        link_row(ui, aox::i18n::t("Project home"), "https://github.com/forever218/AOX");
+        // The two links are one column, so they share one measured width — "Author's blog" is the
+        // wider of the two and would otherwise print over its own URL.
+        let link_keys = [aox::i18n::t("Author's blog"), aox::i18n::t("Project home")];
+        let link_key_w = kv_key_w(ui, &link_keys);
+        link_row(ui, link_key_w, link_keys[0], "https://2am.top");
+        link_row(ui, link_key_w, link_keys[1], "https://github.com/forever218/AOX");
     }
 
     fn auth_overlay(&mut self, ctx: &egui::Context) {
@@ -4247,6 +4273,10 @@ fn seed_demo(app: &mut App) {
             std::path::Path::new(&app.config_path),
             &root.join("plugins"),
             store.location().to_path_buf(),
+            // `--demo` never loads the config, so the shell row uses the defaults (`[shell] bash =
+            // "auto"`). Detection itself only stats files, so this is a real answer for this machine,
+            // not a placeholder.
+            &aox::config::ShellConfig::default(),
         ),
         store: store.clone(),
     });
@@ -7362,9 +7392,14 @@ const SETTINGS_NAV_W: f32 = 132.0;
 const SETTINGS_RIGHT_W: f32 = SETTINGS_W - SETTINGS_NAV_W - 24.0;
 /// The height the bottom "Close" row takes up (including the gap between it and the content).
 const SETTINGS_FOOT_H: f32 = 44.0;
-/// Width taken by the left column (the name) in a "name + value" row. Fixing it is what makes the
-/// values line up in a column.
-const KV_KEY_W: f32 = 84.0;
+/// Floor for the name column in a "name + value" row.
+///
+/// The column is **measured**, not fixed — see `kv_key_w` for why. This is only the lower bound, so
+/// that a column of short names ("History", "App root") still looks deliberate instead of hugging
+/// the values. It is also what the Chinese column lands on, so the zh layout is unchanged.
+const KV_KEY_MIN: f32 = 84.0;
+/// Air between a name and its value: the value's first glyph is what the eye lines up on.
+const KV_KEY_GAP: f32 = 18.0;
 
 /// The open-source license text. **The repo's own `LICENSE`, embedded directly** -- not copied by
 /// hand: a hand copy will sooner or later drift from the file, and what "About" shows has to be the
@@ -7571,18 +7606,50 @@ fn draw_grid_mark(p: &egui::Painter, r: Rect, fg: Color32) {
     }
 }
 
-/// A "name + value" row (the "System" column is all rows like this).
-fn kv_row(ui: &mut Ui, key: &str, val: &str) {
-    kv_row_colored(ui, key, val, P::text_faint());
+/// The font every name in a "name + value" row is set in.
+///
+/// Shared with [`kv_key_w`] on purpose: the column is measured with the same font it is painted
+/// with, and a second literal here would let the two drift apart silently.
+fn kv_key_font() -> egui::FontId {
+    egui::FontId::proportional(13.5)
 }
 
-/// As above, but the value may be coloured ("runtime environment" uses this to flag "not found").
-fn kv_row_colored(ui: &mut Ui, key: &str, val: &str, color: Color32) {
+/// Width of the name column for a **whole** column of rows: the widest name actually drawn.
+///
+/// A fixed width was the wrong tool. `84` had been measured against the Chinese label ("运行时环境");
+/// English names run ~40% wider — "Runtime environment" is ~118 pt — and the name is painted
+/// straight onto the painter, which neither clips nor takes part in layout, so an overlong one does
+/// not push anything aside: it prints **on top of** the value. That was the whole of "英文排版混乱".
+///
+/// It has to be the width of the widest name in the column, not per row: a per-row width would let
+/// each value start wherever, and a column that lines up is the entire point of these rows. So the
+/// caller collects its rows first and measures once. The cost is one layout call per name.
+fn kv_key_w(ui: &Ui, keys: &[&str]) -> f32 {
+    let mut w = KV_KEY_MIN;
+    for k in keys {
+        if k.is_empty() {
+            continue;
+        }
+        // The same entry point the drawing code uses, so the measured width is the painted width.
+        let g = ui.painter().layout_no_wrap((*k).to_owned(), kv_key_font(), P::text_dim());
+        w = w.max(g.size().x + KV_KEY_GAP);
+    }
+    // Rounded up to a whole point: the values' x would otherwise land on a fraction, and every glyph
+    // after the first in a monospace value would be nudged off the pixel grid.
+    w.ceil()
+}
+
+/// A "name + value" row (the "System" column is all rows like this).
+///
+/// `key_w` comes from [`kv_key_w`] and must be the same for every row of a column. The colour is a
+/// parameter rather than a second function: the runtime rows use it to say "not found", and one
+/// entry point is one place to change.
+fn kv_row(ui: &mut Ui, key_w: f32, key: &str, val: &str, color: Color32) {
     ui.horizontal_top(|ui| {
-        let (r, _) = ui.allocate_exact_size(Vec2::new(KV_KEY_W, 19.0), Sense::hover());
+        let (r, _) = ui.allocate_exact_size(Vec2::new(key_w, 19.0), Sense::hover());
         if !key.is_empty() {
             let p = ui.painter();
-            let g = p.layout_no_wrap(key.to_string(), egui::FontId::proportional(13.5), P::text_dim());
+            let g = p.layout_no_wrap(key.to_string(), kv_key_font(), P::text_dim());
             p.galley(Pos2::new(r.left(), r.top() + 1.0), g, P::text_dim());
         }
         // Values are always monospace: they are paths, commands, version numbers, not prose.
@@ -7597,12 +7664,12 @@ fn kv_row_colored(ui: &mut Ui, key: &str, val: &str, color: Color32) {
     ui.add_space(4.0);
 }
 
-/// A "name + clickable link" row (used by the "About" column).
-fn link_row(ui: &mut Ui, key: &str, url: &str) {
+/// A "name + clickable link" row (used by the "About" column). `key_w` as in [`kv_row`].
+fn link_row(ui: &mut Ui, key_w: f32, key: &str, url: &str) {
     ui.horizontal_top(|ui| {
-        let (r, _) = ui.allocate_exact_size(Vec2::new(KV_KEY_W, 19.0), Sense::hover());
+        let (r, _) = ui.allocate_exact_size(Vec2::new(key_w, 19.0), Sense::hover());
         let p = ui.painter();
-        let g = p.layout_no_wrap(key.to_string(), egui::FontId::proportional(13.5), P::text_dim());
+        let g = p.layout_no_wrap(key.to_string(), kv_key_font(), P::text_dim());
         p.galley(Pos2::new(r.left(), r.top() + 1.0), g, P::text_dim());
 
         let resp = ui.add(
@@ -7730,6 +7797,120 @@ mod tests {
             "a\nb",           // control characters would end up literally in the folder name
         ] {
             assert!(check_ws_name(typed).is_err(), "{typed:?} must be refused");
+        }
+    }
+
+    /// The names the "System" column can put in the name slot — the English source literals, which
+    /// are also the keys of `locales/zh.toml`. Adding a row without adding its label here leaves
+    /// that label unmeasured (and that is exactly how the bug below got in).
+    const SYSTEM_EN: [&str; 11] = [
+        "System info",
+        "Command line",
+        "Runtime environment",
+        "Model in use",
+        "Config file",
+        "Config layers",
+        "App root",
+        "Workspace",
+        "History",
+        "Plugins directory",
+        "Runtime directory",
+    ];
+    const SYSTEM_ZH: [&str; 11] = [
+        "系统信息",
+        "命令行",
+        "运行时环境",
+        "所用模型",
+        "配置文件",
+        "配置层",
+        "应用根目录",
+        "工作区",
+        "历史记录",
+        "插件目录",
+        "运行时目录",
+    ];
+    const ABOUT_EN: [&str; 2] = ["Author's blog", "Project home"];
+    const ABOUT_ZH: [&str; 2] = ["作者博客", "项目地址"];
+
+    /// The name column must be wide enough for **every** name it can show, in **every** language.
+    ///
+    /// This is "设置-系统界面英文排版混乱" as an executable statement. The column used to be a
+    /// constant (`84`) measured against the Chinese labels; English runs ~40% wider ("Runtime
+    /// environment" ≈ 118 pt) and the name is painted straight onto the painter — no clipping, no
+    /// participation in layout — so the overlong name printed **on top of** its value. The fix was
+    /// to measure the widest name in the column (`kv_key_w`); this states the property that fix has
+    /// to keep: `column >= widest name + gap`.
+    ///
+    /// The second assertion is the other half of the contract: the Chinese layout must not move.
+    /// `KV_KEY_MIN` exists so that a column of short names still looks deliberate — if this ever
+    /// fails, the minimum was changed and the zh dialog now has a gap where there wasn't one.
+    #[test]
+    fn the_name_column_fits_every_name_it_can_show() {
+        let ctx = egui::Context::default();
+        // Fonts are per-Context while `theme`'s "bold available" flags are process-global: a Context
+        // that lays out text installs its own, or it measures whatever a sibling test left behind.
+        crate::theme::install_fonts(&ctx);
+
+        /// Widest of these names, painted the way `kv_row` paints them.
+        fn widest(ui: &Ui, keys: &[&str]) -> f32 {
+            keys.iter()
+                .map(|k| {
+                    ui.painter()
+                        .layout_no_wrap((*k).to_owned(), kv_key_font(), P::text_dim())
+                        .size()
+                        .x
+                })
+                .fold(0.0f32, f32::max)
+        }
+
+        let cases: [(&str, &[&str], &[&str]); 2] =
+            [("System", &SYSTEM_EN, &SYSTEM_ZH), ("About", &ABOUT_EN, &ABOUT_ZH)];
+        // (column, key_w for English, key_w for Chinese, widest English name, widest Chinese name)
+        let mut measured: Vec<(&str, f32, f32, f32, f32)> = Vec::new();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for (col, en, zh) in cases {
+                    measured.push((
+                        col,
+                        kv_key_w(ui, en),
+                        kv_key_w(ui, zh),
+                        widest(ui, en),
+                        widest(ui, zh),
+                    ));
+                }
+            });
+        });
+
+        for (col, key_en, key_zh, widest_en, widest_zh) in measured {
+            println!(
+                "{col}: en column={key_en:.1} (widest {widest_en:.1}) · \
+                 zh column={key_zh:.1} (widest {widest_zh:.1})"
+            );
+            assert!(
+                key_en + 0.01 >= widest_en + KV_KEY_GAP,
+                "{col}: the column is {key_en:.1} pt but the widest English name needs \
+                 {:.1} — it will print over its value",
+                widest_en + KV_KEY_GAP
+            );
+            assert!(
+                key_zh + 0.01 >= widest_zh + KV_KEY_GAP,
+                "{col}: the column is {key_zh:.1} pt but the widest Chinese name needs {:.1}",
+                widest_zh + KV_KEY_GAP
+            );
+            // Chinese is the language the old constant was tuned for. It may settle a hair above
+            // the floor — 67.5 + the 18 pt gap is 85.5, so it lands on 86 rather than 84 — but it
+            // must not *jump*: the floor is there precisely so the zh dialog keeps the column it
+            // has always had, and 2 pt is invisible while 60 would not be.
+            assert!(
+                key_zh <= KV_KEY_MIN + 4.0,
+                "{col}: the Chinese column jumped from {KV_KEY_MIN} to {key_zh:.1}"
+            );
+            // The values are paths; a name column that eats the panel would wrap them for nothing.
+            assert!(
+                key_en <= SETTINGS_RIGHT_W - 240.0,
+                "{col}: a {key_en:.1} pt name column leaves too little room for values \
+                 (panel {SETTINGS_RIGHT_W:.0} pt)"
+            );
         }
     }
 }

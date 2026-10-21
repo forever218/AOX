@@ -31,6 +31,7 @@ pub mod runtime;
 pub mod runtimes;
 pub mod sandbox;
 pub mod selftest;
+pub mod shell;
 pub mod space;
 pub mod store;
 pub mod sysinfo;

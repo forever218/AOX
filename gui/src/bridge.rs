@@ -269,6 +269,11 @@ pub struct BootPaths {
     pub runtime: String,
     /// Host info, e.g. `windows x86_64 · 16 cores · 31.7 GB RAM`.
     pub host: String,
+    /// Which command-line tool the model gets first, e.g. `bash · git-bash — C://Program Files\Git\bin\bash.exe`.
+    ///
+    /// Computed by the core (`aox::shell::command_line_summary`) so the row cannot drift from what is
+    /// actually registered: the sentence is a claim about behaviour, not decoration.
+    pub command_line: String,
 }
 
 impl BootPaths {
@@ -283,6 +288,7 @@ impl BootPaths {
         config: &std::path::Path,
         plugins: &std::path::Path,
         history: std::path::PathBuf,
+        shell: &aox::config::ShellConfig,
     ) -> Self {
         Self {
             root: root.display().to_string(),
@@ -291,6 +297,7 @@ impl BootPaths {
             history: history.display().to_string(),
             runtime: root.join("runtime").display().to_string(),
             host: aox::sysinfo::host_summary(),
+            command_line: aox::shell::command_line_summary(shell, root),
         }
     }
 }
@@ -596,8 +603,9 @@ fn boot_paths(
     config: &std::path::Path,
     plugins: &std::path::Path,
     store: &Arc<dyn aox::store::Store>,
+    shell: &aox::config::ShellConfig,
 ) -> BootPaths {
-    BootPaths::new(root, config, plugins, store.location().to_path_buf())
+    BootPaths::new(root, config, plugins, store.location().to_path_buf(), shell)
 }
 
 /// Restore persisted plugins and report everything about them the user needs to know.
@@ -834,7 +842,15 @@ async fn boot_and_run(
             // workspaces. Exactly the call `Runtime::new` makes.
             let spaces = aox::space::Registry::load(&root);
             store.set_workspaces(&spaces.workspace_roots(&root));
-            let paths = boot_paths(&root, &config_path, &plugins_dir, &store);
+            // Config could not be read: the row uses the defaults (`[shell] bash = "auto"`), which is
+            // the honest thing to show — the reason the config failed is shown right above it.
+            let paths = boot_paths(
+                &root,
+                &config_path,
+                &plugins_dir,
+                &store,
+                &aox::config::ShellConfig::default(),
+            );
             boot(
                 &tx,
                 &config_path,
@@ -882,6 +898,16 @@ async fn boot_and_run(
         rt.register(t).await?;
     }
     // Verification (`aox::tool::verify`). Same story: visible to the model, executed by the agent loop.
+    // The built-in command line (`aox::tool::shell`): same tool, same boundary, same executor as in
+    // the CLI. Registering it here is what makes "the GUI has no shell" stop being true.
+    if rt.config.shell.enabled {
+        for t in aox::tool::shell::shell_tools() {
+            rt.register(t).await?;
+        }
+        for t in aox::tool::bash::bash_tools(&rt) {
+            rt.register(t).await?;
+        }
+    }
     for t in aox::tool::verify::verify_tools() {
         rt.register(t).await?;
     }
@@ -904,7 +930,7 @@ async fn boot_and_run(
             ui.emit(AgentEvent::Info(
                 aox::i18n::t("Fill in base_url and api_key (or api_key_env) under [provider] in config.toml, then restart.").into(),
             ));
-            let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store);
+            let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store, &rt.config.shell);
             boot(
                 &tx,
                 &config_path,
@@ -928,7 +954,7 @@ async fn boot_and_run(
     // The project rules file (RULES.md) is now read centrally by `aox::prompt::build`, no longer once
     // each in the GUI and CLI (see src/prompt.rs).
     let mut agent = Agent::new(llm, rt.clone());
-    let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store);
+    let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store, &rt.config.shell);
     // Hand the session to the UI **before** touching plugins. The history sidebar reads off the store
     // that `boot` carries, so restoring plugins first used to blank it for the whole wait — up to
     // `INIT_TIMEOUT` (20 s) per cold-or-broken plugin. This order is the point of the fix.
