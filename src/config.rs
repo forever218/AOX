@@ -88,6 +88,12 @@ pub struct ProviderConfig {
     pub model: String,
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
+    /// Cap on the reply's tokens. Omitted ⇒ [`DEFAULT_MAX_TOKENS`].
+    ///
+    /// It is also the amount **reserved** inside the context budget (`compact::Policy`), so the reply
+    /// does not get cut off by the input having filled the window: raising it lowers the input budget
+    /// by the same number.
+    #[serde(default = "default_max_tokens")]
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     /// Whether to request via SSE streaming (default true).
@@ -95,17 +101,41 @@ pub struct ProviderConfig {
     /// not accept stream / stream_options, set it false to fall back to waiting for the full response.
     #[serde(default = "default_true")]
     pub stream: bool,
-    /// The model's context window, in tokens.
+    /// The model's context window, in tokens. Omitted ⇒ [`DEFAULT_CONTEXT_WINDOW`].
     ///
-    /// **Only a display denominator**: the GUI draws a small ring showing "how full is the
-    /// context", and that needs to know what "full" means. Nothing in the agent truncates or
-    /// budgets against this number — sending too much is the endpoint's call to make, and it
-    /// already answers with a clear error.
+    /// **Two readers, and the second one is not cosmetic** (this doc said otherwise until
+    /// 2026-10-23, and the stale half was the important one):
     ///
-    /// Absent means "unknown", and the GUI falls back to its own default rather than drawing a
-    /// ring that is always 0%.
-    #[serde(default)]
+    /// 1. the GUI's context ring — "how full is the window" needs to know what full means;
+    /// 2. **`compact::Policy`**, which derives the compaction budget as
+    ///    `context_window × compact_ratio − max_tokens`. Set it too high and compaction never
+    ///    triggers, so an over-long conversation goes to the endpoint and comes back as a 400; set it
+    ///    too low and context that would still fit gets folded away.
+    ///
+    /// So this must be the **model's real window**, not an aspiration. `[agent]
+    /// context_budget_tokens` overrides the derivation outright if a single number is easier to
+    /// reason about.
+    #[serde(default = "default_context_window")]
     pub context_window: Option<u32>,
+}
+
+/// Default reply-token cap: generous enough that a normal answer, a diff or a file write fits in one
+/// call, far below what any current endpoint considers "too many".
+pub const DEFAULT_MAX_TOKENS: u32 = 32_000;
+
+/// Default context window assumed when the config says nothing.
+///
+/// ⚠️ It feeds the compaction budget (see [`ProviderConfig::context_window`]), so it has to match the
+/// model actually in use. When a model is smaller than this, **set the real number**: an oversized
+/// assumption is not "extra headroom", it is "compaction never runs".
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 600_000;
+
+fn default_max_tokens() -> Option<u32> {
+    Some(DEFAULT_MAX_TOKENS)
+}
+
+fn default_context_window() -> Option<u32> {
+    Some(DEFAULT_CONTEXT_WINDOW)
 }
 
 fn default_true() -> bool {
@@ -188,8 +218,9 @@ pub struct AgentConfig {
     /// else. Use it when the window is known to be smaller than `context_window` says (or when only
     /// part of the window is usable).
     ///
-    /// 0 = "derive it from `[provider] context_window × compact_ratio`", and when that is absent too,
-    /// compaction stays **off** — an unknown window is not guessed at (see `crate::compact`).
+    /// 0 = "derive it from `[provider] context_window × compact_ratio`". Since 2026-10-23 both of
+    /// those have defaults (600k / 0.8), so **0 means "compact at ~448k input tokens"**, not "off".
+    /// Set this explicitly when a single number is easier to reason about than the product.
     pub context_budget_tokens: u64,
     /// How much of the model's context window may be used for input, before the reply's reserve is
     /// taken off. Only read when `context_budget_tokens == 0` and `context_window` is set.
@@ -1551,5 +1582,35 @@ api_key = "k"
         )
         .expect("should parse");
         assert!(!c.sandbox.enabled);
+    }
+
+    /// The two provider defaults, checked through **serde** rather than by reading the struct: the
+    /// defaults live in `#[serde(default = ...)]` attributes, so a test that sets the fields directly
+    /// would prove nothing about what a config file actually gets.
+    ///
+    /// Pinned because both numbers have a second job beyond "a sensible value": `context_window` and
+    /// `max_tokens` are the compaction budget (`window x ratio - max_tokens`). A silent change here
+    /// moves the point where long conversations start being folded, and nothing would fail.
+    #[test]
+    fn a_minimal_config_gets_the_documented_provider_defaults() {
+        let c: Config = toml::from_str(
+            "[provider]\nbase_url = \"https://example.invalid\"\nmodel = \"m\"\n",
+        )
+        .expect("a config with only the required provider keys must parse");
+        assert_eq!(c.provider.max_tokens, Some(DEFAULT_MAX_TOKENS));
+        assert_eq!(c.provider.context_window, Some(DEFAULT_CONTEXT_WINDOW));
+
+        // ...and a default config therefore DOES compact: 600000 x 0.8 - 32000.
+        let p = crate::compact::Policy::from_config(&c).expect("the defaults give a budget");
+        assert_eq!(p.budget, 448_000);
+
+        // An explicit window still wins on its own terms (10k x 0.8 - 32000 would go negative, so
+        // the budget floors at SMALLEST_BUDGET rather than at zero).
+        let mut small = c.clone();
+        small.provider.context_window = Some(10_000);
+        assert_eq!(
+            crate::compact::Policy::from_config(&small).unwrap().budget,
+            crate::compact::SMALLEST_BUDGET
+        );
     }
 }

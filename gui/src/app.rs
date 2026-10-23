@@ -445,9 +445,9 @@ pub struct App {
     usage_open: bool,
     /// The model's context window in tokens -- the denominator of the ring in the input box.
     ///
-    /// Comes from `[provider] context_window`; the fallback (128K) is only a sensible default for
-    /// the OpenAI-compatible endpoints this app targets, and it is what an unconfigured install
-    /// gets. See [`App::context_used`] for the numerator.
+    /// Comes from `[provider] context_window` (which now has a default, see
+    /// [`aox::config::DEFAULT_CONTEXT_WINDOW`]); the fallback here only covers a host that reports 0.
+    /// See [`App::context_used`] for the numerator.
     context_window: u64,
     /// When the host is compacting the context right now (the instant the event arrived), so the
     /// input box can show "compacting…" with an animation instead of a gauge that is pinned at full.
@@ -5025,12 +5025,13 @@ const HISTORY_LIST_LIMIT: usize = 80;
 // lived in `SidePanel::default_width(266)`. With both the top bar and the side column removed they
 // have no "container" to lean on, so they are pinned explicitly here.
 
-/// The context window assumed when `[provider] context_window` is not set.
+/// The denominator for the ring when the host reports no window at all (it normally reports one:
+/// `[provider] context_window` has a default now).
 ///
-/// Only a denominator for the ring — nothing is truncated at this number, so a wrong value costs a
-/// misleading percentage and nothing else. 128K is the floor of what the endpoints this app targets
-/// advertise; a provider with a smaller window should say so in `config.toml`.
-const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+/// The same constant the agent compacts against (`aox::config::DEFAULT_CONTEXT_WINDOW`), not a second
+/// number that happens to agree today: a ring showing "40% full" while compaction runs at a different
+/// threshold is a display that lies.
+const DEFAULT_CONTEXT_WINDOW: u64 = aox::config::DEFAULT_CONTEXT_WINDOW as u64;
 /// The top-left button's hot zone (and the drawer head's, which shares the same drawing).
 ///
 /// 32 rather than the 36 this used to be: the drawer's head icons are 32 so that the whole row

@@ -29,10 +29,14 @@ temperature = 0.3
 # If an endpoint doesn't accept the stream / stream_options parameters, set false to fall back
 # to waiting for the complete response.
 stream = true
-# The model's context window, in tokens. **Display only**: the input box draws a small ring
-# showing how full the context is, and this is what "full" means. Nothing is truncated against
-# it. Leave it out and the GUI assumes 128000.
- context_window = 600000
+# The model's context window, in tokens.
+# Two readers: the input box's "how full is the context" ring, AND the compaction budget, which is
+#   context_window x compact_ratio - max_tokens
+# So this has to be the model's REAL window: too high and compaction never runs (an over-long
+# conversation then comes back from the endpoint as a 400), too low and usable context gets folded
+# away early. `[agent] context_budget_tokens` overrides the derived number outright.
+# Leave it out and the defaults are context_window = 600000, max_tokens = 32000.
+context_window = 600000
 
 [auth]
 # Meta tools (create_plugin / remove_plugin and other operations that change the system

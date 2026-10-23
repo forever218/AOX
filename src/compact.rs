@@ -74,9 +74,11 @@ impl Policy {
     /// `[provider] context_window x compact_ratio - max_tokens` -> **neither means `None` (no
     /// compaction)**.
     ///
-    /// That last branch is deliberate: an unknown window is not guessed at. A guess can only be wrong
-    /// in two directions — compact too early (throwing away context that still fits) or too late (the
-    /// endpoint rejects the request). Both are worse than doing nothing.
+    /// That last branch is deliberately not a guess: an unknown window used to mean "compact
+    /// nothing". Since 2026-10-23 the two provider keys have defaults
+    /// ([`crate::config::DEFAULT_CONTEXT_WINDOW`] / [`crate::config::DEFAULT_MAX_TOKENS`]), so a plain
+    /// config does compact — `None` here now only happens when a caller clears the window
+    /// explicitly (tests, or a config whose model genuinely has no known limit).
     pub fn from_config(cfg: &crate::config::Config) -> Option<Self> {
         let explicit = cfg.agent.context_budget_tokens;
         if explicit > 0 {
@@ -90,7 +92,7 @@ impl Policy {
         } else {
             0.8
         };
-        let reserve = cfg.provider.max_tokens.unwrap_or(4_096) as u64;
+        let reserve = cfg.provider.max_tokens.unwrap_or(crate::config::DEFAULT_MAX_TOKENS) as u64;
         let budget = (window as f64 * ratio) as u64;
         Some(Self { budget: budget.saturating_sub(reserve).max(SMALLEST_BUDGET) })
     }
