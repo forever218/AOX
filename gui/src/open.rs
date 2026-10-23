@@ -9,8 +9,10 @@
 //!
 //! - Only real URLs go to the browser; only absolute local paths go to the file manager. Nothing
 //!   else is even classified (a relative `src/main.rs` stays inert — see `markdown::scan`).
-//! - A path is never handed to a shell and never concatenated into a command line: each one is a
-//!   single [`Command::arg`], so spaces and quotes inside it stay data.
+//! - A path is never handed to a shell. Explorer is the one exception to "one argument per `arg`":
+//!   its parser needs the literal shape `/select,"<path>"`, so that string is built by hand and
+//!   passed with `raw_arg`. The quotes inside it cannot be broken out of — Windows file names may
+//!   not contain `"` — see `select_arg` for why the obvious `arg` version is wrong.
 //! - **A click never executes anything.** For a file the action is "show it in its folder"
 //!   (`explorer /select,<file>`), not "run it". That is the conservative behaviour chosen on
 //!   2026-10-23: a `.exe` in a model reply is exactly what a mis-aimed click must not launch.
@@ -141,18 +143,56 @@ pub fn reveal(path: &Path) -> bool {
 
 #[cfg(windows)]
 fn reveal_impl(path: &Path) -> bool {
+    use std::os::windows::process::CommandExt;
+
+    let native = native_path(path);
     let mut cmd = std::process::Command::new("explorer");
     if path.is_dir() {
-        cmd.arg(path);
+        // A bare path: `arg` quoting it (`"E:\aox probe dir"`) is exactly what Explorer expects.
+        cmd.arg(&native);
     } else {
-        // `/select,<path>` as **one** argument: `arg` quotes it for Windows, so a path with spaces
-        // arrives intact. Explorer splits on the first comma and treats the rest as the path.
-        cmd.arg(format!("/select,{}", path.display()));
+        cmd.raw_arg(select_arg(&native));
     }
     // `explorer` reports a non-zero exit status even when it opened the window, and waiting for it
     // would block the UI thread until the user closed the window. So: spawn, do not wait, do not
     // read the status. A failed spawn (no `explorer` at all) is the only observable failure.
     cmd.spawn().is_ok()
+}
+
+/// Explorer's `/select,` argument for an already-`native_path` path.
+///
+/// **Why this is built by hand.** The obvious version is
+/// `Command::arg(format!("/select,{path}"))`, and it is wrong in a way no type checker sees: `arg`
+/// quotes according to the MSVC rules, so a path containing a space turns the *whole* string into
+/// `"/select,E:\aox probe dir\a.txt"`. Explorer parses its own command line and does not recognise a
+/// switch that sits inside the quotes — it ignores everything and opens **Documents**. The user sees
+/// "clicking a path always opens the Documents folder" while right-click → *open with default app*
+/// (a different code path, `ShellExecuteW`) keeps working. Verified on 2026-10-23 against a path with
+/// a space, then fixed by quoting only the path.
+///
+/// Interpolating into a command line is safe *here*: Windows file names cannot contain `"`, so the
+/// quoted run cannot be broken out of.
+#[cfg(windows)]
+fn select_arg(native: &str) -> String {
+    format!("/select,\"{native}\"")
+}
+
+/// The path in the form Explorer understands: backslashes, no trailing separator.
+///
+/// Two separate reasons, both confirmed by driving `explorer` from a probe on 2026-10-23:
+///
+/// - **Forward slashes are not understood at all.** `/select,E:/rustapp/Cargo.toml` opened Desktop,
+///   and `explorer E:/some/dir` opened nothing — the model writes plenty of `E:/…` paths, so this is
+///   not a theoretical case.
+/// - **A trailing separator inside quotes** reads as an escaped quote (`"E:\dir\"`), so it is
+///   dropped — except on a drive root, where `E:\` *is* the whole path.
+#[cfg(windows)]
+fn native_path(path: &Path) -> String {
+    let mut s = path.to_string_lossy().replace('/', "\\");
+    while s.len() > 3 && s.ends_with('\\') {
+        s.pop();
+    }
+    s
 }
 
 #[cfg(target_os = "macos")]
@@ -352,5 +392,25 @@ mod tests {
         assert_eq!(resolve_relative(r"src\main.rs").map(|p| p.exists()), Some(true), "backslashes work too");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins the 2026-10-23 bug: `Command::arg` on the whole `/select,…` string quotes all of it when
+    /// the path has a space, Explorer stops recognising the switch, and every click opens Documents.
+    #[cfg(windows)]
+    #[test]
+    fn only_the_path_is_quoted_inside_the_select_argument() {
+        assert_eq!(select_arg(r"E:\aox probe dir\a.txt"), r#"/select,"E:\aox probe dir\a.txt""#);
+        assert_eq!(select_arg(r"E:\rustapp\Cargo.toml"), r#"/select,"E:\rustapp\Cargo.toml""#);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explorer_is_never_handed_a_forward_slash_path() {
+        // `explorer /select,E:/rustapp/Cargo.toml` opens Desktop, not the folder — verified against a
+        // live Explorer, which is why this is a test and not a comment.
+        assert_eq!(native_path(Path::new("E:/rustapp/dist")), r"E:\rustapp\dist");
+        assert_eq!(native_path(Path::new(r"E:\dir\")), r"E:\dir", "a dangling separator reads as an escaped quote");
+        assert_eq!(native_path(Path::new("E:/")), r"E:\", "the drive root is the whole path");
+        assert_eq!(native_path(Path::new(r"\\srv\share\")), r"\\srv\share");
     }
 }
