@@ -56,14 +56,18 @@ impl Spec {
 }
 
 /// On paper: ochre-red keywords, pine-green types, steel-blue functions, olive strings, plum numerals, warm-grey comments, amber meta.
+///
+/// `cmt` and `meta` are the two that are **not** hues but greys/ambers, so they are the two that
+/// can fall under the readability floor. Raised on 2026-10-22 with the rest of the text tiers: the
+/// old comment grey was 2.4:1 on the code well, i.e. the least readable text in the whole window.
 const LIGHT: Spec = Spec {
     kw: Color32::from_rgb(0xA3, 0x4A, 0x2A),
     ty: Color32::from_rgb(0x1F, 0x7A, 0x6B),
     func: Color32::from_rgb(0x2F, 0x66, 0x90),
     str_: Color32::from_rgb(0x4C, 0x7A, 0x2F),
     num: Color32::from_rgb(0x8A, 0x5A, 0x9E),
-    cmt: Color32::from_rgb(0x93, 0x8C, 0x7D),
-    meta: Color32::from_rgb(0xB0, 0x7A, 0x1E),
+    cmt: Color32::from_rgb(0x5E, 0x59, 0x4E),
+    meta: Color32::from_rgb(0x7E, 0x54, 0x10),
 };
 
 /// On ink: the same hues brightened overall, with comments kept the weakest.
@@ -73,7 +77,7 @@ const DARK: Spec = Spec {
     func: Color32::from_rgb(0x86, 0xB6, 0xDD),
     str_: Color32::from_rgb(0xA8, 0xC9, 0x7A),
     num: Color32::from_rgb(0xC9, 0xA0, 0xDC),
-    cmt: Color32::from_rgb(0x83, 0x7D, 0x70),
+    cmt: Color32::from_rgb(0xAD, 0xA9, 0x9F),
     meta: Color32::from_rgb(0xD8, 0xB2, 0x6A),
 };
 

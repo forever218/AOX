@@ -66,14 +66,51 @@ impl Bash {
 
     /// Refuse a `bash.exe` that is not an MSYS/Cygwin shell. Runs `uname -s` — one process, so this is
     /// done on the first **call**, not during detection.
+    ///
+    /// Bounded on purpose: `Command::output()` waits forever, and this runs **before** any of the
+    /// call's timeouts are armed (`runner::run` calls it first), so a shim that hangs here would hang
+    /// the whole tool call with nothing counting down. Five seconds is ~20× the measured cost of a
+    /// real bash (`uname -s` ≈ 270 ms including the Git Bash start).
     pub fn check(&self) -> Result<(), String> {
-        let out = std::process::Command::new(&self.exe)
+        let mut child = std::process::Command::new(&self.exe)
             .args(&self.prefix)
             .args(["-c", "uname -s"])
             .stdin(std::process::Stdio::null())
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .map_err(|e| crate::tf!("could not run {}: {}", self.exe.display(), e))?;
-        let s = String::from_utf8_lossy(&out.stdout).to_ascii_uppercase();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut timed_out = false;
+        loop {
+            match child.try_wait() {
+                // Exited (and reaped) — or the handle is gone, which also means "nothing to wait for".
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if timed_out {
+            return Err(crate::tf!(
+                "{} did not answer `uname -s` within 5 s — refusing it rather than hanging the first \
+                 command that uses it",
+                self.exe.display()
+            ));
+        }
+        // Read what it printed. The pipe is bounded by the answer's size (`uname -s` is one line), and
+        // the process has already exited, so this cannot block on a live writer.
+        let mut buf = Vec::new();
+        if let Some(mut out) = child.stdout.take() {
+            use std::io::Read as _;
+            let _ = out.read_to_end(&mut buf);
+        }
+        let s = String::from_utf8_lossy(&buf).to_ascii_uppercase();
         // `Windows_NT` is what busybox-w32 answers — it is a native Win32 program with POSIX tools, not
         // an MSYS runtime. Accepting it here is what lets the ash fallback work at all.
         if s.contains("MINGW") || s.contains("MSYS") || s.contains("CYGWIN") || s.contains("WINDOWS_NT") {

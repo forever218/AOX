@@ -15,6 +15,10 @@
 //! | 4 | the refused file really does not exist | "it got blocked" must not mean "nothing happened" |
 //! | 5 | reading outside the workspace still works | the deliberate read/write asymmetry |
 //! | 6 | a non-zero exit code reaches the model as output, not as a tool error | a compiler error is content |
+//! | 9 | a call past its own `timeout_secs` is killed in about that long | the budget actually binds |
+//! | 10 | a **silent** call is killed by the idle watchdog long before its budget | "wedged" gets reaped |
+//! | 11 | a call that keeps printing is **not** killed by the watchdog | slow ≠ stuck |
+//! | 12 | the ceiling and the model's estimate come back as `(cap, expect)` | what the UI reads |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,7 +74,10 @@ async fn run() -> anyhow::Result<i32> {
         root: Some(ws.to_string_lossy().into_owned()),
     };
     let rt = Arc::new(Runtime::new(cfg, ws.clone(), ws.join("plugins"))?);
-    for t in aox::tool::shell::shell_tools() {
+    // From the runtime, not from `cfg` (it is moved into `Runtime::new`): the registered tool has to
+    // carry the same budgets the calls will actually be held to.
+    let shell_cfg = rt.config.shell.clone();
+    for t in aox::tool::shell::shell_tools(&shell_cfg) {
         rt.register(t).await?;
     }
 
@@ -224,6 +231,111 @@ async fn run() -> anyhow::Result<i32> {
                     failed += 1;
                 }
             }
+        }
+    }
+
+    // 9 ── the total budget actually binds
+    //
+    // `ping -n 30` would run ~29 s; `>nul` keeps it from printing (so the idle watchdog has nothing to
+    // feed it) and `idle_secs: 0` turns that watchdog off, isolating the total timeout.
+    {
+        let t0 = std::time::Instant::now();
+        let args = json!({
+            "command": "ping -n 30 127.0.0.1 >nul",
+            "timeout_secs": 2,
+            "idle_secs": 0,
+        });
+        let took = t0; // measured after the call
+        match ask(&rt, args).await {
+            Ok(out)
+                if out.is_error
+                    && out.content.contains("TIMED OUT after")
+                    && took.elapsed() < std::time::Duration::from_secs(10) =>
+            {
+                println!(
+                    "PASS  a 2 s budget killed a 29 s command after {:.1} s",
+                    took.elapsed().as_secs_f32()
+                )
+            }
+            other => {
+                println!("FAIL  the total timeout did not bind: {}", show(other));
+                failed += 1;
+            }
+        }
+    }
+
+    // 10 ── silence is reaped, and reaped early
+    {
+        let t0 = std::time::Instant::now();
+        let args = json!({
+            "command": "ping -n 30 127.0.0.1 >nul",
+            "timeout_secs": 60,
+            "idle_secs": 2,
+        });
+        match ask(&rt, args).await {
+            Ok(out)
+                if out.is_error
+                    && out.content.contains("KILLED after")
+                    && t0.elapsed() < std::time::Duration::from_secs(20) =>
+            {
+                println!(
+                    "PASS  a silent command was reaped by the idle watchdog after {:.1} s (budget 60 s)",
+                    t0.elapsed().as_secs_f32()
+                );
+                // The model reads this text; showing it here is how the wording gets reviewed.
+                println!("      {}", first_line(&out.content));
+            }
+            other => {
+                println!("FAIL  a silent command was not reaped: {}", show(other));
+                failed += 1;
+            }
+        }
+    }
+
+    // 11 ── and the watchdog must NOT kill a slow-but-alive command
+    //
+    // `ping` prints one line per second for 6 s while the idle budget is 3 s: if the clock ran from the
+    // start instead of from the last byte, this is the check that would fail — which is the whole
+    // difference between "reaps wedged calls" and "reaps slow builds".
+    {
+        let t0 = std::time::Instant::now();
+        let args = json!({
+            "command": "ping -n 6 127.0.0.1",
+            "timeout_secs": 30,
+            "idle_secs": 3,
+        });
+        // Asserted on **time**, not on the output text: `ping` is localized (a Chinese Windows answers
+        // "来自 … 的回复"), so matching "Reply from" would test the machine's locale instead of the
+        // watchdog. Surviving past the 3 s idle budget while the budget itself is untouched is the
+        // property that matters.
+        match ask(&rt, args).await {
+            Ok(out)
+                if !out.is_error
+                    && !out.content.contains("KILLED")
+                    && t0.elapsed() > std::time::Duration::from_secs(4) =>
+            {
+                println!(
+                    "PASS  a command that keeps printing outlived its 3 s idle budget ({:.1} s) unharmed",
+                    t0.elapsed().as_secs_f32()
+                )
+            }
+            other => {
+                println!("FAIL  a printing command was killed or mis-handled: {}", show(other));
+                failed += 1;
+            }
+        }
+    }
+
+    // 12 ── the two numbers the UI shows
+    {
+        let hints = rt
+            .call_hints(aox::tool::shell::SHELL_TOOL, &json!({"timeout_secs": 45, "expect_secs": 30}))
+            .await;
+        if hints == (Some(45), Some(30)) {
+            println!("PASS  the call reports cap 45 s and the model's estimate of 30 s")
+        } else {
+            println!("FAIL  call_hints returned {hints:?}, expected (Some(45), Some(30))");
+            failed += 1;
         }
     }
 

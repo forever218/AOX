@@ -418,7 +418,8 @@ impl Tool for WriteFileTool {
             "properties": {
                 PATH_ARG: {"type": "string", "description": crate::i18n::t("Path of the file to write (absolute, inside the workspace)")},
                 "content": {"type": "string", "description": crate::i18n::t("File content (full overwrite)")},
-                "create_dirs": {"type": "boolean", "description": crate::i18n::t("Whether to create missing parent directories automatically; default true")}
+                "create_dirs": {"type": "boolean", "description": crate::i18n::t("Whether to create missing parent directories automatically; default true")},
+                crate::tool::PURPOSE_ARG: {"type": "string", "description": crate::i18n::t(crate::tool::PURPOSE_DESC)}
             },
             "required": [PATH_ARG, "content"]
         })

@@ -22,8 +22,16 @@ pub enum AgentEvent {
     InterimText(String),
     /// About to execute a tool call
     ToolCall { name: String, args: Value },
-    /// The tool passed authorisation and is starting to run (may take a while)
-    ToolRunning { name: String, timeout_secs: u64 },
+    /// The tool passed authorisation and is starting to run (may take a while).
+    ///
+    /// `timeout_secs` is **this call's** ceiling, not the generic per-tool one: for `shell`/`bash` the
+    /// model may have asked for more, and telling the user "120 s" while the call is allowed 600 would
+    /// make an honest cap look like a stalled clock.
+    ///
+    /// `expect_secs` is the model's own estimate, when it bothered to say one ("this is a compile,
+    /// ~2 min"). It is an announcement, not a limit — the UI shows it so "still working" and "wedged"
+    /// stop looking identical.
+    ToolRunning { name: String, timeout_secs: u64, expect_secs: Option<u64> },
     /// The tool call finished. `diff` is the edit statistic — `(added, removed)` lines, or `None`
     /// when the call was not an edit; the GUI shows it as "+N / −N" on the call's own row. The same
     /// row can be unfolded, and `diff_detail` is what it then draws — the diff itself, one line per

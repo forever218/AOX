@@ -350,10 +350,16 @@ const LIGHT: Palette = Palette {
     border: Color32::from_rgb(0xDD, 0xD7, 0xC9),
     border_strong: Color32::from_rgb(0xC2, 0xBA, 0xA8),
     text: Color32::from_rgb(0x1A, 0x19, 0x16),
-    text_dim: Color32::from_rgb(0x64, 0x5F, 0x55),
-    text_faint: Color32::from_rgb(0x9B, 0x94, 0x86),
+    // The three text tiers are **readability first, hierarchy second** (2026-10-22). The old
+    // `text_faint` (#9B9486) sat at 2.6:1 on this paper base — half the WCAG AA floor for body
+    // text — so every label drawn with it looked switched off rather than quiet. The tiers are now
+    // measured (see `every_text_tier_stays_readable`): `text_dim` ~7.6:1, `text_faint` ~5.7:1.
+    // A deliberately grey tier still exists, but only for things that are *not content*:
+    // [`P::quiet`] (input placeholders, disabled glyphs).
+    text_dim: Color32::from_rgb(0x4A, 0x46, 0x3D),
+    text_faint: Color32::from_rgb(0x5E, 0x59, 0x4E),
     ink: Color32::from_rgb(0x1A, 0x19, 0x16),
-    ink_soft: Color32::from_rgb(0x6B, 0x65, 0x5A),
+    ink_soft: Color32::from_rgb(0x4F, 0x4A, 0x40),
     user_bg: Color32::from_rgb(0xE7, 0xE2, 0xD6),
     code_bg: Color32::from_rgb(0xEC, 0xE8, 0xDE),
     code_chip: Color32::from_rgb(0xE0, 0xD9, 0xC7),
@@ -382,10 +388,13 @@ const DARK: Palette = Palette {
     border: Color32::from_rgb(0x33, 0x33, 0x2E),
     border_strong: Color32::from_rgb(0x4C, 0x4C, 0x45),
     text: Color32::from_rgb(0xEA, 0xE7, 0xDF),
-    text_dim: Color32::from_rgb(0xA3, 0x9F, 0x96),
-    text_faint: Color32::from_rgb(0x71, 0x6E, 0x66),
+    // Same calibration as the light palette, inverted (see the note there): `text_dim` ~11.5:1,
+    // `text_faint` ~7:1 on this base. The old #716E66 was 3.6:1 — the dark theme's copy of the
+    // same "everything looks greyed out" complaint.
+    text_dim: Color32::from_rgb(0xDC, 0xD8, 0xCE),
+    text_faint: Color32::from_rgb(0xAD, 0xA9, 0x9F),
     ink: Color32::from_rgb(0xEC, 0xE9, 0xE1),
-    ink_soft: Color32::from_rgb(0x9A, 0x96, 0x8D),
+    ink_soft: Color32::from_rgb(0xC4, 0xC0, 0xB6),
     user_bg: Color32::from_rgb(0x25, 0x25, 0x21),
     code_bg: Color32::from_rgb(0x10, 0x10, 0x0E),
     code_chip: Color32::from_rgb(0x39, 0x39, 0x32),
@@ -521,6 +530,22 @@ impl P {
     }
     pub fn text_faint() -> Color32 {
         pal().text_faint
+    }
+
+    /// The **deliberately low-contrast** tier: input placeholders and disabled glyphs.
+    ///
+    /// This is the only text colour allowed to fail the readability floor, and it is allowed to
+    /// here because of what it means: a placeholder is not content (it disappears the moment you
+    /// type), and a disabled glyph is saying "not now". Both read as *absent* only if they stay
+    /// clearly quieter than every real label — which is why it keeps the values the third tier
+    /// used to have before the 2026-10-22 readability pass, instead of following it down.
+    ///
+    /// Everything else must use [`P::text`] / [`P::text_dim`] / [`P::text_faint`].
+    pub fn quiet() -> Color32 {
+        match mode() {
+            Mode::Light => Color32::from_rgb(0x9B, 0x94, 0x86),
+            Mode::Dark => Color32::from_rgb(0x71, 0x6E, 0x66),
+        }
     }
     /// Monochrome accent color (formerly ACCENT).
     pub fn ink() -> Color32 {
@@ -1362,6 +1387,55 @@ mod tests {
             Some(P::text()),
             "settle must actually install the style"
         );
+    }
+
+    /// WCAG relative luminance, for the contrast assertions below.
+    fn lum(c: Color32) -> f32 {
+        let ch = |v: u8| {
+            let s = v as f32 / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (x, y) = (lum(a), lum(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// Every readable tier must clear 4.5:1 on every base it can land on — in **both** themes.
+    ///
+    /// This is the regression guard for the 2026-10-22 complaint ("labels look greyed out and are
+    /// hard to read in either theme"). The old `text_faint` measured 2.6:1 on the light page: half
+    /// the AA floor, and it carried 109 call sites (timestamps, counts, settings values, section
+    /// labels). Numbers, not eyeballs — a future palette tweak that "looks fine" on one monitor
+    /// fails here instead of shipping.
+    ///
+    /// `P::quiet` is deliberately **not** in the list: it is the one tier meant to look switched
+    /// off (placeholders, disabled glyphs).
+    #[test]
+    fn every_text_tier_stays_readable_on_every_base() {
+        for (name, p) in [("light", LIGHT), ("dark", DARK)] {
+            for (base_name, base) in [("bg", p.bg), ("panel", p.panel), ("surface", p.surface)] {
+                for (tier, c) in [
+                    ("text", p.text),
+                    ("text_dim", p.text_dim),
+                    ("text_faint", p.text_faint),
+                    ("ink_soft", p.ink_soft),
+                ] {
+                    let r = contrast(c, base);
+                    assert!(
+                        r >= 4.5,
+                        "{name}/{base_name}: {tier} is {r:.2}:1 — below the 4.5:1 floor for body text"
+                    );
+                }
+            }
+        }
     }
 }
 

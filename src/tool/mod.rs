@@ -17,6 +17,24 @@ use serde_json::{json, Value};
 
 use crate::runtime::Runtime;
 
+/// The optional `purpose` argument: one short line saying what a call is **for**.
+///
+/// Declared here rather than in each schema because four tools carry it (`shell`, `bash`,
+/// `write_file`, `edit_file`) and a reworded copy in three of them is exactly how tool descriptions
+/// drift apart. It is model-facing text, so the wording is the whole feature: a purpose that reads
+/// "do the thing" is worse than none.
+pub const PURPOSE_ARG: &str = "purpose";
+
+/// What `purpose` is for. See [`PURPOSE_ARG`].
+///
+/// The last sentence is the part that earns its tokens: without it the model writes purposes for the
+/// trivial calls and skips the interesting ones ("bash" is exactly the row that needs a label).
+pub const PURPOSE_DESC: &str = "One short line (a few words, not a sentence) saying what this \
+     call is for — e.g. \"fix the title save\", \"run the test suite\", \"count files by type\". The \
+     UI shows it next to the tool name, so the user can tell calls apart without opening the \
+     arguments. Optional, but fill it in whenever the tool name alone does not say what you are \
+     doing — which is almost always for `bash`/`shell`, whose name says nothing about the command.";
+
 /// Names of the host's built-in **file tools** (same order as `hostfs::host_file_tools()`).
 ///
 /// This is a constant table rather than a literal repeated in four `name()` methods because
@@ -244,17 +262,39 @@ pub trait Tool: Send + Sync {
         })
     }
 
-    /// How long this call expects to take, when the tool can tell from its arguments.
+    /// How long **this call** is allowed to run, in seconds — the number that gets shown to the user
+    /// and that the outer guard is built from.
     ///
-    /// Only the **shell** tools answer this. `Runtime::execute` wraps every call in
-    /// `[agent] tool_timeout_secs + 30 s`; a command that asked for 300 s would be cut off at 90 s
-    /// by that *outer* guard, before its own timeout could ever fire — and the error would blame
-    /// "the tool", while the process tree was left to the Job's kill-on-close. A hint here is how
-    /// the outer guard learns to stay out of the way.
+    /// Only the shell tools answer this: their ceiling is per call (`timeout_secs`, clamped to
+    /// `[shell] max_timeout_secs`), not the flat `[agent] tool_timeout_secs` everything else gets.
+    /// Kept separate from [`Tool::timeout_hint`] because a *budget* and the *leash wrapped around it*
+    /// are different numbers, and a screen that says "cap 125 s" for a 120 s budget is a small lie
+    /// that invites a bug report.
+    fn cap_hint(&self, _args: &Value) -> Option<u64> {
+        None
+    }
+
+    /// The leash the **outer** guard in `Runtime::execute` should use.
     ///
-    /// Default `None`: a tool that finishes in milliseconds should not be given a longer leash just
-    /// because some other tool needs one.
-    fn timeout_hint(&self, _args: &Value) -> Option<std::time::Duration> {
+    /// A command that asked for 300 s would otherwise be cut off at
+    /// `[agent] tool_timeout_secs + 30 s` — before its own timeout could fire — and the error would
+    /// blame "the tool" while the process tree was left to the Job's kill-on-close. A hint here is how
+    /// that outer guard learns to stay out of the way.
+    ///
+    /// Default: derived from [`Tool::cap_hint`] plus a few seconds of slack, so the two can never
+    /// disagree. `None` = "I have no opinion", and the outer guard uses its flat rule.
+    fn timeout_hint(&self, args: &Value) -> Option<std::time::Duration> {
+        self.cap_hint(args).map(|s| std::time::Duration::from_secs(s + 5))
+    }
+
+    /// How long the model **expects** this call to take, in seconds — its own announcement
+    /// ("this is a compile, give me two minutes").
+    ///
+    /// Only the shell tools answer this, and only when the model chose to say so. It is not a limit
+    /// and nothing enforces it: it exists so the UI can show "expected ~2 min" next to the elapsed
+    /// clock, which is the difference between "working" and "wedged" from the user's chair. A tool
+    /// that has no idea simply does not answer, and the UI shows the cap instead.
+    fn expect_hint(&self, _args: &Value) -> Option<u64> {
         None
     }
 
@@ -279,7 +319,7 @@ mod tests {
             + discover::find_tools().len()
             + task::task_tools().len()
             + verify::verify_tools().len()
-            + shell::shell_tools().len();
+            + shell::shell_tools(&crate::config::ShellConfig::default()).len();
         assert_eq!(n, DOCUMENTED, "update every doc that quotes the host tool count");
     }
 }

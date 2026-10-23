@@ -24,6 +24,7 @@ mod bridge;
 mod cache;
 mod gwin;
 mod markdown;
+mod open;
 mod syntax;
 mod svg;
 mod tex;

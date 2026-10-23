@@ -3,12 +3,23 @@
 //! Supports: headings, paragraphs, unordered/ordered lists, block quotes, fenced code blocks,
 //! inline code, **bold**, *italic*, links and tables. The goal is "good-looking and loses nothing",
 //! not spec completeness.
+//!
+//! **Clickable targets.** A run of text that names a URL or an absolute local path is clickable: it
+//! goes through `open` on click (see that module for what a click is allowed to do). Detecting them
+//! is split in two, because the two halves have opposite requirements:
+//!
+//! - [`scan`] is **pure string work, no filesystem** — it runs on every frame, since `render` parses
+//!   and lays out the whole reply again each frame.
+//! - hit testing is done against the **laid-out galley**, not by splitting the paragraph into
+//!   widgets. One `Label` for the whole paragraph is what keeps wrapping, text selection and copying
+//!   behaving exactly as before.
 
 use egui::{
     text::LayoutJob, Color32, CornerRadius, FontId, Frame, Label, Margin, RichText, Stroke,
     TextFormat, Ui,
 };
 
+use crate::open::{self, Target};
 use crate::syntax;
 use crate::theme::{self, P};
 
@@ -18,7 +29,20 @@ struct Span {
     bold: bool,
     italic: bool,
     code: bool,
-    link: bool,
+    /// Where a click on this run goes; `None` = ordinary text.
+    href: Option<Target>,
+}
+
+/// One clickable stretch of a laid-out paragraph, as **character** offsets into `LayoutJob::text`.
+///
+/// Characters, not bytes: `Galley::cursor_from_pos` answers in character offsets
+/// (`epaint::CCursor::index` — explicitly "NOT byte offset"), so mixing the two units would put
+/// every hit box in the wrong place the moment a path sits next to Chinese text.
+#[derive(Debug, Clone)]
+struct Hot {
+    start: usize,
+    end: usize,
+    target: Target,
 }
 
 #[derive(Debug, Clone)]
@@ -260,7 +284,17 @@ fn inline(s: &str) -> Vec<Span> {
                         let text: String = chars[i + 1..close].iter().collect();
                         if !text.is_empty() {
                             flush(&mut out, &mut buf);
-                            out.push(Span { text, link: true, ..Default::default() });
+                            // The href is the whole point of a link — until now it was parsed and
+                            // then dropped, so a standard `[text](url)` could be written but never
+                            // clicked. A relative href (`[x](docs/a.md)`) classifies to `None` and
+                            // simply stays plain text: the underline is an affordance, and an
+                            // affordance that does nothing is worse than none.
+                            let href: String = chars[close + 2..paren].iter().collect();
+                            out.push(Span {
+                                text,
+                                href: open::classify(&href),
+                                ..Default::default()
+                            });
                             i = paren + 1;
                             continue;
                         }
@@ -276,6 +310,234 @@ fn inline(s: &str) -> Vec<Span> {
     out
 }
 
+// ──────────────────────── Clickable targets: detection ────────────────────────
+
+/// A boundary that ends a path or URL run.
+///
+/// Whitespace, quotes and CJK. The CJK half matters more than it looks: a model writing Chinese puts
+/// a path flush against the sentence — no space before it, a full-width comma right after — so
+/// splitting on whitespace alone would swallow that comma into the path (and `exists()` would then
+/// fail, so the click would silently do nothing). Stopping at *any* CJK character is exactly right in
+/// the other direction too: a path can never contain one.
+fn is_boundary(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(c, '"' | '\'' | '`' | '<' | '>' | '|' | '“' | '”' | '‘' | '’')
+        || is_cjk(c)
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3000..=0x303F      // CJK punctuation: ，。、；：！？ and 「」
+        | 0x3400..=0x4DBF    // extension A
+        | 0x4E00..=0x9FFF    // the common block
+        | 0xF900..=0xFAFF    // compatibility ideographs
+        | 0xFF00..=0xFFEF    // full-width forms: ，！？：（） etc.
+    )
+}
+
+/// The character that closes a run opened by `c`, if `c` opens one.
+fn closing_quote(c: char) -> Option<char> {
+    Some(match c {
+        '"' => '"',
+        '“' => '”',
+        '‘' => '’',
+        '\'' => '\'',
+        '「' => '」',
+        '『' => '』',
+        _ => return None,
+    })
+}
+
+/// Every URL / absolute path inside one run of prose, as character ranges.
+///
+/// **Pure string work — no filesystem, no allocation of a per-frame cache.** `render` re-parses the
+/// whole reply every frame, so a `stat` in here would turn scrolling into disk I/O.
+fn scan(s: &str) -> Vec<(usize, usize, Target)> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out: Vec<(usize, usize, Target)> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        // A quoted run whose **whole** body is a target: `"E:\my folder\a.txt"`. This is the only way
+        // a path containing spaces survives — a space is a boundary everywhere else.
+        if let Some(close_ch) = closing_quote(chars[i]) {
+            if let Some(j) = (i + 1..chars.len()).find(|&k| chars[k] == close_ch) {
+                let body: String = chars[i + 1..j].iter().collect();
+                if let Some(t) = open::classify(&body) {
+                    out.push((i + 1, j, t));
+                    i = j + 1;
+                    continue;
+                }
+            }
+            // Not a target: fall through one character at a time, so a URL inside a quoted *sentence*
+            // is still found — the quotes only decide where a target-shaped run may start and end.
+        }
+
+        if let Some(end) = url_end(&chars, i).or_else(|| path_end(&chars, i)) {
+            let end = trim_tail(&chars, i, end);
+            if end > i {
+                let text: String = chars[i..end].iter().collect();
+                if let Some(t) = open::classify(&text) {
+                    out.push((i, end, t));
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// End (exclusive) of a bare `http(s)://` URL starting at `i`.
+fn url_end(chars: &[char], i: usize) -> Option<usize> {
+    // Glued to a Latin word (`xhttps://`) it is not a URL.
+    //
+    // `is_ascii_alphanumeric` and **not** `is_alphanumeric`: the latter is true for every Unicode
+    // letter including CJK, so a path glued to Chinese text — the most common shape in a Chinese
+    // reply — would be read as "a word ends here, so this is not a path" and nothing would be
+    // clickable. The test `the_sentence_full_stop_is_not_part_of_the_path` is what caught this.
+    // A CJK character before a path is a boundary, not a word continuation.
+    if i > 0 && chars[i - 1].is_ascii_alphanumeric() {
+        return None;
+    }
+    let mut matched = false;
+    for scheme in ["https://", "http://"] {
+        let n = scheme.chars().count();
+        if i + n < chars.len()
+            && chars[i..i + n].iter().zip(scheme.chars()).all(|(a, b)| a.eq_ignore_ascii_case(&b))
+        {
+            matched = true;
+            break;
+        }
+    }
+    if !matched {
+        return None;
+    }
+    let mut end = i;
+    while end < chars.len() && !is_boundary(chars[end]) {
+        end += 1;
+    }
+    Some(end)
+}
+
+/// End (exclusive) of an absolute Windows path starting at `i` — `X:\…`, `X:/…`, `\\server\share`.
+fn path_end(chars: &[char], i: usize) -> Option<usize> {
+    // ASCII only, for the reason spelled out in [`url_end`].
+    if i > 0 && chars[i - 1].is_ascii_alphanumeric() {
+        return None;
+    }
+    let n = chars.len();
+    let drive = chars[i].is_ascii_alphabetic()
+        && i + 2 < n
+        && chars[i + 1] == ':'
+        && matches!(chars[i + 2], '\\' | '/');
+    let unc = chars[i] == '\\' && i + 2 < n && chars[i + 1] == '\\' && chars[i + 2] != '\\';
+    if !drive && !unc {
+        return None;
+    }
+    let mut end = i;
+    while end < n {
+        let c = chars[end];
+        // `* ? |` are illegal in a Windows file name and are also what markdown emphasis looks like
+        // when it is glued straight onto a path.
+        if is_boundary(c) || matches!(c, '*' | '?' | '|') {
+            break;
+        }
+        // A colon past the drive prefix is `file:line`, not part of the path (and Windows forbids
+        // ':' in a file name anyway).
+        if c == ':' && end >= i + 2 {
+            break;
+        }
+        end += 1;
+    }
+    if end <= i + 2 {
+        return None;
+    }
+    Some(end)
+}
+
+/// Drop the punctuation a sentence leaves glued to the end of a target: `see E:\a.txt.` — that
+/// period belongs to the sentence, not to the file name.
+///
+/// Closing brackets are dropped only when they are **unbalanced**, so a URL ending in
+/// `(disambiguation)` keeps its bracket.
+fn trim_tail(chars: &[char], start: usize, mut end: usize) -> usize {
+    while end > start {
+        let c = chars[end - 1];
+        let drop = match c {
+            '.' | ',' | ';' | '!' | '?' | ':' => true,
+            ')' => !balanced(chars, start, end, '(', ')'),
+            ']' => !balanced(chars, start, end, '[', ']'),
+            '}' => !balanced(chars, start, end, '{', '}'),
+            _ => false,
+        };
+        if !drop {
+            break;
+        }
+        end -= 1;
+    }
+    end
+}
+
+fn balanced(chars: &[char], start: usize, end: usize, open: char, close: char) -> bool {
+    let opens = chars[start..end].iter().filter(|c| **c == open).count();
+    let closes = chars[start..end].iter().filter(|c| **c == close).count();
+    opens >= closes
+}
+
+/// Turn the targets inside a set of spans into clickable spans.
+///
+/// Runs on the **already-parsed** spans, so a path inside `**bold**` is found as well (`inline`
+/// recurses for emphasis, and each recursion starts from plain runs).
+fn autolink(spans: Vec<Span>) -> Vec<Span> {
+    let mut out = Vec::with_capacity(spans.len());
+    for sp in spans {
+        let (bold, italic) = (sp.bold, sp.italic);
+        let plain = |text: String, href: Option<Target>| Span { text, bold, italic, code: false, href };
+
+        // Inline code is a literal value, not prose: the whole run is the candidate, with no scanning
+        // and no trimming. This is the most common shape of all — "written to
+        // `E:\rustapp\dist\x.exe`", in backticks.
+        //
+        // A run that is not absolute is still tried **against the workspace root**, which is what
+        // makes `` `src/tool/shell.rs` `` clickable. That resolution is gated on the file existing
+        // (see `open::resolve_relative`), because unlike a drive letter a relative path is
+        // indistinguishable from ordinary text — `and/or` and `1.5/2` are both shaped like one.
+        if sp.code {
+            let mut sp = sp;
+            if sp.href.is_none() {
+                sp.href = open::classify(&sp.text).or_else(|| {
+                    open::resolve_relative(&sp.text).map(Target::Path)
+                });
+            }
+            out.push(sp);
+            continue;
+        }
+        if sp.href.is_some() {
+            out.push(sp);
+            continue;
+        }
+        let ranges = scan(&sp.text);
+        if ranges.is_empty() {
+            out.push(sp);
+            continue;
+        }
+        let chars: Vec<char> = sp.text.chars().collect();
+        let mut at = 0usize;
+        for (start, end, target) in ranges {
+            if start > at {
+                out.push(plain(chars[at..start].iter().collect(), None));
+            }
+            out.push(plain(chars[start..end].iter().collect(), Some(target)));
+            at = end;
+        }
+        if at < chars.len() {
+            out.push(plain(chars[at..].iter().collect(), None));
+        }
+    }
+    out
+}
+
 /// Line-height factor.
 ///
 /// Font size only sets how tall the glyphs are; the gap between lines is governed by
@@ -288,11 +550,29 @@ const LEADING: f32 = 1.5;
 /// The breathing room between blocks. The default 11 is too small; two paragraphs nearly touch.
 const BLOCK_GAP: f32 = 15.0;
 
-fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool) -> LayoutJob {
+/// Lay out one paragraph's spans, and report where the clickable runs ended up.
+///
+/// The two outputs are produced in the same pass on purpose: the offsets must describe **this**
+/// job's text, and the padding spaces an inline code chip prepends are part of that text. Recovering
+/// the offsets afterwards would mean re-deriving them from the spans and re-counting the padding —
+/// two chances to drift by a character per chip, i.e. a hit box that jumps sideways once a path
+/// appears after inline code.
+fn job_of(
+    spans: Vec<Span>,
+    size: f32,
+    color: Color32,
+    wrap: f32,
+    force_bold: bool,
+) -> (LayoutJob, Vec<Hot>) {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap.max(40.0);
     job.wrap.break_anywhere = false;
-    for sp in spans {
+    let mut hots: Vec<Hot> = Vec::new();
+    // Character offset into `job.text`, tracked as the job is built.
+    let mut at = 0usize;
+    for sp in autolink(spans) {
+        let start = at;
+        let len = sp.text.chars().count();
         let strong = sp.bold || force_bold;
         let font: FontId = if strong {
             theme::bold_font(size)
@@ -301,9 +581,7 @@ fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool
         } else {
             theme::body_font(size)
         };
-        let col = if sp.code {
-            P::ink()
-        } else if sp.link {
+        let col = if sp.code || sp.href.is_some() {
             P::ink()
         } else if strong && !theme::bold_available() {
             Color32::from_rgb(0xFF, 0xFF, 0xFF)
@@ -333,8 +611,11 @@ fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool
             background: if sp.code { P::code_chip() } else { Color32::TRANSPARENT },
             // Links get an underline: in body text they're the same color as ordinary text, so
             // color alone can't tell them apart (in a monochrome scheme "blacker" isn't noticeable).
-            // Code chips must never be underlined.
-            underline: if sp.link && !sp.code {
+            // Code chips must never be underlined — they already look like a value, and a line
+            // through the chip smears the "this is code" signal. A path in backticks is therefore
+            // clickable without a visible cue: the pointer turning into a hand and the tooltip are
+            // the whole affordance there.
+            underline: if sp.href.is_some() && !sp.code {
                 Stroke::new(1.0, P::ink_soft())
             } else {
                 Stroke::NONE
@@ -349,13 +630,23 @@ fn job_of(spans: &[Span], size: f32, color: Color32, wrap: f32, force_bold: bool
             // different size would split it into three pieces with stepped edges.
             let pad = TextFormat { background: P::code_chip(), ..fmt.clone() };
             job.append(" ", 0.0, pad.clone());
+            // The hit box covers the code itself, not the two padding spaces — hovering the one
+            // pixel of air before the chip must not count as hovering the chip.
+            if let Some(t) = sp.href.clone() {
+                hots.push(Hot { start: start + 1, end: start + 1 + len, target: t });
+            }
             job.append(&sp.text, 0.0, fmt);
             job.append(" ", 0.0, pad);
+            at = start + len + 2;
         } else {
+            if let Some(t) = sp.href.clone() {
+                hots.push(Hot { start, end: start + len, target: t });
+            }
             job.append(&sp.text, 0.0, fmt);
+            at = start + len;
         }
     }
-    job
+    (job, hots)
 }
 
 /// A fenced code block: one LayoutJob section per line, colored token by token.
@@ -415,6 +706,237 @@ fn wrap_label(ui: &mut Ui, job: LayoutJob) -> egui::Response {
     )
 }
 
+/// Draw a paragraph and make its `hots` clickable.
+///
+/// Still **one `Label`** for the whole paragraph: splitting the text into per-link widgets would put
+/// every link on its own line and throw away text selection, which is the thing people actually use
+/// most on a reply full of paths.
+///
+/// So the hit test runs *after* layout, against the galley: the pointer position is mapped to a
+/// character offset (`Galley::cursor_from_pos`) and looked up in `hots`. This is why `hots` counts
+/// characters, not bytes — see [`Hot`].
+fn text_label(ui: &mut Ui, job: LayoutJob, hots: &[Hot]) -> egui::Response {
+    if hots.is_empty() {
+        // The overwhelmingly common case, and the cheap one: no galley of our own to keep.
+        return wrap_label(ui, job);
+    }
+
+    // Lay out here rather than inside `Label` so the galley survives the call — the hit test needs
+    // it, and a `Response` does not carry one.
+    let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
+    // Where `Label` is about to put this galley (`allocate_exact_size` starts at the cursor). Knowing
+    // it *before* the widget exists is what lets the hover wash be painted under the text instead of
+    // over it — painting after `ui.add` would draw on top of the glyphs.
+    let origin = ui.cursor().min;
+    let bounds = egui::Rect::from_min_size(origin, galley.size()).expand(2.0);
+    let hovered = ui
+        .input(|i| i.pointer.hover_pos())
+        .filter(|p| bounds.contains(*p))
+        .and_then(|p| hot_at(&galley, hots, p - origin));
+
+    if let Some(i) = hovered {
+        // One pill per row the run covers: a path long enough to wrap gets its wash continued on the
+        // next line, which is the only visual cue that the two halves are one target.
+        for r in run_rects(&galley, hots[i].start, hots[i].end) {
+            ui.painter().rect_filled(
+                r.translate(origin.to_vec2()).expand2(egui::vec2(2.0, 0.0)),
+                CornerRadius::same(4),
+                P::hover_fill(),
+            );
+        }
+    }
+
+    let resp = ui.add(
+        Label::new(egui::WidgetText::Galley(galley.clone()))
+            .selectable(true)
+            .wrap_mode(egui::TextWrapMode::Wrap),
+    );
+
+    if let Some(i) = hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        // The tooltip and the right-click menu are both anchored at the pointer, so with the menu open
+        // they draw over each other — the tooltip's path line lands on the menu's second row and both
+        // become unreadable. The menu already names the target in its own way (its rows are what you
+        // are about to do), so the tooltip steps aside while it is up.
+        let quiet = resp.context_menu_opened() || ui.input(|i| i.pointer.any_down());
+        let t = &hots[i].target;
+        // The hint is phrased from what the click will actually do, and "not found" is stated
+        // before the click rather than after it: a click that quietly does nothing would read as
+        // a broken link.
+        let hint = if !exists_on_hover(ui, resp.id, i, t) {
+            aox::i18n::t("Path not found")
+        } else if matches!(t, Target::Url(_)) {
+            aox::i18n::t("Open in browser")
+        } else {
+            aox::i18n::t("Open containing folder")
+        };
+        if !quiet {
+            egui::Tooltip::always_open(
+                ui.ctx().clone(),
+                ui.layer_id(),
+                resp.id.with("aox-href"),
+                egui::PopupAnchor::Pointer,
+            )
+            .gap(14.0)
+            .show(|ui| {
+                ui.label(RichText::new(t.text()).font(theme::mono_font(12.5)).color(P::text()));
+                ui.label(RichText::new(hint).color(P::text_dim()).size(12.0));
+            });
+        }
+    }
+
+    // `clicked()` and not `drag_stopped()`: a selectable label senses `click_and_drag`, and only a
+    // press-and-release **without** movement counts as a click — so dragging a selection across a
+    // link still selects instead of opening something.
+    if resp.clicked() {
+        if let Some(i) = resp.interact_pointer_pos().and_then(|p| hot_at(&galley, hots, p - resp.rect.min)) {
+            open::open(ui.ctx(), &hots[i].target);
+        }
+    }
+
+    context_menu(ui, &resp, &galley, hots);
+    resp
+}
+
+/// Right-click menu, **only on a link**.
+///
+/// The "only on a link" part is why this does not just call `Response::context_menu`: that opens on a
+/// secondary click anywhere on the widget, and the widget here is a whole paragraph — a right-click on
+/// ordinary prose would pop an empty menu (or, worse, act on the link the pointer happens to be
+/// nearest to). So the hit is taken at the moment of the click, remembered per widget, and the popup
+/// is force-closed when that click was not on a link.
+fn context_menu(ui: &mut Ui, resp: &egui::Response, galley: &egui::Galley, hots: &[Hot]) {
+    let slot = egui::Id::new("aox-href-menu");
+    if resp.secondary_clicked() {
+        let hit = resp
+            .interact_pointer_pos()
+            .and_then(|p| hot_at(galley, hots, p - resp.rect.min));
+        ui.ctx().data_mut(|d| d.insert_temp(slot, (resp.id, hit)));
+    }
+    let Some((id, hit)) = ui.ctx().data(|d| d.get_temp::<(egui::Id, Option<usize>)>(slot)) else {
+        return;
+    };
+    if id != resp.id {
+        return;
+    }
+    let mut popup = egui::Popup::context_menu(resp);
+    if hit.is_none() {
+        // Also clears `Popup`'s memory, otherwise the *next* right-click on a link would find a menu
+        // already marked open and open without a click.
+        popup = popup.open_memory(Some(egui::containers::SetOpenCommand::Bool(false)));
+    }
+    popup.show(|ui| {
+        if let Some(i) = hit {
+            link_menu(ui, &hots[i].target);
+        }
+    });
+}
+
+/// The rows inside [`context_menu`], drawn with the app's own row widget so a menu opened in the
+/// transcript is indistinguishable from the ones in the sidebar.
+fn link_menu(ui: &mut Ui, t: &Target) {
+    match t {
+        Target::Url(url) => {
+            if menu_row(ui, aox::i18n::t("Open in browser")) {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                ui.close();
+            }
+            if menu_row(ui, aox::i18n::t("Copy link")) {
+                ui.ctx().copy_text(url.clone());
+                ui.close();
+            }
+        }
+        Target::Path(p) => {
+            if menu_row(ui, aox::i18n::t("Open containing folder")) {
+                open::reveal(p);
+                ui.close();
+            }
+            // The one action that starts a program. It lives **here** and not on the click for the
+            // reason the whole feature is conservative: a reply full of `.exe` paths is exactly where
+            // a single mis-aimed left click would run something.
+            if menu_row(ui, aox::i18n::t("Open with default app")) {
+                open::open_with_default(p);
+                ui.close();
+            }
+            if menu_row(ui, aox::i18n::t("Copy path")) {
+                ui.ctx().copy_text(p.display().to_string());
+                ui.close();
+            }
+        }
+    }
+}
+
+fn menu_row(ui: &mut Ui, label: &str) -> bool {
+    crate::app::menu_item(ui, label, crate::app::MENU_W, true, false).clicked()
+}
+
+/// The glyph boxes of the characters in `[start, end)`, merged into one rect per row.
+///
+/// Built from `Glyph::logical_rect()` — the same rect the inline-code chip paints its background
+/// from — so a wash under a chip lines up with the chip exactly instead of drifting by the leading.
+fn run_rects(galley: &egui::Galley, start: usize, end: usize) -> Vec<egui::Rect> {
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    for row in galley.rows.iter() {
+        let mut acc: Option<egui::Rect> = None;
+        for g in &row.row.glyphs {
+            if idx >= start && idx < end {
+                let r = g.logical_rect();
+                acc = Some(acc.map_or(r, |a: egui::Rect| a.union(r)));
+            }
+            idx += 1;
+        }
+        if let Some(r) = acc {
+            out.push(r);
+        }
+        // Newlines (and any whitespace elided at a wrap point) occupy text positions but have no
+        // glyph of their own, so the counter has to be advanced past them explicitly.
+        idx += row.row.char_count_including_newline().saturating_sub(row.row.glyphs.len());
+    }
+    out
+}
+
+/// Which hot run is under `local`, a position relative to the galley's origin.
+///
+/// The row check is not belt-and-braces: `cursor_from_pos` snaps to the **nearest** caret, so a
+/// pointer in the empty right margin of a short row would otherwise "hit" whatever ends that row —
+/// and since the label's rect is as wide as its widest row, that margin is inside the widget. Two
+/// pixels of slack keep the row's own edge clickable.
+fn hot_at(galley: &egui::Galley, hots: &[Hot], local: egui::Vec2) -> Option<usize> {
+    let dist = |r: &egui::epaint::text::PlacedRow| {
+        (r.min_y() - local.y).abs().min((r.max_y() - local.y).abs())
+    };
+    let row = galley.rows.iter().min_by(|a, b| dist(a).total_cmp(&dist(b)))?;
+    let rect = row.rect();
+    if local.x > rect.right() + 2.0 || local.x < rect.left() - 2.0 {
+        return None;
+    }
+    let idx = galley.cursor_from_pos(local).index;
+    hots.iter().position(|h| idx >= h.start && idx < h.end)
+}
+
+/// `Target::exists`, but asked **once per link**, not once per frame.
+///
+/// The tooltip is redrawn every frame the pointer sits on a link, and `exists` is a `stat` — cheap on
+/// a local disk, but on a path over a slow share (or a sleeping network drive) 60 stats a second is
+/// enough to make the whole window stutter while the pointer rests.
+///
+/// Only the **hint** is cached; the click re-checks from scratch (`open::reveal` refuses a path that
+/// is gone), so a stale entry can at worst phrase one tooltip wrongly for as long as the app runs —
+/// it can never open or fail to open something on the strength of it.
+fn exists_on_hover(ui: &Ui, widget: egui::Id, index: usize, t: &Target) -> bool {
+    let slot = egui::Id::new("aox-href-exists");
+    let key = (widget, index);
+    if let Some((seen, yes)) = ui.ctx().data(|d| d.get_temp::<((egui::Id, usize), bool)>(slot)) {
+        if seen == key {
+            return yes;
+        }
+    }
+    let yes = open::exists(t);
+    ui.ctx().data_mut(|d| d.insert_temp(slot, (key, yes)));
+    yes
+}
+
 pub fn render(ui: &mut Ui, md: &str, base: Color32) {
     // Right-edge boundary: fixed at the available width when entering this column, and not changed for the rest of the render.
     let width = ui.available_width().max(160.0);
@@ -433,8 +955,8 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                     _ => 16.5,
                 };
                 ui.add_space(if level <= 2 { 15.0 } else { 9.0 });
-                let job = job_of(&inline(&text), size, P::text(), width, level <= 2);
-                wrap_label(ui, job);
+                let (job, hots) = job_of(inline(&text), size, P::text(), width, level <= 2);
+                text_label(ui, job, &hots);
                 // Level-1 and level-2 headings each carry a thin line: in a monochrome scheme,
                 // "bigger and bolder" isn't enough — a line separates the heading from the body, and
                 // the hierarchy pops out immediately when scanning.
@@ -448,8 +970,8 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
             }
 
             Block::Para(text) => {
-                let job = job_of(&inline(&text), theme::body_size(), base, width, false);
-                wrap_label(ui, job);
+                let (job, hots) = job_of(inline(&text), theme::body_size(), base, width, false);
+                text_label(ui, job, &hots);
                 ui.add_space(BLOCK_GAP);
             }
 
@@ -463,8 +985,8 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                         let m = marker.clone().unwrap_or_else(|| "•".to_string());
                         ui.label(RichText::new(m).color(P::ink()).size(17.5));
                     });
-                    let job = job_of(&inline(&text), theme::body_size(), base, inner_w, false);
-                    wrap_label(ui, job);
+                    let (job, hots) = job_of(inline(&text), theme::body_size(), base, inner_w, false);
+                    text_label(ui, job, &hots);
                 });
                 ui.add_space(6.0);
             }
@@ -476,8 +998,8 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                     ui.label(RichText::new("▎").color(P::quote_bar()).size(20.0));
                     ui.add_space(4.0);
                     let spans = inline(&text);
-                    let job = job_of(&spans, theme::body_size(), P::text_dim(), inner_w, false);
-                    wrap_label(ui, job);
+                    let (job, hots) = job_of(spans, theme::body_size(), P::text_dim(), inner_w, false);
+                    text_label(ui, job, &hots);
                 });
                 ui.add_space(BLOCK_GAP);
             }
@@ -661,8 +1183,8 @@ fn cells(ui: &mut Ui, widths: &[f32], row: &[String], head: bool, color: Color32
             .show(ui, |ui| {
                 ui.set_width(w);
                 ui.set_max_width(w);
-                let job = job_of(&inline(txt), 15.0, color, w, head);
-                wrap_label(ui, job);
+                let (job, hots) = job_of(inline(txt), 15.0, color, w, head);
+                text_label(ui, job, &hots);
             });
     }
 }
@@ -811,7 +1333,7 @@ mod tests {
         // has different ascent/descent and would calibrate the wrong thing).
         crate::theme::install_fonts(&ctx);
         let _ = ctx.run(Default::default(), |_| {});
-        let job = job_of(&inline(md), 14.0, egui::Color32::BLACK, 800.0, false);
+        let (job, _) = job_of(inline(md), 14.0, egui::Color32::BLACK, 800.0, false);
         let galley = ctx.fonts_mut(|f| f.layout_job(job));
 
         let want: Vec<char> = code.chars().collect();
@@ -944,5 +1466,138 @@ a code line long enough that it must wrap rather than widen the card beyond the 
         let md = format!("- token {}", "x".repeat(400));
         let (_avail, inner, used) = probe(1280.0, &md);
         assert!(used <= inner + 0.5, "used {used} > column {inner}");
+    }
+
+    // ──────────────────── Clickable targets ────────────────────
+
+    /// `(text, target)` for each clickable run of `md`, read back **out of the laid-out job**.
+    ///
+    /// Read from `job.text` by character offset rather than from the spans, because that is the
+    /// coordinate space the hit test uses: a miscounted padding space then fails here, as a wrong
+    /// string, instead of failing on screen as a hit box two characters off.
+    fn hot_texts(md: &str) -> Vec<(String, Target)> {
+        let (job, hots) = job_of(inline(md), 14.0, egui::Color32::BLACK, 800.0, false);
+        hots.iter()
+            .map(|h| {
+                let text: String = job.text.chars().skip(h.start).take(h.end - h.start).collect();
+                (text, h.target.clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_bare_url_in_a_sentence_becomes_one_clickable_run() {
+        let got = hot_texts("see https://example.com/a?b=c for details");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "https://example.com/a?b=c");
+        assert!(matches!(got[0].1, Target::Url(_)), "{:?}", got[0].1);
+    }
+
+    #[test]
+    fn the_sentence_full_stop_is_not_part_of_the_path() {
+        // Both endings a reply actually produces: an ASCII period, and Chinese glued straight on.
+        for md in [r"written to E:\rustapp\a.txt.", "已生成E:\\rustapp\\a.txt，请查看"] {
+            let got = hot_texts(md);
+            assert_eq!(got.len(), 1, "{md}: {got:?}");
+            assert_eq!(got[0].0, r"E:\rustapp\a.txt", "{md}");
+        }
+    }
+
+    #[test]
+    fn an_inline_code_path_is_clickable_and_excludes_the_chip_padding() {
+        // The chip is laid out as `" " + text + " "`, so a naive offset is two characters off. The
+        // box must cover exactly the path: no leading space, no trailing one.
+        let got = hot_texts(r"文件在 `E:\rustapp\dist\aox.exe` 下");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, r"E:\rustapp\dist\aox.exe");
+    }
+
+    #[test]
+    fn offsets_stay_aligned_across_several_chips() {
+        let got = hot_texts(r"`a` E:\one.txt `bb` E:\two.txt");
+        let texts: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(texts, vec![r"E:\one.txt", r"E:\two.txt"]);
+    }
+
+    #[test]
+    fn prose_that_only_looks_like_a_target_stays_plain() {
+        // All of these turn up in ordinary replies; underlining them would be noise on every answer.
+        let got = hot_texts("aox 1.5, v1.2.3, aox.exe, src/main.rs, C: drive, http//broken");
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn a_quoted_path_may_contain_spaces() {
+        let got = hot_texts(r#"put it in "E:\my folder\a.txt" now"#);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, r"E:\my folder\a.txt");
+    }
+
+    #[test]
+    fn a_markdown_link_carries_its_href() {
+        let got = hot_texts("报告在[这里](E:\\rustapp\\out.md)，站点见[主页](https://2am.top)");
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].0, "这里");
+        assert_eq!(got[0].1, Target::Path("E:\\rustapp\\out.md".into()));
+        assert_eq!(got[1].1, Target::Url("https://2am.top".into()));
+    }
+
+    /// The one part a string test cannot cover: a **pointer position** through the real galley.
+    ///
+    /// This is the half of the feature a unit test could otherwise only assume: clicking is out of the
+    /// question here (it would open Explorer), so instead take a pixel that the path's own ink
+    /// occupies and require the hit test to find the path; take a pixel in the words before it and
+    /// require it not to.
+    #[test]
+    fn a_pointer_on_the_path_hits_it_and_a_pointer_before_it_does_not() {
+        let ctx = egui::Context::default();
+        // Fonts are per-Context; without this the galley is laid out in a family whose metrics are
+        // not the ones on screen (and `theme`'s process-wide flags would make this depend on test
+        // order — see the note in `probe`).
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(Default::default(), |_| {});
+
+        let md = r"see E:\rustapp\a.txt now";
+        let (job, hots) = job_of(inline(md), 14.0, egui::Color32::BLACK, 800.0, false);
+        assert_eq!(hots.len(), 1, "precondition: one path");
+        let galley = ctx.fonts_mut(|f| f.layout_job(job));
+        let h = &hots[0];
+
+        // A caret rect sits *between* characters, so `start + 1` puts us just after the path's first
+        // character — i.e. inside the run, which is where a click on its ink lands.
+        let inside = galley.pos_from_cursor(egui::text::CCursor::new(h.start + 1));
+        let p = inside.center().to_vec2();
+        assert_eq!(hot_at(&galley, &hots, p), Some(0), "a click on the path must hit it (at {p:?})");
+
+        // The same row, but on the word "see" — plain text must stay unclickable.
+        let before = galley.pos_from_cursor(egui::text::CCursor::new(1));
+        let p = before.center().to_vec2();
+        assert_eq!(hot_at(&galley, &hots, p), None, "plain text must not be a link (at {p:?})");
+    }
+
+    #[test]
+    fn an_inline_code_path_is_clickable_only_when_it_exists_in_the_workspace() {
+        // Relative paths are the one place where the *only* thing separating "a file" from "a string"
+        // is the filesystem, so the existence check is load-bearing rather than a nicety. The root is
+        // a thread-local, so this test cannot disturb any other one.
+        let dir = std::env::temp_dir().join("aox-md-relative-7c1");
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes").join("todo.md"), "# t\n").unwrap();
+        crate::open::set_workspace_root(&dir);
+
+        let got = hot_texts("wrote `notes/todo.md` just now");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(
+            matches!(&got[0].1, Target::Path(p) if p.ends_with("todo.md")),
+            "{:?}",
+            got[0].1
+        );
+
+        // Not there ⇒ plain text. This is what keeps `and/or`, `1.5/2` and `src/gone.rs` quiet.
+        assert!(hot_texts("wrote `notes/gone.md` just now").is_empty());
+        // ...and prose is never scanned for relative paths, only inline code is.
+        assert!(hot_texts("wrote notes/todo.md just now").is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

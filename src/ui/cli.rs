@@ -430,11 +430,17 @@ impl Ui for CliUi {
                     s::dim(&crate::tf!("args {}", one_line(&args.to_string(), 200)))
                 );
             }
-            AgentEvent::ToolRunning { name, timeout_secs } => {
-                println!(
-                    "  {}",
-                    s::dim(&crate::tf!("…{} running (timeout {}s, Ctrl+C to interrupt)", name, timeout_secs))
-                );
+            AgentEvent::ToolRunning { name, timeout_secs, expect_secs } => {
+                // The cap is this call's real ceiling, and the estimate is the model's own promise —
+                // both are what the user needs to tell "still working" from "wedged".
+                let line = match expect_secs {
+                    Some(e) => crate::tf!(
+                        "…{} running (expected ~{}s, cap {}s, Ctrl+C to interrupt)",
+                        name, e, timeout_secs
+                    ),
+                    None => crate::tf!("…{} running (cap {}s, Ctrl+C to interrupt)", name, timeout_secs),
+                };
+                println!("  {}", s::dim(&line));
             }
             // ── Tool result: a green/red marker + a one-line summary
             AgentEvent::ToolResult { name, is_error, preview, .. } => {

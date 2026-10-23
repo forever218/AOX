@@ -119,7 +119,7 @@ impl ActKind {
                 // Only a last-resort fallback — see the note on this function
                 ActKind::Tool => Color32::from_rgb(0xB3, 0x74, 0x22),
                 ActKind::Auth => Color32::from_rgb(0x9A, 0x6C, 0x1C),
-                ActKind::Info => Color32::from_rgb(0x77, 0x71, 0x64),
+                ActKind::Info => Color32::from_rgb(0x60, 0x5B, 0x4F),
                 ActKind::Warn => Color32::from_rgb(0xA8, 0x76, 0x20),
                 ActKind::Error => Color32::from_rgb(0xA3, 0x4A, 0x2A),
             },
@@ -129,7 +129,7 @@ impl ActKind {
                 // Only a last-resort fallback — see the note on this function
                 ActKind::Tool => Color32::from_rgb(0xD3, 0x94, 0x5A),
                 ActKind::Auth => Color32::from_rgb(0xD8, 0xB2, 0x6A),
-                ActKind::Info => Color32::from_rgb(0x7E, 0x79, 0x6E),
+                ActKind::Info => Color32::from_rgb(0xA5, 0xA1, 0x98),
                 ActKind::Warn => Color32::from_rgb(0xD8, 0xB2, 0x6A),
                 ActKind::Error => Color32::from_rgb(0xE0, 0x8A, 0x6B),
             },

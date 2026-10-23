@@ -88,7 +88,8 @@ impl Tool for EditFileTool {
                         "required": ["old_text", "new_text"]
                     }
                 },
-                "expected_hash": {"type": "string", "description": crate::i18n::t("Optional. The hash shown in read_file's header for the version you are editing. If the file has changed since, the edit is refused instead of landing on a version you never saw.")}
+                "expected_hash": {"type": "string", "description": crate::i18n::t("Optional. The hash shown in read_file's header for the version you are editing. If the file has changed since, the edit is refused instead of landing on a version you never saw.")},
+                crate::tool::PURPOSE_ARG: {"type": "string", "description": crate::i18n::t(crate::tool::PURPOSE_DESC)}
             },
             "required": [PATH_ARG, "edits"]
         })

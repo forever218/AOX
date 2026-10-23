@@ -375,8 +375,12 @@ prefer = "bash"
 enabled = true            # false = neither tool is registered; the model never sees them
 bash = "auto"             # auto | off | an absolute path to bash.exe
 bash_pack = "runtime"     # whether <app root>\runtime\bash\ is considered by `auto`
-timeout_secs = 120        # per call; a call may ask for more via its own timeout_secs
+timeout_secs = 60         # per call; a call may ask for more via its own timeout_secs
 max_timeout_secs = 600    # hard ceiling
+idle_timeout_secs = 30    # kill a call that prints nothing for this long (0 = off). Measured from
+                          # the last byte, so a build that keeps printing is never killed for being
+                          # slow; a wedged command is reaped in 30 s instead of at the 120 s cap.
+                          # A call may raise it via its own `idle_secs` (e.g. a long `sleep`).
 max_output_bytes = 131072 # per stream; beyond it the head and the tail are kept
 max_processes = 16        # one Job Object per call; 0 = the command may not spawn anything
 env_cache = true          # point CARGO_HOME / npm / pip / TMP into <workspace>\.aox

@@ -55,6 +55,31 @@ exit 0 · 0.26 s · cmd · boundary: guard-rail-only · cwd E:\rustapp\workplace
 `guard-rail-only` is the only value under a confined tier; `unrestricted` appears under
 `[workplace] mode = "full"`. There is no `kernel` value because nothing produces one (§4).
 
+## 3a. When a call takes too long
+
+Two independent conditions end a call, and they answer two different questions:
+
+| Condition | Answers | Default |
+|-----------|---------|---------|
+| `timeout_secs` | "this must not run forever" | 60 s (ceiling `max_timeout_secs`, 600) |
+| `idle_timeout_secs` | "is it doing anything at all" | 30 s without a single byte on either stream |
+
+The idle one is the answer to the report that started it: a `bash` call sat at **471 s** with no
+visible reason, and from the outside "building for eight minutes" and "wedged" looked identical. The
+**stream** is what separates them — a build prints, a deadlock does not — and the clock runs from the
+*last byte*, never from the start, so a slow-but-chatty command is never killed for being slow.
+A call that is legitimately silent (`sleep`, a download with no progress output) raises it with its
+own `idle_secs`, or turns it off with `idle_secs = 0`.
+
+Both kills are bounded: `TerminateJobObject` gets 5 s, then a direct `kill` gets 2 s, and if the
+process still has not been reaped **the call returns anyway** with `TIMED OUT` / `KILLED` in the
+header. An earlier version called `child.wait()` right after `terminate()`, which is a no-op when
+there is no Job — the one code path that could outlive every timeout in the program.
+
+What the model can announce: `expect_secs`. It is **not** a limit and nothing enforces it — the user
+just sees `expected ~2:00` next to `0:47 / 2:00` in the running row (and the same in the CLI's
+"running" line), which is how "still working" stops looking like "stuck".
+
 ## 4. Why there is no kernel boundary (the measurements)
 
 The intended design: run the command at **Low integrity** and label the workspace Low, so
@@ -88,8 +113,9 @@ tweak, and both would change the feature's contract.
 [shell]
 enabled          = true      # false = the tools are never registered
 prefer           = "bash"    # which tool the model is told to reach for first: bash | cmd
-timeout_secs     = 120       # per call; the call may ask for more
+timeout_secs     = 60        # per call; the call may ask for more
 max_timeout_secs = 600       # hard cap
+idle_timeout_secs = 30       # no output for this long ⇒ treated as wedged and killed (0 = off)
 max_output_bytes = 131072    # per stream, head + tail
 max_processes    = 16        # per call (one Job Object per call; 0 = no children at all)
 env_cache        = true      # CARGO_HOME / NPM_CONFIG_CACHE / PIP_CACHE_DIR / TMP inside the workspace

@@ -625,6 +625,16 @@ impl Agent {
             // Directory creation itself failed (permissions / disk); report it honestly but don't interrupt the conversation: from now on file writes will be rejected by the boundary.
             Err(e) => ui.emit(AgentEvent::Warn(crate::tf!("failed to create the workspace: {}", format!("{e:#}")))),
         }
+        // Scratch hygiene, part 1: whatever a **crashed** turn left behind (`SCRATCH_STALE` — a day
+        // is long enough that no live session notices). The turn-end sweep below is the one that does
+        // the everyday work; this is the safety net for the process that never got there.
+        //
+        // Both sweeps live here, in the agent, rather than in the two frontends: "clean up after
+        // yourself" is a property of the host, and a CLI-only or GUI-only version would be a bug
+        // nobody notices until they switch frontends.
+        if let Some(ws) = self.rt.workplace.active_root() {
+            crate::workplace::sweep_scratch(&ws, crate::workplace::SCRATCH_STALE);
+        }
         // `ensure_started` may have just decided the root (first turn), and the user may have
         // switched it since the last turn — either way the prompt must name the current workspace
         // before the model sees this message.
@@ -644,6 +654,14 @@ impl Agent {
         // "the task died halfway" is precisely the moment the next `resume` needs to know where it got
         // to. Writes only when something actually changed (see `persist_task`).
         self.persist_task();
+        // Scratch hygiene, part 2: the everyday sweep. `<ws>/.aox/tmp` is where the host points
+        // `TMP`/`TEMP`, so it is where the model's throwaway scripts land — and before this line
+        // existed, nothing ever removed them (122 files / 4.5 MB found in this very repo, none of it
+        // asked for). The ten-minute grace keeps a script alive across the turns of one task; see
+        // `workplace::SCRATCH_GRACE`.
+        if let Some(ws) = self.rt.workplace.active_root() {
+            crate::workplace::sweep_scratch(&ws, crate::workplace::SCRATCH_GRACE);
+        }
         ui.turn_end().await;
         // Report usage after the waiting animation stops (see `Ui::turn_usage`'s docs).
         // Report it even on error: the tokens were genuinely spent; we can't pretend they weren't just because the task failed.
@@ -997,9 +1015,16 @@ impl Agent {
             if name == crate::tool::verify::VERIFY_TOOL {
                 return self.verify_tool(args);
             }
+            // The numbers the user sees have to be **this call's**, not the generic per-tool
+            // defaults: `shell`/`bash` compute their own budget from `timeout_secs` (up to the
+            // configured ceiling), and the model may announce an estimate of its own. Reading them
+            // through the same trait hooks the outer guard uses means the two can never disagree.
+            let (cap, expect) = self.rt.call_hints(name, &args).await;
+            let cap = cap.unwrap_or(self.rt.config.agent.tool_timeout_secs);
             ui.emit(AgentEvent::ToolRunning {
                 name: name.to_string(),
-                timeout_secs: self.rt.config.agent.tool_timeout_secs,
+                timeout_secs: cap,
+                expect_secs: expect,
             });
             // A plugin that has just been built gets its tools **advertised immediately**: the model
             // is one step away from calling them, and making it run `find_tools` for the thing it

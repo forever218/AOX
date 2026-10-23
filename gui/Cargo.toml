@@ -25,3 +25,13 @@ serde_json = "1"
 # Only needed to obtain the window handle (HWND on Windows), used to set DWM attributes directly and tint the
 # native title bar to match the UI. The version must match the one eframe 0.33 depends on, or the trait won't line up.
 raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+# `ShellExecuteW`: "open this with whatever the user has associated with it" — the one honest way to
+# mean "default program" on Windows (it is what Explorer itself calls). The core crate already
+# depends on windows-sys 0.59 for the same target, so this pulls in no new crate and adds bytes only
+# for one import from shell32.dll.
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

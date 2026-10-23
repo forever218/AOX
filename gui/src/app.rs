@@ -87,6 +87,14 @@ impl NoteKind {
 struct StepView {
     name: String,
     plugin: Option<String>,
+    /// What this call is **for**, in a few words — the model's own `purpose` argument when it gave
+    /// one, otherwise the command itself for `bash`/`shell`.
+    ///
+    /// The row used to name the tool and nothing else, which for the two shell tools is the whole
+    /// problem: a row reading `bash` says nothing about whether it is compiling, searching or
+    /// reading a log. Like [`Self::subject`], this is parsed out of the arguments while they are
+    /// still arriving, so the label appears with the row rather than after the call.
+    purpose: Option<String>,
     /// The file this call is *about*, when naming it is worth a glance — `write_file`'s `path`, read
     /// off the arguments. `None` for every other tool (see `SUBJECT_TOOLS`).
     ///
@@ -174,6 +182,12 @@ enum Item {
 /// A turn in progress.
 struct Live {
     status: String,
+    /// The tool call running right now, if any — its own clock and the two numbers published for it.
+    ///
+    /// The header used to show only the **turn** clock, which is why "Running bash 471.5s" told the
+    /// user nothing they could act on: 471 s of a turn may be 40 s of thinking plus a 430 s command,
+    /// and there was no way to see either the call's own time or its ceiling.
+    call: Option<RunningCall>,
     reasoning: String,
     reasoning_live: bool,
     steps: Vec<StepView>,
@@ -214,12 +228,24 @@ struct Live {
     out: TokenEstimate,
 }
 
+/// The call the live row is reporting on right now.
+///
+/// Three numbers, and each answers a different question: `started` = "how long has it been going",
+/// `cap` = "when will the host give up on it", `expect` = "how long did the model say it would take".
+/// Without all three, a long call is indistinguishable from a wedged one.
+struct RunningCall {
+    /// Activity-clock reading when `ToolRunning` arrived.
+    started: f32,
+    /// This call's ceiling, in seconds (the shell tools compute it per call).
+    cap: u64,
+    /// The model's own estimate, when it chose to give one.
+    expect: Option<u64>,
+}
+
 struct AuthCard {
     tool: String,
     args: String,
-}
-
-/// A multiple-choice question waiting on the user (`ask_user`). The question and the
+}/// A multiple-choice question waiting on the user (`ask_user`). The question and the
 /// options are the model's own words.
 ///
 /// `Clone` is derived because the answer row needs `&mut self.choice_text` while the same
@@ -628,6 +654,56 @@ fn subject_from_json(name: &str, args: &str) -> Option<String> {
     subject_from_value(name, &v)
 }
 
+/// Longest `purpose` shown on a call row. Long enough for "fix the 471 s shell hang", short enough
+/// that the row still fits beside the tool name and the file path.
+const PURPOSE_MAX: usize = 48;
+
+/// What a call is **for**, read off its arguments: `(purpose, subject)`.
+///
+/// | tool | purpose | subject |
+/// |------|---------|---------|
+/// | anything with a `purpose` argument | the model's words | — |
+/// | `bash` / `shell` | the **command**, elided at the tail | — |
+/// | `write_file` / `edit_file` | the model's words, if any | the file path |
+///
+/// The command is used as a *fallback*, never paraphrased: `bash` + `cargo build --release` tells the
+/// user more than any four-word summary could, and it cannot be wrong. A purpose the model *did* write
+/// wins, because "why" is the thing the command line does not say.
+fn purpose_from_value(name: &str, args: &serde_json::Value) -> Option<String> {
+    if let Some(p) = args.get(aox::tool::PURPOSE_ARG).and_then(|v| v.as_str()) {
+        let p = flat_line(p);
+        if !p.is_empty() {
+            return Some(clip_head(&p, PURPOSE_MAX));
+        }
+    }
+    if matches!(name, "shell" | "bash") {
+        let cmd = flat_line(args.get("command").and_then(|v| v.as_str())?);
+        return (!cmd.is_empty()).then(|| clip_head(&cmd, PURPOSE_MAX));
+    }
+    None
+}
+
+/// The same, from the arguments as text (a row rebuilt from `history/*.jsonl`).
+fn purpose_from_json(name: &str, args: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(args).ok()?;
+    purpose_from_value(name, &v)
+}
+
+/// Collapse a multi-line script into one line: a `bash` row must stay one row.
+fn flat_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Cut at the **tail** — unlike [`clip_path`], the beginning of a command is the identifying half
+/// (the program being run), so the ellipsis belongs at the end.
+fn clip_head(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
 /// Shorten a path from the middle: `keep/both/ends.rs`. See `SUBJECT_MAX`.
 fn clip_path(s: &str) -> String {
     let n = s.chars().count();
@@ -917,6 +993,7 @@ impl App {
                     let base = self.now();
                     self.live = Some(Live {
                         status: aox::i18n::t("Thinking").into(),
+                        call: None,
                         reasoning: String::new(),
                         reasoning_live: false,
                         steps: Vec::new(),
@@ -2175,6 +2252,20 @@ impl App {
         } else {
             None
         };
+        // Same reasoning for the purpose: `purpose` is a short string and `command` is the first
+        // argument of a shell call, so either is normally complete within a fragment or two. Taking
+        // only whole values keeps a half-arrived command from being drawn as if it were the command.
+        let purpose = match aox::llm::partial_json_string(
+            &self.stream_calls[slot].args,
+            aox::tool::PURPOSE_ARG,
+        ) {
+            Some(p) => Some(clip_head(&flat_line(&p), PURPOSE_MAX)),
+            None if matches!(call_name.as_str(), "shell" | "bash") => {
+                aox::llm::partial_json_string(&self.stream_calls[slot].args, "command")
+                    .map(|c| clip_head(&flat_line(&c), PURPOSE_MAX))
+            }
+            None => None,
+        };
         let fresh = self.stream_calls[slot].step == usize::MAX;
         let step = self.stream_calls[slot].step;
         let plugin = self.plugin_of(&call_name);
@@ -2183,6 +2274,7 @@ impl App {
             l.steps.push(StepView {
                 name: call_name.clone(),
                 plugin,
+                purpose: purpose.clone(),
                 subject: subject.clone(),
                 // Left empty until the call really runs: the row shows no arguments (see
                 // `step_row`), and what the model eventually sends is filled in by the `ToolCall`
@@ -2205,6 +2297,9 @@ impl App {
             if subject.is_some() {
                 st.subject = subject;
             }
+            if purpose.is_some() {
+                st.purpose = purpose;
+            }
             // Only ever the added side: how many lines are *disappearing* cannot be known until the
             // old file is read, which happens when the call runs.
             if lines > 0 {
@@ -2226,6 +2321,12 @@ impl App {
     /// Called on every delta, hence the comparison before anything is built — this costs a string
     /// compare in the common case and allocates nothing.
     fn status_back_to_thinking(&mut self) {
+        // A tool cannot be running while the model is writing, so this is also where the call's own
+        // clock retires. Cleared unconditionally: leaving it behind would show a frozen "0:47 / 2:00"
+        // next to a "Thinking" label.
+        if let Some(l) = self.live.as_mut() {
+            l.call = None;
+        }
         let want = aox::i18n::t("Thinking");
         if self.status != want {
             self.status = want.to_string();
@@ -2279,6 +2380,7 @@ impl App {
                 // this is the authoritative reading, and the streaming one (which has to decode a
                 // half-arrived string) is only ever a preview of it.
                 let subject = subject_from_value(&name, &args);
+                let purpose = purpose_from_value(&name, &args);
                 let args = compact_json(&args);
                 // The model has just finished writing this call, so its row is normally already on
                 // screen (opened by the streaming fragments — see `stream_tool_delta`). Adopt that
@@ -2298,6 +2400,9 @@ impl App {
                             if subject.is_some() {
                                 st.subject = subject.clone();
                             }
+                            if purpose.is_some() {
+                                st.purpose = purpose.clone();
+                            }
                             adopted = true;
                         }
                     }
@@ -2312,6 +2417,7 @@ impl App {
                         l.steps.push(StepView {
                             name: name.clone(),
                             plugin: plugin.clone(),
+                            purpose,
                             subject,
                             args: args.clone(),
                             result: None,
@@ -2334,8 +2440,12 @@ impl App {
                     );
                 }
             }
-            AgentEvent::ToolRunning { name, timeout_secs } => {
+            AgentEvent::ToolRunning { name, timeout_secs, expect_secs } => {
                 self.status = aox::tf!("Running {}", name);
+                let started = self.now();
+                if let Some(l) = self.live.as_mut() {
+                    l.call = Some(RunningCall { started, cap: timeout_secs, expect: expect_secs });
+                }
                 if live {
                     activity::lock(&self.act).tool_note(&aox::tf!("Timeout limit {}s", timeout_secs));
                 }
@@ -2349,6 +2459,8 @@ impl App {
                     wsview::note_edit(&self.wsview, p, diff, diff_detail.clone());
                 }
                 if let Some(l) = self.live.as_mut() {
+                    // The call is over: retire its clock before the row shows its result.
+                    l.call = None;
                     if let Some(st) =
                         l.steps.iter_mut().rev().find(|s| s.name == name && s.result.is_none())
                     {
@@ -3180,6 +3292,13 @@ impl App {
     fn transcript(&mut self, ui: &mut Ui) {
         let avail = ui.available_width();
         let (inner, pad) = column(avail);
+        // What a **relative** path in a reply is relative to, for the two leaf consumers that are
+        // several layers of painting code away from here (`markdown::scan`'s inline-code paths and
+        // the file name on a tool-call row). The workspace root, not the app root: that is the
+        // directory the agent actually writes into, and the one the user thinks in.
+        crate::open::set_workspace_root(
+            &self.ws.view().and_then(|v| v.root.clone()).unwrap_or_else(aox::paths::app_root),
+        );
         let out = ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(self.follow || self.force_follow)
@@ -3373,11 +3492,34 @@ impl App {
                     .size(15.0),
             );
             ui.add_space(8.0);
-            ui.label(
-                RichText::new(format!("{:.1}s", (now - l.turn_base).max(0.0)))
-                    .color(P::text_faint())
-                    .size(13.0),
-            );
+            // The **call's** clock while a call is running, the turn's otherwise. A running call is
+            // the one case where "how long has this been going" has an answer the user can act on,
+            // and it needs its ceiling right next to it: `0:47 / 2:00` says "fine", `1:58 / 2:00`
+            // says "about to be cut off".
+            match &l.call {
+                Some(c) => {
+                    ui.label(
+                        RichText::new(span(now - c.started, c.cap as f32))
+                            .color(P::text_faint())
+                            .size(13.0),
+                    );
+                    if let Some(e) = c.expect {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(aox::tf!("expected ~{}", clock(e as f32)))
+                                .color(P::text_faint())
+                                .size(13.0),
+                        );
+                    }
+                }
+                None => {
+                    ui.label(
+                        RichText::new(format!("{:.1}s", (now - l.turn_base).max(0.0)))
+                            .color(P::text_faint())
+                            .size(13.0),
+                    );
+                }
+            }
             // The output token count scrolls live. The `~` is because the server hasn't reported
             // during streaming and this value is estimated from characters; once the turn ends the
             // exact total takes over.
@@ -3584,7 +3726,7 @@ impl App {
                                 .desired_rows(1)
                                 .desired_width(edit_w)
                                 .frame(false)
-                                .hint_text(RichText::new(hint).color(P::text_faint()).size(16.0));
+                                .hint_text(RichText::new(hint).color(P::quiet()).size(16.0));
                             let resp = ui.add(text_edit);
                             if self.focus_input {
                                 resp.request_focus();
@@ -4332,6 +4474,7 @@ fn seed_demo(app: &mut App) {
             StepView {
                 name: "list_plugins".into(),
                 plugin: Some("meta".into()),
+                purpose: Some(aox::i18n::t("see what the host already has").into()),
                 subject: None,
                 args: "{}".into(),
                 result: Some((false, aox::i18n::t("Plugins loaded: probe_screen, fs").into())),
@@ -4342,6 +4485,7 @@ fn seed_demo(app: &mut App) {
             StepView {
                 name: "create_plugin".into(),
                 plugin: Some("meta".into()),
+                purpose: Some(aox::i18n::t("make the filestat plugin").into()),
                 subject: None,
                 args: r#"{"name":"filestat","language":"python"}"#.into(),
                 result: Some((false, aox::i18n::t("Plugin filestat created, registered and persisted (1 tool)").into())),
@@ -4352,9 +4496,14 @@ fn seed_demo(app: &mut App) {
             StepView {
                 name: "write_file".into(),
                 plugin: None,
-                subject: Some("plugins/filestat/main.py".into()),
-                args: r#"{"path":"plugins/filestat/main.py"}"#.into(),
-                result: Some((false, aox::i18n::t("Overwrote plugins/filestat/main.py (2.4 KB)").into())),
+                purpose: Some(aox::i18n::t("write the plugin").into()),
+                // A file that is **really there**: this row is the demo of "click a tool call's file
+                // name and it opens in the file manager", and a path that resolves to nothing would
+                // demonstrate the opposite (`plugins/filestat/main.py` only exists if you built the
+                // demo plugin). See `open::resolve_relative`.
+                subject: Some("plugins/sdk/plugin_sdk.py".into()),
+                args: r#"{"path":"plugins/sdk/plugin_sdk.py"}"#.into(),
+                result: Some((false, aox::i18n::t("Overwrote plugins/sdk/plugin_sdk.py (2.4 KB)").into())),
                 // Demo data for the edit statistic — the row draws it as "+46 / −2", and unfolds
                 // into a diff in the very shape `diff_text` produces.
                 diff: Some((46, 2)),
@@ -4367,6 +4516,7 @@ fn seed_demo(app: &mut App) {
             StepView {
                 name: "filestat_count".into(),
                 plugin: Some("filestat".into()),
+                purpose: Some(aox::i18n::t("count the files here").into()),
                 subject: None,
                 args: r#"{"path":".","ext":null}"#.into(),
                 result: Some((false, ".rs 14 · .py 9 · .toml 4 · .md 2 · .lock 1".into())),
@@ -4389,9 +4539,16 @@ fn seed_demo(app: &mut App) {
     // ▼▼▼ diagnostics: over-wide content (long code lines / long inline code / long words /
     //      lists / tables) -- to verify that content wider than the measure wraps at the right
     //      edge instead of being clipped.
+    //
+    // The bare path is **this binary's own path**, not a made-up one: the whole point of that line is
+    // that clicking it opens a real Explorer window, and a placeholder that resolves to nothing would
+    // only ever show the "path not found" tooltip — which is the opposite of a demo.
+    let self_path = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "E:\\rustapp\\dist\\aox-gui.exe".into());
     app.items.push(Item::Assistant(
-        "## Over-wide content\n\n```json\n{\"very_long_key_that_never_wraps\":\"C:/Users/someone/AppData/Local/Temp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\",\"n\":1}\n```\n\nThe path `E:/rustapp/plugins/filestat/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.py` is very long.\n\n### Connectivity test\n\n- `httpfetch_raw` → requested bilibili.com, got HTTP 200 and fetched the page text (183539 chars, truncated); network and plugin-process communication are fine.\n\n- `bilibili_video_info` → fetched BV1GJ411x7h7 successfully with full metadata (title \"Never Gonna Give You Up (Official MV)\", publisher \"Sony Music China\", 106M plays).\n\n| Plugin | Language | Tools |\n| --- | --- | --- |\n| bilibili | python | bilibili_video_info (video metadata), bilibili_danmaku (bullet comments), bilibili_comments (comments), bilibili_subtitle (subtitles), bilibili_related (related videos) |\n| httpfetch | python | httpfetch_raw (generic GET for API debugging / web page fetching) |\n\nConclusion: no new or fixed plugins needed -- existing capabilities already cover Bilibili video info fetching + generic web requests, ready to take the job. File I/O, command execution, data export (CSV/Excel) and similar can be added later as needed.\n\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            .into(),
+        "## Over-wide content\n\n```json\n{\"very_long_key_that_never_wraps\":\"C:/Users/someone/AppData/Local/Temp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json\",\"n\":1}\n```\n\nThe path `E:/rustapp/plugins/filestat/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.py` is very long.\n\nA bare path in prose, and a URL: {SELF} · https://github.com/forever218/AOX — both are clickable (click the path: Explorer opens with the file selected; click the URL: it opens in your browser).\n\n### Connectivity test\n\n- `httpfetch_raw` → requested bilibili.com, got HTTP 200 and fetched the page text (183539 chars, truncated); network and plugin-process communication are fine.\n\n- `bilibili_video_info` → fetched BV1GJ411x7h7 successfully with full metadata (title \"Never Gonna Give You Up (Official MV)\", publisher \"Sony Music China\", 106M plays).\n\n| Plugin | Language | Tools |\n| --- | --- | --- |\n| bilibili | python | bilibili_video_info (video metadata), bilibili_danmaku (bullet comments), bilibili_comments (comments), bilibili_subtitle (subtitles), bilibili_related (related videos) |\n| httpfetch | python | httpfetch_raw (generic GET for API debugging / web page fetching) |\n\nConclusion: no new or fixed plugins needed -- existing capabilities already cover Bilibili video info fetching + generic web requests, ready to take the job. File I/O, command execution, data export (CSV/Excel) and similar can be added later as needed.\n\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .replace("{SELF}", &self_path),
     ));
     // ▲▲▲ diagnostics
     app.items.push(Item::Note(
@@ -4925,7 +5082,12 @@ const HIST_INDENT: f32 = 14.0;
 /// Fixed rather than "as wide as the longest label": the two menus (a conversation's and a
 /// workspace's) would otherwise come out different widths, and a menu that resizes itself when the
 /// pointer crosses rows reads as the UI twitching under the hand.
-const MENU_W: f32 = 178.0;
+///
+/// `pub(crate)`: the transcript's link menu (`markdown::link_menu`) draws its rows with the same
+/// widget and the same width, so a menu opened on a path is indistinguishable from one opened on a
+/// conversation.
+pub(crate) const MENU_W: f32 = 178.0;
+
 /// Height of the drawer's head: icon row, "new conversation", search, section title.
 ///
 /// **Exact, not measured**: the drawer zeroes `item_spacing` and places every gap by hand (see
@@ -5415,7 +5577,7 @@ fn name_dialog_modal(
                     .margin(Margin::symmetric(11, 10))
                     .font(FontId::proportional(14.0))
                     .hint_text(
-                        RichText::new(hint).color(P::text_faint()).size(13.5),
+                        RichText::new(hint).color(P::quiet()).size(13.5),
                     ),
             );
             if !st.focused {
@@ -5701,7 +5863,7 @@ fn new_chat_row(ui: &mut Ui, width: f32, enabled: bool) -> egui::Response {
         Stroke::new(1.0, P::border()),
         egui::StrokeKind::Inside,
     );
-    let fg = if enabled { P::text() } else { P::text_faint() };
+    let fg = if enabled { P::text() } else { P::quiet() };
     let cy = rect.center().y;
     let cx = rect.left() + 16.0;
     let s = 4.2;
@@ -5772,7 +5934,9 @@ fn search_row(ui: &mut Ui, width: f32, query: &mut String) {
             .id(id)
             .frame(false)
             .margin(Margin::ZERO)
-            .hint_text(aox::i18n::t("Search workspaces"))
+            .hint_text(
+                RichText::new(aox::i18n::t("Search workspaces")).color(P::quiet()).size(12.0),
+            )
             .font(theme::body_font(12.0))
             .desired_width(inner.width()),
     );
@@ -5890,7 +6054,7 @@ fn foot_row(ui: &mut Ui, width: f32, enabled: bool, icon: FootIcon, label: &str)
         ui.painter().rect_filled(rect, CornerRadius::same(8), P::hover_fill());
     }
     let fg = if !enabled {
-        P::text_faint()
+        P::quiet()
     } else if hov {
         P::text()
     } else {
@@ -5934,7 +6098,7 @@ fn foot_row(ui: &mut Ui, width: f32, enabled: bool, icon: FootIcon, label: &str)
 /// is this palette's own rule -- hue is reserved for [`P::danger`], and that is a deep brick red the
 /// theme docs forbid spending on anything recoverable. A deletion that lands in the recycle bin is
 /// exactly that, so the row reads stronger rather than louder.
-fn menu_item(ui: &mut Ui, label: &str, w: f32, enabled: bool, strong: bool) -> egui::Response {
+pub(crate) fn menu_item(ui: &mut Ui, label: &str, w: f32, enabled: bool, strong: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
     let hov = pointer_if(ui, &resp) && enabled;
     if hov {
@@ -5942,7 +6106,7 @@ fn menu_item(ui: &mut Ui, label: &str, w: f32, enabled: bool, strong: bool) -> e
         ui.painter().rect_filled(rect, CornerRadius::same(7), P::surface_hi());
     }
     let fg = if !enabled {
-        P::text_faint()
+        P::quiet()
     } else if strong {
         P::text()
     } else if hov {
@@ -5962,18 +6126,11 @@ fn menu_item(ui: &mut Ui, label: &str, w: f32, enabled: bool, strong: bool) -> e
 
 /// Show `dir` in the OS file manager.
 ///
-/// Spawned and **not waited on**: the file manager is a separate, long-lived process, so waiting for
-/// it would block the UI thread until the user closed the window.
+/// Delegates to [`crate::open`]: there is now a second caller (a clickable path in a reply) that
+/// needs exactly this behaviour, and two copies of "how this OS shows a folder" is one copy too
+/// many — the copy that gets fixed is never the copy that is used.
 fn reveal_in_file_manager(dir: &Path) {
-    // `explorer` reports a non-zero exit code even when it opened the window, so the status is
-    // deliberately dropped -- there is nothing actionable to report and no reason not to try.
-    #[cfg(windows)]
-    let _ = std::process::Command::new("explorer").arg(dir).spawn();
-    #[cfg(not(windows))]
-    {
-        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-        let _ = std::process::Command::new(opener).arg(dir).spawn();
-    }
+    crate::open::reveal(dir);
 }
 
 /// One conversation row in the drawer: title on the first line, "last activity · message count" on
@@ -6163,6 +6320,10 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
                             // The file name still comes from the arguments, which the history file
                             // does keep — only the diff itself was never written down.
                             subject: subject_from_json(
+                                &c.function.name,
+                                &c.function.arguments,
+                            ),
+                            purpose: purpose_from_json(
                                 &c.function.name,
                                 &c.function.arguments,
                             ),
@@ -6438,7 +6599,7 @@ fn ask_input_row(ui: &mut Ui, w: f32, text: &mut String) -> Option<String> {
             .desired_width(edit_rect.width())
             .font(FontId::proportional(13.5))
             .hint_text(
-                RichText::new(aox::i18n::t("You can also type here…")).color(P::text_faint()).size(13.0),
+                RichText::new(aox::i18n::t("You can also type here…")).color(P::quiet()).size(13.0),
             ),
     );
     // The standard test for "Enter" on a single-line TextEdit: it **lost focus** this frame and
@@ -6665,6 +6826,22 @@ fn paint_tri(painter: &egui::Painter, center: Pos2, size: f32, down: bool, color
         ]
     };
     painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+}
+
+/// A duration as a clock: `0:47`, `2:00`.
+///
+/// `m:ss` for every size rather than a decimal below a minute: this readout's whole job is
+/// "elapsed over ceiling", and two different formats side by side (`47.0s / 2:00`) reads as a unit
+/// mistake. Seconds are truncated, not rounded, so the number never claims a second that has not
+/// passed.
+fn clock(secs: f32) -> String {
+    let s = secs.max(0.0) as u32;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// `elapsed / cap` — the one readout that answers "is this still fine".
+fn span(elapsed: f32, cap: f32) -> String {
+    format!("{} / {}", clock(elapsed), clock(cap))
 }
 
 fn spinner_dot(ui: &mut Ui, spin: f32, color: Color32) {
@@ -7149,6 +7326,9 @@ fn step_row_inner(ui: &mut Ui, st: &mut StepView) {
     // and clicking it opens the change"). Every other row stays plain and inert.
     let foldable = st.diff_detail.is_some();
     let unfolded = st.expanded;
+    // The file name, if it resolves to something on disk. Collected inside the row and used *after*
+    // the row's own click is registered -- see below.
+    let mut name_hit: Option<(egui::Rect, std::path::PathBuf)> = None;
     let row = ui
         .horizontal_top(|ui| {
             // Status markers (the form settled on with the user, 2026-10-05): in progress = a three-dot
@@ -7163,15 +7343,38 @@ fn step_row_inner(ui: &mut Ui, st: &mut StepView) {
             }
             ui.add_space(4.0);
             ui.label(RichText::new(&st.name).color(P::text()).size(14.5));
+            // Why this call exists, between the name and the file it works on: "why, then where" is
+            // the order people read them, and without it a row reading `bash` said nothing at all
+            // about what was about to run. Dimmer than the name so rows stay scannable by tool name.
+            if let Some(why) = &st.purpose {
+                ui.add_space(6.0);
+                ui.label(RichText::new(why).color(P::text_dim()).size(13.5));
+            }
             // The file this call works on, straight after its name (user request, 2026-10-11): a row
             // reading only "write_file" leaves you counting back to find out which file it was.
             // Monospaced so two paths line up, and shortened from the middle -- the tail is the half
             // that identifies a file.
             if let Some(sub) = &st.subject {
                 ui.add_space(6.0);
-                ui.label(
-                    RichText::new(clip_path(sub)).font(theme::mono_font(13.0)).color(P::text_dim()),
+                // Clickable when it resolves inside the workspace: "which file was that" is one
+                // click from "show me". The rect is collected here and re-registered after the row's
+                // own click below -- see the note there.
+                let path = crate::open::resolve_relative(sub);
+                let resp = ui.add(
+                    Label::new(
+                        RichText::new(clip_path(sub))
+                            .font(theme::mono_font(13.0))
+                            .color(P::text_dim()),
+                    )
+                    .selectable(false)
+                    .sense(Sense::click()),
                 );
+                if path.is_some() {
+                    pointer_if(ui, &resp);
+                }
+                if let Some(p) = path {
+                    name_hit = Some((resp.rect, p));
+                }
             }
             if let Some(pl) = &st.plugin {
                 ui.add_space(2.0);
@@ -7219,6 +7422,16 @@ fn step_row_inner(ui: &mut Ui, st: &mut StepView) {
         // hands a click to the topmost widget that wants it, and the labels inside the row are added
         // before this, so the row wins.
         let resp = row.interact(Sense::click());
+        // ...and for the same reason the file name has to be registered *after that* to win in turn:
+        // on a foldable row a click on the path must reveal the file, not fold the diff shut.
+        if let Some((rect, path)) = name_hit {
+            let name = ui
+                .interact(rect, ui.id().with("aox-step-file"), Sense::click())
+                .on_hover_text(path.display().to_string());
+            if name.clicked() {
+                crate::open::reveal(&path);
+            }
+        }
         if pointer_if(ui, &resp) && resp.clicked() {
             st.expanded = !st.expanded;
         }
@@ -7690,6 +7903,113 @@ fn link_row(ui: &mut Ui, key_w: f32, key: &str, url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The readout that makes a long call legible: elapsed over ceiling, plus the model's estimate.
+    ///
+    /// Truncating rather than rounding is deliberate — a clock that says `1:59` while the kill fires
+    /// would be the one number the user is watching, so it must never run ahead of the truth.
+    #[test]
+    fn the_running_call_reads_elapsed_over_ceiling() {
+        assert_eq!(clock(0.0), "0:00");
+        assert_eq!(clock(59.9), "0:59");
+        assert_eq!(clock(120.0), "2:00");
+        assert_eq!(clock(-3.0), "0:00", "a clock cannot run backwards");
+        assert_eq!(span(47.2, 120.0), "0:47 / 2:00");
+        assert_eq!(span(5.0, 600.0), "0:05 / 10:00");
+    }
+
+    /// What a call row says about the call — the three shapes it can arrive in, and the one case
+    /// where it must stay silent.
+    #[test]
+    fn a_row_says_what_the_call_is_for() {
+        use serde_json::json;
+
+        // The model's own words win: the command line cannot say *why*.
+        assert_eq!(
+            purpose_from_value("edit_file", &json!({"path": "a.rs", "purpose": "fix the 471 s hang"})),
+            Some("fix the 471 s hang".into())
+        );
+        // `bash` has no purpose of its own here, so the command is the label — real, not paraphrased.
+        assert_eq!(
+            purpose_from_value("bash", &json!({"command": "cargo build --release"})),
+            Some("cargo build --release".into())
+        );
+        // A multi-line script must not turn one row into five.
+        assert_eq!(
+            purpose_from_value("shell", &json!({"command": "cd a\n  && cargo test\n"})),
+            Some("cd a && cargo test".into())
+        );
+        // A long command keeps its **head** (the program identifies it) and gets one ellipsis.
+        let long = purpose_from_value("bash", &json!({"command": "x".repeat(200)})).unwrap();
+        assert!(long.ends_with('…'), "{long}");
+        assert_eq!(long.chars().count(), PURPOSE_MAX);
+        // Nothing to say, and nothing invented.
+        assert_eq!(purpose_from_value("read_file", &json!({"path": "a.rs"})), None);
+        // Whitespace-only purpose is not a purpose.
+        assert_eq!(purpose_from_value("bash", &json!({"purpose": "   ", "command": "dir"})), Some("dir".into()));
+    }
+
+    /// Why `step_row` re-registers the file name **after** the row's own click, instead of just
+    /// adding a clickable label inside it.
+    ///
+    /// Two widgets laid over the same rect: egui gives the click to the **last** one registered, which
+    /// is the opposite of what "the row's own click wins" (the older comment in `step_row_inner`) is
+    /// usually read to mean. Both facts are true at once — the row wins over the labels built *inside*
+    /// it because it is registered after them, and it loses to the name because the name is registered
+    /// after the row. That ordering is the whole feature ("click a tool call's file name to reveal it,
+    /// instead of folding the diff"), and it is invisible in the source: deleting the second
+    /// `ui.interact` would leave a file name that looks clickable and folds the row instead.
+    ///
+    /// A test rather than a manual click, because a click here has to open a real Explorer window.
+    #[test]
+    fn a_click_goes_to_the_widget_registered_last_on_the_same_rect() {
+        use egui::{Event, PointerButton, Sense};
+
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(240.0, 22.0));
+        let (row, name) = (egui::Id::new("aox-test-row"), egui::Id::new("aox-test-name"));
+        let mut clicks = (false, false);
+
+        // The hit test for clicks uses **last frame's** widget rects, so this needs a couple of idle
+        // frames before the press/release, or nothing is registered yet and neither widget is hit.
+        let mut frame = |events: Vec<Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::Area::new(egui::Id::new("aox-test-area")).show(ctx, |ui| {
+                    let row_resp = ui.interact(rect, row, Sense::click());
+                    // ...and this is the line `step_row_inner` adds, in the same position.
+                    let name_resp = ui.interact(rect, name, Sense::click());
+                    clicks = (row_resp.clicked(), name_resp.clicked());
+                });
+            });
+        };
+
+        frame(vec![]);
+        frame(vec![Event::PointerMoved(rect.center())]);
+        frame(vec![Event::PointerButton {
+            pos: rect.center(),
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        }]);
+        frame(vec![Event::PointerButton {
+            pos: rect.center(),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+
+        assert_eq!(
+            clicks,
+            (false, true),
+            "the widget registered last must own the click; if this flips, `step_row_inner` has to \
+             register the file name before the row (and then the row would swallow it instead)"
+        );
+    }
 
     /// Nail down, as an executable statement, why the settings dialog **has to pin** its content
     /// width.

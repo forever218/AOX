@@ -397,7 +397,7 @@ async fn main() -> Result<()> {
     // not a convention the model may skip. `[shell] enabled = false` leaves it unregistered, which is
     // the difference between "not advertised" and "advertised then refused".
     if rt.config.shell.enabled {
-        for t in tool::shell::shell_tools() {
+        for t in tool::shell::shell_tools(&rt.config.shell) {
             rt.register(t).await?;
         }
         // The POSIX shell. Registered **only when a real bash was found**: a tool that can only fail
@@ -594,7 +594,11 @@ async fn main() -> Result<()> {
                     name: "fs_read".into(),
                     args: serde_json::json!({"path": "config.toml"}),
                 });
-                ui.emit(AgentEvent::ToolRunning { name: "fs_read".into(), timeout_secs: 120 });
+                ui.emit(AgentEvent::ToolRunning {
+                    name: "fs_read".into(),
+                    timeout_secs: 120,
+                    expect_secs: Some(1),
+                });
                 tokio::time::sleep(std::time::Duration::from_millis(700)).await;
                 ui.emit(AgentEvent::ToolResult {
                     name: "fs_read".into(),

@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::runtime::Runtime;
-use crate::shell::runner::{self, Dialect, Failure, Outcome, Spec};
+use crate::shell::runner::{self, Dialect, Failure, Outcome, Spec, Stop};
 use crate::tool::{Tool, ToolKind, ToolOutput};
 
 /// The tool's name. Also the key `[auth] shell` governs (see `crate::auth::SHELL_TOOLS`), which is
@@ -41,11 +41,23 @@ pub const SHELL_TOOL: &str = "shell";
 /// The `cwd` parameter (the tool's own name for it — [`PATH_ARG`] is the *file* tools' name).
 const CWD_ARG: &str = "cwd";
 
-pub fn shell_tools() -> Vec<Arc<dyn Tool>> {
-    vec![Arc::new(ShellTool)]
+pub fn shell_tools(cfg: &crate::config::ShellConfig) -> Vec<Arc<dyn Tool>> {
+    vec![Arc::new(ShellTool {
+        timeout: cfg.timeout_secs,
+        max_timeout: cfg.max_timeout_secs,
+    })]
 }
 
-pub(crate) struct ShellTool;
+pub(crate) struct ShellTool {
+    /// `[shell] timeout_secs` / `max_timeout_secs`, snapshotted at registration.
+    ///
+    /// The tool needs them in [`Tool::timeout_hint`], which is asked **before** `call` and gets no
+    /// `Runtime` — and the outer guard in `Runtime::execute` is armed from that answer, so "I don't
+    /// know my own budget yet" is not an option. Config is read once at startup; reading it again
+    /// here would be the same numbers.
+    timeout: u64,
+    max_timeout: u64,
+}
 
 #[async_trait]
 impl Tool for ShellTool {
@@ -65,7 +77,11 @@ impl Tool for ShellTool {
          `shell`. Work inside the workspace: the working directory must be inside it, and **writes and \
          deletes outside it are refused**. Reading anywhere is allowed. Use it for a Windows-native \
          command, a cmd builtin, `git`, or any CLI tool instead of writing a plugin for it. Output: \
-         exit code + stdout + stderr (long output is truncated to its head and tail)."
+         exit code + stdout + stderr (long output is truncated to its head and tail). \
+         If you expect a call to take a while (a build, a big search), say so in your reply and pass \
+         `expect_secs` so the user can see \"expected ~N s\" instead of guessing. A call that prints \
+         nothing for 30 s is treated as wedged and killed — raise `idle_secs` for a command that is \
+         legitimately silent."
     }
 
     fn parameters(&self) -> Value {
@@ -90,7 +106,19 @@ impl Tool for ShellTool {
                 "timeout_secs": {
                     "type": "integer",
                     "description": "Give up after this many seconds and kill the whole process tree. \
-                                    Default from config (120), hard cap 600."
+                                    Default from config (60), hard cap 600."
+                },
+                "idle_secs": {
+                    "type": "integer",
+                    "description": IDLE_DESC
+                },
+                "expect_secs": {
+                    "type": "integer",
+                    "description": EXPECT_DESC
+                },
+                crate::tool::PURPOSE_ARG: {
+                    "type": "string",
+                    "description": crate::tool::PURPOSE_DESC
                 },
                 "env": {
                     "type": "object",
@@ -101,11 +129,14 @@ impl Tool for ShellTool {
         })
     }
 
-    fn timeout_hint(&self, args: &Value) -> Option<Duration> {
+    fn cap_hint(&self, args: &Value) -> Option<u64> {
         // Tell `Runtime::execute` to stay out of the way: this call may legitimately run for
         // minutes, and the tool has its own, more precise timeout (which kills the tree).
-        let secs = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(600);
-        Some(Duration::from_secs(secs.min(600) + 5))
+        hint_cap(args, self.timeout, self.max_timeout)
+    }
+
+    fn expect_hint(&self, args: &Value) -> Option<u64> {
+        hint_expected(args, self.max_timeout)
     }
 
     async fn call(&self, args: Value, rt: &Arc<Runtime>) -> ToolOutput {
@@ -213,6 +244,7 @@ pub(crate) async fn run_shell(
         command: script,
         cwd: cwd.clone(),
         timeout: Duration::from_secs(call_timeout(args, rt)),
+        idle: call_idle(args, rt),
         env: child_env(rt, &ws, boundary_note),
         // Always false: see the note above. The helper still supports it, and the measurement that
         // made it useless lives in `docs/SHELL.md`.
@@ -227,7 +259,7 @@ pub(crate) async fn run_shell(
     };
 
     let mut text = format_outcome(&outcome, dialect, &cwd, boundary_note);
-    if cfg.track_changes && !outcome.timed_out {
+    if cfg.track_changes && outcome.stopped.is_none() {
         let changed = changed_since(&ws, started);
         if !changed.is_empty() {
             text.push_str(&crate::tf!("\nchanged: {} file(s)\n", changed.len()));
@@ -240,7 +272,7 @@ pub(crate) async fn run_shell(
         }
     }
 
-    let failed = outcome.timed_out || outcome.code != Some(0);
+    let failed = outcome.stopped.is_some() || outcome.code != Some(0);
     let mut out = ToolOutput::ok(text);
     out.is_error = failed;
     Ok(out)
@@ -267,10 +299,57 @@ impl Boundary {
     }
 }
 
+/// The two call-level knobs the `shell` and `bash` schemas share, described **once**: two copies of a
+/// paragraph drift the first time one of them is reworded, and the model would then be reading two
+/// different stories about the same number.
+pub(crate) const IDLE_DESC: &str = "Kill the call if it writes nothing to stdout or stderr for \
+     this many seconds (default 30; 0 disables it for this call). Raise it for a command that is \
+     legitimately silent for a long time (a `sleep`, a download with no progress output). A build or \
+     a compile prints constantly, so the default suits those.";
+
+pub(crate) const EXPECT_DESC: &str = "Your own estimate of how long this will take, in seconds. \
+     Informational only — nothing enforces it. The user sees \"expected ~N s\" next to the running \
+     call, which is how they tell \"still working\" from \"wedged\", so fill it in for anything you \
+     expect to take more than a few seconds.";
+
+/// This call's ceiling, in seconds — the number the UI shows and the outer guard is built from.
+///
+/// Shared by both shell tools. A flat constant here (it used to be `600 + 5`) meant the backstop was
+/// five times wider than the timeout it backs up — so when the inner kill path failed, the user's only
+/// exit was 615 s away.
+pub(crate) fn hint_cap(args: &Value, timeout: u64, max: u64) -> Option<u64> {
+    Some(call_timeout_with(args, timeout, max))
+}
+
+/// The model's own estimate, clamped so a typo cannot put "expected 999999 s" on the user's screen.
+pub(crate) fn hint_expected(args: &Value, max: u64) -> Option<u64> {
+    args.get("expect_secs")
+        .and_then(|v| v.as_u64())
+        .filter(|s| *s > 0)
+        .map(|s| s.min(max.max(1)))
+}
+
 fn call_timeout(args: &Value, rt: &Arc<Runtime>) -> u64 {
     let cfg = &rt.config.shell;
-    let asked = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(cfg.timeout_secs);
-    asked.clamp(1, cfg.max_timeout_secs.max(1))
+    call_timeout_with(args, cfg.timeout_secs, cfg.max_timeout_secs)
+}
+
+/// The total budget for one call: what the model asked for, else the configured default, clamped to
+/// the ceiling. Shared by the two readers that must never disagree — the spec that runs the command
+/// and the hint that keeps the outer guard out of the way.
+fn call_timeout_with(args: &Value, default: u64, max: u64) -> u64 {
+    let asked = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(default);
+    asked.clamp(1, max.max(1))
+}
+
+/// The idle budget for one call, or `None` when the watchdog is off.
+fn call_idle(args: &Value, rt: &Arc<Runtime>) -> Option<Duration> {
+    let cfg = &rt.config.shell;
+    let secs = args.get("idle_secs").and_then(|v| v.as_u64()).unwrap_or(cfg.idle_timeout_secs);
+    // A model can raise it for a command that is legitimately silent, but not past the total budget:
+    // an idle budget larger than the call's own is a number that can never fire.
+    let secs = secs.min(cfg.max_timeout_secs.max(1));
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 /// The environment the command sees.
@@ -314,11 +393,25 @@ fn format_outcome(
     boundary: Boundary,
 ) -> String {
     let mut s = String::new();
-    if o.timed_out {
-        s.push_str(&crate::tf!(
-            "TIMED OUT after {} s — the whole process tree was terminated.\n",
-            format!("{:.0}", o.elapsed.as_secs_f64())
-        ));
+    match o.stopped {
+        Some(Stop::Timeout(budget)) => s.push_str(&crate::tf!(
+            "TIMED OUT after {} s (the call's budget was {} s) — the whole process tree was \
+             terminated.\n",
+            format!("{:.0}", o.elapsed.as_secs_f64()),
+            budget.as_secs()
+        )),
+        // The idle case carries the "what to do about it" line because the model is the only one who
+        // knows whether silence was expected. Without it the natural next move is to retry the same
+        // call and be killed again.
+        Some(Stop::Idle(idle)) => s.push_str(&crate::tf!(
+            "KILLED after {} s: it wrote nothing to stdout or stderr for {} s, which is how a \
+             wedged process looks. The whole tree was terminated; whatever it printed before that is \
+             below. If the silence was expected — a `sleep`, a download with no progress output — \
+             retry with a larger `idle_secs` (0 turns the watchdog off for that call).\n",
+            format!("{:.0}", o.elapsed.as_secs_f64()),
+            idle.as_secs()
+        )),
+        None => {}
     }
     s.push_str(&crate::tf!(
         "exit {} · {} s · {} · boundary: {} · cwd {}\n",
@@ -701,6 +794,27 @@ pub fn report(rt: &Arc<Runtime>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// The three knobs, at the boundary values a model actually produces: nothing, a sensible ask,
+    /// an impossible ask, and a zero (which must not mean "no timeout").
+    #[test]
+    fn the_call_budget_is_what_was_asked_for_clamped_to_the_ceiling() {
+        assert_eq!(call_timeout_with(&json!({}), 120, 600), 120);
+        assert_eq!(call_timeout_with(&json!({"timeout_secs": 30}), 120, 600), 30);
+        assert_eq!(call_timeout_with(&json!({"timeout_secs": 9999}), 120, 600), 600);
+        assert_eq!(call_timeout_with(&json!({"timeout_secs": 0}), 120, 600), 1);
+        // What the UI shows must be the budget itself, not the outer leash wrapped around it.
+        assert_eq!(hint_cap(&json!({"timeout_secs": 30}), 120, 600), Some(30));
+    }
+
+    #[test]
+    fn the_estimate_is_clamped_and_zero_means_silence() {
+        assert_eq!(hint_expected(&json!({}), 600), None);
+        assert_eq!(hint_expected(&json!({"expect_secs": 0}), 600), None);
+        assert_eq!(hint_expected(&json!({"expect_secs": 90}), 600), Some(90));
+        assert_eq!(hint_expected(&json!({"expect_secs": 99_999}), 600), Some(600));
+    }
 
     fn ws() -> PathBuf {
         PathBuf::from(r"E:\rustapp\workplace\demo")

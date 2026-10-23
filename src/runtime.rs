@@ -406,6 +406,20 @@ impl Runtime {
             .unwrap_or_default()
     }
 
+    /// The two numbers a running call reports to the UI: `(cap_secs, expect_secs)`.
+    ///
+    /// Lives here rather than in `Agent` because the tool registry is private to `Runtime`, and
+    /// because these are the same hooks [`Self::execute`] builds its outer guard from — one reader,
+    /// one answer. Either half is `None` when the tool has no opinion (which is every tool except the
+    /// shell ones).
+    pub async fn call_hints(&self, name: &str, args: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+        let tool = { self.tools.read().await.get(name).cloned() };
+        match tool {
+            Some(t) => (t.cap_hint(args), t.expect_hint(args)),
+            None => (None, None),
+        }
+    }
+
     pub async fn execute(self: &Arc<Self>, name: &str, args: serde_json::Value) -> ToolOutput {
         let tool = { self.tools.read().await.get(name).cloned() };
         let Some(tool) = tool else {

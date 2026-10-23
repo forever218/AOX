@@ -94,6 +94,83 @@ pub const WORKPLACE_DIR: &str = "workplace";
 /// now; the prompt tells the model where to put them (see the `# Workspace layout` segment).
 pub const TMP_DIR: &str = "tmp";
 
+/// How old a scratch file has to be before a **turn-end** sweep removes it.
+///
+/// Ten minutes, not zero, because a task often spans several turns: a script written in one turn and
+/// re-run two turns later is a legitimate pattern, and a zero grace would delete it between them (a
+/// wasted rebuild, occasionally a wasted round trip). Ten minutes is longer than any healthy gap
+/// inside one task and shorter than any gap between tasks.
+pub const SCRATCH_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How old a scratch file has to be before a **turn-start** sweep removes it.
+///
+/// This one exists for the case a turn-end sweep cannot cover: the process was killed, or the turn
+/// never ended. A day is long enough that nothing a live session cares about is touched, and short
+/// enough that a crashed session does not leave gigabytes behind for a week.
+pub const SCRATCH_STALE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// What a scratch sweep removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Swept {
+    pub files: usize,
+    pub dirs: usize,
+    pub bytes: u64,
+}
+
+impl Swept {
+    pub fn any(&self) -> bool {
+        self.files + self.dirs > 0
+    }
+}
+
+/// Empty the workspace's scratch directory of everything older than `min_age`.
+///
+/// The host points `TMP`/`TEMP`/`TMPDIR` at `<ws>/.aox/tmp` for every shell call (see
+/// `shell::child_env`), so that is where a model puts its throwaway scripts ("fix1.py", a screenshot,
+/// a `__pycache__`) — and until now **nothing ever removed them**. Measured in this repo on
+/// 2026-10-23: 122 files, 4.5 MB, accumulated over two days, none of it asked for. The directory is
+/// pre-created and named by the host, so emptying it is maintenance of the host's own state, not a
+/// judgment about the user's files.
+///
+/// Scoped **strictly** to `TMP_DIR`: a file elsewhere in the workspace is indistinguishable from a
+/// deliverable, and the host has no business guessing. The prompt asks the model to tidy those
+/// itself; this function is the part the model cannot forget.
+///
+/// Errors are swallowed per entry on purpose — a file held open by a build that outlived its turn (or
+/// by a plugin) cannot be deleted on Windows, and that is not a reason to stop the sweep or to tell
+/// the user. The next sweep gets it.
+pub fn sweep_scratch(ws: &Path, min_age: std::time::Duration) -> Swept {
+    let dir = ws.join(AOX_DIR).join(TMP_DIR);
+    let mut out = Swept::default();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        // No scratch directory: nothing to do (a workspace that was never started).
+        return out;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .unwrap_or_default();
+        if age < min_age {
+            continue;
+        }
+        if meta.is_dir() {
+            // Recursive: `__pycache__`, `pip-xxxx`, a scratch folder the model made for itself.
+            if std::fs::remove_dir_all(&path).is_ok() {
+                out.dirs += 1;
+            }
+        } else if meta.is_file() && std::fs::remove_file(&path).is_ok() {
+            out.files += 1;
+            out.bytes += meta.len();
+        }
+    }
+    out
+}
+
 /// Subdirectory of [`AOX_DIR`] holding conversations (`<workspace>/.aox/history/`).
 ///
 /// ⚠️ **This name must match the storage backend's.** The backend owns the directory it writes into
@@ -1741,5 +1818,53 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&app);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The scratch sweep removes what the model left, and **only** that.
+    ///
+    /// The age filter is exercised at both ends (`0` = everything, an hour = nothing) rather than by
+    /// back-dating a file, which `std` cannot do: the two extremes are the whole rule, and the middle
+    /// is the same comparison.
+    #[test]
+    fn the_scratch_sweep_empties_tmp_and_nothing_else() {
+        let root = std::env::temp_dir().join(format!("aox-sweep-{}", std::process::id()));
+        let aox = root.join(AOX_DIR);
+        let tmp = aox.join(TMP_DIR);
+        std::fs::create_dir_all(tmp.join("__pycache__")).unwrap();
+        std::fs::create_dir_all(aox.join(HISTORY_DIR)).unwrap();
+        std::fs::create_dir_all(aox.join(MEMORY_DIR)).unwrap();
+        std::fs::write(tmp.join("fix1.py"), "print(1)").unwrap();
+        std::fs::write(tmp.join("__pycache__").join("x.pyc"), "junk").unwrap();
+        std::fs::write(aox.join(HISTORY_DIR).join("conv.jsonl"), "{}").unwrap();
+        std::fs::write(aox.join(MEMORY_DIR).join("2026-10-23.md"), "# note").unwrap();
+        std::fs::write(root.join("deliverable.txt"), "keep me").unwrap();
+
+        // A window longer than the files are old must leave everything alone.
+        let none = sweep_scratch(&root, std::time::Duration::from_secs(3600));
+        assert_eq!(none, Swept::default());
+        assert!(tmp.join("fix1.py").is_file());
+
+        // No window: the scratch directory is emptied, recursively...
+        let all = sweep_scratch(&root, std::time::Duration::ZERO);
+        assert_eq!(all.files, 1, "{all:?}");
+        assert_eq!(all.dirs, 1, "the __pycache__ directory counts as one, not one per file");
+        assert!(all.bytes > 0);
+        assert!(!tmp.join("fix1.py").exists());
+        assert!(!tmp.join("__pycache__").exists());
+        // ...and the directory itself survives, because the host pre-creates it per turn.
+        assert!(tmp.is_dir());
+        // The rest of `.aox` (conversations, notes) and the workspace's own files are untouched —
+        // the sweep must never be a reason to lose history.
+        assert!(aox.join(HISTORY_DIR).join("conv.jsonl").is_file());
+        assert!(aox.join(MEMORY_DIR).join("2026-10-23.md").is_file());
+        assert!(root.join("deliverable.txt").is_file());
+
+        // A workspace that was never started has no tmp dir: a sweep is a no-op, not an error.
+        let bare = std::env::temp_dir().join(format!("aox-sweep-bare-{}", std::process::id()));
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(sweep_scratch(&bare, std::time::Duration::ZERO), Swept::default());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bare);
     }
 }

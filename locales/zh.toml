@@ -706,7 +706,8 @@
 "{}…\n[result too long; truncated, original length {} characters]" = "{}…\n[结果过长已截断，原长度 {} 字符]"
 "· {}s · /expand to unfold" = "· {}s · /expand 展开"
 "…(earlier text trimmed){}" = "…（前文省略）{}"
-"…{} running (timeout {}s, Ctrl+C to interrupt)" = "…{} 执行中（超时 {} 秒，Ctrl+C 中断）"
+"…{} running (cap {}s, Ctrl+C to interrupt)" = "…{} 执行中（上限 {} 秒，Ctrl+C 中断）"
+"…{} running (expected ~{}s, cap {}s, Ctrl+C to interrupt)" = "…{} 执行中（预计 ~{} 秒，上限 {} 秒，Ctrl+C 中断）"
 "──────────────── last task process · {} steps · {}s ────────────────" = "──────────────── 上次任务过程 · {} 步 · {}s ────────────────"
 "┌─ authorization request ────────────────────────────────" = "┌─ 授权请求 ────────────────────────────────"
 "┌─ pick one ────────────────────────────" = "┌─ 需要你选一个 ────────────────────────────"
@@ -981,3 +982,25 @@
 # Verification: the criterion text travels with the evidence (option A)
 "criterion {} is out of range: this checkpoint has {} acceptance item(s), so the range is 1..={}. Nothing was recorded." = "criterion {} 超出范围：这个检查点有 {} 条验收，可用范围是 1..={}。没有记录任何内容。"
 "this checkpoint has no acceptance criteria yet, so a check cannot prove anything. Add them with task_state {acceptance: [...]} first." = "这个检查点还没有验收条件，检查无从证明任何东西。先用 task_state {acceptance: [...]} 补上。"
+
+# Clickable targets in a reply (a URL, or an absolute path the model mentioned)
+"Open in browser" = "在浏览器中打开"
+"Open containing folder" = "打开所在文件夹"
+"Path not found" = "路径不存在"
+"Copy link" = "复制链接"
+"Copy path" = "复制路径"
+"Open with default app" = "用默认程序打开"
+"Overwrote plugins/sdk/plugin_sdk.py (2.4 KB)" = "已覆盖 plugins/sdk/plugin_sdk.py（2.4 KB）"
+
+# A long-running tool call: the model's own estimate, and the two ways the host stops it
+"expected ~{}" = "预计 ~{}"
+"TIMED OUT after {} s (the call's budget was {} s) — the whole process tree was terminated.\n" = "超时：{} 秒（本次调用的预算是 {} 秒）—— 整棵进程树已被终止。\n"
+"KILLED after {} s: it wrote nothing to stdout or stderr for {} s, which is how a wedged process looks. The whole tree was terminated; whatever it printed before that is below. If the silence was expected — a `sleep`, a download with no progress output — retry with a larger `idle_secs` (0 turns the watchdog off for that call).\n" = "已中止：{} 秒里它一直没有向 stdout/stderr 写任何东西（连续 {} 秒静默），这正是卡死进程的样子。整棵进程树已终止，之前打印的内容在下面。如果这段静默是你预期的 —— 比如 `sleep`、不带进度输出的下载 —— 请把 `idle_secs` 调大重试（0 表示这次调用关掉静默看门狗）。\n"
+"{} did not answer `uname -s` within 5 s — refusing it rather than hanging the first command that uses it" = "{} 在 5 秒内没有回应 `uname -s` —— 直接拒绝它，而不是让第一条用到它的命令挂住"
+
+# Tool-call purpose: the optional `purpose` argument, and the demo's own labels
+"One short line (a few words, not a sentence) saying what this call is for — e.g. \"fix the title save\", \"run the test suite\", \"count files by type\". The UI shows it next to the tool name, so the user can tell calls apart without opening the arguments. Optional, but fill it in whenever the tool name alone does not say what you are doing — which is almost always for `bash`/`shell`, whose name says nothing about the command." = "一句话（几个词，不要整句）说明这次调用是为了做什么 —— 例如「修好标题保存」「跑一遍测试」「按类型统计文件数」。界面会把它显示在工具名旁边，用户不用展开参数就能分清每个调用。可选，但只要工具名本身说不清你在干嘛就填上 —— 对 `bash`/`shell` 尤其是这样，它们的名字对命令内容一无所知。"
+"see what the host already has" = "看看宿主机已有的能力"
+"make the filestat plugin" = "创建 filestat 插件"
+"write the plugin" = "写插件源码"
+"count the files here" = "统计当前目录的文件"

@@ -26,11 +26,12 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 use super::helper::{self, HelperSpec};
 use crate::plugin::ProcessFlags;
@@ -206,6 +207,8 @@ pub struct Spec {
     /// Already checked against the workplace boundary; the helper also sets it as the child's cwd.
     pub cwd: PathBuf,
     pub timeout: Duration,
+    /// Kill the call when it has written nothing to either stream for this long. `None` = off.
+    pub idle: Option<Duration>,
     /// Extra environment entries, on top of the inherited environment.
     pub env: Vec<(String, String)>,
     /// Run at Low integrity (the kernel boundary). `false` = scan-only mode.
@@ -234,8 +237,18 @@ pub struct Outcome {
     pub elapsed: Duration,
     pub out: Capture,
     pub err: Capture,
-    /// The call was stopped by its own timeout (the tree was killed).
-    pub timed_out: bool,
+    /// The call was **stopped by us** (the whole tree was killed), and why.
+    pub stopped: Option<Stop>,
+}
+
+/// Why a call was stopped early. Both are the host's decision, never the command's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// It ran out of its total budget.
+    Timeout(Duration),
+    /// It had written nothing to either stream for this long. Carries the idle budget, not the
+    /// actual silence — same number, and the one the message needs to quote.
+    Idle(Duration),
 }
 
 /// The call never became an outcome.
@@ -302,23 +315,43 @@ pub async fn run(rt: &Arc<Runtime>, spec: &Spec) -> Result<Outcome, Failure> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let cap = rt.config.shell.max_output_bytes;
-    let out_task = tokio::spawn(read_capped(stdout, cap));
-    let err_task = tokio::spawn(read_capped(stderr, cap));
+    // Milliseconds since `started` at which the last byte arrived, **one shared stamp for both
+    // streams**: a command that only writes to stderr is making progress just as much as one that
+    // writes to stdout, and a wedged one writes to neither.
+    let activity = Arc::new(AtomicU64::new(0));
+    let out_task = tokio::spawn(read_capped(stdout, cap, activity.clone(), started));
+    let err_task = tokio::spawn(read_capped(stderr, cap, activity.clone(), started));
 
-    let (code, timed_out) = match tokio::time::timeout(spec.timeout, child.wait()).await {
-        Ok(Ok(status)) => (status.code(), false),
-        Ok(Err(e)) => {
-            fence.terminate();
-            return Err(Failure::Spawn(crate::tf!("the shell helper could not be waited on: {}", e)));
+    // Poll rather than `timeout(child.wait())`: **two** conditions can end the call (the total
+    // budget, and "no output for a while"), and re-arming a `wait()` future every tick would make
+    // the cancel-safety of `Child::wait` load-bearing for a correctness rule. Polling at 100 ms
+    // costs 10 cheap `try_wait` calls a second and answers "is it still there" without ambiguity.
+    let deadline = started + spec.timeout;
+    let mut stopped: Option<Stop> = None;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {}
+            Err(e) => {
+                fence.terminate();
+                return Err(Failure::Spawn(crate::tf!("the shell helper could not be waited on: {}", e)));
+            }
         }
-        Err(_) => {
-            // The whole tree, not just the child we hold: `cargo` leaves `rustc` behind otherwise.
-            fence.terminate();
-            let _ = child.wait().await;
-            (None, true)
+        let now = Instant::now();
+        if let Some(stop) =
+            budget_spent(now, deadline, started, activity.load(Ordering::Relaxed), spec.idle)
+        {
+            stopped = Some(stop);
+            break None;
         }
+        tokio::time::sleep(TICK).await;
     };
+    // Measured **before** the kill: "TIMED OUT after 120 s" must mean the budget, not the budget plus
+    // however long the tree took to die.
     let elapsed = started.elapsed();
+    if stopped.is_some() {
+        kill_tree(&fence, &mut child).await;
+    }
 
     // After `terminate` the pipes reach EOF as the tree dies; a short grace period is enough, and a
     // pipe that still does not close must not hang the tool call.
@@ -346,7 +379,76 @@ pub async fn run(rt: &Arc<Runtime>, spec: &Spec) -> Result<Outcome, Failure> {
         return Err(Failure::Spawn(why));
     }
 
-    Ok(Outcome { code, elapsed, out, err, timed_out })
+    Ok(Outcome { code, elapsed, out, err, stopped })
+}
+
+/// How often the wait loop looks at the child. Also the resolution of both deadlines — a 30 s idle
+/// budget does not need a millisecond-accurate clock, and 10 wake-ups a second is not a cost.
+const TICK: Duration = Duration::from_millis(100);
+
+/// Which budget, if any, has run out — the whole policy of the wait loop, in one testable place.
+///
+/// Split out because the alternative is a test that waits 30 seconds: the rule is "the total budget,
+/// or `idle` without a single byte arriving", and both are arithmetic on clocks.
+///
+/// `last_activity_ms` is measured from `started`, not from now: a command that has printed nothing
+/// has its last activity at 0, which is exactly "quiet since it started".
+fn budget_spent(
+    now: Instant,
+    deadline: Instant,
+    started: Instant,
+    last_activity_ms: u64,
+    idle: Option<Duration>,
+) -> Option<Stop> {
+    if now >= deadline {
+        return Some(Stop::Timeout(deadline.saturating_duration_since(started)));
+    }
+    let idle = idle?;
+    let ran = now.saturating_duration_since(started);
+    let quiet = ran.saturating_sub(Duration::from_millis(last_activity_ms));
+    (quiet >= idle).then_some(Stop::Idle(idle))
+}
+
+/// How long the tree gets to die after `TerminateJobObject`, before we stop believing in the fence.
+const GRACE: Duration = Duration::from_secs(5);
+
+/// How long the process we hold gets after a direct `kill`, before the call gives up on it.
+const GRACE_HARD: Duration = Duration::from_secs(2);
+
+/// Stop the whole tree, and **bound how long we wait for it to die**.
+///
+/// `terminate()` is a no-op when there is no Job (`Fence.job == 0`: not Windows, `CreateJobObjectW`
+/// failed, or the helper had already exited so `contain` had nothing to put in it). The previous
+/// version called `child.wait()` unconditionally right after it, so in exactly those cases the call
+/// waited **forever** — which is the one outcome a timeout must never produce. Measured complaint
+/// behind this: a `bash` call sitting at 471 s with no way out.
+async fn kill_tree(fence: &crate::sandbox::Fence, child: &mut Child) {
+    fence.terminate();
+    if died_within(child, GRACE).await {
+        return;
+    }
+    // The fence did not take it (no Job, or the helper escaped one). Kill what we hold: its own
+    // children may survive — that is exactly what the Job was for — but the call returns, which is
+    // the part the user can act on.
+    let _ = child.start_kill();
+    let _ = died_within(child, GRACE_HARD).await;
+}
+
+/// `true` when the child has exited (and been reaped) within `d`.
+async fn died_within(child: &mut Child, d: Duration) -> bool {
+    let until = Instant::now() + d;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            // The handle is gone; nothing left to wait for.
+            Err(_) => return true,
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn join_capture(
@@ -363,7 +465,12 @@ async fn join_capture(
 /// Keeping both ends is deliberate: a build log puts the *reason* at the top ("error: linking with
 /// `cc` failed") and the *list of failures* at the bottom. A plain "first N bytes" would show a
 /// screen of `Compiling …` and none of the answer.
-async fn read_capped<R>(reader: Option<R>, cap: usize) -> Capture
+async fn read_capped<R>(
+    reader: Option<R>,
+    cap: usize,
+    activity: Arc<AtomicU64>,
+    started: Instant,
+) -> Capture
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -379,6 +486,9 @@ where
             Ok(0) => break,
             Ok(n) => {
                 total += n as u64;
+                // The idle watchdog reads this. Stamped on **any** byte, not on a "useful" one:
+                // the question it answers is "did the process say anything at all".
+                activity.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                 let mut chunk = &buf[..n];
                 if head.len() < head_cap {
                     let take = (head_cap - head.len()).min(chunk.len());
@@ -459,5 +569,59 @@ mod tests {
         assert_eq!(Dialect::parse("bash"), Some(Dialect::Bash));
         assert_eq!(Dialect::parse("sh"), Some(Dialect::Bash));
         assert_eq!(Dialect::parse("fish"), None);
+    }
+
+    /// The two deadlines, without waiting for either.
+    ///
+    /// This is the rule the user's complaint was about: an eight-minute hang is either "the total
+    /// budget has not run out yet" or "it has not said anything for a while", and until now neither
+    /// could be checked without sitting through the wall clock.
+    #[test]
+    fn the_budget_is_spent_on_time_or_on_silence() {
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let timeout = Duration::from_secs(120);
+        let deadline = at(120);
+        let idle = Some(Duration::from_secs(30));
+
+        // Running, printing: nothing to do.
+        assert_eq!(budget_spent(at(10), deadline, start, 9_000, idle), None);
+        // Silent since the start, 30 s in ⇒ idle.
+        assert_eq!(budget_spent(at(30), deadline, start, 0, idle), Some(Stop::Idle(Duration::from_secs(30))));
+        // Printed at 25 s, now 40 s: only 15 s of silence, still fine.
+        assert_eq!(budget_spent(at(40), deadline, start, 25_000, idle), None);
+        // ...and at 56 s the same print is 31 s old ⇒ idle fires.
+        assert_eq!(budget_spent(at(56), deadline, start, 25_000, idle), Some(Stop::Idle(Duration::from_secs(30))));
+        // The total budget wins over a call that kept printing (a build that never ends).
+        assert_eq!(budget_spent(at(120), deadline, start, 119_000, idle), Some(Stop::Timeout(timeout)));
+        // Watchdog off: silence is not a reason to kill anything.
+        assert_eq!(budget_spent(at(119), deadline, start, 0, None), None);
+    }
+
+    /// The wait after a kill **must** be bounded. A wedged `child.wait()` with no deadline was the
+    /// one path that could outlive every timeout in the program (the `471 s and still counting`
+    /// report): `terminate()` is a no-op when there is no Job, and the old code waited forever.
+    ///
+    /// Uses a real process but not the shell *helper* — that path needs the built binary, and the
+    /// helper handshake is not what is under test here.
+    #[tokio::test]
+    async fn waiting_for_a_killed_child_gives_up_instead_of_hanging() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "ping -n 30 127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cmd.exe must exist on Windows");
+
+        // Still alive: the grace period must expire and say so, not block.
+        assert!(!died_within(&mut child, Duration::from_millis(150)).await);
+
+        // Killed directly (no Job here): it must be reaped well inside the grace.
+        let _ = child.start_kill();
+        assert!(
+            died_within(&mut child, Duration::from_secs(3)).await,
+            "a killed child must be reaped; hanging here is what the timeout path used to do"
+        );
     }
 }

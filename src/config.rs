@@ -579,10 +579,25 @@ pub struct ShellConfig {
     /// shipped or skipped independently. `off` ignores it.
     pub bash_pack: String,
     /// Default per-call timeout, in seconds. A call may ask for more via its own `timeout_secs`.
+    ///
+    /// 60 rather than the old 120 (user decision, 2026-10-23): a normal command finishes in
+    /// milliseconds, a build in a couple of minutes, and anything already running for a minute with
+    /// no result is far more often wedged than working. A call that really needs longer says so —
+    /// `timeout_secs` is right there in the schema, and running out of budget is a *readable*
+    /// outcome (`TIMED OUT … the whole tree was terminated`), not a silent hang.
     pub timeout_secs: u64,
     /// Hard ceiling for `timeout_secs`. A model that asks for an hour waits an hour otherwise,
     /// while holding one tool slot the whole time.
     pub max_timeout_secs: u64,
+    /// Kill a call that has written **nothing** to either stream for this many seconds.
+    ///
+    /// This is the answer to "it has been running for eight minutes, is it working or wedged?". A
+    /// total timeout cannot tell the two apart — a build legitimately runs for minutes — but the
+    /// *stream* can: a build prints constantly, a wedged process prints nothing. Measured from the
+    /// last byte that arrived, not from the start, so `cargo build` is never killed for being slow.
+    ///
+    /// `0` = off (only `timeout_secs` applies). A call may override it with its own `idle_secs`.
+    pub idle_timeout_secs: u64,
     /// How much of a command's output to keep (stdout and stderr counted separately), in bytes.
     ///
     /// Beyond it the **head and the tail** are kept and the elided middle is reported with its
@@ -619,8 +634,9 @@ impl Default for ShellConfig {
             prefer: default_shell_prefer(),
             bash: "auto".into(),
             bash_pack: "runtime".into(),
-            timeout_secs: 120,
+            timeout_secs: 60,
             max_timeout_secs: 600,
+            idle_timeout_secs: 30,
             max_output_bytes: 128 * 1024,
             max_processes: 16,
             env_cache: true,

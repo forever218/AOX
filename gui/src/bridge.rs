@@ -901,7 +901,7 @@ async fn boot_and_run(
     // The built-in command line (`aox::tool::shell`): same tool, same boundary, same executor as in
     // the CLI. Registering it here is what makes "the GUI has no shell" stop being true.
     if rt.config.shell.enabled {
-        for t in aox::tool::shell::shell_tools() {
+        for t in aox::tool::shell::shell_tools(&rt.config.shell) {
             rt.register(t).await?;
         }
         for t in aox::tool::bash::bash_tools(&rt) {

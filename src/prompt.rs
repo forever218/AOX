@@ -286,7 +286,8 @@ fn env_section(rt: &Runtime) -> String {
     s.push_str(&tf!(
         "\n\n# Workspace layout\n\
          Your workspace is {} —— {}. The \"app root\" above is only where plugins run; your workspace can be a different directory, and it is where the user expects you to work.\n\
-         - Scratch files —— screenshots, caches, one-off output —— go under {}\\.aox\\tmp\\. That `.aox\\` folder is the host's own: `history\\` holds this workspace's conversations and `memory\\` your notes (see the next section), so read them if they help, but never reorganise or delete them. Don't scatter files in the workspace root.\n\
+         - Scratch files —— screenshots, caches, one-off output —— go under {}\\.aox\\tmp\\. That `.aox\\` folder is the host's own: `history\\` holds this workspace's conversations and `memory\\` your notes (see the next section), so read them if they help, but never reorganise or delete them. **`.aox\\tmp\\` is swept by the host** (anything there older than a few minutes is removed), so it is for what you need *now* — not for anything a later turn must find. Don't scatter files in the workspace root.\n\
+         - **Clean up after yourself.** When the work a file was for is done, delete it: a scratch script you wrote outside `.aox\\tmp\\`, a probe you created to check one thing, a generated file that is not part of the answer. Deleting is a real step of a finished job, not tidying for its own sake — the next person to open that folder should find the work, not its scaffolding. (`remove` moves it to the recycle bin, so this is recoverable.)\n\
          - When the user asks you to create something durable (a document, a code project), give it its own folder: {}\\workplace\\<short project name>\\, and work inside it. Name the folder after the project in a few words (e.g. workplace\\business-site).\n",
         ws.display(),
         rule,
@@ -384,7 +385,16 @@ fn env_section(rt: &Runtime) -> String {
              head and tail) and the boundary it actually got. Read `stderr` before concluding a \
              command failed for your own reason.\n\
              - Prefer one command that pipes and chains over several round trips: each call costs a \
-             request.",
+             request.\n\
+             - **Announce anything slow before you run it.** A build, a test run, a big search, a \
+             download: write one short line in your reply saying what it is and roughly how long — \
+             \"Building now, about a minute.\" — and pass the same number as `expect_secs`. The user \
+             reads that line while the call runs; without it a call that takes two minutes is \
+             indistinguishable from a freeze, and they will interrupt something that was working. Say \
+             nothing for the millisecond calls.\n\
+             - Every call takes an optional `purpose`: a few words saying what it is **for** (\"run the \
+             test suite\", \"fix the title save\"). That is what the user sees next to the tool name, \
+             and `bash`'s name says nothing about the command it is about to run.",
         ));
     }
     s
@@ -614,6 +624,21 @@ mod tests {
                 println!("--- prefer={tag} ---\n{}", &s[i..end]);
             }
         }
+    }
+
+    /// The command-line section has to ask for the two things the UI cannot invent: a **spoken**
+    /// announcement before a slow call, and a `purpose` on the call itself.
+    ///
+    /// Pinned because both are pure wording: nothing in the host enforces them, so the only place
+    /// they can silently disappear is a reworded paragraph — and the symptom (rows reading `bash`
+    /// with nothing else, long calls looking frozen) is exactly what they were added to fix.
+    #[test]
+    fn the_shell_section_asks_for_an_announcement_and_a_purpose() {
+        let rt = rt_tuned(PromptConfig::default(), "bash");
+        let s = env_section(&rt);
+        assert!(s.contains("Announce anything slow"), "the announcement rule is missing:\n{s}");
+        assert!(s.contains("`expect_secs`"), "the rule must name the argument to set:\n{s}");
+        assert!(s.contains("optional `purpose`"), "the purpose convention is missing:\n{s}");
     }
 
     /// Splitting must be lossless: reassembling verbatim must equal the original string.
