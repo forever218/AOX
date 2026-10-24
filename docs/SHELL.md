@@ -80,6 +80,37 @@ What the model can announce: `expect_secs`. It is **not** a limit and nothing en
 just sees `expected ~2:00` next to `0:47 / 2:00` in the running row (and the same in the CLI's
 "running" line), which is how "still working" stops looking like "stuck".
 
+## 3b. Long-lived processes (`shell_job`)
+
+A normal call is a **one-shot fenced job**. When the shell exits, its Job closes and every descendant
+dies with it. That is what makes `cargo build` safe, and it is also why `npm run dev &`, `nohup` and
+`start /b` cannot work: they change the child's relation to the shell, not its membership in the Job.
+Before this feature the result was a successful, silent call, a closed port, and a model retrying the
+same command.
+
+`shell_job` owns the same Job from the **runtime** instead of from the call:
+
+```json
+{"action":"start","command":"npm run dev","name":"vite","cwd":"E:/project"}
+{"action":"status"}              // id optional; without it, everything
+{"action":"logs","id":"vite-1","max_bytes":20000}
+{"action":"stop","id":"vite-1"}
+```
+
+- Output goes to `<workspace>/.aox/run/<name>-<stamp>.log`, not a pipe. Nobody has to read it for
+  minutes, and a full pipe would block the server.
+- `timeout_secs` / `idle_secs` do not apply. The lifetime cap does:
+  `[shell] background_max_hours` (default 2, checked before every agent request).
+- The process tree is still fenced. `stop`, the lifetime cap, or AOX exiting closes the Job and
+  terminates every process in it.
+- A background job **must** fit its Job; if the fence cannot be installed, the command is killed and
+  `start` fails rather than running an untracked daemon.
+- `continue` applies unchanged: the same cwd check, command scan, bash prologue and environment as a
+  one-shot call.
+
+A one-shot call that *does* leave descendants now says so, with the count, in its result — that
+sentence is the difference between "the server is flaky" and "a shell call cannot keep a server".
+
 ## 4. Why there is no kernel boundary (the measurements)
 
 The intended design: run the command at **Low integrity** and label the workspace Low, so
@@ -118,6 +149,9 @@ max_timeout_secs = 600       # hard cap
 idle_timeout_secs = 30       # no output for this long ⇒ treated as wedged and killed (0 = off)
 max_output_bytes = 131072    # per stream, head + tail
 max_processes    = 16        # per call (one Job Object per call; 0 = no children at all)
+background_max_jobs = 4      # live shell_job trees; 0 = the tool refuses to start any
+background_max_processes = 64 # per background Job (browsers need more than builds)
+background_max_hours = 2     # lifetime cap; 0 = no expiry (stop explicitly)
 env_cache        = true      # CARGO_HOME / NPM_CONFIG_CACHE / PIP_CACHE_DIR / TMP inside the workspace
 track_changes    = true      # report workspace files whose mtime moved
 ```
@@ -135,10 +169,10 @@ enough after the first prompt.
 
 ## 6. Deliberately not done
 
-- **No output streaming**: a call returns when the command ends (bounded by the timeout), so
-  `npm run dev` hangs until it is killed. Streaming needs an event channel through the `Ui` trait.
-- **No background processes**: no `shell_bg`, no `/ps`. A long-lived server is out of scope until
-  streaming exists.
+- **No output streaming for one-shot calls**: `shell` still returns when the command ends. A server
+  belongs in `shell_job`, whose output is a log file rather than a live stream.
+- **No `/ps` screen**: `shell_job {"action":"status"}` is the source of truth. A GUI window can be
+  added over the registry without changing lifetime rules.
 - **No network boundary**: a command can download and upload. Nothing here restricts that.
 - **No stdin**: the child's stdin is null; use `echo y | …` inside the command if something prompts.
 

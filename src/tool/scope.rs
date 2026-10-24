@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn below_the_threshold_nothing_is_hidden() {
-        // The default threshold (24): 14 host tools plus a few plugins => full list, byte-identical
+        // The default threshold (24): 16 host tools plus a few plugins => full list, byte-identical
         // to the behaviour before this module existed.
         let s = scope(24, &[]);
         assert!(!s.hides(12));

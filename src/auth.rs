@@ -57,7 +57,11 @@ pub trait Policy: Send + Sync {
 /// A name list rather than "every `ToolKind::Host` tool": `read_file` / `write_file` are host tools
 /// too, and putting a command line and a file write behind one switch would be wrong in both
 /// directions (someone who tightens the shell should not suddenly be prompted on every read).
-const SHELL_TOOLS: [&str; 2] = [crate::tool::shell::SHELL_TOOL, crate::tool::bash::BASH_TOOL];
+const SHELL_TOOLS: [&str; 3] = [
+    crate::tool::shell::SHELL_TOOL,
+    crate::tool::bash::BASH_TOOL,
+    crate::tool::job::JOB_TOOL,
+];
 
 /// The policy decided by `config.toml [auth]`: overrides win (by tool name, then
 /// by plugin name), otherwise the tool's category default applies.

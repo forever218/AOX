@@ -919,6 +919,11 @@ async fn boot_and_run(
         for t in aox::tool::bash::bash_tools(&rt) {
             rt.register(t).await?;
         }
+        // Long-lived jobs (`shell_job`): same host-owned Job fence as a one-shot call, but the
+        // runtime keeps it, so a dev server survives the calls that use it.
+        for t in aox::tool::job::job_tools() {
+            rt.register(t).await?;
+        }
     }
     for t in aox::tool::verify::verify_tools() {
         rt.register(t).await?;

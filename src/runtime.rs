@@ -50,6 +50,12 @@ pub struct Runtime {
     runtimes: std::sync::RwLock<RuntimesConfig>,
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
     pub plugins: Mutex<HashMap<String, Arc<PluginHandle>>>,
+    /// Long-lived shell jobs (`shell_job`, see `src/jobs.rs`).
+    ///
+    /// One record owns one fenced process tree. The registry — not the launching tool call — is what
+    /// keeps the fence alive, so a dev server survives across calls and is still killed when the
+    /// record is dropped (explicit stop, lifetime expiry, or host exit).
+    pub jobs: Mutex<crate::jobs::Jobs>,
     /// Tool names the user chose "always allow" for in this session
     pub session_allowed: RwLock<HashSet<String>>,
     /// The system prompt's **segment registry** (`src/prompt.rs`).
@@ -180,7 +186,7 @@ impl Runtime {
         // **at startup** — the same principle as `[store] backend` / `[loop] impl`
         // (something configured but not taking effect is the hardest to diagnose).
         let workplace = crate::workplace::Workplace::new(config.workplace.clone(), &root)?;
-        Ok(Arc::new(Self {
+        let rt = Arc::new(Self {
             config,
             auth,
             store,
@@ -189,6 +195,7 @@ impl Runtime {
             runtimes: std::sync::RwLock::new(resolved),
             tools: RwLock::new(HashMap::new()),
             plugins: Mutex::new(HashMap::new()),
+            jobs: Mutex::new(crate::jobs::Jobs::new()),
             session_allowed: RwLock::new(HashSet::new()),
             prompt_segments: std::sync::RwLock::new(prompt_segments),
             hooks,
@@ -196,7 +203,36 @@ impl Runtime {
             sandbox,
             workplace,
             spaces: std::sync::RwLock::new(spaces),
-        }))
+        });
+        rt.start_job_reaper();
+        Ok(rt)
+    }
+
+    /// Terminate `shell_job` trees that outlive `[shell] background_max_hours`, even when nobody is
+    /// talking to the model.
+    ///
+    /// The same check runs before every request and every `shell_job` action; this task is what makes
+    /// the cap true for an idle window too. A `Weak` is used so the reaper never keeps the runtime (or
+    /// its process fences) alive. `try_current` keeps `Runtime::new` usable from a synchronous test
+    /// context — there is simply no timer to spawn there.
+    fn start_job_reaper(self: &Arc<Self>) {
+        let hours = self.config.shell.background_max_hours;
+        if hours == 0 {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        handle.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let Some(rt) = weak.upgrade() else { break };
+                let _ = rt.jobs.lock().await.expire(hours);
+            }
+        });
     }
 
     /// A snapshot of the space registry.

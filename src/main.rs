@@ -8,6 +8,7 @@ mod config;
 mod history;
 mod hook;
 mod i18n;
+mod jobs;
 mod llm;
 mod message;
 mod notes;
@@ -406,6 +407,11 @@ async fn main() -> Result<()> {
         // The POSIX shell. Registered **only when a real bash was found**: a tool that can only fail
         // would cost the model a round trip to learn what `[shell] bash` already knows.
         for t in tool::bash::bash_tools(&rt) {
+            rt.register(t).await?;
+        }
+        // Long-lived jobs (`shell_job`). Registered even when the limit is 0, because status/logs/
+        // stop must stay available to clean up jobs started before the limit was tightened.
+        for t in tool::job::job_tools() {
             rt.register(t).await?;
         }
     }

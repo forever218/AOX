@@ -22,6 +22,7 @@ pub mod history;
 pub mod hook;
 pub mod i18n;
 pub mod image;
+pub mod jobs;
 pub mod llm;
 pub mod message;
 pub mod paths;

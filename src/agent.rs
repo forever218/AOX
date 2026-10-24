@@ -1135,11 +1135,13 @@ impl Agent {
         match kind {
             ToolKind::Meta => None,
             ToolKind::Host => {
-                // The shell tools carry their directory in `cwd`, not in `path` — and a missing
-                // `path` here makes the generic branch below return `None` through `?`, i.e. **allow
-                // the call**. That is why they are handled first and explicitly: "no parameter" must
-                // never quietly mean "no boundary".
-                if name == crate::tool::shell::SHELL_TOOL {
+                // The shell tools (including `shell_job`) carry their directory in `cwd`, not in
+                // `path` — and a missing `path` here makes the generic branch below return `None`
+                // through `?`, i.e. **allow the call**. That is why they are handled first and
+                // explicitly: "no parameter" must never quietly mean "no boundary".
+                if name == crate::tool::shell::SHELL_TOOL
+                    || name == crate::tool::job::JOB_TOOL
+                {
                     let raw = args.get("cwd").and_then(|v| v.as_str())?;
                     return self
                         .rt

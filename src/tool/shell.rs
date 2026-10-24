@@ -155,6 +155,75 @@ pub(crate) async fn run_shell(
     forced: Option<Dialect>,
 ) -> Result<ToolOutput, String> {
     let cfg = &rt.config.shell;
+    let prepared = prepare(args, rt, forced)?;
+    let dialect = prepared.dialect;
+    let cwd = prepared.cwd.clone();
+    let ws = prepared.workspace.clone();
+    let boundary_note = prepared.boundary;
+
+    let started = Instant::now();
+    let spec = Spec {
+        dialect,
+        command: prepared.script,
+        cwd: cwd.clone(),
+        timeout: Duration::from_secs(call_timeout(args, rt)),
+        idle: call_idle(args, rt),
+        env: prepared.env,
+        // Always false: see the note in `prepare`. The helper still supports it, and the measurement
+        // that made it useless lives in `docs/SHELL.md`.
+        lowil: false,
+    };
+
+    let outcome = match runner::run(rt, &spec).await {
+        Ok(o) => o,
+        // `NoBoundary` cannot happen while `lowil` is false, but the helper is a separate binary and a
+        // mismatch between the two would otherwise surface as "no such variant" far from here.
+        Err(Failure::NoBoundary(why)) | Err(Failure::Spawn(why)) => return Err(why),
+    };
+
+    let mut text = format_outcome(&outcome, dialect, &cwd, boundary_note);
+    if cfg.track_changes && outcome.stopped.is_none() {
+        let changed = changed_since(&ws, started);
+        if !changed.is_empty() {
+            text.push_str(&crate::tf!("\nchanged: {} file(s)\n", changed.len()));
+            for p in changed.iter().take(40) {
+                text.push_str(&format!("  {}\n", p.display()));
+            }
+            if changed.len() > 40 {
+                text.push_str(&crate::tf!("  … and {} more\n", changed.len() - 40));
+            }
+        }
+    }
+
+    let failed = outcome.stopped.is_some() || outcome.code != Some(0);
+    let mut out = ToolOutput::ok(text);
+    out.is_error = failed;
+    Ok(out)
+}
+
+/// Everything a command needs before it is spawned, after policy has been applied.
+///
+/// Shared by the one-shot path and `shell_job`: a background command must pass the **same** cwd
+/// check, command scan, bash prologue and environment setup as a foreground one. Keeping this in
+/// one function is what stops "background" from becoming a second, weaker execution path.
+pub(crate) struct Prepared {
+    pub dialect: Dialect,
+    /// The command's script after the bash prologue (for `cmd` / PowerShell: unchanged).
+    pub script: String,
+    /// The model's own line, for display.
+    pub command: String,
+    pub cwd: PathBuf,
+    pub workspace: PathBuf,
+    pub env: Vec<(String, String)>,
+    pub boundary: Boundary,
+}
+
+/// Parse and validate a command against the workplace, producing a spawn-ready description.
+pub(crate) fn prepare(
+    args: &Value,
+    rt: &Arc<Runtime>,
+    forced: Option<Dialect>,
+) -> Result<Prepared, String> {
     let command = args
         .get("command")
         .and_then(|v| v.as_str())
@@ -172,7 +241,7 @@ pub(crate) async fn run_shell(
                 let raw = v.as_str().unwrap_or("");
                 Dialect::parse(raw).ok_or_else(|| {
                     crate::tf!(
-                        "{} is not a shell this tool has. Valid values: cmd, pwsh, powershell, git.",
+                        "{} is not a shell this tool has. Valid values: cmd, bash, pwsh, powershell, git.",
                         format!("{raw:?}")
                     )
                 })?
@@ -226,8 +295,7 @@ pub(crate) async fn run_shell(
     // inside the workspace fail too. `docs/SHELL.md` records the measurements and what would have to be
     // different for it to work. Shipping a `boundary = "kernel"` switch would promise something the
     // program cannot deliver, so there is no switch.
-    let boundary_note =
-        if unrestricted { Boundary::Unrestricted } else { Boundary::GuardRail };
+    let boundary = if unrestricted { Boundary::Unrestricted } else { Boundary::GuardRail };
 
     // A bash script gets the host's two exports in front of it (workspace in both path forms). It is a
     // prefix rather than a file on purpose: no dotfiles, nothing to clean up, and the model's own script
@@ -238,50 +306,21 @@ pub(crate) async fn run_shell(
         command.to_string()
     };
 
-    let started = Instant::now();
-    let spec = Spec {
+    Ok(Prepared {
         dialect,
-        command: script,
-        cwd: cwd.clone(),
-        timeout: Duration::from_secs(call_timeout(args, rt)),
-        idle: call_idle(args, rt),
-        env: child_env(rt, &ws, boundary_note),
-        // Always false: see the note above. The helper still supports it, and the measurement that
-        // made it useless lives in `docs/SHELL.md`.
-        lowil: false,
-    };
-
-    let outcome = match runner::run(rt, &spec).await {
-        Ok(o) => o,
-        // `NoBoundary` cannot happen while `lowil` is false, but the helper is a separate binary and a
-        // mismatch between the two would otherwise surface as "no such variant" far from here.
-        Err(Failure::NoBoundary(why)) | Err(Failure::Spawn(why)) => return Err(why),
-    };
-
-    let mut text = format_outcome(&outcome, dialect, &cwd, boundary_note);
-    if cfg.track_changes && outcome.stopped.is_none() {
-        let changed = changed_since(&ws, started);
-        if !changed.is_empty() {
-            text.push_str(&crate::tf!("\nchanged: {} file(s)\n", changed.len()));
-            for p in changed.iter().take(40) {
-                text.push_str(&format!("  {}\n", p.display()));
-            }
-            if changed.len() > 40 {
-                text.push_str(&crate::tf!("  … and {} more\n", changed.len() - 40));
-            }
-        }
-    }
-
-    let failed = outcome.stopped.is_some() || outcome.code != Some(0);
-    let mut out = ToolOutput::ok(text);
-    out.is_error = failed;
-    Ok(out)
+        script,
+        command: command.to_string(),
+        env: child_env(rt, &ws, boundary),
+        cwd,
+        workspace: ws,
+        boundary,
+    })
 }
 
 /// Which boundary this call actually got — reported in the header, because "the write was refused"
 /// means something different in each case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Boundary {
+pub(crate) enum Boundary {
     /// The command scan only. A guard rail: it stops the obvious out-of-bounds writes and produces a
     /// readable refusal, and it is bypassable by construction (`-EncodedCommand`, a script file, a
     /// child process). The name says "only" so nobody mistakes it for a kernel boundary.
@@ -396,7 +435,8 @@ fn format_outcome(
     match o.stopped {
         Some(Stop::Timeout(budget)) => s.push_str(&crate::tf!(
             "TIMED OUT after {} s (the call's budget was {} s) — the whole process tree was \
-             terminated.\n",
+             terminated. A server never exits, so a larger timeout cannot help; use \
+             shell_job {action:\"start\"} for a long-lived process.\n",
             format!("{:.0}", o.elapsed.as_secs_f64()),
             budget.as_secs()
         )),
@@ -407,11 +447,27 @@ fn format_outcome(
             "KILLED after {} s: it wrote nothing to stdout or stderr for {} s, which is how a \
              wedged process looks. The whole tree was terminated; whatever it printed before that is \
              below. If the silence was expected — a `sleep`, a download with no progress output — \
-             retry with a larger `idle_secs` (0 turns the watchdog off for that call).\n",
+             retry with a larger `idle_secs` (0 turns the watchdog off for that call). If this is a \
+             server or watcher, do not raise the budget: use shell_job {action:\"start\"} so it can \
+             outlive the call.\n",
             format!("{:.0}", o.elapsed.as_secs_f64()),
             idle.as_secs()
         )),
         None => {}
+    }
+    // The command detached something and the fence is about to take it away. Without this sentence
+    // the model sees only "exit 0, no output, port closed" and retries the same command — which is
+    // exactly the loop this feature exists to end.
+    if o.stopped.is_none() {
+        if let Some(n) = o.left_behind.filter(|n| *n > 0) {
+            s.push_str(&crate::tf!(
+                "host: this call returned, but {} background process(es) it had started were \
+                 terminated with its Job. A shell call cannot leave a server running. For a \
+                 long-lived process use shell_job (action \"start\") instead of `&`, `nohup` or \
+                 `start /b`.\n",
+                n
+            ));
+        }
     }
     s.push_str(&crate::tf!(
         "exit {} · {} s · {} · boundary: {} · cwd {}\n",
@@ -921,5 +977,51 @@ mod tests {
         assert_eq!(tokenize(r#"echo "a b" | more"#), vec!["echo", "a b", "|", "more"]);
         assert_eq!(tokenize("a && b || c"), vec!["a", "&&", "b", "||", "c"]);
         assert_eq!(tokenize(r"x > out.txt"), vec!["x", ">", "out.txt"]);
+    }
+
+    /// A one-shot call that detaches a child must say so. Without this sentence the model sees a
+    /// successful, silent command followed by a closed port, and its only apparent option is to run
+    /// the same thing again.
+    #[tokio::test]
+    async fn a_detached_child_is_reported_as_terminated() {
+        if !cfg!(windows) {
+            return;
+        }
+        let host = ["target/debug/aox.exe", "target/release/aox.exe"]
+            .iter()
+            .map(|rel| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel))
+            .find(|p| p.is_file());
+        let Some(host) = host else { return };
+        crate::shell::runner::use_test_host(host);
+
+        let dir = std::env::temp_dir().join("aox-shell-detached-child");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::dummy();
+        cfg.workplace = crate::config::WorkplaceConfig {
+            mode: "fixed".into(),
+            root: Some(dir.to_string_lossy().into_owned()),
+        };
+        let rt = crate::runtime::Runtime::new(cfg.clone(), dir.clone(), dir.join("plugins"))
+            .expect("runtime");
+        let tool = shell_tools(&cfg.shell).into_iter().next().expect("shell tool");
+
+        let out = tool
+            .call(
+                json!({
+                    "command": "start /b ping -n 8 127.0.0.1",
+                    "purpose": "detached-child probe"
+                }),
+                &rt,
+            )
+            .await;
+        assert!(
+            out.content.contains("background process(es)"),
+            "a detached child must be reported, not silently killed:\n{}",
+            out.content
+        );
+        assert!(out.content.contains("shell_job"), "{}", out.content);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -274,7 +274,7 @@ pub struct ToolsConfig {
     /// Registry size at or below which the whole list is sent (old behaviour). `0` = never hide
     /// plugin tools, ever — the permanent escape hatch.
     ///
-    /// The default (24) is picked so that the 14 host tools plus a handful of plugins stay fully
+    /// The default (24) is picked so that the 16 host tools plus a handful of plugins stay fully
     /// inline: discovery costs a round trip, and paying it to save a few hundred tokens is a bad
     /// trade. It starts paying when a registry holds dozens of tools.
     pub inline_max: usize,
@@ -706,6 +706,25 @@ pub struct ShellConfig {
     /// (`cargo` → `rustc` × N), so the fence is created regardless of `[sandbox] enabled`.
     /// `0` = the command may not spawn anything at all.
     pub max_processes: u32,
+    /// How many **long-lived** `shell_job` trees may exist at once. `0` disables the tool.
+    ///
+    /// Separate from `max_processes`: that one is the process allowance *inside one Job*, this one
+    /// is how many Jobs are allowed to stay alive across calls. A dev server, a watcher and a
+    /// preview process all have legitimate reasons to coexist, but an unbounded set of them is just
+    /// the orphan-process problem with better bookkeeping.
+    pub background_max_jobs: usize,
+    /// Process allowance **inside one background Job**.
+    ///
+    /// Browser-driven checks are the reason this is larger than [`Self::max_processes`]: a single
+    /// Chromium launch can occupy a dozen processes before the site has even rendered. `0` means
+    /// the helper may not start a command at all and is rejected by the tool.
+    pub background_max_processes: u32,
+    /// Maximum lifetime of one background job, in hours. `0` = no expiry (stop explicitly instead).
+    ///
+    /// Expiry is checked when `shell_job` is used and before every agent request; a job cannot slip
+    /// past it just because the model stopped asking. The hard guarantee remains host exit: the
+    /// registry owns every fence, so closing it kills all trees at once.
+    pub background_max_hours: u64,
     /// Point build caches at the workspace (`CARGO_HOME`, `NPM_CONFIG_CACHE`, `PIP_CACHE_DIR`,
     /// `TMP`/`TEMP`) instead of the user profile.
     ///
@@ -735,6 +754,9 @@ impl Default for ShellConfig {
             idle_timeout_secs: 30,
             max_output_bytes: 128 * 1024,
             max_processes: 16,
+            background_max_jobs: 4,
+            background_max_processes: 64,
+            background_max_hours: 2,
             env_cache: true,
             track_changes: true,
         }
@@ -1664,6 +1686,17 @@ api_key = "k"
         assert_eq!(c.sandbox.max_memory_mb, 512);
         assert!(c.sandbox.enabled, "keys that were not written keep their defaults");
         assert!(c.sandbox.ui_limits);
+    }
+
+    /// Background jobs are on by default, but bounded: four trees, 64 processes each, two hours.
+    /// These are not arbitrary — a browser check can exceed the one-shot process allowance, and an
+    /// unbounded lifetime is the orphan-process problem this feature is meant to avoid.
+    #[test]
+    fn background_job_defaults_are_bounded() {
+        let d = ShellConfig::default();
+        assert_eq!(d.background_max_jobs, 4);
+        assert_eq!(d.background_max_processes, 64);
+        assert_eq!(d.background_max_hours, 2);
     }
 
     /// The path to turn the fence off must really exist (it is the only way back).

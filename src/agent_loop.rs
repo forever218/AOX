@@ -31,6 +31,7 @@
 //! trimming naturally belongs to the loop layer: it has to touch both memory and the conversation
 //! file, and it must **rebuild the request** after trimming.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -201,6 +202,11 @@ impl AgentLoop for StandardLoop {
         // "You already asked that" — see `crate::repeat`. Rebuilt per turn: a repeat only counts
         // inside one instruction, never across two.
         let mut guard = crate::repeat::Guard::default();
+        // How many times one **identical** shell command has failed in this turn. This does not
+        // block the retry (a transient failure can genuinely clear), but after the second failure
+        // the model gets a sentence saying the command is unchanged — the loop we saw was four
+        // identical `bash` calls and four identical error blocks.
+        let mut shell_failures: HashMap<String, usize> = HashMap::new();
         // How many model requests this turn has spent (`[loop] max_iters_per_turn` caps it).
         let mut rounds = 0usize;
         // The project's check command, detected **once per turn** (a handful of `metadata` calls).
@@ -222,6 +228,23 @@ impl AgentLoop for StandardLoop {
                 break;
             }
             rounds += 1;
+            // Lifetime cap for `shell_job` trees. Checked before every request so a server cannot
+            // outlive its configured budget just because nobody called `shell_job` again; host exit
+            // remains the hard stop (the registry owns the fences).
+            {
+                let rt = agent.rt();
+                let expired = rt
+                    .jobs
+                    .lock()
+                    .await
+                    .expire(rt.config.shell.background_max_hours);
+                if !expired.is_empty() {
+                    ui.emit(AgentEvent::Warn(crate::tf!(
+                        "background job lifetime reached; stopped: {}",
+                        expired.join(", ")
+                    )));
+                }
+            }
             // ── Context trimming (item 1 of the stage-4 leftovers).
             //    Placed "before this turn's request is assembled": assemble after trimming, so the
             //    model sees the trimmed context.
@@ -501,6 +524,7 @@ impl AgentLoop for StandardLoop {
                 // Kept before `args` is handed to the tool: "did this call run the check" is answered
                 // by the command line, and the command line is inside the arguments.
                 let call_text = if name == "shell" || name == "bash" { Some(args.to_string()) } else { None };
+                let failure_key = call_text.as_ref().map(|t| format!("{name}\u{0}{t}"));
                 let read_only = crate::repeat::Guard::eligible(&rt, &name).await;
                 let repeated = read_only && guard.repeats(&name, &args, agent.messages());
                 // Only reads are ever recorded, so only reads need their arguments kept around.
@@ -560,6 +584,19 @@ impl AgentLoop for StandardLoop {
                     ui.emit(AgentEvent::Recycled(output.recycled));
                 }
                 let mut content = cap_chars(&output.content, rt.config.agent.max_result_chars);
+                // ── "the same command again" ──
+                //
+                // Not a block: the call already ran. The note is for the **next** round — a command
+                // that fails the same way twice is usually a wrong approach (or a long-lived
+                // process mistaken for a one-shot), and silently letting the model try a fifth time
+                // is what turns one bad guess into a whole turn.
+                if let Some(key) = &failure_key {
+                    if let Some(note) =
+                        repeated_shell_failure_note(&mut shell_failures, key, &name, output.is_error)
+                    {
+                        content.push_str(&note);
+                    }
+                }
                 // ── "this write is unverified" ──
                 //
                 // `verify` + the gate only cover tasks that have a checkpoint; a short task had no
@@ -673,6 +710,34 @@ fn produced_files_message(paths: &[PathBuf]) -> (Option<Message>, Vec<PathBuf>, 
             (None, Vec::new(), problems)
         }
     }
+}
+
+/// Count a failed shell command and return the "you are repeating yourself" note on the second and
+/// later identical failures. A later success clears the entry.
+///
+/// Deliberately a note, not a refusal: the command already ran, and a transient failure can clear.
+/// The goal is to make the loop visible to the model, not to make "retry after fixing" impossible.
+fn repeated_shell_failure_note(
+    seen: &mut HashMap<String, usize>,
+    key: &str,
+    name: &str,
+    is_error: bool,
+) -> Option<String> {
+    if !is_error {
+        seen.remove(key);
+        return None;
+    }
+    let n = seen.entry(key.to_string()).or_insert(0);
+    *n += 1;
+    (*n >= 2).then(|| {
+        crate::tf!(
+            "\n\nhost: this exact {} command has now failed {} times in this turn. Running it \
+             unchanged again is unlikely to give a different result — read the error, change the \
+             command, or use shell_job for a process that is meant to stay alive.",
+            name,
+            *n
+        )
+    })
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -920,5 +985,24 @@ mod tests {
         assert_eq!(problems.len(), 1, "{problems:?}");
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The loop we are fixing: four identical failing `bash` calls in a row. The first retry gets a
+    /// pointed note, and a success clears the count so a later unrelated failure starts at one again.
+    #[test]
+    fn a_repeated_failed_shell_command_is_called_out() {
+        let mut seen = HashMap::new();
+        let key = "bash\u{0}{\"command\":\"npm run dev &\"}";
+        assert!(repeated_shell_failure_note(&mut seen, key, "bash", true).is_none());
+        let note = repeated_shell_failure_note(&mut seen, key, "bash", true)
+            .expect("the second identical failure is worth saying");
+        assert!(note.contains("failed 2 times"), "{note}");
+        assert!(note.contains("shell_job"), "{note}");
+        assert!(repeated_shell_failure_note(&mut seen, key, "bash", true)
+            .expect("third failure")
+            .contains("failed 3 times"));
+        // A success is evidence that the command can work; forget the history.
+        assert!(repeated_shell_failure_note(&mut seen, key, "bash", false).is_none());
+        assert!(seen.is_empty());
     }
 }

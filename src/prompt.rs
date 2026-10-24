@@ -409,6 +409,17 @@ fn env_section(rt: &Runtime) -> String {
              test suite\", \"fix the title save\"). That is what the user sees next to the tool name, \
              and `bash`'s name says nothing about the command it is about to run.",
         ));
+        if rt.config.shell.background_max_jobs > 0 {
+            s.push_str(&t(
+                "\n- A `bash` / `shell` call is a **one-shot fenced job**: when it returns, every \
+                 process it started is terminated with it. `&`, `nohup`, `disown` and `start /b` do \
+                 **not** keep a server alive, and adding `timeout_secs` does not change that. For a \
+                 dev server, watcher or preview process, use `shell_job {action:\"start\"}`; then \
+                 use ordinary `bash`/`shell` for `curl` and screenshots, `shell_job` `logs` for its \
+                 output, and `shell_job` `stop` when done. Never retry a detached server as a \
+                 foreground `bash` call.",
+            ));
+        }
     }
     s
 }

@@ -197,6 +197,38 @@ impl Fence {
             }
         }
     }
+
+    /// How many processes are alive in this Job right now (including the process that holds it).
+    ///
+    /// `None` when there is no Job or the query failed. Two callers need the distinction between
+    /// "the shell helper exited" and "the tree is really empty":
+    /// - a one-shot call can tell the model it left background descendants behind;
+    /// - a managed background job can outlive its shell wrapper and still report `running`.
+    pub fn active_processes(&self) -> Option<u32> {
+        #[cfg(windows)]
+        {
+            if self.job == 0 {
+                return None;
+            }
+            use windows_sys::Win32::System::JobObjects as jo;
+            let mut info: jo::JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: `job` is a live handle owned by this struct; `info` is correctly sized.
+            let rc = unsafe {
+                jo::QueryInformationJobObject(
+                    self.job as _,
+                    jo::JobObjectBasicAccountingInformation,
+                    &mut info as *mut _ as *mut core::ffi::c_void,
+                    std::mem::size_of::<jo::JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            (rc != 0).then_some(info.ActiveProcesses)
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
 }
 
 #[cfg(windows)]

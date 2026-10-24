@@ -4,6 +4,7 @@ pub mod discover;
 pub mod edit;
 pub mod fingerprint;
 pub mod hostfs;
+pub mod job;
 pub mod meta;
 pub mod scope;
 pub mod shell;
@@ -312,14 +313,15 @@ mod tests {
     /// executes is a comment, not a fact. Adding a host tool now breaks this test first.
     #[test]
     fn the_quoted_host_tool_count_matches_reality() {
-        const DOCUMENTED: usize = 15;
+        const DOCUMENTED: usize = 16;
         let n = meta::meta_tools().len()
             + hostfs::host_file_tools().len()
             + ask::ask_tools().len()
             + discover::find_tools().len()
             + task::task_tools().len()
             + verify::verify_tools().len()
-            + shell::shell_tools(&crate::config::ShellConfig::default()).len();
+            + shell::shell_tools(&crate::config::ShellConfig::default()).len()
+            + job::job_tools().len();
         assert_eq!(n, DOCUMENTED, "update every doc that quotes the host tool count");
     }
 }

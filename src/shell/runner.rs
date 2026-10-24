@@ -37,6 +37,28 @@ use super::helper::{self, HelperSpec};
 use crate::plugin::ProcessFlags;
 use crate::runtime::Runtime;
 
+/// Test-only override for "which executable re-enters as the shell helper".
+///
+/// Unit tests run inside a harness binary that does not understand `--aox-shell-exec`. The tests
+/// point this at a freshly built `aox.exe`; production never sets it and always re-enters the actual
+/// host binary.
+#[cfg(test)]
+static TEST_HOST: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn use_test_host(path: std::path::PathBuf) {
+    *TEST_HOST.lock().unwrap() = Some(path);
+}
+
+fn host_exe() -> Result<PathBuf, Failure> {
+    #[cfg(test)]
+    if let Some(p) = TEST_HOST.lock().unwrap().clone() {
+        return Ok(p);
+    }
+    std::env::current_exe()
+        .map_err(|e| Failure::Spawn(crate::tf!("could not locate my own exe: {}", e)))
+}
+
 /// Which interpreter the command is handed to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
@@ -239,6 +261,13 @@ pub struct Outcome {
     pub err: Capture,
     /// The call was **stopped by us** (the whole tree was killed), and why.
     pub stopped: Option<Stop>,
+    /// Processes still alive in the Job when the shell finished, before the fence was dropped.
+    ///
+    /// A normal one-shot command leaves 0. A positive number means the command detached something
+    /// (`&`, `nohup`, `start /b`) and the host is about to terminate it with the Job. The model
+    /// cannot see the difference from stdout — the shell exits successfully either way — so this
+    /// count is what turns a puzzling "output was empty and the port is closed" into a fact.
+    pub left_behind: Option<u32>,
 }
 
 /// Why a call was stopped early. Both are the host's decision, never the command's.
@@ -261,8 +290,12 @@ pub enum Failure {
     Spawn(String),
 }
 
-/// Run one command. The caller has already made every policy decision — this only executes.
-pub async fn run(rt: &Arc<Runtime>, spec: &Spec) -> Result<Outcome, Failure> {
+/// Build the host-side helper command: program, helper argv, env and cwd.
+///
+/// Shared by the one-shot runner and the managed background runner. Both **must** take the same
+/// path here: a background command that skipped the bash `PATH` rewrite or the environment
+/// redirection would fail on the exact projects it was meant to serve.
+fn command_for(rt: &Arc<Runtime>, spec: &Spec) -> Result<Command, Failure> {
     // A bash has to be found *before* the command line is built (its path is the program), and its
     // `PATH` must be rewritten: MSYS would otherwise treat every `C:\…` entry as a relative POSIX path.
     let bash = match spec.dialect {
@@ -287,19 +320,86 @@ pub async fn run(rt: &Arc<Runtime>, spec: &Spec) -> Result<Outcome, Failure> {
     };
     let encoded = serde_json::to_string(&helper_spec)
         .map_err(|e| Failure::Spawn(crate::tf!("could not encode the shell spec: {}", e)))?;
-
-    let exe = std::env::current_exe()
-        .map_err(|e| Failure::Spawn(crate::tf!("could not locate my own exe: {}", e)))?;
-
-    // The fence is created **regardless of `[sandbox] enabled`**: a timeout must kill the whole
-    // tree, and that is a correctness need, not a hardening option.
-    let sandbox = crate::sandbox::Sandbox::for_shell(rt.config.shell.max_processes);
+    let exe = host_exe()?;
 
     let mut cmd = Command::new(&exe);
     cmd.arg(helper::FLAG)
         .env(helper::SPEC_ENV, encoded)
-        .current_dir(&spec.cwd)
-        .stdin(Stdio::null())
+        .current_dir(&spec.cwd);
+    Ok(cmd)
+}
+
+/// A shell process that is deliberately allowed to outlive its call.
+///
+/// The `Fence` is **not** a local of this function's caller: it is moved into the job registry, so
+/// `KILL_ON_JOB_CLOSE` fires when the registry drops the record (explicit stop, lifetime expiry, or
+/// host exit) rather than when the launching tool call returns.
+pub struct Background {
+    pub child: Child,
+    pub fence: crate::sandbox::Fence,
+    pub started: Instant,
+}
+
+/// Start a command and keep its process tree alive under a caller-owned Job.
+///
+/// Output goes to `log` instead of pipes: nobody may be reading for minutes, and a full pipe would
+/// block the server. `spec.timeout` / `spec.idle` are deliberately ignored — a long-lived server has
+/// no meaningful total budget, and its silence is normal.
+///
+/// A background job **requires** a working Job Object. If the fence cannot be fitted, the child is
+/// killed and the call fails: letting it run unwrapped would create exactly the untracked daemon
+/// this feature exists to prevent.
+pub fn spawn_background(
+    rt: &Arc<Runtime>,
+    spec: &Spec,
+    log: &std::path::Path,
+    max_processes: u32,
+) -> Result<Background, Failure> {
+    use std::fs::OpenOptions;
+
+    let out = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map_err(|e| Failure::Spawn(crate::tf!("could not open the job log {}: {}", log.display(), e)))?;
+    let err = out
+        .try_clone()
+        .map_err(|e| Failure::Spawn(crate::tf!("could not duplicate the job log handle: {}", e)))?;
+
+    let sandbox = crate::sandbox::Sandbox::for_shell(max_processes);
+    let mut cmd = command_for(rt, spec)?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .process_flags(sandbox.create_flags());
+
+    let started = Instant::now();
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Failure::Spawn(crate::tf!("could not start the background command: {}", e)))?;
+    let fence = sandbox.contain(&child);
+    if !fence.active {
+        let why = fence
+            .reason
+            .clone()
+            .unwrap_or_else(|| crate::i18n::t("the Job Object could not be fitted").to_string());
+        let _ = child.start_kill();
+        return Err(Failure::Spawn(crate::tf!(
+            "refusing to run an untracked background process: {}",
+            why
+        )));
+    }
+    Ok(Background { child, fence, started })
+}
+
+/// Run one command. The caller has already made every policy decision — this only executes.
+pub async fn run(rt: &Arc<Runtime>, spec: &Spec) -> Result<Outcome, Failure> {
+    // The fence is created **regardless of `[sandbox] enabled`**: a timeout must kill the whole
+    // tree, and that is a correctness need, not a hardening option.
+    let sandbox = crate::sandbox::Sandbox::for_shell(rt.config.shell.max_processes);
+
+    let mut cmd = command_for(rt, spec)?;
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // `CREATE_SUSPENDED` when the fence is on, so the process cannot run one line before it is in
@@ -379,7 +479,17 @@ pub async fn run(rt: &Arc<Runtime>, spec: &Spec) -> Result<Outcome, Failure> {
         return Err(Failure::Spawn(why));
     }
 
-    Ok(Outcome { code, elapsed, out, err, stopped })
+    // Read the tree's size **after** the shell itself has been reaped and before this function
+    // returns. Anything still in the Job at this point was detached by the command and is about to
+    // be terminated. Terminate it now rather than waiting for `Fence::drop`: a detached child may be
+    // holding the stdout pipe open, and the capture join would otherwise sit out its 3 s grace for a
+    // command that already finished.
+    let left_behind = if stopped.is_some() { Some(0) } else { fence.active_processes() };
+    if left_behind.unwrap_or(0) > 0 {
+        fence.terminate();
+    }
+
+    Ok(Outcome { code, elapsed, out, err, stopped, left_behind })
 }
 
 /// How often the wait loop looks at the child. Also the resolution of both deadlines — a 30 s idle

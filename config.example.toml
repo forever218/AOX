@@ -409,6 +409,12 @@ idle_timeout_secs = 30    # kill a call that prints nothing for this long (0 = o
                           # A call may raise it via its own `idle_secs` (e.g. a long `sleep`).
 max_output_bytes = 131072 # per stream; beyond it the head and the tail are kept
 max_processes = 16        # one Job Object per call; 0 = the command may not spawn anything
+# Long-lived jobs (`shell_job`, for `npm run dev` and similar). They are still Job Objects with
+# KILL_ON_JOB_CLOSE; the runtime owns them so they survive the launching call, and explicit `stop`,
+# the lifetime cap, or AOX exiting still kills the whole tree.
+background_max_jobs = 4       # 0 disables background jobs
+background_max_processes = 64 # per job; browsers need more than a build
+background_max_hours = 2      # 0 = no lifetime cap (stop explicitly)
 env_cache = true          # point CARGO_HOME / npm / pip / TMP into <workspace>\.aox
 track_changes = true      # report which workspace files the call changed
 # There is deliberately no `boundary` switch: the only layer is the host's command scan, and
