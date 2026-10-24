@@ -118,6 +118,90 @@ struct StepView {
     /// Whether the row is unfolded. Clicking it flips this — possible only when there is a
     /// `diff_detail` to unfold, which is also exactly when the row shows its caret.
     expanded: bool,
+    /// Images this call handed to the model (`attach_file`, or a plugin's `attach` declaration).
+    ///
+    /// Stored on the call, not as a separate transcript entry: the picture answers "what did this
+    /// step produce", so it belongs directly under this row. The old separate `Images` item put
+    /// every tool picture at the **top** of the conversation, detached from the call that made it.
+    images: Vec<PathBuf>,
+}
+
+/// Compare two local paths the way Windows does: separators and letter case are not identity.
+fn same_path(a: &Path, b: &Path) -> bool {
+    fn norm(p: &Path) -> String {
+        p.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    }
+    norm(a) == norm(b)
+}
+
+/// The `path` argument of a call, when it has one and the arguments can still be parsed.
+fn call_path(st: &StepView) -> Option<PathBuf> {
+    let v: serde_json::Value = serde_json::from_str(&st.args).ok()?;
+    v.get("path").and_then(|p| p.as_str()).map(PathBuf::from)
+}
+
+/// Put one tool's images under the call that produced them.
+///
+/// First choice is the call whose `path` argument **is** this file (`attach_file`'s exact case;
+/// this also keeps two `attach_file` calls in one response from swapping pictures). A plugin's
+/// attachments carry no path in the call arguments, so they fall back to the latest call of the
+/// same name. Appending rather than replacing matters: one call may attach several files.
+fn attach_tool_images(steps: &mut [StepView], tool: &str, paths: &[PathBuf]) {
+    for path in paths {
+        let exact = steps
+            .iter()
+            .rposition(|s| s.name == tool && call_path(s).is_some_and(|p| same_path(&p, path)));
+        let fallback = || {
+            steps
+                .iter()
+                .rposition(|s| s.name == tool && s.result.is_some())
+                .or_else(|| steps.iter().rposition(|s| s.name == tool))
+                .or_else(|| steps.len().checked_sub(1))
+        };
+        let Some(i) = exact.or_else(fallback) else { continue };
+        if !steps[i].images.iter().any(|p| same_path(p, path)) {
+            steps[i].images.push(path.clone());
+        }
+    }
+}
+
+/// Find the call that produced a file when replaying history.
+///
+/// History has no call id and no per-event owner, so the matching is deliberately conservative:
+/// exact `path` argument first, then the most recent `attach_file`, then the last completed call
+/// (a plugin's `attach` has no path to match). Paths that cannot be matched still land on the last
+/// call rather than at the top of the conversation.
+fn attach_history_images(p: &mut Process, paths: &[PathBuf]) {
+    for path in paths {
+        // `attach_file` first: a batch may also contain a `write_file` to the same path, and that
+        // call did not produce this attachment. A path match on another tool (a plugin that takes
+        // `path` arguments) is the second-best evidence.
+        let exact = p
+            .steps
+            .iter()
+            .rposition(|s| {
+                s.name == "attach_file" && call_path(s).is_some_and(|q| same_path(&q, path))
+            })
+            .or_else(|| {
+                p.steps
+                    .iter()
+                    .rposition(|s| call_path(s).is_some_and(|q| same_path(&q, path)))
+            });
+        let fallback = || {
+            p.steps
+                .iter()
+                .rposition(|s| s.name == "attach_file" && s.result.is_some())
+                .or_else(|| p.steps.iter().rposition(|s| s.result.is_some()))
+                .or_else(|| p.steps.len().checked_sub(1))
+        };
+        let Some(i) = exact.or_else(fallback) else { continue };
+        if !p.steps[i].images.iter().any(|q| same_path(q, path)) {
+            p.steps[i].images.push(path.clone());
+        }
+    }
 }
 
 /// A tool call the model is **still writing** — its arguments are arriving in fragments.
@@ -162,14 +246,12 @@ enum Item {
     Assistant(String),
     Process(Process),
     Note(NoteKind, String),
-    /// An **image** carried by the previous message, drawn as its own block below it.
+    /// Images attached to a **user's own message**, drawn as its own block below the bubble.
     ///
-    /// Why a separate Item rather than a field on `User` / `Note`: images have two sources
-    /// (dragged in by the user, produced by a tool/plugin) which land on `User` and `Note`
-    /// respectively, yet **the drawing is exactly the same**. With a variant of its own the
-    /// rendering is written once, and it won't need changing again when a future
-    /// "message type with images" shows up (changing a variant touches every construction
-    /// site).
+    /// Tool-produced images do **not** live here any more: they belong to the call that made them
+    /// (`StepView::images`), so each picture appears under its own `attach_file` row instead of in
+    /// a detached block above it. This variant is still the right shape for a user's drag-and-drop
+    /// attachments, whose owner is the message bubble itself.
     Images(Vec<PathBuf>),
     /// One turn's token breakdown. It sits right under that turn's AI reply -- the bill
     /// belongs next to where it was spent, not piled into a top bar for the user to match
@@ -868,7 +950,7 @@ impl App {
             plan_open: false,
             plan_t: 0.0,
             plan_anim: None,
-            composer_base_h: COMPOSER_RESERVE,
+            composer_base_h: COMPOSER_FIRST_FRAME_H,
         };
         if demo {
             seed_demo(&mut app);
@@ -2377,6 +2459,7 @@ impl App {
                 // Not known until the call returns, and there is nothing to unfold before that.
                 diff_detail: None,
                 expanded: false,
+                images: Vec::new(),
             });
             l.steps.len() - 1
         } else {
@@ -2517,6 +2600,7 @@ impl App {
                             diff: None,
                             diff_detail: None,
                             expanded: false,
+                            images: Vec::new(),
                         });
                     }
                 }
@@ -2643,15 +2727,22 @@ impl App {
                     ),
                 );
             }
-            AgentEvent::Images(paths) => {
-                // Images produced by a tool: **drawn right here**.
+            AgentEvent::ToolImages { tool, paths } => {
+                // Images produced by a tool: **attached to that call's own row**.
                 //
-                // Before this, the flow had an ending that made no sense: the model would say "the
-                // image is ready, just look at the one above", and on the human side there was
-                // nothing -- the image went into **the request sent to the model**, and the UI only
-                // drew the accompanying sentence as a tiny dot. So the model could see it and the
-                // person couldn't; of the two front ends, only the graphical one had this problem.
-                self.items.push(Item::Images(paths));
+                // It used to be a separate `Item::Images`, which could only sit in the transcript's
+                // normal flow -- and because the host message carrying the attachments starts a new
+                // user message, that meant the picture appeared at the top of a fresh block, with a
+                // visible "(host hint) …" sentence beside it. The hint is protocol, not content: it
+                // stays in the model's request but is no longer drawn. The picture now belongs to
+                // the call that produced it.
+                if let Some(l) = self.live.as_mut() {
+                    attach_tool_images(&mut l.steps, &tool, &paths);
+                } else {
+                    // Late event (no turn in flight): keep it rather than dropping it, but still
+                    // below the conversation instead of pretending it belongs to a call.
+                    self.items.push(Item::Images(paths));
+                }
                 self.force_follow = true;
             }
             AgentEvent::Error(m) => {
@@ -3036,6 +3127,18 @@ impl App {
     ///     would mean writing the same thing twice;
     /// (2) one sweep is **idempotent** -- a path that already has an entry isn't queued again,
     ///     so no convention like "remember to call this after step X" is needed.
+    /// Collect the image paths that still need a texture, deduplicated.
+    ///
+    /// Kept outside `poll_images` so the three sources listed there share one rule for "is this
+    /// worth decoding"; a second copy is how one of them ends up showing "Decoding image…" forever.
+    fn queue_images(want: &mut Vec<PathBuf>, tex: &HashMap<PathBuf, Tex>, paths: &[PathBuf]) {
+        for p in paths {
+            if looks_like_image(p) && !tex.contains_key(p) && !want.contains(p) {
+                want.push(p.clone());
+            }
+        }
+    }
+
     fn poll_images(&mut self, ctx: &egui::Context) {
         // ① Collect: finished decodes become textures (`try_recv` doesn't block the UI)
         let done: Vec<(PathBuf, Result<aox::image::Bitmap, String>)> = self
@@ -3064,17 +3167,26 @@ impl App {
             self.tex.insert(p, entry);
         }
 
-        // ② Queue: ones not yet queued go into the queue
+        // ② Queue: ones not yet queued go into the queue.
+        //
+        // Three sources: a user's own attachments (`Item::Images`), images produced by tools and
+        // already sitting under their call row (`Item::Process`), and the same thing while the turn
+        // is still running (`Live::steps`).
         let mut want: Vec<PathBuf> = Vec::new();
         for it in &self.items {
-            if let Item::Images(paths) = it {
-                for p in paths {
-                    // Deduplicate (the same image can be listed twice in one message), and pick
-                    // only the ones that look like images
-                    if looks_like_image(p) && !self.tex.contains_key(p) && !want.contains(p) {
-                        want.push(p.clone());
+            match it {
+                Item::Images(paths) => Self::queue_images(&mut want, &self.tex, paths),
+                Item::Process(p) => {
+                    for st in &p.steps {
+                        Self::queue_images(&mut want, &self.tex, &st.images);
                     }
                 }
+                _ => {}
+            }
+        }
+        if let Some(l) = &self.live {
+            for st in &l.steps {
+                Self::queue_images(&mut want, &self.tex, &st.images);
             }
         }
         // At most 4 decode threads per frame: a screen with twenty images shouldn't spin up
@@ -3452,9 +3564,15 @@ impl App {
         }
     }
 
-    fn transcript(&mut self, ui: &mut Ui) {
+    /// `composer_top` is the input card's **actual** top edge for this frame. The viewport stops
+    /// there instead of running to the window's bottom edge: the card is a floating `Area`, so
+    /// without this boundary the conversation keeps painting underneath it and the last lines (and
+    /// the per-turn cache-hit block) are permanently half-covered.
+    fn transcript(&mut self, ui: &mut Ui, composer_top: f32) {
         let avail = ui.available_width();
         let (inner, pad) = column(avail);
+        let viewport_top = ui.cursor().top();
+        let viewport_h = (composer_top - viewport_top).max(0.0);
         // What a **relative** path in a reply is relative to, for the two leaf consumers that are
         // several layers of painting code away from here (`markdown::scan`'s inline-code paths and
         // the file name on a tool-call row). The workspace root, not the app root: that is the
@@ -3463,6 +3581,8 @@ impl App {
             &self.ws.view().and_then(|v| v.root.clone()).unwrap_or_else(aox::paths::app_root),
         );
         let out = ScrollArea::vertical()
+            .max_height(viewport_h)
+            .min_scrolled_height(viewport_h)
             .auto_shrink([false, false])
             .stick_to_bottom(self.follow || self.force_follow)
             .show(ui, |ui| {
@@ -3502,7 +3622,7 @@ impl App {
                             match item {
                                 Item::User(t, files) => user_bubble(ui, t, files, inner * 0.80),
                                 Item::Assistant(t) => assistant_block(ui, t, inner),
-                                Item::Process(p) => process_block(ui, p, inner),
+                                Item::Process(p) => process_block(ui, p, inner, tex),
                                 Item::Note(k, t) => note_row(ui, *k, t),
                                 Item::Images(paths) => images_block(ui, paths, inner, tex),
                                 Item::Usage(t) => usage_row(ui, t),
@@ -3512,9 +3632,9 @@ impl App {
                         if self.live.is_some() {
                             self.live_block(ui, inner);
                         }
-                        // Reserve the floating input box's height at the end, so the last message
-                        // can scroll above it instead of being permanently half-covered.
-                        ui.add_space(COMPOSER_RESERVE + self.plan_block_height());
+                        // The viewport already ends above the card; this is breathing room for its
+                        // top edge and shadow, not a second copy of the composer's height.
+                        ui.add_space(TRANSCRIPT_BOTTOM_GAP);
                     });
                 });
             });
@@ -3618,6 +3738,9 @@ impl App {
         // the whole struct.
         let spin = self.spin;
         let now = self.now();
+        // A different field from `live`, so the two borrows coexist: the rows need the step list
+        // mutably and the images need the decoded textures.
+        let tex = &self.tex;
         let Some(l) = self.live.as_mut() else { return };
         // The live area is cut by **stage**: a stretch of call stream -> one interim reply ->
         // another stretch of call stream -> ...
@@ -3630,7 +3753,7 @@ impl App {
             let from = if seg == 0 { 0 } else { l.cuts.get(seg - 1).copied().unwrap_or(0) };
             let to = l.cuts.get(seg).copied().unwrap_or(l.steps.len()).min(l.steps.len());
             if from < to {
-                calls_card(ui, &mut l.steps[from..to]);
+                calls_card(ui, &mut l.steps[from..to], tex);
                 ui.add_space(14.0);
             }
             if let Some(say) = l.interim.get(seg) {
@@ -4845,6 +4968,7 @@ fn seed_demo(app: &mut App) {
                 diff: None,
                 diff_detail: None,
                 expanded: false,
+                images: Vec::new(),
             },
             StepView {
                 name: "create_plugin".into(),
@@ -4856,6 +4980,7 @@ fn seed_demo(app: &mut App) {
                 diff: None,
                 diff_detail: None,
                 expanded: false,
+                images: Vec::new(),
             },
             StepView {
                 name: "write_file".into(),
@@ -4876,6 +5001,7 @@ fn seed_demo(app: &mut App) {
                         .into(),
                 ),
                 expanded: false,
+                images: Vec::new(),
             },
             StepView {
                 name: "filestat_count".into(),
@@ -4887,6 +5013,7 @@ fn seed_demo(app: &mut App) {
                 diff: None,
                 diff_detail: None,
                 expanded: false,
+                images: Vec::new(),
             },
         ],
         interim: vec![aox::i18n::t("Check for existing capabilities to reuse first.").into()],
@@ -5281,14 +5408,21 @@ impl eframe::App for App {
             } else {
                 None
             };
-            // The transcript fills the whole central panel; no bottom bar is given up for the
-            // input box any more
-            self.transcript(ui);
+            // One height, two consumers: the composer is positioned from it, and the transcript
+            // ends there. Computing either independently is how the last line (and the hit-rate
+            // block) ended up behind the card. The plan's height is exact for this frame because
+            // `plan_t` drives it; the rest of the card was measured on the previous frame.
+            let plan_h = self.plan_block_height();
+            let composer_h = self.composer_base_h + plan_h;
+            let composer_top =
+                (column_rect.bottom() - COMPOSER_BOTTOM_GAP - composer_h).max(column_rect.top());
 
-            // The input box became a floating card (a Foreground layer) pressed right on top of
-            // the transcript. Why not put it in a `TopBottomPanel::bottom`: that would permanently
-            // eat a bottom bar, and since the panel's fill matches the background it just looks
-            // like an empty region at the bottom.
+            self.transcript(ui, composer_top);
+
+            // The input box became a floating card (a Foreground layer) ending exactly at the
+            // boundary the transcript stopped at. Why not put it in a `TopBottomPanel::bottom`:
+            // that would permanently eat a bottom bar, and since the panel's fill matches the
+            // background it just looks like an empty region at the bottom.
             // `constrain_to` does two jobs here: it confines the clip region to this column (so it
             // can't cover the content of the layer below), and it makes the anchor's centring
             // reference frame exactly this column.
@@ -5311,9 +5445,7 @@ impl eframe::App for App {
             // the rest of the composer is measured once per frame. Both together give the total
             // height now, so `bottom - height` is a real bottom: the card grows upwards and its
             // bottom stays put.
-            let plan_h = self.plan_block_height();
-            let composer_h = self.composer_base_h + plan_h;
-            let origin = Pos2::new(column_rect.left(), column_rect.bottom() - 18.0 - composer_h);
+            let origin = Pos2::new(column_rect.left(), composer_top);
             egui::Area::new(egui::Id::new("aox-composer"))
                 .order(egui::Order::Foreground)
                 .movable(false)
@@ -5410,11 +5542,18 @@ pub(crate) fn column(available: f32) -> (f32, f32) {
     (inner, pad)
 }
 
-/// The vertical space the floating input box takes up (card height + bottom margin + room for the
-/// shadow).
-/// That much blank is reserved at the end of the transcript, so the last message can't be pressed
-/// under the card.
-const COMPOSER_RESERVE: f32 = 118.0;
+/// First-frame estimate for the floating input box's height, before it has been measured once.
+///
+/// This is **not** the transcript's reserve any more. The viewport's bottom edge is derived from the
+/// same live height that positions the composer (`composer_top`), so the two can never disagree —
+/// the fixed reserve could: it was 118 points while a measured card with a plan open was taller,
+/// and the last lines of the conversation stayed underneath it.
+const COMPOSER_FIRST_FRAME_H: f32 = 118.0;
+/// Gap between the composer card and the window's bottom edge.
+const COMPOSER_BOTTOM_GAP: f32 = 18.0;
+/// Breathing room between the transcript's last line and the composer's top edge. The viewport ends
+/// at the card; this keeps its shadow from touching the text.
+const TRANSCRIPT_BOTTOM_GAP: f32 = 18.0;
 
 /// The plan block inside the input card: header row, one row per step, and the gap under the
 /// divider.
@@ -6686,7 +6825,6 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
         let m = &it.msg;
         match m.role.as_str() {
             "user" => {
-                flush(&mut out, &mut pending);
                 // `flat_text` rather than `content.clone()`: a user message may carry attachments,
                 // in which case content is a parts array -- cloning it directly shows not a single
                 // character. The attachment manifest block the host adds itself is filtered out by
@@ -6700,17 +6838,36 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
                     .as_ref()
                     .map(aox::attach::files_from_content)
                     .unwrap_or_default();
-                if text.trim_start().starts_with(aox::history::HOST_PREFIX) {
+                let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+                let mut paths: Vec<PathBuf> = files.into_iter().map(|(_, p)| p).collect();
+                let from_host = text.trim_start().starts_with(aox::history::HOST_PREFIX);
+
+                // A host message carrying files is the protocol envelope for what a tool just
+                // produced. It is **not** conversation content: the "(host hint) …" sentence was
+                // never meant for the person, and the images belong under the call that made them.
+                // `flat_text` also lists the attachments separately, so `text` would only repeat
+                // what the tool row already says.
+                if from_host && !paths.is_empty() {
+                    if let Some(p) = pending.as_mut() {
+                        attach_history_images(p, &paths);
+                    } else {
+                        // No call to attach to (a truncated/old file): keep the pictures visible,
+                        // but still do not print the host sentence.
+                        out.push(Item::Images(paths));
+                    }
+                    continue;
+                }
+
+                flush(&mut out, &mut pending);
+                if from_host {
                     out.push(Item::Note(NoteKind::Warn, text.trim().to_string()));
                 } else {
-                    out.push(Item::User(
-                        text,
-                        files.iter().map(|(n, _)| n.clone()).collect(),
-                    ));
-                }
-                let paths: Vec<PathBuf> = files.into_iter().map(|(_, p)| p).collect();
-                if !paths.is_empty() {
-                    out.push(Item::Images(paths));
+                    out.push(Item::User(text, names));
+                    // Only a **user's** own attachments get their own block. Tool attachments were
+                    // handled above, on the call they belong to.
+                    if !paths.is_empty() {
+                        out.push(Item::Images(std::mem::take(&mut paths)));
+                    }
                 }
             }
             "assistant" => {
@@ -6757,6 +6914,7 @@ fn items_from_history(loaded: &[aox::history::Loaded]) -> Vec<Item> {
                             diff: None,
                             diff_detail: None,
                             expanded: false,
+                            images: Vec::new(),
                         });
                     }
                 }
@@ -7544,7 +7702,8 @@ fn images_block(ui: &mut Ui, paths: &[PathBuf], inner: f32, tex: &HashMap<PathBu
     for p in paths {
         if !looks_like_image(p) {
             // Not an image (.txt / .zip and the like): there was never meant to be a picture, so
-            // skip quietly. Its name is already in the bubble / notice line above.
+            // skip quietly. A user's bubble lists its file names; a tool's row names the tool and
+            // its result already says what was attached, so neither needs a second line here.
             continue;
         }
         ui.add_space(6.0);
@@ -7621,7 +7780,7 @@ fn error_card(ui: &mut Ui, text: &str, width: f32) {
     ui.add_space(18.0);
 }
 
-fn process_block(ui: &mut Ui, p: &mut Process, width: f32) {
+fn process_block(ui: &mut Ui, p: &mut Process, width: f32, tex: &HashMap<PathBuf, Tex>) {
     let n = p.steps.len();
     // History has no elapsed-time information (that only exists at runtime), so only the step
     // count is reported here.
@@ -7665,6 +7824,20 @@ fn process_block(ui: &mut Ui, p: &mut Process, width: f32) {
     }
     ui.add_space(7.0);
 
+    // Collapsed, the individual rows are not drawn — but a picture the tool produced must not
+    // disappear behind "12 tool calls". Show the batch's images under the summary row; expanded,
+    // each one is drawn under its own call (see `step_row_inner`).
+    if !p.expanded {
+        let images: Vec<PathBuf> = p
+            .steps
+            .iter()
+            .flat_map(|s| s.images.iter().cloned())
+            .collect();
+        if !images.is_empty() {
+            images_block(ui, &images, width, tex);
+        }
+    }
+
     if p.expanded {
         Frame::NONE
             .fill(P::surface())
@@ -7679,7 +7852,7 @@ fn process_block(ui: &mut Ui, p: &mut Process, width: f32) {
                 ui.set_width(w);
                 ui.set_max_width(w);
                 for (i, st) in p.steps.iter_mut().enumerate() {
-                    step_row(ui, st, i);
+                    step_row(ui, st, i, tex);
                 }
                 if !p.interim.is_empty() {
                     ui.add_space(8.0);
@@ -7741,11 +7914,11 @@ fn live_plain_text(ui: &mut Ui, text: &str, color: Color32) {
 /// Two rows in one card can both be unfolded, and each panel is *its own* scroll area and *its own*
 /// draggable height — with a shared id they fight over one offset and one size (user report,
 /// 2026-10-11: "unfold two diff panels and scrolling one scrolls the other too").
-fn step_row(ui: &mut Ui, st: &mut StepView, idx: usize) {
-    ui.push_id(idx, |ui| step_row_inner(ui, st));
+fn step_row(ui: &mut Ui, st: &mut StepView, idx: usize, tex: &HashMap<PathBuf, Tex>) {
+    ui.push_id(idx, |ui| step_row_inner(ui, st, tex));
 }
 
-fn step_row_inner(ui: &mut Ui, st: &mut StepView) {
+fn step_row_inner(ui: &mut Ui, st: &mut StepView, tex: &HashMap<PathBuf, Tex>) {
     // A row with a diff behind it is **foldable** (user request, 2026-10-11: "the file being edited,
     // and clicking it opens the change"). Every other row stays plain and inert.
     let foldable = st.diff_detail.is_some();
@@ -7860,6 +8033,17 @@ fn step_row_inner(ui: &mut Ui, st: &mut StepView) {
             st.expanded = !st.expanded;
         }
     }
+    // Directly below the call, indented under its text column: the answer to "what did this step
+    // produce" sits next to the step, not in a separate block at the top of the conversation.
+    if !st.images.is_empty() {
+        ui.horizontal_top(|ui| {
+            ui.add_space(20.0);
+            ui.vertical(|ui| {
+                let w = ui.available_width();
+                images_block(ui, &st.images, w, tex);
+            });
+        });
+    }
     if st.expanded {
         // Borrowed, never cloned: the transcript is laid out again on every repaint, and this string
         // is the length of the diff.
@@ -7925,7 +8109,7 @@ fn step_diff(ui: &mut Ui, diff: &str) {
 /// The live area gets **one card per stretch** (see the segmentation loop in `live_block`), whereas
 /// the process card puts everything in a single card -- the row rendering is shared, only the
 /// grouping differs.
-fn calls_card(ui: &mut Ui, steps: &mut [StepView]) {
+fn calls_card(ui: &mut Ui, steps: &mut [StepView], tex: &HashMap<PathBuf, Tex>) {
     Frame::NONE
         .fill(P::surface())
         .corner_radius(CornerRadius::same(theme::card_radius()))
@@ -7940,7 +8124,7 @@ fn calls_card(ui: &mut Ui, steps: &mut [StepView]) {
             for (i, st) in steps.iter_mut().enumerate() {
                 // Each row ids itself off its slot (see `step_row`), so panels never share a scroll
                 // offset or a height.
-                step_row(ui, st, i);
+                step_row(ui, st, i, tex);
             }
         });
 }
@@ -8371,6 +8555,122 @@ mod tests {
         assert_eq!(purpose_from_value("read_file", &json!({"path": "a.rs"})), None);
         // Whitespace-only purpose is not a purpose.
         assert_eq!(purpose_from_value("bash", &json!({"purpose": "   ", "command": "dir"})), Some("dir".into()));
+    }
+
+    /// Live events carry only the tool **name**, so the path argument is what keeps two calls of
+    /// the same tool from swapping pictures. A plugin has no path argument; it still lands on the
+    /// most recent call of that tool rather than being dropped.
+    #[test]
+    fn live_tool_images_land_on_the_matching_call() {
+        use serde_json::json;
+
+        let step = |name: &str, args: serde_json::Value| StepView {
+            name: name.into(),
+            plugin: None,
+            purpose: None,
+            subject: None,
+            args: args.to_string(),
+            result: Some((false, "ok".into())),
+            diff: None,
+            diff_detail: None,
+            expanded: false,
+            images: Vec::new(),
+        };
+        let (a, b) = (PathBuf::from(r"C:\shots\a.png"), PathBuf::from(r"C:\shots\b.png"));
+        let mut calls = vec![
+            step("attach_file", json!({"path": a.to_string_lossy()})),
+            step("attach_file", json!({"path": b.to_string_lossy()})),
+            // A plugin's result has no `path` argument to match.
+            step("probe_screen", json!({})),
+        ];
+
+        attach_tool_images(&mut calls, "attach_file", &[b.clone(), a.clone()]);
+        assert_eq!(calls[0].images, vec![a], "exact path wins over call order");
+        assert_eq!(calls[1].images, vec![b], "the second call keeps its own picture");
+
+        attach_tool_images(&mut calls, "probe_screen", &[PathBuf::from(r"C:\shots\c.png")]);
+        assert_eq!(calls[2].images.len(), 1, "a plugin image still attaches to its own tool row");
+        assert_eq!(calls[0].images.len(), 1, "other calls stay untouched");
+    }
+
+    /// History replay must hide the host's attachment sentence and put each picture under the
+    /// `attach_file` call that produced it.
+    ///
+    /// Two calls, two pictures: matching only by tool name would put both under the last row. The
+    /// exact `path` argument is what keeps them apart, and the absence of a `Note` is the other half
+    /// of the user-visible fix (the host sentence is protocol for the model, not conversation text).
+    #[test]
+    fn replayed_tool_images_sit_under_their_own_call_and_hide_the_host_hint() {
+        use aox::message::{FunctionCall, Message, ToolCall};
+
+        let d = std::env::temp_dir().join("aox-gui-images-under-call");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let a = d.join("a.png");
+        let b = d.join("b.png");
+        for p in [&a, &b] {
+            std::fs::write(p, b"\x89PNG\r\n\x1a\n\x00\x00").unwrap();
+        }
+        let call = |id: &str, path: &Path| ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "attach_file".into(),
+                arguments: serde_json::json!({ "path": path }).to_string(),
+            },
+        };
+        let host_text = aox::tf!(
+            "{} the files below were produced by the tool call just now.",
+            aox::history::HOST_PREFIX
+        );
+        let host = Message::user_with_files(
+            &host_text,
+            &[
+                aox::attach::Attachment::probe(a.clone()).unwrap(),
+                aox::attach::Attachment::probe(b.clone()).unwrap(),
+            ],
+        )
+        .unwrap();
+        let loaded = vec![
+            aox::history::Loaded {
+                msg: Message::assistant(None, None, vec![call("c1", &a), call("c2", &b)]),
+                is_error: None,
+            },
+            aox::history::Loaded {
+                msg: Message::tool_result("c1", "attach_file", "attached a".into()),
+                is_error: None,
+            },
+            aox::history::Loaded {
+                msg: Message::tool_result("c2", "attach_file", "attached b".into()),
+                is_error: None,
+            },
+            aox::history::Loaded { msg: host, is_error: None },
+            aox::history::Loaded {
+                msg: Message::assistant(Some("done".into()), None, vec![]),
+                is_error: None,
+            },
+        ];
+
+        let items = items_from_history(&loaded);
+        assert!(
+            !items.iter().any(|it| matches!(it, Item::Note(_, t) if t.contains("(host hint)"))),
+            "the protocol sentence must not be drawn as a transcript note"
+        );
+        assert!(
+            !items.iter().any(|it| matches!(it, Item::Images(_))),
+            "tool images must not become a separate block at the top of a message"
+        );
+        let p = items
+            .iter()
+            .find_map(|it| match it {
+                Item::Process(p) => Some(p),
+                _ => None,
+            })
+            .expect("the two calls form one process");
+        assert_eq!(p.steps[0].images, vec![a], "first call keeps its own picture");
+        assert_eq!(p.steps[1].images, vec![b], "second call keeps its own picture");
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Why `step_row` re-registers the file name **after** the row's own click, instead of just

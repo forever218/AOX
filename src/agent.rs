@@ -916,10 +916,29 @@ impl Agent {
                     st.task_id,
                     st.context_block()
                 );
+                // The next open step, named with its number: the checkpoint reply is read right
+                // before the model continues, so this is the cheapest place to put the exact tick
+                // call it should make when that step is finished. Without it the model tends to run
+                // a whole chain of tools and tick everything at the end — the GUI can only draw a
+                // checkpoint it receives, so the delay looks like a UI bug.
+                let pending = st.pending_steps();
+                if let Some((i, step)) = st
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .find(|(_, s)| !s.done)
+                {
+                    let n = i + 1;
+                    out.push_str(&crate::tf!(
+                        "\nnext open step: #{} \"{}\" — the moment it is genuinely finished, call task_state {{\"tick\":[{}]}} before starting any tool for the step after it. Do not defer this tick to the final answer.",
+                        n,
+                        crate::task::clamp(&step.text, crate::task::STEP_TEXT_MAX),
+                        n
+                    ));
+                }
                 // `done` is only accepted when the gate passed (see `task::apply`), but the model's
                 // own plan may still have open steps. Saying so out loud is cheap; accepting in
                 // silence is how "did four of six and called it done" stays invisible.
-                let pending = st.pending_steps();
                 if st.status == crate::task::Status::Done && pending > 0 {
                     out.push_str(&crate::tf!(
                         "\nnote: the host accepted \"done\", but {} step(s) of your plan are still open — tick them if they are genuinely finished, so the next session is not misled.",
@@ -1524,6 +1543,39 @@ mod tests {
         b.new_conversation();
         assert!(b.task().is_none(), "a new conversation must not inherit the previous task");
         assert!(b.task_saved.is_none());
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// The checkpoint reply must name the **exact next tick** while the plan is open. The GUI can
+    /// only draw ticks it receives; a model that batches five steps and ticks them at the end looks
+    /// like a broken progress bar even though every event was delivered immediately.
+    #[tokio::test]
+    async fn every_checkpoint_reply_points_at_the_next_tick() {
+        let ws = std::env::temp_dir().join("aox-task-next-tick");
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::create_dir_all(&ws);
+        let mut a = agent_with(&ws, "t", crate::workplace::Access::Read).await;
+
+        let out = a.task_tool(json!({
+            "goal": "ship the plan",
+            "steps": ["read it", "write it", "test it"],
+        }));
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("next open step: #1"), "{}", out.content);
+        assert!(out.content.contains("\"read it\""), "{}", out.content);
+        assert!(out.content.contains("{\"tick\":[1]}"), "{}", out.content);
+
+        // One tick moves the instruction to the next open step — never back to #1.
+        let out = a.task_tool(json!({"tick": 1}));
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("next open step: #2"), "{}", out.content);
+        assert!(out.content.contains("{\"tick\":[2]}"), "{}", out.content);
+
+        // A finished plan has nothing left to nag about.
+        let out = a.task_tool(json!({"tick": [2, 3]}));
+        assert!(!out.is_error, "{}", out.content);
+        assert!(!out.content.contains("next open step"), "{}", out.content);
 
         let _ = std::fs::remove_dir_all(&ws);
     }

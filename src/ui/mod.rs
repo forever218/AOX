@@ -54,21 +54,29 @@ pub enum AgentEvent {
     Info(String),
     Warn(String),
     Error(String),
-    /// The host has just attached **an image produced by a tool** to the conversation (see
+    /// The host has just attached **images produced by one tool call** to the conversation (see
     /// `crate::attach`).
     ///
     /// A separate event rather than stuffing paths into that `Warn`: `Warn` is **a sentence for a
-    /// human to read**, whereas this is **a picture for a human to see**. The GUI takes it and
-    /// renders the image; the command line has nowhere to render, so it can simply ignore it (the
-    /// filenames are already listed in that sentence).
+    /// human to read**, whereas this is **a picture for a human to see**. The GUI draws it under
+    /// the very call that produced it (`tool` says which); the command line has nowhere to render,
+    /// so it ignores the event.
+    ///
+    /// `tool` is the tool's name, not a call id: the paths themselves identify an `attach_file`
+    /// call exactly (its argument is that path), and a plugin's images can only be grouped by tool.
+    /// The front end uses that to keep the picture **below its own call row**, where "what did this
+    /// step produce" is answerable at a glance.
     ///
     /// Why `#[allow(dead_code)]`: `src/main.rs` (the CLI bin) compiles the same batch of modules a
-    /// second time, and there it only ever writes `Images(_)` and never reads the paths inside it —
-    /// so that field is judged dead code in the bin, even though the `lib` side is plainly using it.
+    /// second time, and there it only ever writes `ToolImages { .. }` and never reads the fields —
+    /// so they are judged dead code in the bin, even though the `lib` side plainly uses them.
     /// **Do not** touch the module structure for this (same cause as the "bin and lib each compile
     /// the same-named modules" entry in `TRAPS.md`).
     #[allow(dead_code)]
-    Images(Vec<std::path::PathBuf>),
+    ToolImages {
+        tool: String,
+        paths: Vec<std::path::PathBuf>,
+    },
     /// The task checkpoint was just written (see [`crate::task`]) — the front end should show the
     /// **plan** it carries.
     ///

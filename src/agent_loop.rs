@@ -443,6 +443,11 @@ impl AgentLoop for StandardLoop {
             // by a plugin in its result). Collect them, and inject a single user message once this
             // whole batch of tools has finished — the reason is in the paragraph below.
             let mut produced: Vec<PathBuf> = Vec::new();
+            // Which call produced which files, in call order. Kept separately from `produced` so
+            // the GUI can draw an image under its own row rather than dumping every picture at the
+            // end of the turn (the old `Images` event had no owner and put them at the top of the
+            // transcript).
+            let mut produced_by_call: Vec<(String, Vec<PathBuf>)> = Vec::new();
             for call in calls {
                 let name = call.function.name.clone();
                 let mut args: Value = match serde_json::from_str(&call.function.arguments) {
@@ -582,7 +587,13 @@ impl AgentLoop for StandardLoop {
                     (None, _, _) => guard.touched(),
                     _ => {}
                 }
-                produced.extend(output.attach.iter().cloned());
+                // Taken, not cloned: this is the only consumer of the list, and a shell result can
+                // declare several attachments.
+                let attached = std::mem::take(&mut output.attach);
+                if !attached.is_empty() {
+                    produced.extend(attached.iter().cloned());
+                    produced_by_call.push((name.clone(), attached));
+                }
                 agent.push_message(
                     Message::tool_result(&call.id, &name, content),
                     Some(output.is_error),
@@ -610,8 +621,18 @@ impl AgentLoop for StandardLoop {
                     agent.push_message(m, None);
                     // Also have the UI **draw** these images — "the image came out" is the most
                     // confusing thing about a picture the model can see but the human cannot.
-                    if !shown.is_empty() {
-                        ui.emit(AgentEvent::Images(shown));
+                    //
+                    // One event per producing call, with only the paths that really made it into
+                    // the request. The GUI then puts each picture below that call's row instead of
+                    // starting a separate image block at the top of the conversation.
+                    for (tool, paths) in produced_by_call {
+                        let visible: Vec<PathBuf> = paths
+                            .into_iter()
+                            .filter(|p| shown.contains(p))
+                            .collect();
+                        if !visible.is_empty() {
+                            ui.emit(AgentEvent::ToolImages { tool, paths: visible });
+                        }
                     }
                 }
             }
@@ -624,7 +645,7 @@ impl AgentLoop for StandardLoop {
 ///
 /// Returns `(message to push, paths actually attached, notes to report to the user)`.
 /// A message of `None` means none could be attached; "paths actually attached" is handed to the
-/// UI for **display** (see `AgentEvent::Images`) — only the successful ones may be reported, else
+/// UI for **display** (see `AgentEvent::ToolImages`) — only the successful ones may be reported, else
 /// the UI would draw a "display failed" line for a path that was already blocked, right below a
 /// blocking reason for that same path.
 ///

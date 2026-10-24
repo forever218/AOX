@@ -60,7 +60,7 @@ impl Tool for TaskStateTool {
         ToolKind::Host
     }
     fn description(&self) -> &str {
-        crate::i18n::t("Record or update a checkpoint for a LONG, multi-step task (several stages, several files, or work that may be interrupted or have its context compacted). Write the goal, the constraints that must not be broken, the acceptance criteria, what is done, what is in progress, key decisions, what is unresolved, and the next step. Arrays REPLACE the previous value, so send the full current list each time. Do not use this for a single question or a one-file edit — a checkpoint there is pure overhead. modified_files and the verification record are maintained by the host from real tool results: gather evidence with verify, and status \"done\" is accepted only when every acceptance item has a current passing check.")
+        crate::i18n::t("Record or update a checkpoint for a LONG, multi-step task (several stages, several files, or work that may be interrupted or have its context compacted). Write the goal, the constraints that must not be broken, the acceptance criteria, what is done, what is in progress, key decisions, what is unresolved, and the next step. Arrays REPLACE the previous value, so send the full current list each time. Do not use this for a single question or a one-file edit — a checkpoint there is pure overhead. Keep the plan live: when a step is genuinely finished, tick it immediately with `tick`, before the next step's tools; put that tick call first in the same response rather than saving several ticks for the final answer. modified_files and the verification record are maintained by the host from real tool results: gather evidence with verify, and status \"done\" is accepted only when every acceptance item has a current passing check.")
     }
     fn parameters(&self) -> Value {
         json!({
@@ -84,7 +84,7 @@ impl Tool for TaskStateTool {
                 "tick": {
                     "type": "array",
                     "items": {"type": "integer"},
-                    "description": crate::i18n::t("Mark these steps (1-based numbers) as done. This is the cheap way to record progress — one number instead of the whole list — so use it the moment a step is finished, before starting the next one. A single number is accepted too."),
+                    "description": crate::i18n::t("Mark these steps (1-based numbers) as done. This is the cheap way to record progress — one number instead of the whole list. Use it the moment a step is finished and put it first in the same response as the next step's tools; never defer several ticks to the end. A single number is accepted too."),
                 },
                 "untick": {
                     "type": "array",

@@ -352,7 +352,7 @@ impl CliUi {
             // it** is deliberate — the accompanying message already lists the filenames (see
             // `attach`'s path list), and adding a "there's an image but it can't be shown" line
             // would just be noise.
-            AgentEvent::Images(_) => {}
+            AgentEvent::ToolImages { .. } => {}
         }
     }
 
@@ -475,7 +475,7 @@ impl Ui for CliUi {
                 s::cyan("·"),
                 s::dim(&crate::recycle::notice(n))
             ),
-            AgentEvent::Images(_) => {}
+            AgentEvent::ToolImages { .. } => {}
             // Compaction is host housekeeping, but it is the one step that can pause the turn for a
             // whole round trip, so the terminal says it out loud rather than looking stuck.
             AgentEvent::ContextCompacting { used, budget } => println!(
