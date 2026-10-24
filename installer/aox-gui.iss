@@ -22,10 +22,19 @@
 ;
 ;  Design notes (and why they match the CLI edition):
 ;    * Installs for the **current user only** (PrivilegesRequired=lowest), into
-;      %LOCALAPPDATA%\Programs\AOX GUI -- the GUI and the CLI share the root-directory
+;      %LOCALAPPDATA%\Programs\AOX-GUI -- the GUI and the CLI share the root-directory
 ;      resolution in aox::paths, and at runtime they need to write config.toml and plugins/
 ;      inside their own directory, which under Program Files would fail for lack of write
-;      permission.
+;      permission. The folder name has **no space** (2026-10-25, user request): the install
+;      directory is where config.toml, plugins\ and history\ live, and every command that
+;      touches it -- `cd`, a path in a shell, a shortcut argument -- would otherwise need
+;      quoting. The *display* name stays "AOX GUI" (see AppName), which is a label, not a path.
+;    * Renamed from `AOX GUI` on 2026-10-25. `UsePreviousAppDir=no` is what makes the rename
+;      take effect: without it Setup pre-fills the old path from the uninstall registry entry
+;      (same AppId) and an upgrade would quietly stay in the old folder. The consequence is
+;      that an install of the old edition is **left untouched**: its config.toml, plugins\ and
+;      history\ have to be moved across by hand (or copied before uninstalling), because the
+;      new folder starts empty.
 ;    * config.toml is not packaged (so a personal API key is never baked into the installer);
 ;      the program generates one on first run.
 ;    * plugins/ is not packaged either: the host creates plugins/sdk on startup.
@@ -41,9 +50,11 @@
 ; ============================================================================
 
 #define AppName        "AOX GUI"
-; The short name used in file names: AppName has a space in it, and using it directly as a file
-; name gives you "AOX GUI-Setup-0.1.0.exe", which needs escaping in URLs, terminals and
-; scripts alike -- hence the separate definition.
+; The short name: file names, the **install folder** (`%LOCALAPPDATA%\Programs\AOX-GUI`) and the
+; Start-menu group's uninstall key. AppName keeps its space because it is only ever shown, whereas
+; this one ends up in paths -- "AOX GUI-Setup-0.1.0.exe" would need escaping in URLs, terminals and
+; scripts alike, and an install directory with a space needs quoting on every `cd` and every path
+; handed to a command. Same reason the CLI edition is simply `AOX`.
 #define AppSlug        "AOX-GUI"
 
 ; The version can be overridden from the command line, so it can't drift from Cargo.toml:
@@ -87,7 +98,14 @@ VersionInfoDescription={#AppName} Setup
 VersionInfoProductName={#AppName}
 VersionInfoProductVersion={#AppVersion}
 
-DefaultDirName={localappdata}\Programs\{#AppName}
+; The **slug**, not the display name: this directory holds config.toml / plugins\ / history\, and a
+; space in it has to be quoted in every command that names it.
+DefaultDirName={localappdata}\Programs\{#AppSlug}
+; Off for the 2026-10-25 rename only: with it on, Setup pre-fills the directory remembered by the
+; previous install (same AppId) and the new folder would never be used. **Put it back to `yes` in
+; the next release** -- the cost of leaving it off is that anyone who installs into a custom
+; directory stops having it remembered by later upgrades.
+UsePreviousAppDir=no
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 DisableDirPage=no

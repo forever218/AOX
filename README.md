@@ -212,7 +212,7 @@ history/
 ```
 
 > The two installers default to different directories by design (`%LOCALAPPDATA%\Programs\AOX` and
-> `…\AOX GUI`), so each has its own `history/`. To share them, just install one into the other's
+> `…\AOX-GUI`), so each has its own `history/`. To share them, just install one into the other's
 > directory.
 
 The filename stem is the conversation's id (`yyyymmdd-hhmmss-4 random chars`) and is also the key

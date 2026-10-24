@@ -182,7 +182,7 @@ history/
   20261002-160001-e98c.jsonl
 ```
 
-> 两个安装包默认装到不同目录（`%LOCALAPPDATA%\Programs\AOX` 与 `…\AOX GUI`），
+> 两个安装包默认装到不同目录（`%LOCALAPPDATA%\Programs\AOX` 与 `…\AOX-GUI`），
 > 因此各自有一份 `history/`。想让它们共用，把其中一个装到另一个的目录即可。
 
 文件名主干就是这次对话的 id（`年月日-时分秒-4位随机`），也是命令行 `show` / `rm` 认的键。
