@@ -751,6 +751,21 @@ impl PlanView {
     }
 }
 
+/// Conversation `id`'s last task checkpoint, or `None`.
+///
+/// `None` for both cases that must look the same on screen: a brand-new conversation (no id yet) and
+/// an existing one whose file has no `kind:"task"` row (written before checkpoints existed, or a
+/// conversation that never needed one). A card is not drawn at all in either case — an empty "0/0"
+/// card is noise.
+///
+/// A free function rather than a method so the "the plan belongs to the conversation" rule can be
+/// tested against a real store without standing up a whole `App` (see
+/// `the_plan_belongs_to_the_conversation_not_to_the_window`).
+fn plan_of(store: Option<&dyn aox::store::Store>, id: Option<&str>) -> Option<aox::task::TaskState> {
+    let (store, id) = (store?, id?);
+    store.load_task(id).and_then(|v| aox::task::TaskState::from_value(&v))
+}
+
 /// How long a toast stays up, in seconds. Also the window in which a second delete merges into it.
 const TOAST_SECS: f32 = 6.0;
 /// The last stretch of that, during which it fades instead of vanishing mid-read.
@@ -1756,6 +1771,23 @@ impl App {
             None => act.reset(),
         }
         drop(act);
+        // The plan card is the conversation's **own**, off the same row the agent reads on resume
+        // (`kind:"task"`, newest wins). Reopening a conversation therefore draws the plan it stopped
+        // at -- and a conversation that never had a checkpoint draws nothing.
+        //
+        // Reading it from the store, rather than keeping whatever is already in `self.plan`, is the
+        // fix for 2026-10-24: the card used to survive a switch and sit there claiming the *previous*
+        // conversation's progress until a new checkpoint happened to overwrite it -- on a brand-new
+        // conversation, which may never produce one, indefinitely.
+        self.task = plan_of(self.store.as_deref(), id);
+        self.plan = self.task.as_ref().and_then(PlanView::of);
+        // The card always arrives **collapsed**, and without an animation: `plan_open` / `plan_t` /
+        // `plan_anim` describe the widget on screen, not the conversation. Carrying them over would
+        // unfold the new conversation's plan on its first frame, and the disclosure would look like
+        // it sprang open by itself.
+        self.plan_open = false;
+        self.plan_t = 0.0;
+        self.plan_anim = None;
         self.follow = true;
         self.force_follow = true;
     }
@@ -8956,5 +8988,57 @@ mod tests {
                  (panel {SETTINGS_RIGHT_W:.0} pt)"
             );
         }
+    }
+
+    /// The plan card belongs to the **conversation**, not to the window it is drawn in.
+    ///
+    /// Reported 2026-10-24: a plan written in conversation A stayed on screen after switching to B —
+    /// and on a brand-new conversation it stayed until B happened to write a checkpoint of its own,
+    /// which for a one-off question may be never. Nothing was wrong with the card; it simply was
+    /// never re-read on a switch, so it showed whatever it had been told last.
+    ///
+    /// `adopt_conversation` now asks the same row the agent reads on resume (`kind:"task"`, newest
+    /// wins), and this states the three answers that has to give: the plan of a conversation that has
+    /// one, nothing for a conversation that has none, nothing for a conversation not created yet.
+    #[test]
+    fn the_plan_belongs_to_the_conversation_not_to_the_window() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("aox-gui-plan-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch app root");
+
+        let store = aox::store::default_store(&dir, 0);
+        // Two conversations, and only the first one gets a checkpoint — exactly the pair that used to
+        // show the same card.
+        let mut planned = store.create(None, None).expect("create a conversation");
+        let demo = aox::task::TaskState::steps_demo();
+        let steps = demo.steps.len();
+        planned.append_task(&demo.to_value());
+        let planned = planned.id().to_string();
+        let blank = store.create(None, None).expect("create a second conversation").id().to_string();
+
+        let restored = plan_of(Some(store.as_ref()), Some(&planned)).expect("its own checkpoint comes back");
+        assert_eq!(restored.steps.len(), steps, "the card must show this conversation's own steps");
+        assert_eq!(
+            PlanView::of(&restored).map(|v| v.total),
+            Some(steps),
+            "and the view built from it is the one the bar draws"
+        );
+
+        assert!(
+            plan_of(Some(store.as_ref()), Some(&blank)).is_none(),
+            "a conversation with no checkpoint must draw no card — the previous conversation's plan \
+             used to survive the switch and claim progress that was never its own"
+        );
+        assert!(plan_of(Some(store.as_ref()), None).is_none(), "a new conversation starts with no plan");
+        assert!(
+            plan_of(None, Some(&planned)).is_none(),
+            "no store (demo mode) means no plan, never a panic"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
