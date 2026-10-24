@@ -296,6 +296,10 @@ impl CliUi {
                     t.interim.push(text);
                 }
             }
+            // The checkpoint's plan changed. Nothing is printed mid-turn: the folded process area
+            // already shows the call, and a dim line per update would be noise for a 20-step task.
+            // `/task` and the GUI bar are where a human reads the plan.
+            AgentEvent::Task(_) => {}
             AgentEvent::ToolCall { name, args } => {
                 if let Some(t) = self.turn.as_mut() {
                     t.steps.push(Step { name, args: args.to_string(), result: None });
@@ -420,6 +424,12 @@ impl Ui for CliUi {
             AgentEvent::AssistantText(text) | AgentEvent::InterimText(text) => {
                 println!();
                 println!("{}", s::render_markdown(&text));
+            }
+            // ── The plan moved: one dim line, so progress is visible even in a terminal
+            AgentEvent::Task(t) => {
+                if let Some(line) = crate::task::plan_line(&t) {
+                    println!("{}", s::dim(&line));
+                }
             }
             // ── Tool call: a yellow arrow + bold tool name + dim arguments
             AgentEvent::ToolCall { name, args } => {

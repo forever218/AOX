@@ -69,6 +69,28 @@ impl Tool for TaskStateTool {
                 "goal": {"type": "string", "description": crate::i18n::t("One sentence: what is this task achieving? Required the first time you record a checkpoint for a task.")},
                 "constraints": {"type": "array", "items": {"type": "string"}, "description": crate::i18n::t("Hard rules that must not be broken (interfaces to keep, files not to touch, style or dependency limits).")},
                 "acceptance": {"type": "array", "items": {"type": "string"}, "description": crate::i18n::t("How this task counts as done, in checkable terms (e.g. \"cargo test passes\", \"API unchanged\"). Each item can be proven by verify; replacing this list clears the evidence collected for the old one.")},
+                "steps": {
+                    "type": "array",
+                    "description": crate::i18n::t("Your own plan: the ordered steps you intend to take, each ticked as you finish it. This is the only part of the checkpoint that answers \"what was I about to do next\" after the conversation is compacted, so keep it current — mark a step done in the same update as the work it describes. Replaced wholesale like every other array; a plain string means an unfinished step."),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": crate::i18n::t("One concrete step (what you will do, not how you feel about it).")},
+                            "done": {"type": "boolean", "description": crate::i18n::t("true once this step is genuinely finished.")},
+                        },
+                        "required": ["text"],
+                    },
+                },
+                "tick": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": crate::i18n::t("Mark these steps (1-based numbers) as done. This is the cheap way to record progress — one number instead of the whole list — so use it the moment a step is finished, before starting the next one. A single number is accepted too."),
+                },
+                "untick": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": crate::i18n::t("Mark these steps (1-based numbers) as NOT done, for a step that turned out not to be finished after all."),
+                },
                 "completed": {"type": "array", "items": {"type": "string"}, "description": crate::i18n::t("Stages that are genuinely finished.")},
                 "in_progress": {"type": "array", "items": {"type": "string"}, "description": crate::i18n::t("What is being worked on right now.")},
                 "decisions": {"type": "array", "items": {"type": "string"}, "description": crate::i18n::t("Important decisions and why (the reason is what a later you needs).")},

@@ -100,6 +100,14 @@ async fn recycle_all(paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<FromAgent>)
 pub enum FromAgent {
     /// Startup info (config / model / paths / whether usable)
     Boot(Box<BootInfo>),
+    /// A model request is **starting**: `n == 0` is the first attempt, `n >= 1` is a retry after a
+    /// failure, and `delay_ms` is how long the loop waited before it (see
+    /// [`aox::llm::StreamSink::on_attempt`]).
+    ///
+    /// A retry needs its own event rather than a `Warn`, because the UI has to *undo* work: a stream
+    /// that was cut has already drawn half an answer, and the retyped one must replace it, not
+    /// appear beneath it.
+    Attempt { n: u32, delay_ms: u64 },
     /// The core event stream (fully shared with the CLI)
     Event(AgentEvent),
     /// A turn starts
@@ -388,6 +396,10 @@ impl StreamSink for ChanSink {
 
     fn on_finish(&self) {
         let _ = self.tx.send(FromAgent::ReasoningEnd);
+    }
+
+    fn on_attempt(&self, attempt: u32, delay: std::time::Duration) {
+        let _ = self.tx.send(FromAgent::Attempt { n: attempt, delay_ms: delay.as_millis() as u64 });
     }
 }
 

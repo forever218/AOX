@@ -96,10 +96,15 @@ pub fn report(rt: &Runtime) -> String {
         )
     };
     crate::tf!(
-        "loop implementation: {} (available: {})\ncontext trimming: {}\n\nchange the [loop] section in config.toml and restart for it to take effect; /hook lists the hooks, /prompt lists the prompt sections.",
+        "loop implementation: {} (available: {})\ncontext trimming: {}\nrequests per turn: {}\n\nchange the [loop] section in config.toml and restart for it to take effect; /hook lists the hooks, /prompt lists the prompt sections.",
         rt.loop_impl.name(),
         IMPLS.join(" / "),
-        trim
+        trim,
+        if cfg.max_iters_per_turn == 0 {
+            crate::i18n::t("Off (max_iters_per_turn = 0)").to_string()
+        } else {
+            crate::tf!("at most {} (max_iters_per_turn)", cfg.max_iters_per_turn)
+        }
     )
 }
 
@@ -121,6 +126,20 @@ pub fn report(rt: &Runtime) -> String {
 ///   reject with a straight 400. That property is **not re-argued here**: it *is*
 ///   [`crate::message::is_legal_body`], the crate's one definition of a legal boundary, and the
 ///   `debug_assert` below simply checks this cut against it.
+/// One line, at most 120 characters: what went wrong, for a warning the user reads at a glance.
+///
+/// `{e:#}` renders the whole cause chain and, for an HTTP failure, up to 500 characters of the
+/// endpoint's body — far too much for a status line, and it would push the useful half ("retrying in
+/// 2.0 s") off the end of it. The full text still reaches the log and, if we give up, the error.
+fn brief(e: &anyhow::Error) -> String {
+    let full = format!("{e:#}");
+    let first = full.lines().next().unwrap_or("").trim();
+    if first.chars().count() <= 120 {
+        return first.to_string();
+    }
+    format!("{}…", first.chars().take(120).collect::<String>())
+}
+
 fn trim_point(msgs: &[Message], max_rounds: usize) -> Option<usize> {
     if max_rounds == 0 {
         return None;
@@ -166,9 +185,9 @@ impl AgentLoop for StandardLoop {
         const MAX_EMPTY_RETRY: u32 = 2;
 
         let mut empty_retries = 0u32;
-        // Host fallback retry budget for request errors (`[hook] max_llm_retries`). **Independent
-        // per turn** — it lives in `run`'s locals and cannot cross into the next turn, so "the
-        // longer you chat the more retries you get" cannot happen.
+        // How many request errors this turn has already retried (`[retry] attempts` is the ceiling).
+        // **Independent per turn** — it lives in `run`'s locals and cannot cross into the next turn,
+        // so "the longer you chat the more retries you get" cannot happen.
         let mut llm_retries = 0usize;
         // Hooks need to inspect the system's current state (tool table, plugin table), while
         // `agent.messages()` is about to be lent to `llm.chat`. Clone an `Arc` out first: hooks
@@ -177,8 +196,32 @@ impl AgentLoop for StandardLoop {
         // their return value.
         let rt = agent.rt().clone();
         let max_rounds = rt.config.loop_config.max_rounds;
-        let max_llm_retries = rt.config.hook.max_llm_retries;
+        let max_iters = rt.config.loop_config.max_iters_per_turn;
+        let retry = rt.config.retry.clone();
+        // "You already asked that" — see `crate::repeat`. Rebuilt per turn: a repeat only counts
+        // inside one instruction, never across two.
+        let mut guard = crate::repeat::Guard::default();
+        // How many model requests this turn has spent (`[loop] max_iters_per_turn` caps it).
+        let mut rounds = 0usize;
+        // The project's check command, detected **once per turn** (a handful of `metadata` calls).
+        // `unchecked` is the latch that makes the reminder fire once per write-batch instead of
+        // nagging on every single write: it arms on the first write after a check and disarms when
+        // that check actually runs.
+        let check = rt.workplace.active_root().and_then(|r| crate::checks::detect(&r));
+        let mut unchecked = false;
         loop {
+            // ── The work ceiling ──
+            // Checked **before** the request, so `max_iters_per_turn = 3` means "three requests at
+            // most", not four. Breaking here ends the turn normally: `run_turn` persists the
+            // checkpoint and closes the card afterwards, exactly as for a finished task.
+            if max_iters > 0 && rounds >= max_iters {
+                ui.emit(AgentEvent::Warn(crate::tf!(
+                    "stopped after {} requests in this turn (the ceiling from [loop] max_iters_per_turn). Everything done so far is kept — send another message to carry on from here.",
+                    max_iters
+                )));
+                break;
+            }
+            rounds += 1;
             // ── Context trimming (item 1 of the stage-4 leftovers).
             //    Placed "before this turn's request is assembled": assemble after trimming, so the
             //    model sees the trimmed context.
@@ -241,6 +284,12 @@ impl AgentLoop for StandardLoop {
             // otherwise the `&mut agent` that `push_message` needs below would conflict.
             let chat = {
                 let sink = ui.stream_sink();
+                // "A request starts here" (attempt 0). The front end uses it to mark where this
+                // attempt's rows begin, so a later retry can roll exactly this attempt back — a
+                // stream that was cut has already drawn half an answer.
+                if let Some(s) = sink.as_deref() {
+                    s.on_attempt(0, std::time::Duration::ZERO);
+                }
                 agent.llm().chat(body, &schemas, sink.as_deref()).await
             };
             let reply = match chat {
@@ -258,29 +307,41 @@ impl AgentLoop for StandardLoop {
                         continue;
                     }
                     // Nobody asked for a retry — but "nobody is managing it" should not mean
-                    // "never even try once". `[hook] max_llm_retries` is the configured fallback for
-                    // exactly this: occasional upstream jitter is worth asking once more, without
-                    // having to write a component for it. Defaults to 0, so **with no config written
-                    // this is byte-identical to the original implementation** (throw straight away).
+                    // "never even try once". `[retry] attempts` is the configured policy for exactly
+                    // this: a rate limit or a dropped stream is worth asking again, without having to
+                    // write a component for it.
+                    //
+                    // Two questions decide it, and they are answered in different places:
+                    // ① **is this failure worth repeating at all** — `llm::failure::retryable`, which
+                    //    reads the status out of the error (401/400/413 fail on the first attempt:
+                    //    retrying a wrong key just delays the message the user has to see);
+                    // ② **how long to wait** — `llm::failure::delay`, exponential from `[retry] base_ms`,
+                    //    never shorter than a `Retry-After` the server sent, never longer than `max_ms`.
                     ErrorAction::Propagate => {
-                        if llm_retries >= max_llm_retries {
+                        if !crate::llm::failure::retryable(&e) || llm_retries >= retry.attempts {
                             return Err(e);
                         }
                         llm_retries += 1;
+                        let wait = crate::llm::failure::delay(llm_retries, &retry, crate::llm::failure::retry_after(&e));
+                        // Before the sleep, not after: whatever the abandoned attempt already put on
+                        // screen has to go now, so the user sees "retrying" rather than half an
+                        // answer that is about to be replaced.
+                        if let Some(s) = ui.stream_sink() {
+                            s.on_attempt(llm_retries as u32, wait);
+                        }
                         ui.emit(AgentEvent::Warn(crate::tf!(
-                            "model request failed; the host is retrying automatically (attempt {}/{}): {}",
+                            "model request failed ({}); retrying in {} s (attempt {}/{})",
+                            brief(&e),
+                            format!("{:.1}", wait.as_secs_f32()),
                             llm_retries,
-                            max_llm_retries,
-                            format!("{e:#}")
+                            retry.attempts
                         )));
-                        agent.push_message(
-                            Message::user(crate::tf!(
-                                "{} the previous model request failed: {}. Please continue the task you were on.",
-                                crate::history::HOST_PREFIX,
-                                format!("{e:#}")
-                            )),
-                            None,
-                        );
+                        tokio::time::sleep(wait).await;
+                        // **No message is injected.** The failed attempt never touched
+                        // `agent.messages()` (a reply only lands there once it arrives whole), so
+                        // `continue` re-sends the identical request. It used to push a "please
+                        // continue the task you were on" user message, which meant every upstream
+                        // hiccup permanently added a sentence the model then had to read back.
                         continue;
                     }
                 },
@@ -426,7 +487,34 @@ impl AgentLoop for StandardLoop {
                     continue;
                 }
                 ui.emit(AgentEvent::ToolCall { name: name.clone(), args: args.clone() });
-                let mut output = agent.authorize_and_execute(ui, &name, args).await;
+                // ── "You already asked that" ──
+                // A read-only call whose arguments are unchanged **and** after which nothing at all
+                // ran: the answer is still in the conversation, so running it again would buy a
+                // second copy of up to 20,000 characters. A write/delete/command in between clears
+                // the verdict (the measured case is a script re-run after being edited) — the rule
+                // is not "same tool + same args", see `crate::repeat`'s module docs.
+                // Kept before `args` is handed to the tool: "did this call run the check" is answered
+                // by the command line, and the command line is inside the arguments.
+                let call_text = if name == "shell" || name == "bash" { Some(args.to_string()) } else { None };
+                let read_only = crate::repeat::Guard::eligible(&rt, &name).await;
+                let repeated = read_only && guard.repeats(&name, &args, agent.messages());
+                // Only reads are ever recorded, so only reads need their arguments kept around.
+                let guard_args = read_only.then(|| args.clone());
+                let mut output = if repeated {
+                    ToolOutput::ok(crate::repeat::notice())
+                } else {
+                    agent.authorize_and_execute(ui, &name, args).await
+                };
+                // `output.path` is consumed by the event below, and "did this call write a file" is
+                // needed after it.
+                let wrote = output.path.is_some();
+                // A check that ran clears the latch — including one that failed: the model now knows
+                // the answer, which is the whole point of asking.
+                if let (Some(c), Some(t)) = (&check, &call_text) {
+                    if c.ran_in(t) {
+                        unchecked = false;
+                    }
+                }
                 // ── Hook point ④ after tool result: can modify the result, can block (blocking =
                 //    replace the whole block with a reasoned error).
                 //    Placed before `ui.emit` — so the UI and the history file see the **same**
@@ -466,7 +554,34 @@ impl AgentLoop for StandardLoop {
                 if output.recycled > 0 {
                     ui.emit(AgentEvent::Recycled(output.recycled));
                 }
-                let content = cap_chars(&output.content, rt.config.agent.max_result_chars);
+                let mut content = cap_chars(&output.content, rt.config.agent.max_result_chars);
+                // ── "this write is unverified" ──
+                //
+                // `verify` + the gate only cover tasks that have a checkpoint; a short task had no
+                // pressure at all (measured: half of the turns that wrote code never ran a check
+                // afterwards). The line goes **into the tool result** because the model is the one who
+                // has to act on it, and it is a statement of fact ("nothing has run since"), not an
+                // order. Once per batch: repeating it on every write teaches the model to ignore it.
+                if wrote && !unchecked {
+                    if let Some(c) = &check {
+                        unchecked = true;
+                        content.push_str(&crate::tf!(
+                            "\n\nhost: this write is unverified — `{}` has not been run since the last change.",
+                            c.command
+                        ));
+                    }
+                }
+                // The guard learns from the **final** text (post-hook, post-cap) so "is that result
+                // still in the conversation" compares like with like. A skipped call records
+                // nothing: the entry it matched is still valid and still points at the real result.
+                // A **failed** call is not recorded either — its "result" (a denial, a timeout) is
+                // not an answer, and handing it back as "unchanged" would present a failure as a
+                // fact about the file.
+                match (&guard_args, repeated, output.is_error) {
+                    (Some(a), false, false) => guard.record(&name, a, &content),
+                    (None, _, _) => guard.touched(),
+                    _ => {}
+                }
                 produced.extend(output.attach.iter().cloned());
                 agent.push_message(
                     Message::tool_result(&call.id, &name, content),
@@ -711,7 +826,7 @@ mod tests {
 
     #[test]
     fn unknown_impl_is_an_error() {
-        let cfg = LoopConfig { implementor: "react".into(), max_rounds: 0 };
+        let cfg = LoopConfig { implementor: "react".into(), max_rounds: 0, max_iters_per_turn: 0 };
         let e = build(&cfg).err().expect("an unknown implementation must error").to_string();
         assert!(e.contains("react"), "the error must include the misspelled name: {e}");
         assert!(e.contains("standard"), "the error must tell the user what is currently available: {e}");
@@ -720,7 +835,7 @@ mod tests {
     #[test]
     fn empty_or_default_impl_builds_standard() {
         for name in ["", "standard", "  standard  "] {
-            let cfg = LoopConfig { implementor: name.into(), max_rounds: 0 };
+            let cfg = LoopConfig { implementor: name.into(), max_rounds: 0, max_iters_per_turn: 0 };
             let lp = build(&cfg).unwrap_or_else(|e| panic!("{name:?} should be available: {e:#}"));
             assert_eq!(lp.name(), "standard");
         }

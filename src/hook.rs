@@ -101,8 +101,10 @@ pub enum ErrorAction {
     /// Swallow this error: inject `note` into the conversation as a host prompt, then retry.
     ///
     /// Guarding against infinite loops is **the emitter's own responsibility** (e.g. degrade the
-    /// same error only once). The host side has another config fallback
-    /// (`[hook] max_llm_retries`) — retries work without writing a hook or installing a component.
+    /// same error only once). The host side has a config fallback (`[retry]`, plus a delay curve and
+    /// a status-code classification) — retries work without writing a hook or installing a component.
+    /// That fallback is deliberately **independent of this variant**: it lives in the loop, not in
+    /// the hook seam, and it was moved out of `[hook] max_llm_retries` on 2026-10-23.
     ///
     /// The real constructor (from phase 6 · 6b on): a component's `hooks/on_error` returns
     /// `{"action":"retry","note":"…"}`, which [`ComponentHook`] maps here.

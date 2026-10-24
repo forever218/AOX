@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use super::failure::{self, HttpFailure, Stalled, StreamCut};
 use super::{ChatReply, LlmProvider, StreamSink, Usage};
 use crate::config::ProviderConfig;
 use crate::message::{FunctionCall, Message, ToolCall};
@@ -30,8 +32,13 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(cfg: &ProviderConfig) -> Result<Self> {
         Ok(Self {
+            // No **total** deadline on the client any more: a streaming answer may legitimately take
+            // minutes (a thinking model writing 32k tokens), and a whole-request deadline kills it
+            // mid-sentence and, with retries on, pays for it twice. What replaces it is a silence
+            // watchdog inside `chat_stream`; the non-streaming path sets its own per-request
+            // deadline, where "the whole response" is the right unit.
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(180))
+                .connect_timeout(Duration::from_secs(failure::CONNECT_SECS))
                 .build()?,
             url: cfg.chat_url(),
             api_key: cfg.resolve_key()?,
@@ -68,12 +75,23 @@ impl OpenAiProvider {
 
     /// Non-streaming request: wait for the full response and return it in one go.
     async fn chat_blocking(&self, body: &Value) -> Result<ChatReply> {
-        let resp = self.client.post(&self.url).bearer_auth(&self.api_key).json(body).send().await?;
+        let resp = self
+            .client
+            .post(&self.url)
+            // Here a whole-response deadline *is* the right shape: nothing is being displayed, so
+            // "it has taken too long" is exactly what we need to know.
+            .timeout(Duration::from_secs(failure::BLOCKING_TOTAL_SECS))
+            .bearer_auth(&self.api_key)
+            .json(body)
+            .send()
+            .await?;
         let status = resp.status();
+        // Read the header **before** `text()` consumes the response.
+        let retry_after = retry_after_of(&resp);
         let text = resp.text().await?;
         debug_dump(body, &text);
         if !status.is_success() {
-            bail!(crate::tf!("LLM request failed HTTP {}: {}", status, api_error(&text)));
+            return Err(http_failure(status, retry_after, &text));
         }
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| anyhow!(crate::tf!("LLM returned invalid JSON: {}; body={}", format!("{e}"), truncate(&text, 500))))?;
@@ -100,10 +118,11 @@ impl OpenAiProvider {
     ) -> Result<ChatReply> {
         let mut resp = self.client.post(&self.url).bearer_auth(&self.api_key).json(body).send().await?;
         let status = resp.status();
+        let retry_after = retry_after_of(&resp);
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             debug_dump(body, &text);
-            bail!(crate::tf!("LLM request failed HTTP {}: {}", status, api_error(&text)));
+            return Err(http_failure(status, retry_after, &text));
         }
 
         let mut acc = StreamAcc::default();
@@ -111,7 +130,17 @@ impl OpenAiProvider {
         // Network chunks don't align with SSE line boundaries, so buffer to a
         // newline before treating it as a line
         let mut buf = String::new();
-        while let Some(chunk) = resp.chunk().await? {
+        let idle = Duration::from_secs(failure::STREAM_IDLE_SECS);
+        loop {
+            // A **silence** deadline per chunk, not a deadline for the response as a whole: a model
+            // thinking for two minutes between two tokens is normal, a model that has said nothing
+            // for two minutes has died. `?` here keeps a transport error as a `reqwest::Error`, which
+            // the retry policy reads as "try again" (see `failure::retryable`).
+            let chunk = match tokio::time::timeout(idle, resp.chunk()).await {
+                Ok(next) => next?,
+                Err(_) => return Err(anyhow::Error::new(Stalled { idle_secs: failure::STREAM_IDLE_SECS })),
+            };
+            let Some(chunk) = chunk else { break };
             buf.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(pos) = buf.find('\n') {
                 let line: String = buf[..pos].trim_end_matches('\r').to_string();
@@ -129,6 +158,17 @@ impl OpenAiProvider {
             let line = buf.trim_end().to_string();
             push_raw(&mut raw, &line);
             acc.feed(&line, sink);
+        }
+        // ── Did the model actually finish? ──
+        // Until 2026-10-23 this question was not asked, and a dropped connection (or a proxy cutting
+        // a long body) produced a **successful** reply holding half a sentence: it went into the
+        // conversation file and the turn ended as if the model had answered. A `finish_reason` chunk
+        // or `data: [DONE]` is the only proof that the model is done talking.
+        if !finished(&acc) {
+            debug_dump(body, &raw);
+            return Err(anyhow::Error::new(StreamCut {
+                detail: crate::tf!("{} chars received, no finish_reason", acc.content.chars().count()),
+            }));
         }
         debug_dump(body, &raw);
         Ok(acc.into_reply())
@@ -312,11 +352,33 @@ impl StreamAcc {
     }
 }
 
+/// Did the model prove it finished talking?
+///
+/// Two signals, either is enough: the `data: [DONE]` sentinel, or a chunk carrying `finish_reason`.
+/// Endpoints vary — some send both, some only one — so "both missing" is the only reliable sign of a
+/// response that was cut, and it is exactly what a dropped TCP connection leaves behind.
+fn finished(acc: &StreamAcc) -> bool {
+    acc.is_done() || acc.finish_reason.is_some()
+}
+
 fn push_raw(raw: &mut String, line: &str) {
     if raw.len() < MAX_RAW {
         raw.push_str(line);
         raw.push('\n');
     }
+}
+
+/// The `Retry-After` the endpoint sent, if any. Read **before** the response is consumed.
+fn retry_after_of(resp: &reqwest::Response) -> Option<Duration> {
+    resp.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok().and_then(failure::parse_retry_after)
+}
+
+/// A non-2xx response, as an error the retry policy can read ([`failure::retryable`]).
+///
+/// The status travels *inside* the error rather than in its message: telling `429` from `401` by
+/// parsing text would be the kind of thing that breaks the day an endpoint rewords its body.
+fn http_failure(status: reqwest::StatusCode, retry_after: Option<Duration>, body: &str) -> anyhow::Error {
+    anyhow::Error::new(HttpFailure { status: status.as_u16(), retry_after, detail: api_error(body) })
 }
 
 /// Extract readable information from an error response body: prefer
@@ -380,4 +442,42 @@ fn head_tail(s: &str, n: usize) -> String {
     let h: String = s.chars().take(head).collect();
     let t: String = s.chars().skip(total - tail).collect();
     crate::tf!("{}\n…[{} chars omitted in the middle]…\n{}", h, total - n, t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed raw SSE lines, exactly as `chat_stream` would, without a socket.
+    fn acc_of(lines: &[&str]) -> StreamAcc {
+        let mut acc = StreamAcc::default();
+        for l in lines {
+            acc.feed(l, None);
+        }
+        acc
+    }
+
+    const CONTENT: &str = r#"data: {"choices":[{"delta":{"content":"half an answer"},"finish_reason":null}]}"#;
+    const FINISH: &str = r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
+
+    #[test]
+    fn a_stream_that_just_stops_is_not_a_finished_answer() {
+        // The 2026-10-23 bug: this used to be a *successful* reply holding half a sentence.
+        let acc = acc_of(&[CONTENT]);
+        assert!(!finished(&acc), "content without finish_reason means the connection dropped");
+        assert!(!acc.is_done());
+    }
+
+    #[test]
+    fn either_proof_of_completion_is_enough() {
+        assert!(finished(&acc_of(&[CONTENT, FINISH])), "finish_reason alone is a finish");
+        assert!(finished(&acc_of(&[CONTENT, "data: [DONE]"])), "[DONE] alone is a finish");
+    }
+
+    #[test]
+    fn an_empty_stream_is_not_finished_either() {
+        // Zero lines: nothing to hand to the model, and handing back "no message" as success is how
+        // a turn silently ends with no answer at all.
+        assert!(!finished(&acc_of(&[])));
+    }
 }

@@ -43,7 +43,7 @@ engine's ignition timing -- though **the key stays with the host** (see §4).
 | inject project rules into **every** request (coding conventions, tone of voice) | edit the host's system-prompt constant and rebuild | a component contributes one `prompt_segments` |
 | stamp / redact / truncate tool results uniformly | impossible | the `after_tool` hook |
 | auto-fill or correct an argument before a tool call | only `[hook] tool_args_default` (fills gaps only, static values only) | the `before_tool` hook, which **can compute from the content** |
-| auto-retry a failed request | impossible (nobody constructed the `Retry` variant) | the `on_error` hook, or the config `[hook] max_llm_retries` |
+| auto-retry a failed request | nothing (a failed request is thrown at the user) | the `on_error` hook, or the built-in `[retry]` policy — which since 2026-10-23 retries `429` / `5xx` / cut streams on its own, with backoff, and never retries a `401` |
 | require a question before a plugin tool runs | allow or deny a whole class | a `caps` capability request => **that plugin's tools always ask** |
 | let a plugin colour the interface | impossible | a component contributes a theme patch (v1 only reaches "fetch + validate + report", see §3) |
 | log/audit every model reply | impossible | the `after_reply` hook |

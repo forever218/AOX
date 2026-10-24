@@ -601,6 +601,72 @@ pub struct App {
     /// arrives and the row becomes an ordinary one; anything still here when a turn ends never ran
     /// and its row is dropped.
     stream_calls: Vec<StreamCall>,
+
+    /// How many rows `live.steps` held when the **current request** started.
+    ///
+    /// A retried request (`FromAgent::Attempt` with `n >= 1`) has to roll its own rows back: the
+    /// abandoned attempt may already have opened tool rows from streamed argument fragments, and
+    /// keeping them would leave the transcript showing work that never happened.
+    attempt_mark: Option<usize>,
+
+    /// The latest task checkpoint of this conversation, if the model recorded one.
+    ///
+    /// Until 2026-10-23 nothing outside the model's context ever saw this: a checkpoint went into the
+    /// conversation file and into the prompt, and the interface showed nothing. What is worth a line
+    /// is the **plan** — "4 of 6 done, next is run the tests" is the one reading that says whether a
+    /// long task is actually moving.
+    task: Option<aox::task::TaskState>,
+    /// What the plan card draws (derived from `task`, rebuilt only when a checkpoint arrives).
+    plan: Option<PlanView>,
+    /// Whether the plan card is expanded. **Collapsed by default** (user request, 2026-10-23): while
+    /// work is running the only thing worth the space is "which step, and how far in".
+    plan_open: bool,
+    /// Expand/collapse position of the plan block: 0 = closed, 1 = fully open.
+    plan_t: f32,
+    /// `(started, from, to)` while the disclosure is in flight.
+    ///
+    /// Driven by the **wall clock**, not by `dt`. The frame-by-frame stepping used by `hist_t` reads
+    /// `dt` from the input state, which while idle reports a stale, much larger value than the real
+    /// frame time — so a 0.18 s animation collapsed into four jumps of 28% each, which is the
+    /// stutter reported on 2026-10-23. Elapsed time is immune to both a stale `dt` and a low frame
+    /// rate.
+    plan_anim: Option<(Instant, f32, f32)>,
+    /// Height of the composer **excluding** the plan block, measured last frame.
+    ///
+    /// The composer is a floating area pinned by an explicit position (see `show`'s note): the plan
+    /// block's height is known in advance from `plan_t`, and this is the only part that has to be
+    /// measured — which is fine, because it only changes when the text in the input grows a line.
+    composer_base_h: f32,
+}
+
+/// What the plan card draws, cached when a checkpoint arrives.
+///
+/// Cached rather than read from `TaskState` every frame: the paint path runs at 60 Hz and a plan is
+/// a few hundred bytes of strings — cloning that per frame to satisfy the borrow checker would be
+/// paying for nothing. Building it once, in the event arm, also keeps every "what is the current
+/// step" decision in one place.
+struct PlanView {
+    done: usize,
+    total: usize,
+    /// The first open step — what the model says it is working on (see `TaskState::steps`).
+    current: Option<String>,
+    steps: Vec<(String, bool)>,
+}
+
+impl PlanView {
+    /// `None` when the checkpoint has no plan: a card that always says "0/0" is noise.
+    fn of(st: &aox::task::TaskState) -> Option<Self> {
+        if st.steps.is_empty() {
+            return None;
+        }
+        let steps: Vec<(String, bool)> = st.steps.iter().map(|s| (s.text.clone(), s.done)).collect();
+        Some(Self {
+            done: st.steps.len() - st.pending_steps(),
+            total: st.steps.len(),
+            current: steps.iter().find(|(_, d)| !d).map(|(t, _)| t.clone()),
+            steps,
+        })
+    }
 }
 
 /// How long a toast stays up, in seconds. Also the window in which a second delete merges into it.
@@ -796,6 +862,13 @@ impl App {
             ws: workplace_ui::WorkplaceUi::new(),
             toast: None,
             stream_calls: Vec::new(),
+            attempt_mark: None,
+            task: None,
+            plan: None,
+            plan_open: false,
+            plan_t: 0.0,
+            plan_anim: None,
+            composer_base_h: COMPOSER_RESERVE,
         };
         if demo {
             seed_demo(&mut app);
@@ -1129,6 +1202,25 @@ impl App {
                     // on its own.
                     if let Some(l) = self.live.as_mut() {
                         l.reasoning_live = false;
+                    }
+                }
+                FromAgent::Attempt { n, delay_ms } => {
+                    if n == 0 {
+                        // A request is starting. Remember where its rows begin so a retry can undo
+                        // exactly this attempt and nothing before it.
+                        self.attempt_mark = self.live.as_ref().map(|l| l.steps.len());
+                    } else {
+                        // The abandoned attempt is being thrown away: its half-typed body text, the
+                        // tool rows its streamed fragments opened, and the clock it was holding.
+                        if let Some(l) = self.live.as_mut() {
+                            l.streaming.clear();
+                            if let Some(mark) = self.attempt_mark {
+                                l.steps.truncate(mark);
+                            }
+                            l.call = None;
+                        }
+                        self.stream_calls.clear();
+                        self.status = aox::tf!("Retrying in {} s", format!("{:.1}", delay_ms as f32 / 1000.0));
                     }
                 }
                 FromAgent::Event(ev) => self.on_event(ev),
@@ -2487,6 +2579,13 @@ impl App {
                     self.items.push(Item::Note(NoteKind::Warn, m));
                 }
             }
+            AgentEvent::Task(t) => {
+                // Nothing is drawn here: the bar above the input reads it on every frame (see
+                // `plan_bar`). Storing it is enough, and it must survive the end of the turn --
+                // a plan outlives the work that wrote it.
+                self.plan = PlanView::of(&t);
+                self.task = Some(*t);
+            }
             AgentEvent::Recycled(n) => {
                 // Two audiences, two shapes (the same split as `Images` below): the activity stream
                 // gets a bar — "how this turn ran" — and the human gets a **toast** that fades on
@@ -2701,6 +2800,70 @@ impl App {
     /// problems together on 2026-10-06).
     /// Vertical also settles "read it in one sweep": you read an option and pick it, whereas
     /// horizontal makes you hunt left and right.
+    /// The task plan: a small **card** above the input, collapsed by default.
+    ///
+    /// Collapsed it answers the one question worth the space while work is running — "which step is
+    /// it on, and how far in". One click opens the whole list, ticked and unticked, which is what a
+    /// long task needs when the model's own account of progress is worth checking.
+    ///
+    /// (First version was a bare dim line that turned out to be unreadable against the page — the
+    /// text was `text_dim` on no background at all. A card was the user's call, and it is the right
+    /// one: a persistent, clickable reading is a panel, not a whisper.)
+    /// Height of the **rows** part of the plan block, interpolated continuously from `plan_t`.
+    ///
+    /// Continuous, not `rows × t` rounded to whole rows: stepping one 20 px row at a time is what
+    /// made the disclosure feel like a stutter (reported 2026-10-23) — the card, its shadow and the
+    /// space reserved in the transcript all jumped together, several times per click. A fractional
+    /// height is clipped instead, so the last row slides into view.
+    ///
+    /// The reserve and the drawing read this same number, in the same frame: two independent floats
+    /// is exactly how the transcript's last line ends up behind the card for a frame.
+    fn plan_body_height(&self) -> f32 {
+        self.plan_rows_height() + self.plan_gap_height() + if self.plan.is_some() { PLAN_DIV_H } else { 0.0 }
+    }
+
+    /// Height of the **viewport** the rows scroll in.
+    ///
+    /// Exactly `rows × PLAN_ROW_H` — not a pixel more. A viewport that is 9 px taller than the rows
+    /// it shows displays the top strip of the next row, which reads as a sliced line of text at the
+    /// bottom of the list (2026-10-23). The breathing room beneath belongs to the card, not to the
+    /// scrolled area, so it is counted separately (see `plan_gap_height`).
+    fn plan_rows_height(&self) -> f32 {
+        let Some(v) = self.plan.as_ref() else { return 0.0 };
+        let rows = v.steps.len().min(PLAN_ROWS) as f32;
+        rows * PLAN_ROW_H * self.plan_t
+    }
+
+    /// Breathing room under the last row; animated with the rows, and **outside** the scroll area.
+    fn plan_gap_height(&self) -> f32 {
+        if self.plan.is_none() || self.plan_t <= 0.0 {
+            return 0.0;
+        }
+        PLAN_GAP * self.plan_t
+    }
+
+    /// The whole plan block's height for this frame.
+    ///
+    /// The header is there whenever a plan exists — only the rows animate. (Returning 0 at
+    /// `plan_t == 0` was the first version's bug: the collapsed block reserved no space and the last
+    /// line of the conversation sat underneath it.)
+    fn plan_block_height(&self) -> f32 {
+        if self.plan.is_none() {
+            return 0.0;
+        }
+        PLAN_HEAD_H + self.plan_body_height()
+    }
+
+    fn plan_bar(&mut self, ui: &mut Ui) {
+        let rows_h = self.plan_rows_height();
+        let gap = self.plan_gap_height();
+        // Scrolling only exists once the disclosure has finished: a scroll area whose viewport is
+        // still growing shows a scrollbar for a fifth of a second and then takes it away.
+        let full = self.plan_anim.is_none() && self.plan_t >= 1.0;
+        let Some(view) = self.plan.as_ref() else { return };
+        plan_card(ui, view, &mut self.plan_open, rows_h, gap, full);
+    }
+
     fn choice_bar(&mut self, ui: &mut Ui) {
         // Clone rather than drawing through `self.choice`: the last row needs
         // `&mut self.choice_text`, which together with "read the question and options" is two
@@ -3351,7 +3514,7 @@ impl App {
                         }
                         // Reserve the floating input box's height at the end, so the last message
                         // can scroll above it instead of being permanently half-covered.
-                        ui.add_space(COMPOSER_RESERVE);
+                        ui.add_space(COMPOSER_RESERVE + self.plan_block_height());
                     });
                 });
             });
@@ -3697,6 +3860,11 @@ impl App {
                         let w = ui.available_width();
                         ui.set_width(w);
                         ui.set_max_width(w);
+                        // The plan lives **inside** the input card, above a hairline divider: as a
+                        // card of its own it left a seam against the box, and a card floating over
+                        // the transcript hid the last line of the conversation behind it (both
+                        // reported 2026-10-23).
+                        self.plan_bar(ui);
                         // Note: ui.horizontal_centered() can't be used here -- it requests "the full
                         // available size" in one go, which makes the auto-height bottom bar panel keep
                         // inflating (measured: it swallows the whole window). ui.horizontal centres on
@@ -4383,6 +4551,196 @@ fn trash_glyph(ui: &mut Ui, size: f32, color: Color32) {
 
 /// The counterpart of the CLI's `/demo`: preview the layout and the shape of the event stream
 /// without connecting a real model.
+/// How many rows fit in the card before the list starts **scrolling** inside it.
+///
+/// The card sits above the input box, so an unbounded list would walk the composer off a short
+/// window — and a 30-step plan is legal (see `task::STEPS_MAX`). Scrolling lives inside the card
+/// rather than in the "show the first 8 and a `+k`" version this replaces: a plan you cannot read
+/// past row 8 is not a plan you can check your work against.
+const PLAN_ROWS: usize = 8;
+
+/// Draw the plan card.
+///
+/// A free function rather than a method on purpose: the caller lends `&self.plan` and
+/// `&mut self.plan_open` at the same time, and two disjoint fields are fine while a method call on
+/// `&mut self` would be rejected.
+///
+/// Markers carry the state, colour carries the attention: `✓` done (dim), `▸` the step being worked
+/// on (full text colour), `·` still to come (dim). Only one row is bright, which is the whole point
+/// of a progress list — the rest is context.
+fn plan_card(ui: &mut Ui, view: &PlanView, open: &mut bool, rows_h: f32, gap: f32, full: bool) {
+    let w = ui.available_width();
+    ui.set_width(w);
+
+    // ── Header: always visible, one line ──
+    let header = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            // "3/5" first — it is the number the eye looks for, and on its own it already justifies
+            // the space the collapsed block takes.
+            ui.label(
+                RichText::new(format!("{}/{}", view.done, view.total))
+                    .color(P::text_dim())
+                    .size(12.0),
+            );
+            match &view.current {
+                Some(cur) => {
+                    ui.add(Label::new(RichText::new(cur).color(P::text()).size(12.5)).truncate());
+                }
+                None => {
+                    ui.label(
+                        RichText::new(aox::i18n::t("every step is ticked"))
+                            .color(P::text_dim())
+                            .size(12.0),
+                    );
+                }
+            }
+            // Painted, never typed: `▸` / `▾` have no glyph in the bundled font, so both came out as
+            // tofu boxes (2026-10-23). Three lines cannot go missing.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                chevron(ui, *open, P::text_dim());
+            });
+        })
+        .response;
+    let hit = ui.interact(header.rect, ui.id().with("aox-plan-toggle"), Sense::click());
+    if hit.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if hit.clicked() {
+        *open = !*open;
+    }
+
+    // ── The rule, then the rows sliding out from under it ──
+    //
+    // The rule's band is part of the card from the start (only its ink fades in), and the rows are
+    // clipped **below** it. An earlier version put the rule at the bottom of the animated block, so
+    // while opening it travelled down across the half-revealed row — a line through the text, read
+    // as "overlapping" (2026-10-23).
+    let block_h = PLAN_DIV_H + rows_h;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, block_h), Sense::hover());
+    let line_y = rect.top() + 4.0;
+    ui.painter().hline(
+        rect.x_range(),
+        line_y,
+        Stroke::new(1.0, P::edge().gamma_multiply(plan_rule_alpha(block_h))),
+    );
+
+    let rows_rect = Rect::from_min_max(
+        Pos2::new(rect.left(), line_y + 1.0 + 4.0),
+        Pos2::new(rect.right(), rect.bottom()),
+    );
+    if rows_rect.height() <= 0.5 {
+        ui.add_space(gap);
+        return;
+    }
+    let mut area = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rows_rect)
+            .layout(Layout::top_down(Align::Min)),
+    );
+    area.set_clip_rect(rows_rect.intersect(ui.clip_rect()));
+    if full {
+        // A plan longer than the visible window scrolls **inside the card** (user request,
+        // 2026-10-23): the alternative — showing the first eight and a "+k" — means the tail of the
+        // plan is unreachable, and the tail is exactly where "what is left" lives.
+        egui::ScrollArea::vertical()
+            .id_salt("aox-plan-rows")
+            .max_height(rows_rect.height())
+            .auto_shrink([false, true])
+            .show(&mut area, |ui| plan_rows_into(ui, view));
+    } else {
+        plan_rows_into(&mut area, view);
+    }
+    ui.add_space(gap);
+}
+
+/// The rows themselves.
+///
+/// Shared by the plain path and the scrolling path so the two can never drift apart — and each row
+/// is allocated at **exactly** `PLAN_ROW_H`: the block's height is computed from that constant
+/// before a single row is drawn (the composer's position depends on it), so a row that lays itself
+/// out naturally would make the arithmetic a guess. It was a guess once: five rows reported a
+/// height of three.
+fn plan_rows_into(ui: &mut Ui, view: &PlanView) {
+    let w = ui.available_width();
+    // **No inter-row spacing**: `PLAN_ROW_H` is the row's full pitch, and the block's height was
+    // computed from it before anything was drawn. Leaving egui's default 4 px between rows added
+    // 20 px to five rows, which pushed the first row out of the viewport and produced a scrollbar
+    // for a plan that fits (2026-10-23).
+    ui.spacing_mut().item_spacing.y = 0.0;
+    for (text, done) in view.steps.iter() {
+        let current = !*done && view.current.as_deref() == Some(text.as_str());
+        // Done vs to come is told by the **mark**, not by the text colour: one row is always the
+        // working one, and dimming the rest of them would bury the plan.
+        let (color, size) = if current {
+            (P::text(), 12.5)
+        } else if *done {
+            (P::text_dim(), 12.0)
+        } else {
+            (P::text_dim(), 12.0)
+        };
+        ui.allocate_ui_with_layout(
+            Vec2::new(w, PLAN_ROW_H),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                step_mark(ui, *done);
+                ui.add(Label::new(RichText::new(text).color(color).size(size)).truncate());
+            },
+        );
+    }
+}
+
+/// One step's marker: a hairline box while it is still to come, a low-saturation green tick once it
+/// is done.
+///
+/// Painted rather than typed, for the same reason as the chevron: the bundled fonts have no `✓`
+/// glyph and it came out as an empty rectangle. Painting also lets the box and the tick share one
+/// optical size — no two font glyphs ever do, and at 10 px that shows.
+///
+/// The green is `P::add_green()` (the diff's "lines added" colour), deliberately low-saturation: a
+/// plan is a quiet list, and a saturated tick would out-shout the one row the user is looking at.
+fn step_mark(ui: &mut Ui, done: bool) -> Rect {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+    let c = rect.center();
+    let painter = ui.painter();
+    if done {
+        // Two strokes, corner below-left of centre: that is what makes it read as a tick instead of
+        // a "v". 1.6 px at this size matches the visual weight of the box outline.
+        let s = Stroke::new(1.6, P::add_green());
+        painter.line_segment([c + egui::vec2(-3.7, 0.2), c + egui::vec2(-1.2, 2.7)], s);
+        painter.line_segment([c + egui::vec2(-1.2, 2.7), c + egui::vec2(3.9, -2.9)], s);
+    } else {
+        painter.rect_stroke(
+            Rect::from_center_size(c, Vec2::splat(8.4)),
+            CornerRadius::same(2),
+            Stroke::new(1.0, P::text_dim()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    rect
+}
+
+/// How visible the rule is, given how much of the block is revealed.
+///
+/// Only a fade — the geometry never depends on it, so a frame in the middle of the disclosure cannot
+/// produce a line in the wrong place. It reaches full strength once the rows have started arriving.
+fn plan_rule_alpha(body_h: f32) -> f32 {
+    ((body_h - 6.0) / 6.0).clamp(0.0, 1.0)
+}
+
+/// A small disclosure triangle, painted instead of typed (see `plan_card`).
+fn chevron(ui: &mut Ui, open: bool, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+    let c = rect.center();
+    let pts = if open {
+        vec![c + egui::vec2(-3.5, -1.5), c + egui::vec2(3.5, -1.5), c + egui::vec2(0.0, 2.5)]
+    } else {
+        vec![c + egui::vec2(-1.5, -3.5), c + egui::vec2(-1.5, 3.5), c + egui::vec2(2.5, 0.0)]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+}
+
 fn seed_demo(app: &mut App) {
     app.model = "deepseek-chat".into();
     app.config_path = "config.toml".into();
@@ -4424,6 +4782,12 @@ fn seed_demo(app: &mut App) {
     });
     app.store = Some(store);
     app.refresh_history();
+    // A plan for the bar above the input: `--demo` is how the interface is verified without a
+    // model, and a bar nobody can see in the demo is a bar nobody checks.
+    let demo_task = aox::task::TaskState::steps_demo();
+    // Both: the bar draws from `plan`, and `task` is what `/task`-style reporting would read.
+    app.plan = PlanView::of(&demo_task);
+    app.task = Some(demo_task);
 
     // The workplace button's initial value: in demo mode the bridge won't send
     // `FromAgent::Workplace`, so one is stuffed in locally, letting `--demo` show the tier name
@@ -4825,6 +5189,31 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
+        // The plan block's disclosure clock — the same frame-by-frame stepping as `hist_t`, for the
+        // same reason: reversing mid-flight continues from where it is instead of jumping to 0.
+        let plan_target = if self.plan_open { 1.0 } else { 0.0 };
+        match self.plan_anim {
+            // Reversed mid-flight: carry on from wherever it is, never from 0.
+            Some((_, _, to)) if to != plan_target => {
+                self.plan_anim = Some((Instant::now(), self.plan_t, plan_target));
+                ctx.request_repaint();
+            }
+            Some((started, from, to)) => {
+                let k = (started.elapsed().as_secs_f32() / PLAN_ANIM_SECS).clamp(0.0, 1.0);
+                self.plan_t = from + (to - from) * ease_out_cubic(k);
+                if k >= 1.0 {
+                    self.plan_t = to;
+                    self.plan_anim = None;
+                }
+                ctx.request_repaint();
+            }
+            None if self.plan_t != plan_target => {
+                self.plan_anim = Some((Instant::now(), self.plan_t, plan_target));
+                ctx.request_repaint();
+            }
+            None => {}
+        }
+
         if self.native_theme != Some(theme::mode()) {
             self.native_theme = Some(theme::mode());
             theme::sync_native_theme(ctx);
@@ -4911,15 +5300,31 @@ impl eframe::App for App {
             // column's centre -- and the column starts wherever the drawer ends. Half the drawer's
             // width is exactly the difference, on the same eased clock the panel itself uses, so the
             // card travels with the column instead of being clamped into it after the fact.
-            let drawer_w = HISTORY_W * ease_out_cubic(self.hist_t);
+            // **Pin the composer by its top-left, not by an anchor.**
+            //
+            // `Area::anchor` positions an area using the size measured on the *previous* frame. The
+            // plan block changes height during its disclosure, so the anchor was applied to a stale
+            // height: the card's bottom moved by exactly that frame's delta and snapped back — "the
+            // input box bobs up and down" (reported 2026-10-23).
+            //
+            // Instead the plan block's height is known *exactly* in advance (`plan_t` drives it), and
+            // the rest of the composer is measured once per frame. Both together give the total
+            // height now, so `bottom - height` is a real bottom: the card grows upwards and its
+            // bottom stays put.
+            let plan_h = self.plan_block_height();
+            let composer_h = self.composer_base_h + plan_h;
+            let origin = Pos2::new(column_rect.left(), column_rect.bottom() - 18.0 - composer_h);
             egui::Area::new(egui::Id::new("aox-composer"))
                 .order(egui::Order::Foreground)
                 .movable(false)
                 .constrain_to(clip)
-                .anchor(Align2::CENTER_BOTTOM, Vec2::new(drawer_w * 0.5, -18.0))
+                .fixed_pos(origin)
                 .show(ctx, |ui| {
                     ui.set_width(column_rect.width());
                     self.composer(ui);
+                    // Measured for **next** frame's position: see the note where `top` is computed.
+                    let total = ui.min_rect().height();
+                    self.composer_base_h = (total - plan_h).max(0.0);
                 });
 
             // The last of the three calls that together bury the eight border hot-zones: this one
@@ -5010,6 +5415,24 @@ pub(crate) fn column(available: f32) -> (f32, f32) {
 /// That much blank is reserved at the end of the transcript, so the last message can't be pressed
 /// under the card.
 const COMPOSER_RESERVE: f32 = 118.0;
+
+/// The plan block inside the input card: header row, one row per step, and the gap under the
+/// divider.
+///
+/// These are **reserve** numbers, not drawing numbers: the block lays itself out naturally, and the
+/// transcript reserves at the end of its content what these add up to. Deliberately a couple of
+/// points generous — under-reserving is the reported bug (the last line of the conversation hides
+/// behind the card), while over-reserving is a few blank pixels nobody notices.
+const PLAN_HEAD_H: f32 = 24.0;
+const PLAN_ROW_H: f32 = 22.0;
+/// Breathing room under the last step row.
+const PLAN_GAP: f32 = 9.0;
+/// The hairline between the plan and the text box, plus its margins. **Constant**, never animated:
+/// a rule that slides with the rows crosses the half-revealed text on the way down (that was the
+/// "重叠" seen while opening, 2026-10-23).
+const PLAN_DIV_H: f32 = 10.0;
+/// Disclosure clock. Short enough to read as "opened", long enough not to be a jump cut.
+const PLAN_ANIM_SECS: f32 = 0.2;
 
 /// How many conversations the history overlay lists at most.
 ///

@@ -2,6 +2,7 @@ mod agent;
 mod agent_loop;
 mod attach;
 mod auth;
+mod checks;
 mod compact;
 mod config;
 mod history;
@@ -9,9 +10,11 @@ mod hook;
 mod i18n;
 mod llm;
 mod message;
+mod notes;
 mod plugin;
 mod prompt;
 mod recycle;
+mod repeat;
 mod runtime;
 mod runtimes;
 mod sandbox;
@@ -618,6 +621,14 @@ async fn main() -> Result<()> {
             "/prompt" => ui.emit(AgentEvent::Info(prompt::report(&rt))),
             "/hook" => ui.emit(AgentEvent::Info(hook::report(&rt))),
             "/loop" => ui.emit(AgentEvent::Info(agent_loop::report(&rt))),
+            // The checkpoint is the one thing the CLI had no window onto at all (see the note at the
+            // top of this file). It lives on the `Agent`, not in config, so it is read from there.
+            "/task" => match agent.task() {
+                Some(st) => ui.emit(AgentEvent::Info(crate::task::report(st))),
+                None => ui.emit(AgentEvent::Info(crate::i18n::t(
+                    "no task checkpoint in this conversation yet — the model writes one with task_state on long tasks (goal, plan, acceptance).",
+                ).to_string())),
+            },
             "/sandbox" => ui.emit(AgentEvent::Info(sandbox::report(&rt))),
             // Workplace: `/workplace` shows the current state, `/workplace
             // full|default|<dir>` switches tiers. Both decision and execution live in
@@ -679,7 +690,11 @@ async fn main() -> Result<()> {
                     ("/hook", crate::i18n::t("Show the active loop hooks (from config.toml's [hook] and plugins' [contributes])")),
                     (
                         "/loop",
-                        crate::i18n::t("Show the main-loop implementation and context trimming (config.toml's [loop]: impl swaps the implementation, max_rounds caps the rounds)"),
+                        crate::i18n::t("Show the main-loop implementation, context trimming and the per-turn request ceiling (config.toml's [loop]: impl swaps the implementation, max_rounds caps how much context is kept, max_iters_per_turn caps how many requests one turn may spend)"),
+                    ),
+                    (
+                        "/task",
+                        crate::i18n::t("Show this conversation's task checkpoint: the goal, the plan with its ticks, and the acceptance criteria"),
                     ),
                     (
                         "/sandbox",

@@ -911,11 +911,21 @@ impl Agent {
             .and_then(|p| crate::task::apply(self.task.clone(), &p));
         match applied {
             Ok(st) => {
-                let out = crate::tf!(
+                let mut out = crate::tf!(
                     "checkpoint saved ({}). This is what a restored session will see:\n{}",
                     st.task_id,
                     st.context_block()
                 );
+                // `done` is only accepted when the gate passed (see `task::apply`), but the model's
+                // own plan may still have open steps. Saying so out loud is cheap; accepting in
+                // silence is how "did four of six and called it done" stays invisible.
+                let pending = st.pending_steps();
+                if st.status == crate::task::Status::Done && pending > 0 {
+                    out.push_str(&crate::tf!(
+                        "\nnote: the host accepted \"done\", but {} step(s) of your plan are still open — tick them if they are genuinely finished, so the next session is not misled.",
+                        pending
+                    ));
+                }
                 self.task = Some(st);
                 ToolOutput::ok(out)
             }
@@ -998,7 +1008,18 @@ impl Agent {
             // conversation, so `Tool::call` (which only sees `Runtime`) could not record it. Placed
             // after authorization like everything else: being a host tool is not a bypass.
             if name == crate::tool::task::TASK_TOOL {
-                return self.task_tool(args);
+                let out = self.task_tool(args);
+                // A checkpoint is the only thing a human can watch a long task by, and until
+                // 2026-10-23 nothing outside the model's context ever saw one. Emitted **here**
+                // rather than inside `task_tool`: that function needs no `Ui`, which is what lets
+                // the checkpoint logic be tested without one. A rejected patch changed nothing, so
+                // only a successful write is announced.
+                if !out.is_error {
+                    if let Some(st) = self.task.clone() {
+                        ui.emit(AgentEvent::Task(Box::new(st)));
+                    }
+                }
+                return out;
             }
             // `find_tools`: third interception, same story — "make a hidden tool visible" changes
             // this **conversation's** scope, and `Tool::call` only ever sees `&Runtime`. Placed after

@@ -133,18 +133,29 @@ compact_ratio = 0.8
 # create_dirs = true
 #
 # A second capability (stage 6 · 6b) -- have the host **itself** retry a few times when a
-# request errors:
-#
-# [hook]
-# max_llm_retries = 2
-#
-#   —— when the model request itself fails (a network hiccup, an upstream 5xx, and so on), the
-#      host retries automatically, up to this many times. The count is **per turn**, so it
-#      doesn't accumulate over a long conversation. 0 (the default) = no retries, the error is
-#      thrown as-is, byte for byte identical to stage 4.
+# request errors. As of 2026-10-23 the budget lives in [retry], not here: it never belonged to
+# the hook seam, and it has to agree with the delay curve next to it.
 #      Components (the [contributes] hooks of a plugin's plugin.toml) can also request retries,
-#      and that path takes precedence; this one is the fallback that works when no component
+#      and that path takes precedence; [retry] is the fallback that works when no component
 #      asks at all.
+
+# ── failing model requests (2026-10-23) ──────────────────────────────────────────
+#
+# Only "the request itself never produced a reply" is retried — never a tool call: a tool can
+# have side effects, so the host may report a failure but must never run it twice on its own.
+# And only failures that could plausibly succeed on the next try: 429 / 5xx / connection errors
+# / a stream that stopped mid-answer. A 401, a wrong model name or a context that is too long
+# fails on the first attempt.
+#
+# [retry]
+# attempts = 2      # extra attempts after the first; total requests <= attempts + 1. 0 = off.
+# base_ms  = 1000   # first wait; it doubles per attempt: 1s, 2s, 4s …
+# max_ms   = 30000  # ceiling for one wait, and for a `Retry-After` the endpoint sends — an
+#                   # endpoint asking for an hour must not leave the turn silent for an hour.
+#
+# Defaults are the three values above, i.e. nothing is written and retries are already on.
+# Note that a retry re-sends a **byte-identical** request and injects no message into the
+# conversation: the failed attempt never touched the history.
 
 # ── the main loop (stage 6 · 6a) ──────────────────────────────────────────────────
 #
@@ -174,6 +185,17 @@ compact_ratio = 0.8
 #      Pruning changes **both** memory and the conversation file (rollback is symmetric), so
 #      reading it back after a restart isn't truncated.
 #      ⚠️ It is a "cap", not a "target": while the turn count is below it, nothing is pruned.
+#
+# max_iters_per_turn = 50
+#
+#   —— the other ceiling, and the two are easy to confuse:
+#         max_rounds          caps how much **context** is kept
+#         max_iters_per_turn  caps how much **work** one instruction may cost
+#      A turn spends one request per round (one model reply + the tools it asked for). 0 (the
+#      default) = no limit, exactly as before this key existed. With a value, the turn stops
+#      normally when it is reached -- the checkpoint is persisted, the card is closed, and the
+#      user is told which ceiling fired, so "the task died silently" does not happen.
+#      50 is a reasonable number to start from: a heavy real turn uses 10-20.
 
 # ── plugin process fence (Job Object) ─────────────────────────────────────────────
 #

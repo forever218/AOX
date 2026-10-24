@@ -1,3 +1,4 @@
+pub mod failure;
 pub mod openai;
 
 use anyhow::Result;
@@ -364,6 +365,18 @@ pub trait StreamSink: Send + Sync {
     /// This response ended (whether it succeeded or failed). The UI should tear down the temporarily
     /// displayed reasoning process here, realising "show instantly, vanish instantly".
     fn on_finish(&self) {}
+
+    /// A **new attempt** at the same request is about to start (`attempt` 1 = the first retry).
+    ///
+    /// Called by the agent loop, not by the provider: the retry decision lives there (see
+    /// `crate::llm::failure`), and the provider only ever sees one attempt.
+    ///
+    /// This exists because a retry after a *cut stream* has already shown the user half an answer.
+    /// Whatever is on screen from the abandoned attempt has to go — otherwise the retyped answer
+    /// arrives underneath the fragment and the reply reads as if the model had said it twice. A
+    /// front end is free to ignore this (the default does): the conversation file was never
+    /// polluted, so ignoring it costs only the visual duplication.
+    fn on_attempt(&self, _attempt: u32, _delay: std::time::Duration) {}
 }
 
 /// The model-provider abstraction. Wiring up Anthropic / local inference in the future just means

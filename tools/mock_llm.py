@@ -35,6 +35,32 @@ LAST_PROMPT = [0]
 
 SCENARIO = os.environ.get("AOX_MOCK_SCENARIO", "").strip().lower()
 
+# ── 故障注入（验 [retry] 用，2026-10-23）──
+#
+# AOX_MOCK_FAULT=<kind>[:<count>]，count 默认 1（先坏 N 次，之后恢复正常）：
+#   429        → 第 1 次回 429（带 Retry-After: 1），之后正常
+#   503:2      → 前 2 次回 503，第 3 次正常
+#   401        → 回 1 次 401（不可重试 ⇒ 客户端必须**第一次**就报错，不能等）
+#   cut        → 把流切在两块之后：不发 finish_reason、不发 [DONE]，直接关连接
+#
+# 这三条正好覆盖 [retry] 的三个分支：可重试且会恢复 / 不可重试 / 断流。
+FAULT = os.environ.get("AOX_MOCK_FAULT", "").strip().lower()
+FAULT_HITS = [0]
+
+
+def fault_for_this_request():
+    """('status', code) / ('cut', None) / None。"""
+    if not FAULT:
+        return None
+    kind, _, count = FAULT.partition(":")
+    limit = int(count) if count else 1
+    if FAULT_HITS[0] >= limit:
+        return None
+    FAULT_HITS[0] += 1
+    if kind == "cut":
+        return ("cut", None)
+    return ("status", int(kind))
+
 
 # ── ask 剧本：选项槽 / 图片显示 / SVG 渲染，一条链走完 ──
 #
@@ -84,6 +110,8 @@ ASK_FINAL = """路线定了，我按你选的做。
 
 图里的红蓝两块如果左右调了个，说明 GDI+ 那步 BGRA→RGBA 的通道顺序错了。"""
 
+
+PLAIN_FINAL = """收到。这是一句不需要任何工具就能给出的答复，用来把变量压到只剩"请求成不成"。"""
 
 PHASE0_REASON = (
     "用户想知道现在有哪些能力可用。我应该先 list_plugins 看看已加载的插件，"
@@ -206,6 +234,21 @@ class Handler(BaseHTTPRequestHandler):
         chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in msgs)
         self._prompt = max(1, chars // 4)
 
+        fault = fault_for_this_request()
+        if fault and fault[0] == "status":
+            payload = json.dumps(
+                {"error": {"message": f"mock fault {fault[1]}", "type": "mock"}}
+            ).encode("utf-8")
+            self.send_response(fault[1])
+            self.send_header("Content-Type", "application/json")
+            # 让退避走服务器的提示值，而不是代码里那条 1s —— 这条路径也要被真的跑一次。
+            self.send_header("Retry-After", "1")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            self.wfile.flush()
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -213,7 +256,77 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
-            if SCENARIO == "ask":
+            if fault and fault[0] == "cut":
+                # 说半句话就断：正常内容两块，然后关连接 —— 没有 finish_reason，也没有 [DONE]。
+                # 客户端必须把这条当成"断流"而不是"模型答完了"。
+                self._delta({"content": "我先说一半："})
+                time.sleep(0.05)
+                self._delta({"content": "后面的话还没说完"})
+                self.wfile.flush()
+                self.close_connection = True
+                return
+            if SCENARIO == "write":
+                # 验「写入后一行宿主提示」：写 → 写（不重复）→ 跑检查 → 再写（重新出现）。
+                # 用 `echo cargo test` 冒充检查：这里验的是**匹配器**，不是真的跑 cargo
+                # （真跑会在临时目录里失败，还会拖慢整轮）。
+                if tool_msgs == 0:
+                    self._tool_call(0, "call_w1", "write_file",
+                                    json.dumps({"path": os.path.abspath("a.txt"), "content": "one\n"}))
+                    self._end("tool_calls")
+                elif tool_msgs == 1:
+                    self._tool_call(0, "call_w2", "write_file",
+                                    json.dumps({"path": os.path.abspath("b.txt"), "content": "two\n"}))
+                    self._end("tool_calls")
+                elif tool_msgs == 2:
+                    self._tool_call(0, "call_w3", "shell",
+                                    json.dumps({"command": "echo cargo test"}))
+                    self._end("tool_calls")
+                elif tool_msgs == 3:
+                    self._tool_call(0, "call_w4", "write_file",
+                                    json.dumps({"path": os.path.abspath("c.txt"), "content": "three\n"}))
+                    self._end("tool_calls")
+                else:
+                    for i in range(0, len(PLAIN_FINAL), 8):
+                        self._delta({"content": PLAIN_FINAL[i:i + 8]})
+                    self._end("stop")
+            elif SCENARIO == "steps":
+                # 长任务的计划：先记三步，再勾掉第一步 —— 验 task_state 的 steps、context_block
+                # 的回显，以及前端那条"计划 1/3 · 下一步: …"。
+                if tool_msgs == 0:
+                    self._delta({"content": "先把计划写下来，免得做着做着忘了第几步。"})
+                    args = json.dumps({
+                        "goal": "给 AOX 加计划清单",
+                        "steps": ["读现有 task_state 实现", "加 steps 字段", "接前端"],
+                        "acceptance": ["cargo test 通过"],
+                    }, ensure_ascii=False)
+                    self._tool_call(0, "call_t1", "task_state", args)
+                    self._end("tool_calls")
+                elif tool_msgs <= 3:
+                    # 每轮只勾一步：验的是"实时打勾"（tick: n），不是最后一次性补勾。
+                    # 这里发的是 `tick` 而不是重发整份 steps —— 便宜的那条路。
+                    args = json.dumps({"tick": tool_msgs}, ensure_ascii=False)
+                    self._tool_call(0, f"call_t{tool_msgs + 1}", "task_state", args)
+                    self._end("tool_calls")
+                else:
+                    for i in range(0, len(PLAIN_FINAL), 8):
+                        self._delta({"content": PLAIN_FINAL[i:i + 8]})
+                    self._end("stop")
+            elif SCENARIO == "loop":
+                # 每轮都读同一个文件、同一组参数 —— 验两件事：
+                #   ① 重复守卫从第 2 次起不再真的读，只回一行"同上"；
+                #   ② max_iters_per_turn 到点后正常收尾。
+                self._delta({"content": "再看一眼同一个文件。"})
+                self._tool_call(0, "call_loop", "read_file",
+                                json.dumps({"path": "config.toml"}))
+                self._end("tool_calls")
+            elif SCENARIO == "plain":
+                # 一句话答完，不调任何工具：验 [retry] 时唯一的变量就只剩"这次请求成不成"，
+                # 不必再猜是哪一轮、也不用管授权。
+                for i in range(0, len(PLAIN_FINAL), 6):
+                    self._delta({"content": PLAIN_FINAL[i:i + 6]})
+                    time.sleep(0.01)
+                self._end("stop")
+            elif SCENARIO == "ask":
                 self._ask_scenario(tool_msgs)
             elif tool_msgs == 0:
                 self._reason(PHASE0_REASON)

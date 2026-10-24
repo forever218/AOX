@@ -59,6 +59,7 @@ const BUILTIN_PROMPT: &str = r#"You are AOX, an AI agent running in a Rust host 
 - To change part of an existing file, use edit_file (exact old_text → new_text, all edits applied atomically), not write_file. write_file is for creating a file or replacing all of its content. Before rewriting a file you have not read in this session, read it — and for a large file read only the slice you need (read_file's start_line / max_lines), rather than pulling the whole thing into the request.
 - edit_file needs each old_text to occur exactly once: include the surrounding lines that make it unique. If it reports the file changed, read it again instead of guessing — the header's hash is what expected_hash is for.
 - For a long task (several stages, several files, or work that may be interrupted), keep task_state's checkpoint current: goal, constraints, acceptance, what is done, what is next. A resumed conversation gets it back automatically. A single question or a one-file edit needs no checkpoint.
+- Write the work as `steps` — short, concrete, in order. Tick each step **the moment it is finished, before you start the next one**, with task_state `tick: <number>` (it costs a number, not a list). A plan that is only ticked when everything is done is a summary, not a plan — and after the conversation is compacted the plan is the only thing that still says which step you were on. Tick honestly: an unticked step is the cheapest reminder you will ever get, and a falsely ticked one is worse than none.
 - Before you call a task done, make the evidence real: run verify once per acceptance item (file_hash, file_contains, path_exists, or output_contains over the output of a command tool). task_state with status "done" is refused while any item lacks a current passing check — and any file write after a check makes that check stale, so verify after your last edit.
 - The tools list in each request is what you can call right now. Check it first, and don't reinvent what already exists. On a large registry some plugin tools are left out of the list until you call find_tools (the host's own tools are always listed), so search before concluding a capability is missing.
 - When you need a new capability (running commands, network requests, data processing, parsing specialized formats, etc.), first call list_plugins to see whether an existing plugin can be reused. If not, write one with create_plugin, then call it to finish the task. Plugins are stored in plugins/ and load automatically after a restart.
@@ -154,6 +155,8 @@ pub const CORE: &str = "core";
 pub const PROTOCOL: &str = "protocol";
 /// The runtime-generated segment's id.
 pub const ENV: &str = "env";
+/// The workspace notes ("what earlier sessions wrote") segment's id.
+pub const MEMORY: &str = "memory";
 /// The project rules file segment's id.
 pub const RULES: &str = "rules";
 
@@ -294,6 +297,16 @@ fn env_section(rt: &Runtime) -> String {
         ws.display(),
         ws.display(),
     ));
+    // The project's own check command, when its marker files give it away. It belongs beside the
+    // workspace layout because it is a fact about **this copy of this project**, not a rule about how
+    // to behave — and a named command is what turns "verify your change" from advice into one call.
+    if let Some(c) = crate::checks::detect(&ws) {
+        s.push_str(&tf!(
+            "\n- Check command: `{}` (recognised from `{}`). Run it after you change code — compiling is not the same as working. The host will point out writes that have not been checked since.",
+            c.command,
+            c.from
+        ));
+    }
     // The AI's own per-workspace notes (see `src/workplace.rs`: the `.aox/memory/` folder). Today's
     // local date is passed in so the model can name the file without guessing. Kept in its own `tf!`
     // so the big "run environment" key above is untouched.
@@ -410,6 +423,48 @@ fn env_segment(rt: &Runtime) -> PromptSegment {
     }
 }
 
+/// The workspace-notes segment: a table of contents for `.aox/memory/`.
+///
+/// `None` when nothing has been written yet — a workspace that never kept notes must produce the
+/// **same prompt** it did before this segment existed.
+fn memory_segment(rt: &Runtime) -> Option<PromptSegment> {
+    let (_, ws_root) = rt.workplace.snapshot();
+    let root = ws_root.unwrap_or_else(|| rt.root.clone());
+    let notes = crate::notes::recent(&root, crate::notes::RECENT_MAX);
+    if notes.is_empty() {
+        return None;
+    }
+    // No leading "\n\n": `build()` puts the separator between segments, and a body that also
+    // carried one would leave a triple blank line (the same trap `strip_sep` guards against).
+    let mut body = String::new();
+    body.push_str(t("# Notes from previous sessions"));
+    body.push('\n');
+    body.push_str(t(
+        "`.aox/memory/` holds what earlier sessions wrote in this workspace — the host is only telling you that they exist. Open the one that covers the work in front of you (`read_file` reads it like any other file) before you redo that work:",
+    ));
+    for n in &notes {
+        body.push('\n');
+        body.push_str(&if n.headings.is_empty() {
+            // Sizes are here for the same reason the topics are: "4.5 KB" is what tells the model
+            // whether opening the file costs anything.
+            tf!("- {} ({})", n.name, crate::notes::human_size(n.bytes))
+        } else {
+            tf!("- {} ({}) — {}", n.name, crate::notes::human_size(n.bytes), n.headings.join(" · "))
+        });
+    }
+    body.push('\n');
+    body.push_str(t(
+        "They are notes, not facts: where a note disagrees with the code, the code wins.",
+    ));
+    Some(PromptSegment {
+        id: MEMORY.into(),
+        title: t("Notes from earlier sessions").into(),
+        body,
+        order: 35,
+        source: Source::Runtime,
+    })
+}
+
 /// The project rules segment (`RULES.md`). Returns `None` when the file is missing or
 /// its content is empty.
 fn rules_segment(rt: &Runtime) -> Option<PromptSegment> {
@@ -477,6 +532,9 @@ pub fn registry_from_config(cfg: &PromptConfig) -> Vec<PromptSegment> {
 pub fn collect(rt: &Runtime) -> Vec<PromptSegment> {
     let mut segs = rt.prompt_segments();
     segs.push(env_segment(rt));
+    if let Some(m) = memory_segment(rt) {
+        segs.push(m);
+    }
     if let Some(r) = rules_segment(rt) {
         segs.push(r);
     }
@@ -589,6 +647,40 @@ mod tests {
         cfg.prompt = prompt;
         let root = std::env::temp_dir().join("aox-prompt-test");
         Runtime::new(cfg, root.clone(), root.join("plugins")).expect("test runtime should not fail on the storage backend")
+    }
+
+    /// A workspace with notes lists a **table of contents**, not the notes; a workspace without any
+    /// produces the same segment list it did before this existed.
+    #[test]
+    fn earlier_sessions_notes_are_listed_by_title_only() {
+        let dir = std::env::temp_dir().join(format!("aox-prompt-notes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".aox/memory")).unwrap();
+        let rt = Runtime::new(Config::dummy(), dir.clone(), dir.join("plugins"))
+            .expect("test runtime");
+
+        let ids = |rt: &std::sync::Arc<Runtime>| -> Vec<String> {
+            assemble(rt).into_iter().map(|s| s.id).collect()
+        };
+        assert!(!ids(&rt).contains(&MEMORY.to_string()), "no notes yet ⇒ no segment");
+
+        std::fs::write(
+            dir.join(".aox/memory/2026-10-18.md"),
+            "## 改了输入框\n\n正文，不该出现在提示词里\n",
+        )
+        .unwrap();
+        let segs = assemble(&rt);
+        let seg = segs.iter().find(|s| s.id == MEMORY).expect("the note must be listed");
+        assert!(seg.body.contains("2026-10-18.md"), "{}", seg.body);
+        assert!(seg.body.contains("改了输入框"), "{}", seg.body);
+        assert!(
+            !seg.body.contains("不该出现在提示词里"),
+            "the body is read on demand, never injected: {}",
+            seg.body
+        );
+        // The heading is the first line, which is what `/prompt` shows.
+        assert_eq!(seg.body.lines().next(), Some("# Notes from previous sessions"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `[shell] prefer` moves **one line** and one bullet order — nothing else in the section.

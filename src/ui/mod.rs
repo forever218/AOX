@@ -69,6 +69,16 @@ pub enum AgentEvent {
     /// the same-named modules" entry in `TRAPS.md`).
     #[allow(dead_code)]
     Images(Vec<std::path::PathBuf>),
+    /// The task checkpoint was just written (see [`crate::task`]) — the front end should show the
+    /// **plan** it carries.
+    ///
+    /// Until 2026-10-23 nothing outside the model's context ever saw a checkpoint: it went into the
+    /// conversation file and into the prompt, and that was it. The plan (`steps`) is the part a human
+    /// wants to watch, because it is the only place that says "4 of 6 done, next is run the tests".
+    ///
+    /// Boxed for the same reason as `Boot`: a `TaskState` is several hundred bytes and this variant
+    /// rides in a channel that also carries one-string events.
+    Task(Box<crate::task::TaskState>),
     /// **N files were moved to the system recycle bin** by a host file tool.
     ///
     /// A variant of its own rather than a sentence inside `Info`, for the same split as `Images`:

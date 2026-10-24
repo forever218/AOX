@@ -27,6 +27,15 @@ pub struct Config {
     pub prompt: PromptConfig,
     #[serde(default)]
     pub hook: HookConfig,
+    /// The `[retry]` section of `config.toml` (what to do when a model request fails, see
+    /// [`RetryConfig`] and `src/llm/failure.rs`).
+    ///
+    /// It lives next to `[hook]` on purpose: until 2026-10-23 the retry budget was
+    /// `[hook] max_llm_retries`, a key that only existed because a *hook* was the first thing able
+    /// to ask for a retry. The budget never belonged to the hook seam — it belongs to the loop — and
+    /// it now travels with the delay curve it has to agree with.
+    #[serde(default)]
+    pub retry: RetryConfig,
     /// The `[loop]` section of `config.toml` (the loop seam's second form, see `src/agent_loop.rs`).
     ///
     /// The Rust field name carries an underscore because `loop` is a keyword — **the TOML key is
@@ -436,19 +445,57 @@ pub struct HookConfig {
     /// of "the model said A, the tool received B".
     #[serde(default)]
     pub tool_args_default: HashMap<String, HashMap<String, toml::Value>>,
+}
 
-    /// How many times the host retries **on its own** when a model request errors (a config-driven
-    /// fallback that needs no hook/component).
+/// The `[retry]` section: how many times a failed **model request** is sent again, and how long to
+/// wait between attempts.
+///
+/// Scope is exactly "the request that never produced a reply". Tool calls are not retried here and
+/// never will be — a tool can have side effects, so the host may report a failure but must never
+/// run it a second time on its own. Requests, by contrast, are safe to repeat: `agent.messages()` is
+/// only ever mutated by a *successful* reply, so a retry sends a byte-identical body.
+///
+/// **Defaults are on** (`attempts = 2`): a rate limit or a dropped stream used to throw away the
+/// whole turn, which with a 600k window is the most expensive failure the program has. The cost of
+/// being wrong in the other direction is one second of waiting before the same error appears.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetryConfig {
+    /// Extra attempts **after** the first one (`0` = never retry). Total requests ≤ `attempts + 1`.
     ///
-    /// Like `[loop] max_rounds`, this belongs to the "works without writing a script" category: a
-    /// component can return `retry(note)` for a targeted one-shot degradation, but with no component
-    /// an occasional upstream jitter is still worth one retry. The count is **per turn**
-    /// (`AgentLoop::run` running once is one turn), so it never accumulates into "the longer you chat
-    /// the more retries you get" across a long conversation.
-    ///
-    /// `0` (default) = no retry, the error is thrown as-is — byte-identical to stage 4.
-    #[serde(default)]
-    pub max_llm_retries: usize,
+    /// Only failures that could plausibly succeed on the next try are retried at all — `429`, `5xx`,
+    /// connection errors, a stream that stopped mid-answer. A `401`, a bad model name or a context
+    /// that is too long fails on the first attempt (see `llm::failure::retryable`).
+    #[serde(default = "default_retry_attempts")]
+    pub attempts: usize,
+    /// The first wait, in milliseconds. It doubles per attempt: `base`, `2×base`, `4×base` …
+    #[serde(default = "default_retry_base_ms")]
+    pub base_ms: u64,
+    /// Ceiling for one wait, in milliseconds. It also caps a `Retry-After` the server sends: an
+    /// endpoint asking for an hour would otherwise leave the turn silent for an hour.
+    #[serde(default = "default_retry_max_ms")]
+    pub max_ms: u64,
+}
+
+fn default_retry_attempts() -> usize {
+    2
+}
+
+fn default_retry_base_ms() -> u64 {
+    1_000
+}
+
+fn default_retry_max_ms() -> u64 {
+    30_000
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            attempts: default_retry_attempts(),
+            base_ms: default_retry_base_ms(),
+            max_ms: default_retry_max_ms(),
+        }
+    }
 }
 
 /// The main loop (the loop seam's second form from stage 6 · 6a, implemented in `src/agent_loop.rs`).
@@ -475,11 +522,29 @@ pub struct LoopConfig {
     /// request body, and never leaves the half-message "a tool result remains while its assistant was
     /// already dropped", which the endpoint would reject outright.
     pub max_rounds: usize,
+    /// How many model requests **one turn** may make before the host stops and hands control back.
+    /// `0` (default) = no limit, exactly as before this existed.
+    ///
+    /// A turn makes one request per round (a round = one model reply + the tools it asked for), so
+    /// this is the only hard ceiling on what a confused model can spend in one go: without it, a
+    /// model that keeps calling tools can run until the user notices and interrupts. The count is
+    /// per turn and resets with every user message.
+    ///
+    /// When it fires, the turn ends **normally** (the checkpoint is persisted, the front end closes
+    /// the card) and the user is told which limit fired — "the task died silently" is the failure
+    /// this is trying to prevent, so it must not create that impression.
+    ///
+    /// Not the same thing as `max_rounds`: that one trims the **context** (how much history is kept),
+    /// this one caps the **work** (how many requests a single instruction may cost). A turn can hit
+    /// this ceiling at 50 with a perfectly small context, and can run 200 rounds with
+    /// `max_rounds = 3`.
+    #[serde(default)]
+    pub max_iters_per_turn: usize,
 }
 
 impl Default for LoopConfig {
     fn default() -> Self {
-        Self { implementor: default_loop_impl(), max_rounds: 0 }
+        Self { implementor: default_loop_impl(), max_rounds: 0, max_iters_per_turn: 0 }
     }
 }
 
@@ -1066,6 +1131,7 @@ impl Config {
             store: StoreConfig::default(),
             prompt: PromptConfig::default(),
             hook: HookConfig::default(),
+            retry: RetryConfig::default(),
             loop_config: LoopConfig::default(),
             sandbox: SandboxConfig::default(),
             shell: ShellConfig::default(),
@@ -1328,17 +1394,28 @@ mod tests {
         assert_eq!(d["fs_write_file"]["create_dirs"].as_bool(), Some(true));
     }
 
-    /// `[hook] max_llm_retries` (the config-driven fallback from stage 6 · 6b): unwritten = 0 = no retry.
+    /// `[retry]` — the retry budget lives here since 2026-10-23 (it used to be
+    /// `[hook] max_llm_retries`, which was only ever the hook seam's address of convenience).
+    ///
+    /// Two things are pinned: the defaults are **on** (a rate limit or a dropped stream must not
+    /// throw the turn away), and a whole table may omit fields like every other section.
     #[test]
-    fn hook_section_parses_max_llm_retries() {
+    fn retry_section_defaults_to_two_attempts_and_parses_overrides() {
         let p = "[provider]\nbase_url = \"https://example.com/v1\"\nmodel = \"m\"\napi_key = \"k\"\n";
 
-        let off: Config = toml::from_str(p).expect("omitting [hook] should parse");
-        assert_eq!(off.hook.max_llm_retries, 0, "default 0 = no retry, byte-for-byte identical to stage 4");
+        let d: Config = toml::from_str(p).expect("omitting [retry] should parse");
+        assert_eq!(d.retry.attempts, 2, "two retries by default: one 429 used to cost the whole turn");
+        assert_eq!(d.retry.base_ms, 1_000);
+        assert_eq!(d.retry.max_ms, 30_000);
 
-        let on: Config =
-            toml::from_str(&format!("{p}\n[hook]\nmax_llm_retries = 2\n")).expect("should parse");
-        assert_eq!(on.hook.max_llm_retries, 2);
+        let c: Config = toml::from_str(&format!("{p}\n[retry]\nattempts = 0\n")).expect("should parse");
+        assert_eq!(c.retry.attempts, 0, "0 = the old behaviour, for anyone who wants it");
+        assert_eq!(c.retry.base_ms, 1_000, "a partial table keeps the other defaults");
+
+        let c: Config =
+            toml::from_str(&format!("{p}\n[retry]\nattempts = 5\nbase_ms = 200\nmax_ms = 900\n"))
+                .expect("should parse");
+        assert_eq!((c.retry.attempts, c.retry.base_ms, c.retry.max_ms), (5, 200, 900));
     }
 
     /// `[workplace]` is the official section name, `[workspace]` is the **old name** (unified on 2026-10-04).
@@ -1444,6 +1521,29 @@ api_key = "k"
         .expect("a config with [loop] should parse");
         assert_eq!(c.loop_config.implementor, "standard");
         assert_eq!(c.loop_config.max_rounds, 6);
+    }
+
+    /// `[loop] max_iters_per_turn` — the work ceiling, added 2026-10-23 next to the context ceiling.
+    ///
+    /// Two things matter: it is **off by default** (no written config = the behaviour every earlier
+    /// version had), and it is a separate key from `max_rounds` (that one caps context, this one caps
+    /// requests — conflating them would either trim memory or stop turns for the wrong reason).
+    #[test]
+    fn the_per_turn_request_ceiling_is_separate_from_the_context_cap() {
+        let p = "[provider]\nbase_url = \"https://example.com/v1\"\nmodel = \"m\"\napi_key = \"k\"\n";
+
+        let d: Config = toml::from_str(p).expect("omitting [loop] should parse");
+        assert_eq!(d.loop_config.max_iters_per_turn, 0, "default 0 = no ceiling");
+
+        let c: Config = toml::from_str(&format!("{p}\n[loop]\nmax_iters_per_turn = 50\n"))
+            .expect("should parse");
+        assert_eq!(c.loop_config.max_iters_per_turn, 50);
+        assert_eq!(c.loop_config.max_rounds, 0, "setting one must not touch the other");
+
+        let c: Config = toml::from_str(&format!("{p}\n[loop]\nmax_rounds = 3\n"))
+            .expect("should parse");
+        assert_eq!(c.loop_config.max_iters_per_turn, 0);
+        assert_eq!(c.loop_config.max_rounds, 3);
     }
 
     /// With only `max_rounds` written, `impl` takes the default — like the other tables, "a whole table may omit fields".

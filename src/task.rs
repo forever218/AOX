@@ -63,6 +63,17 @@ pub const VERSION: u32 = 1;
 pub const GOAL_MAX: usize = 2000;
 pub const ITEMS_MAX: usize = 40;
 pub const ITEM_MAX: usize = 500;
+
+/// How many steps one plan may hold. A "plan" longer than this is a list of wishes, not a plan — and
+/// every step is re-sent on every update, so the cap also bounds what a checkpoint costs.
+pub const STEPS_MAX: usize = 30;
+
+/// How much of one step's text is kept: enough for "read gui/src/app.rs and find the input area",
+/// short enough that a dozen of them still render on a line or two.
+pub const STEP_TEXT_MAX: usize = 120;
+
+/// How many steps `context_block` prints before saying "… (+k more)".
+pub const STEPS_SHOWN: usize = 12;
 pub const FILES_MAX: usize = 60;
 pub const CHECKS_MAX: usize = 40;
 /// A check's detail is a one-liner for the model, not a log — bounded like every other column.
@@ -130,6 +141,24 @@ pub struct Check {
     pub epoch: u64,
 }
 
+/// One line of the model's own plan.
+///
+/// Deliberately **not** evidence: `acceptance` is the contract with the user and needs the host's
+/// `verify` proof, whereas a step is the model's own bookkeeping — it may be revised, reordered or
+/// thrown away at any moment, and the host takes its word for it. Keeping the two apart is the whole
+/// point: a plan that cannot be checked is still worth having, because it is what survives compaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Step {
+    pub text: String,
+    /// Ticked by the model. Not written when false, so an untouched plan costs one word per step.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub done: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// One task checkpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskState {
@@ -148,6 +177,16 @@ pub struct TaskState {
     /// Acceptance criteria: what counts as done (checkable wording wins, e.g. "cargo test passes").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acceptance: Vec<String>,
+    /// The plan: ordered steps with a tick each (see [`Step`]).
+    ///
+    /// Sits between "what counts as done" and "what is done" on purpose: `acceptance` says how the
+    /// task will be judged, `steps` says how the model intends to get there, `completed` is the log
+    /// of what actually happened. Only this middle one can answer "what was I about to do next?".
+    ///
+    /// Omitted entirely when empty, so a checkpoint written before this field existed (or by a model
+    /// that does not use it) produces the **same row** byte for byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<Step>,
     /// What is genuinely finished.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed: Vec<String>,
@@ -206,6 +245,7 @@ impl TaskState {
             goal,
             constraints: Vec::new(),
             acceptance: Vec::new(),
+            steps: Vec::new(),
             completed: Vec::new(),
             in_progress: Vec::new(),
             decisions: Vec::new(),
@@ -271,6 +311,11 @@ impl TaskState {
         }
         self.checks.push(check);
         self.last_updated = crate::history::unix_now();
+    }
+
+    /// How many steps of the plan are still open.
+    pub fn pending_steps(&self) -> usize {
+        self.steps.iter().filter(|s| !s.done).count()
     }
 
     /// How many acceptance criteria are currently covered by a **passing, non-stale** check.
@@ -360,6 +405,7 @@ impl TaskState {
         out.push_str(&crate::tf!("\ngoal: {}", self.goal));
         push_list(&mut out, crate::i18n::t("constraints"), &self.constraints, 8);
         push_list(&mut out, crate::i18n::t("acceptance criteria"), &self.acceptance, 8);
+        self.push_steps(&mut out);
         self.push_verification(&mut out);
         push_list(&mut out, crate::i18n::t("done"), &self.completed, 8);
         push_list(&mut out, crate::i18n::t("in progress"), &self.in_progress, 6);
@@ -369,6 +415,31 @@ impl TaskState {
         push_list(&mut out, crate::i18n::t("files touched so far"), &self.modified_files, 10);
         let body = clamp(&out, BLOCK_MAX.saturating_sub(caveat.chars().count() + 1));
         format!("{body}\n{caveat}")
+    }
+
+    /// The plan, ticked and unticked — `plan: [x] a · [x] b · [ ] c — 2 pending`.
+    ///
+    /// This one line is what the whole field exists for: compaction can drop the conversation, but a
+    /// model that can still read "two of four done, next is run the tests" does not have to
+    /// rediscover where it was — which is exactly the "did three steps, forgot the fifth" failure.
+    fn push_steps(&self, out: &mut String) {
+        if self.steps.is_empty() {
+            return;
+        }
+        let parts: Vec<String> = self
+            .steps
+            .iter()
+            .take(STEPS_SHOWN)
+            .map(|s| format!("{} {}", if s.done { "[x]" } else { "[ ]" }, clamp(&s.text, CLAIM_SHOW)))
+            .collect();
+        out.push_str(&crate::tf!("\n{}: {}", crate::i18n::t("plan"), parts.join(" · ")));
+        if self.steps.len() > STEPS_SHOWN {
+            out.push_str(&crate::tf!(" (+{} more)", self.steps.len() - STEPS_SHOWN));
+        }
+        let pending = self.pending_steps();
+        if pending > 0 {
+            out.push_str(&crate::tf!(" — {} pending", pending));
+        }
     }
 
     /// One `verification: #1 ok (file_hash) · #2 stale (output_contains)` line.
@@ -397,6 +468,69 @@ impl TaskState {
             out.push_str(crate::i18n::t(" — accepted by the host"));
         }
     }
+}
+
+/// A checkpoint used by `--demo`, so the plan bar is visible without a model.
+///
+/// Kept in this module rather than in the GUI: the bar reads `plan_line`, the demo data therefore
+/// has to be a real `TaskState`, and inventing one in a second place would be the first step toward
+/// the demo drifting away from what the model actually writes.
+impl TaskState {
+    pub fn steps_demo() -> Self {
+        let mut st = TaskState::new("重构 Activity Stream 独立窗口");
+        st.steps = vec![
+            Step { text: "读现有 timeline 渲染".into(), done: true },
+            Step { text: "把 Activity 改成 Arc<Mutex<>>".into(), done: true },
+            Step { text: "接上跨视口共享".into(), done: true },
+            Step { text: "跑 GUI 测试".into(), done: false },
+            Step { text: "构建 release 并验收".into(), done: false },
+        ];
+        st
+    }
+}
+
+/// One line a human can read at a glance: `4/6 done · next: run the tests`.
+///
+/// `None` when the plan is empty — a checkpoint without steps has nothing to tick, and a bar that
+/// always says "0/0" is noise. Shared by the two front ends so the wording cannot drift apart.
+pub fn plan_line(st: &TaskState) -> Option<String> {
+    if st.steps.is_empty() {
+        return None;
+    }
+    let total = st.steps.len();
+    let done = total - st.pending_steps();
+    let mut out = crate::tf!("{} {}/{}", crate::i18n::t("plan"), done, total);
+    if let Some(next) = st.steps.iter().find(|s| !s.done) {
+        out.push_str(&crate::tf!(" · {} {}", crate::i18n::t("next:"), clamp(&next.text, CLAIM_SHOW)));
+    }
+    Some(out)
+}
+
+/// The whole checkpoint as a human reads it (`/task` in the command line).
+///
+/// Deliberately not [`TaskState::context_block`]: that text ends with a warning addressed to the
+/// *model* ("re-read any file before you change it"), which reads as noise to the person who just
+/// wants to see the plan. The content is the same; the audience is not.
+pub fn report(st: &TaskState) -> String {
+    let mut out = crate::tf!("[{}] {}", st.task_id, st.goal);
+    if !st.steps.is_empty() {
+        let total = st.steps.len();
+        out.push_str(&crate::tf!(
+            "\n{} ({}/{})",
+            crate::i18n::t("plan"),
+            total - st.pending_steps(),
+            total
+        ));
+        for (i, step) in st.steps.iter().enumerate() {
+            let mark = if step.done { "[x]" } else { "[ ]" };
+            out.push_str(&crate::tf!("\n  {} {}. {}", mark, i + 1, clamp(&step.text, STEP_TEXT_MAX)));
+        }
+    }
+    push_list(&mut out, crate::i18n::t("acceptance criteria"), &st.acceptance, 8);
+    push_list(&mut out, crate::i18n::t("done"), &st.completed, 8);
+    push_list(&mut out, crate::i18n::t("unresolved"), &st.unresolved, 6);
+    push_list(&mut out, crate::i18n::t("next steps"), &st.next_steps, 6);
+    out
 }
 
 /// One `- label: a · b · c` line (past `n` items it truncates and says how many are left).
@@ -431,6 +565,16 @@ pub struct Patch {
     pub goal: Option<String>,
     pub constraints: Option<Vec<String>>,
     pub acceptance: Option<Vec<String>>,
+    /// The plan (replaced wholesale like every other array).
+    pub steps: Option<Vec<Step>>,
+    /// Tick these steps (1-based) without resending the plan.
+    ///
+    /// This exists because of *how often* the update happens: ticking is the one change a model makes
+    /// over and over ("step 3 is done"), and making it resend the whole list is why plans ended up
+    /// being ticked once at the end instead of as the work went (2026-10-23). A tick costs a number.
+    pub tick: Option<Vec<usize>>,
+    /// Untick these steps (1-based) — for a step that turned out not to be finished.
+    pub untick: Option<Vec<usize>>,
     pub completed: Option<Vec<String>>,
     pub in_progress: Option<Vec<String>>,
     pub decisions: Option<Vec<String>>,
@@ -445,10 +589,13 @@ pub struct Patch {
 /// The keys allowed in the tool arguments. A **whitelist**, because with lenient "ignore unknown
 /// fields" parsing a typo (`next_step`) fails silently — the model believes it recorded the next step,
 /// nothing was recorded, and it only shows up at restore time.
-const FIELDS: [&str; 10] = [
+const FIELDS: [&str; 13] = [
     "goal",
     "constraints",
     "acceptance",
+    "steps",
+    "tick",
+    "untick",
     "completed",
     "in_progress",
     "decisions",
@@ -511,6 +658,65 @@ impl Patch {
             }
             Ok(Some(out))
         };
+        // Steps are the one list whose items are objects. A bare string is accepted as "an
+        // unfinished step": the model writes `["read the file", "patch it"]` often enough that
+        // rejecting it would cost a whole round trip for a shape, not a mistake in content.
+        let steps = match obj.get("steps") {
+            None => None,
+            Some(Value::Array(arr)) => {
+                let mut out = Vec::with_capacity(arr.len().min(STEPS_MAX));
+                for it in arr.iter().take(STEPS_MAX) {
+                    let (text, done) = match it {
+                        Value::String(t) => (t.trim().to_string(), false),
+                        Value::Object(o) => (
+                            o.get("text").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+                            o.get("done").and_then(Value::as_bool).unwrap_or(false),
+                        ),
+                        other => {
+                            return Err(crate::tf!(
+                                "steps must be an array of objects with a \"text\" and an optional \"done\", or plain strings (found {})",
+                                other
+                            ))
+                        }
+                    };
+                    if text.is_empty() {
+                        continue;
+                    }
+                    out.push(Step { text: clamp(&text, STEP_TEXT_MAX), done });
+                }
+                Some(out)
+            }
+            Some(other) => {
+                return Err(crate::tf!(
+                    "steps must be an array of objects with a \"text\" and an optional \"done\", or plain strings (found {})",
+                    other
+                ))
+            }
+        };
+        // `tick` / `untick` take a number or an array of them. Numbers are **1-based**, the same
+        // numbering `verify` uses for acceptance criteria — one convention for "which item" across
+        // the checkpoint, so a model that learned it once does not have to relearn it.
+        let numbers = |k: &str| -> Result<Option<Vec<usize>>, String> {
+            let Some(v) = obj.get(k) else { return Ok(None) };
+            let items: Vec<&Value> = match v {
+                Value::Array(a) => a.iter().collect(),
+                other => vec![other],
+            };
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match it.as_u64() {
+                    Some(n) if n >= 1 => out.push(n as usize),
+                    _ => {
+                        return Err(crate::tf!(
+                            "{} must be a step number (1-based) or an array of them (found {})",
+                            k,
+                            it
+                        ))
+                    }
+                }
+            }
+            Ok(Some(out))
+        };
         let goal = match obj.get("goal") {
             None => None,
             Some(Value::String(s)) if !s.trim().is_empty() => Some(clamp(s.trim(), GOAL_MAX)),
@@ -534,6 +740,9 @@ impl Patch {
             goal,
             constraints: list("constraints")?,
             acceptance: list("acceptance")?,
+            steps,
+            tick: numbers("tick")?,
+            untick: numbers("untick")?,
             completed: list("completed")?,
             in_progress: list("in_progress")?,
             decisions: list("decisions")?,
@@ -550,6 +759,9 @@ impl Patch {
         self.goal.is_none()
             && self.constraints.is_none()
             && self.acceptance.is_none()
+            && self.steps.is_none()
+            && self.tick.is_none()
+            && self.untick.is_none()
             && self.completed.is_none()
             && self.in_progress.is_none()
             && self.decisions.is_none()
@@ -559,6 +771,32 @@ impl Patch {
     }
 }
 
+/// Set the `done` flag of the given 1-based step numbers.
+///
+/// Rejections are **total** (the same rule as the rest of this module): a bad number fails the whole
+/// update and nothing is written, rather than leaving a plan that was half-ticked by a call the model
+/// believed had failed.
+fn flip_steps(steps: &mut [Step], numbers: &[usize], done: bool) -> Result<(), String> {
+    if steps.is_empty() {
+        return Err(crate::i18n::t(
+            "there is no plan to tick yet: send `steps` first, then tick them by number",
+        )
+        .to_string());
+    }
+    for n in numbers {
+        let Some(step) = steps.get_mut(n - 1) else {
+            return Err(crate::tf!(
+                "step {} does not exist — the plan has {} step(s), numbered 1..={}",
+                n,
+                steps.len(),
+                steps.len()
+            ));
+        };
+        step.done = done;
+    }
+    Ok(())
+}
+
 /// Merge one update into the current state, returning the merged state.
 ///
 /// When `current` is `None` (no checkpoint yet) the update must carry `goal` — a state without a
@@ -566,7 +804,7 @@ impl Patch {
 pub fn apply(current: Option<TaskState>, patch: &Patch) -> Result<TaskState, String> {
     if patch.is_empty() && !patch.reset {
         return Err(crate::i18n::t(
-            "nothing to update: pass at least one of goal / constraints / acceptance / completed / in_progress / decisions / unresolved / next_steps",
+            "nothing to update: pass at least one of goal / constraints / acceptance / steps / completed / in_progress / decisions / unresolved / next_steps",
         )
         .to_string());
     }
@@ -598,6 +836,17 @@ pub fn apply(current: Option<TaskState>, patch: &Patch) -> Result<TaskState, Str
         // losing it, because the gate would then pass on a coincidence.
         st.checks.clear();
         st.acceptance = v.clone();
+    }
+    if let Some(v) = &patch.steps {
+        st.steps = v.clone();
+    }
+    // After `steps`, never before: sending both means "replace the plan, then tick these numbers in
+    // **it**". The other order would tick the old list and then throw the ticks away.
+    if let Some(v) = &patch.tick {
+        flip_steps(&mut st.steps, v, true)?;
+    }
+    if let Some(v) = &patch.untick {
+        flip_steps(&mut st.steps, v, false)?;
     }
     if let Some(v) = &patch.completed {
         st.completed = v.clone();
@@ -913,5 +1162,125 @@ mod tests {
         assert_eq!(back.status, Status::Done);
         assert_eq!(back.checks.len(), 1);
         assert_eq!(back.epoch, done.epoch);
+    }
+
+    /// The plan: a plain string means "not done yet", objects carry the tick, and the list is
+    /// replaced wholesale like every other array.
+    #[test]
+    fn a_plan_is_replaced_wholesale_and_a_plain_string_means_unfinished() {
+        let st = apply(None, &patch(json!({"goal": "g", "steps": ["read it", "patch it"]}))).unwrap();
+        assert_eq!(st.steps.len(), 2);
+        assert!(!st.steps[0].done, "a bare string is an unticked step");
+        assert_eq!(st.pending_steps(), 2);
+
+        let st = apply(
+            Some(st),
+            &patch(json!({"steps": [{"text": "read it", "done": true}, {"text": "patch it"}]})),
+        )
+        .unwrap();
+        assert_eq!(st.steps.len(), 2, "replaced, not appended");
+        assert_eq!(st.pending_steps(), 1);
+    }
+
+    #[test]
+    fn a_plan_cannot_grow_past_the_cap() {
+        let items: Vec<String> = (0..STEPS_MAX + 10).map(|i| format!("step {i}")).collect();
+        let st = apply(None, &patch(json!({"goal": "g", "steps": items}))).unwrap();
+        assert_eq!(st.steps.len(), STEPS_MAX, "the tail is dropped, the order is kept");
+    }
+
+    #[test]
+    fn a_steps_value_of_the_wrong_shape_is_refused_by_name() {
+        // The error has to name the field: a model that gets "invalid arguments" back without a key
+        // name will guess, and guessing costs a round trip.
+        assert!(Patch::from_json(&json!({"steps": 5})).unwrap_err().contains("steps"));
+        assert!(Patch::from_json(&json!({"steps": [5]})).unwrap_err().contains("steps"));
+    }
+
+    /// The line the whole field exists for — and its absence when there is no plan (zero drift:
+    /// a checkpoint written before `steps` existed must render exactly as it used to).
+    #[test]
+    fn the_context_block_ticks_the_plan_and_says_nothing_without_one() {
+        let st = apply(
+            None,
+            &patch(json!({"goal": "g", "steps": [{"text": "a", "done": true}, {"text": "b"}]})),
+        )
+        .unwrap();
+        let blk = st.context_block();
+        assert!(blk.contains("[x] a"), "{}", blk);
+        assert!(blk.contains("[ ] b"), "{}", blk);
+        assert!(blk.contains("1 pending"), "{}", blk);
+
+        let bare = apply(None, &patch(json!({"goal": "g"}))).unwrap();
+        assert!(!bare.context_block().contains("[ ]"), "{}", bare.context_block());
+        let row = serde_json::to_string(&bare).unwrap();
+        assert!(!row.contains("\"steps\""), "no plan ⇒ no key at all: {}", row);
+    }
+
+    /// A human-facing one-liner, shared by the two front ends.
+    #[test]
+    fn the_plan_line_reads_as_progress_and_names_the_next_step() {
+        let st = apply(
+            None,
+            &patch(json!({"goal": "g", "steps": [{"text": "a", "done": true}, {"text": "run the tests"}]})),
+        )
+        .unwrap();
+        let line = plan_line(&st).expect("a plan with steps has a line");
+        assert!(line.contains("1/2"), "{}", line);
+        assert!(line.contains("run the tests"), "{}", line);
+        assert!(plan_line(&apply(None, &patch(json!({"goal": "g"}))).unwrap()).is_none());
+    }
+
+    /// `tick` is the update a model makes most often, so it has to be one number — and it has to
+    /// agree with the numbering `verify` uses (1-based).
+    #[test]
+    fn ticking_by_number_is_the_cheap_update_that_makes_realtime_progress_possible() {
+        let st = apply(None, &patch(json!({"goal": "g", "steps": ["a", "b", "c"]}))).unwrap();
+        let st = apply(Some(st), &patch(json!({"tick": 2}))).unwrap();
+        assert_eq!(st.pending_steps(), 2);
+        assert!(st.steps[1].done, "step 2 is the second one, not the third");
+        // An array works too, and untick takes a step back.
+        let st = apply(Some(st), &patch(json!({"tick": [1, 3]}))).unwrap();
+        assert_eq!(st.pending_steps(), 0);
+        let st = apply(Some(st), &patch(json!({"untick": [3]}))).unwrap();
+        assert_eq!(st.pending_steps(), 1);
+        assert!(!st.steps[2].done);
+    }
+
+    #[test]
+    fn a_step_number_that_does_not_exist_fails_the_whole_update() {
+        let st = apply(None, &patch(json!({"goal": "g", "steps": ["a", "b"]}))).unwrap();
+        let before = st.clone();
+        let e = apply(Some(st), &patch(json!({"tick": 5}))).unwrap_err();
+        assert!(e.contains("1..=2"), "the message must say what the valid range is: {}", e);
+        // Total rejection: the state is untouched.
+        assert_eq!(before.pending_steps(), 2);
+
+        // 0 is not a step number: refused at parse time, before anything is merged.
+        assert!(Patch::from_json(&json!({"tick": 0})).unwrap_err().contains("tick"));
+        // A no-op tick on the untouched state still works: nothing was written by the failed calls.
+        assert_eq!(before.pending_steps(), 2);
+    }
+
+    #[test]
+    fn ticking_without_a_plan_is_refused_with_the_reason() {
+        let st = apply(None, &patch(json!({"goal": "g"}))).unwrap();
+        let a = apply(Some(st.clone()), &patch(json!({"tick": 1})));
+        assert!(a.is_err());
+        assert!(a.unwrap_err().contains("steps"));
+    }
+
+    /// `steps` and `tick` in one call: replace the plan first, then tick numbers **in the new one**.
+    #[test]
+    fn steps_are_replaced_before_the_ticks_are_applied() {
+        let st = apply(None, &patch(json!({"goal": "g", "steps": ["a", "b"]}))).unwrap();
+        let st = apply(
+            Some(st),
+            &patch(json!({"steps": ["x", "y", "z"], "tick": [3]})),
+        )
+        .unwrap();
+        assert_eq!(st.steps.len(), 3);
+        assert!(st.steps[2].done, "ticked inside the replaced list: {}", st.steps[2].text);
+        assert_eq!(st.pending_steps(), 2);
     }
 }
