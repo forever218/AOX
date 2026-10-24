@@ -4765,23 +4765,19 @@ fn plan_card(ui: &mut Ui, view: &PlanView, open: &mut bool, rows_h: f32, gap: f3
         *open = !*open;
     }
 
-    // ── The rule, then the rows sliding out from under it ──
+    // ── The progress bar, then the rows sliding out from under it ──
     //
-    // The rule's band is part of the card from the start (only its ink fades in), and the rows are
-    // clipped **below** it. An earlier version put the rule at the bottom of the animated block, so
-    // while opening it travelled down across the half-revealed row — a line through the text, read
-    // as "overlapping" (2026-10-23).
+    // The bar's band is part of the card from the start, and the rows are clipped **below** it. An
+    // earlier version put the rule at the bottom of the animated block, so while opening it travelled
+    // down across the half-revealed row — a line through the text, read as "overlapping" (2026-10-23).
     let block_h = PLAN_DIV_H + rows_h;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(w, block_h), Sense::hover());
-    let line_y = rect.top() + 4.0;
-    ui.painter().hline(
-        rect.x_range(),
-        line_y,
-        Stroke::new(1.0, P::edge().gamma_multiply(plan_rule_alpha(block_h))),
-    );
+    plan_segments(ui, rect, w, view);
 
+    // The rows start where the bar's band ends — one number (`PLAN_DIV_H`) for both, so the first row
+    // cannot creep up under the bar.
     let rows_rect = Rect::from_min_max(
-        Pos2::new(rect.left(), line_y + 1.0 + 4.0),
+        Pos2::new(rect.left(), rect.top() + PLAN_DIV_H),
         Pos2::new(rect.right(), rect.bottom()),
     );
     if rows_rect.height() <= 0.5 {
@@ -4876,12 +4872,41 @@ fn step_mark(ui: &mut Ui, done: bool) -> Rect {
     rect
 }
 
-/// How visible the rule is, given how much of the block is revealed.
+/// Where every cell of the plan's progress bar starts, and how wide it is.
 ///
-/// Only a fade — the geometry never depends on it, so a frame in the middle of the disclosure cannot
-/// produce a line in the wrong place. It reaches full strength once the rows have started arriving.
-fn plan_rule_alpha(body_h: f32) -> f32 {
-    ((body_h - 6.0) / 6.0).clamp(0.0, 1.0)
+/// One cell per step, and the cells **always span the full width**: `w` is divided between them, so
+/// a 3-step plan and a 30-step plan both start at the left edge and end exactly at the right one
+/// (user request, 2026-10-24 — "5 个节点和 10 个节点都占满一条线"). Nothing is padded to a fixed cell
+/// width, because a plan of five would then stop a fifth of the way across and read as a broken bar.
+///
+/// The gap is what gives way on a long plan, and never below a quarter of a cell: cells thinner than
+/// the space between them stop reading as a measure and start reading as a dotted line. That bound is
+/// also what guarantees `cell >= 3 × gap` at every width (see the test).
+fn plan_segment_spans(w: f32, total: usize) -> Vec<(f32, f32)> {
+    let n = total.max(1) as f32;
+    let gap = if total > 1 { PLAN_SEG_GAP.min(w / (n * 4.0)) } else { 0.0 };
+    let cell = ((w - gap * (n - 1.0)) / n).max(1.0);
+    (0..total.max(1)).map(|i| (i as f32 * (cell + gap), cell)).collect()
+}
+
+/// The plan's progress, drawn as **one cell per step** instead of as a rule.
+///
+/// A hairline said "the header ends here". A row of cells says the same thing the number beside it
+/// says — `5/10` is five green cells and five grey ones — in a form the eye takes in before it reads
+/// the digits. Same 10 px band as the rule it replaces, so no layout number moved.
+///
+/// Colour is the only difference between done and to-come; there is no fill animation, because the
+/// count changes only when a checkpoint arrives and a bar that animates on its own would be claiming
+/// progress between them.
+fn plan_segments(ui: &Ui, rect: Rect, w: f32, view: &PlanView) {
+    let painter = ui.painter();
+    let radius = CornerRadius::same((PLAN_SEG_H * 0.5) as u8);
+    let y = rect.top() + (PLAN_DIV_H - PLAN_SEG_H) * 0.5;
+    for (i, (x, cell_w)) in plan_segment_spans(w, view.total).into_iter().enumerate() {
+        let cell = Rect::from_min_size(Pos2::new(rect.left() + x, y), Vec2::new(cell_w, PLAN_SEG_H));
+        let color = if i < view.done { P::add_green() } else { P::edge() };
+        painter.rect_filled(cell, radius, color);
+    }
 }
 
 /// A small disclosure triangle, painted instead of typed (see `plan_card`).
@@ -5598,10 +5623,16 @@ const PLAN_HEAD_H: f32 = 24.0;
 const PLAN_ROW_H: f32 = 22.0;
 /// Breathing room under the last step row.
 const PLAN_GAP: f32 = 9.0;
-/// The hairline between the plan and the text box, plus its margins. **Constant**, never animated:
-/// a rule that slides with the rows crosses the half-revealed text on the way down (that was the
-/// "重叠" seen while opening, 2026-10-23).
+/// The band holding the plan's **progress bar** (one cell per step, see `plan_segments`), plus its
+/// margins. **Constant**, never animated: a bar that slid with the rows would cross the half-revealed
+/// text on the way down (that was the "重叠" seen while opening, 2026-10-23).
 const PLAN_DIV_H: f32 = 10.0;
+/// Height of one cell of the progress bar. Four is the thinnest pill that still reads as a **cell**
+/// rather than as a thickened rule — the bar sits above the input box, where a heavier bar would
+/// start competing with the text.
+const PLAN_SEG_H: f32 = 4.0;
+/// Gap between two cells. Shrinks on a long plan (see `plan_segment_spans`); never grows past this.
+const PLAN_SEG_GAP: f32 = 2.0;
 /// Disclosure clock. Short enough to read as "opened", long enough not to be a jump cut.
 const PLAN_ANIM_SECS: f32 = 0.2;
 
@@ -8987,6 +9018,45 @@ mod tests {
                 "{col}: a {key_en:.1} pt name column leaves too little room for values \
                  (panel {SETTINGS_RIGHT_W:.0} pt)"
             );
+        }
+    }
+
+    /// The progress bar is a **measure**, so its cells must fill the card exactly and stay readable.
+    ///
+    /// Three properties, at every step count a plan can have (`task::STEPS_MAX` is 30) and every card
+    /// width: one cell per step; the run of cells ends exactly at the right edge (5 steps and 30 steps
+    /// both span the full width — the reported ask); and a cell is never thinner than the gap that
+    /// separates it, which is the point where a measure turns into a dotted line.
+    #[test]
+    fn the_progress_cells_fill_the_card_at_any_step_count() {
+        assert_eq!(plan_segment_spans(400.0, 0).len(), 1, "a plan with no steps still draws one cell");
+        for total in [1usize, 2, 3, 5, 10, 17, 30] {
+            for w in [240.0f32, 400.0, 680.0, 900.0] {
+                let spans = plan_segment_spans(w, total);
+                assert_eq!(spans.len(), total, "{total} steps must draw {total} cells");
+                let (x0, cell) = spans[0];
+                assert_eq!(x0, 0.0, "the first cell starts at the left edge");
+                let (last_x, last_w) = spans[total - 1];
+                assert!(
+                    (last_x + last_w - w).abs() < 0.01,
+                    "{total} cells at {w} pt end at {:.2}, not at the right edge",
+                    last_x + last_w
+                );
+                assert!(
+                    spans.iter().all(|(_, s)| (s - cell).abs() < 1e-3),
+                    "cells of one bar must be equal: a bar of unequal cells misreads as data"
+                );
+                if total > 1 {
+                    let gap = spans[1].0 - spans[0].0 - cell;
+                    assert!(gap > 0.0, "{total} cells at {w} pt touch each other — no visible division");
+                    // `plan_segment_spans` derives the gap from the width precisely to keep this.
+                    assert!(
+                        cell >= 3.0 * gap - 0.01,
+                        "{total} cells at {w} pt: a {cell:.2} pt cell with a {gap:.2} pt gap reads as \
+                         a dotted line, not as a measure"
+                    );
+                }
+            }
         }
     }
 
