@@ -324,14 +324,10 @@ pub(super) fn name_dialog_modal(
                 // pressing it just runs the validation and says why. The live message above is what
                 // makes that feel like an answer rather than a refusal.
                 let verb = if creating { "Create" } else { "Save" };
-                if primary_button(ui, aox::i18n::t(verb)).clicked() {
-                    action = Some(DialogAction::Confirm);
+                // Cancel left, the verb right -- one footer for every dialog, see `dialog_footer`.
+                if let Some(yes) = dialog_footer(ui, |ui| primary_button(ui, aox::i18n::t(verb)).clicked()) {
+                    action = Some(if yes { DialogAction::Confirm } else { DialogAction::Cancel });
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if flat_button(ui, aox::i18n::t("Cancel")).clicked() {
-                        action = Some(DialogAction::Cancel);
-                    }
-                });
             });
         });
 
@@ -405,6 +401,103 @@ pub(super) fn check_conv_title(raw: &str) -> Result<String, String> {
     Ok(title.to_string())
 }
 
+// ─────────────────────────── "are you sure?" ───────────────────────────
+
+/// A **destructive** action waiting on a yes.
+///
+/// Two things in this window can lose something the user put there, and until 2026-10-25 both fired
+/// on a single click in a right-click menu: `Delete` on a conversation row, `Remove from AOX` on a
+/// workspace group. A context menu is a place where a mis-aimed click costs nothing anywhere else in
+/// this program, so the one irreversible pair gets a stop.
+///
+/// The wording is the contract, and the two are **not** the same promise softened:
+///
+/// | | what actually happens |
+/// |---|---|
+/// | conversation | the file is moved to the recycle bin — recoverable, and the dialog says so |
+/// | workspace | only a registry entry goes away; not one byte on the device changes |
+///
+/// Which is why each variant carries only the field its sentence talks about, and why a new
+/// destructive action must not reuse an existing arm: the text would then be lying.
+pub(super) enum Confirm {
+    /// `ToAgent::Recycle` on one conversation file. `title` is what the row was showing, so the
+    /// dialog can name its subject.
+    DeleteConversation { path: PathBuf, title: String },
+    /// `App::forget_workspace` — unregister the root, touch nothing on disk.
+    RemoveWorkspace { root: PathBuf },
+}
+
+/// The words of a confirmation: `(title, body, verb, subject)`.
+///
+/// Split out from [`confirm_modal`] so the promise each dialog makes can be **asserted** — these
+/// sentences are a contract with the user (one says the file is recoverable, the other says nothing
+/// on the device changes), and a future destructive action must not quietly reuse an arm and thereby
+/// display a promise that does not apply to it.
+pub(super) fn confirm_copy(what: &Confirm) -> (&'static str, &'static str, &'static str, String) {
+    match what {
+        // The path is not shown: the row's label is what the user recognises, and the file stem is a
+        // timestamp. It is still carried, because it is what gets recycled.
+        Confirm::DeleteConversation { title, path: _ } => (
+            "Delete this conversation?",
+            "Its file will be moved to the system recycle bin, so it can be restored if you need it.",
+            "Delete",
+            middle_elide(title, 52),
+        ),
+        Confirm::RemoveWorkspace { root } => (
+            "Remove this workspace?",
+            "This only removes the directory from AOX; nothing on this device is changed.",
+            "Remove",
+            workplace_ui::elide_path(&root.display().to_string(), 56),
+        ),
+    }
+}
+
+/// The confirmation box. `None` = still open, `Some(true)` = go ahead, `Some(false)` = dismissed.
+///
+/// A free function for the same reason as [`name_dialog_modal`]: the body needs no `App` state, so
+/// leaving it out of the `impl` lets the caller hold the pending action apart from `self` while the
+/// dialog is on screen.
+pub(super) fn confirm_modal(ctx: &egui::Context, what: &Confirm) -> Option<bool> {
+    let (title, body, verb, subject) = confirm_copy(what);
+
+    let mut answer = None;
+    let resp = egui::Modal::new(egui::Id::new("aox-confirm"))
+        .backdrop_color(P::scrim())
+        .frame(theme::raised(theme::card_radius()).inner_margin(Margin::symmetric(22, 18)))
+        .show(ctx, |ui| {
+            ui.set_width(430.0);
+            // Not in `danger`: that hue is reserved for the one toggle that crosses every protection
+            // (see `P::danger`). This is a stop, not an alarm -- the sentence under it is what tells
+            // the user how bad it is, and for both of these the honest answer is "not very".
+            ui.label(RichText::new(aox::i18n::t(title)).color(P::text()).size(16.0).strong());
+            ui.add_space(6.0);
+            ui.label(RichText::new(aox::i18n::t(body)).color(P::text_faint()).size(12.5));
+            ui.add_space(10.0);
+            // **Which one**. A confirmation that does not name its subject is the "…was that the one I
+            // meant?" dialog; the row is gone from view the moment the menu closes.
+            theme::well(8).inner_margin(Margin::symmetric(10, 7)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(subject)
+                        .font(theme::mono_font(12.5))
+                        .color(P::text_dim()),
+                );
+            });
+            ui.add_space(18.0);
+            // Same footer as every other dialog: Cancel on the left, the verb on the right.
+            if let Some(yes) = dialog_footer(ui, |ui| primary_button(ui, aox::i18n::t(verb)).clicked()) {
+                answer = Some(yes);
+            }
+        });
+
+    // Esc / a click on the backdrop is a dismissal, like every other modal here: nothing was asked
+    // for, so nothing happens.
+    if resp.should_close() {
+        answer.get_or_insert(false);
+    }
+    answer
+}
+
 impl App {
     /// The name dialog ("new workspace" from the panel's foot row, "rename workspace" from a
     /// group's right-click menu, or "rename conversation" from a conversation row's).
@@ -449,6 +542,31 @@ impl App {
                     self.name_dialog = Some(st);
                 }
             }
+        }
+    }
+
+    /// Draw the "are you sure?" box and, on a yes, perform the thing it asked about.
+    ///
+    /// The action is carried **in the dialog's own state** ([`Confirm`]) rather than re-derived from
+    /// the current selection: between opening the dialog and answering it the tree can be refreshed,
+    /// re-sorted or re-folded under the pointer, and a confirm that reads "the row I would delete now"
+    /// would then delete something other than what its text named.
+    pub(super) fn confirm_overlay(&mut self, ctx: &egui::Context) {
+        let Some(what) = self.confirm.take() else { return };
+        match confirm_modal(ctx, &what) {
+            // Still open: hand it back so the next frame draws the same question.
+            None => self.confirm = Some(what),
+            // Dismissed — the backdrop, Esc, or Cancel.
+            Some(false) => {}
+            Some(true) => match what {
+                Confirm::DeleteConversation { path, .. } => {
+                    // Down the same channel, as the same single-item list, the model's own deletions
+                    // take: the move is a blocking shell call made by the agent thread, and the toast
+                    // plus the refresh then arrive as one `AgentEvent::Recycled` for both doors.
+                    let _ = self.tx.send(ToAgent::Recycle(vec![path]));
+                }
+                Confirm::RemoveWorkspace { root } => self.forget_workspace(&root),
+            },
         }
     }
 
@@ -508,16 +626,20 @@ impl App {
                     decision = Some(AuthDecision::Deny);
                 }
             }
+            // Same rule as every dialog footer (Cancel left, the committing button right), written
+            // out because this card has **three** buttons rather than a pair: denying stays on the
+            // left where a mis-click costs nothing, and the two ways to allow sit on the right, with
+            // the narrower one ("once") nearest the edge.
             ui.horizontal(|ui| {
-                if primary_button(ui, aox::i18n::t("Allow once")).clicked() {
-                    decision = Some(AuthDecision::Allow);
-                }
-                if flat_button(ui, aox::i18n::t("Always allow this session")).clicked() {
-                    decision = Some(AuthDecision::AllowSession);
+                if flat_button(ui, aox::i18n::t("Deny")).clicked() {
+                    decision = Some(AuthDecision::Deny);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if flat_button(ui, aox::i18n::t("Deny")).clicked() {
-                        decision = Some(AuthDecision::Deny);
+                    if primary_button(ui, aox::i18n::t("Allow once")).clicked() {
+                        decision = Some(AuthDecision::Allow);
+                    }
+                    if flat_button(ui, aox::i18n::t("Always allow this session")).clicked() {
+                        decision = Some(AuthDecision::AllowSession);
                     }
                 });
             });
@@ -651,5 +773,37 @@ mod tests {
         ] {
             assert!(check_ws_name(typed).is_err(), "{typed:?} must be refused");
         }
+    }
+
+    /// The two "are you sure?" boxes make **different promises**, and each has to keep its own.
+    ///
+    /// The wording *is* the feature (user request, 2026-10-25): one says the conversation file goes to
+    /// the recycle bin and can come back, the other says not one byte on the device is touched. A
+    /// future destructive action that reused an arm would therefore display a promise that does not
+    /// apply to it, so both the sentences and the subjects they name are pinned here.
+    #[test]
+    fn the_two_confirmations_promise_different_things() {
+        let conv = Confirm::DeleteConversation {
+            path: PathBuf::from(r"E://rustapp//.aox//history//20261025-142000-abcd.jsonl"),
+            title: "重构 Activity Stream 独立窗口".to_string(),
+        };
+        let ws = Confirm::RemoveWorkspace { root: PathBuf::from(r"E://rustapp//workplace//text") };
+
+        let (title_a, body_a, verb_a, subject_a) = confirm_copy(&conv);
+        let (title_b, body_b, verb_b, subject_b) = confirm_copy(&ws);
+
+        assert_ne!(title_a, title_b, "two different questions must not share a title");
+        assert_ne!(body_a, body_b, "and must not share a promise");
+        assert_eq!((verb_a, verb_b), ("Delete", "Remove"));
+
+        // Each sentence has to stay true of the path behind it: `ToAgent::Recycle` moves the file,
+        // `forget_workspace` only drops a registry entry.
+        assert!(body_a.contains("recycle bin") && body_a.contains("restored"), "{body_a}");
+        assert!(body_b.contains("nothing on this device"), "{body_b}");
+
+        // The subject is the row's **label**, not the file stem -- a timestamp identifies nothing to
+        // the person reading the dialog.
+        assert_eq!(subject_a, "重构 Activity Stream 独立窗口");
+        assert!(subject_b.contains("text"), "{subject_b}");
     }
 }

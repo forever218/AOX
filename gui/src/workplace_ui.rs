@@ -427,16 +427,16 @@ pub fn confirm(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
                     .size(13.0),
             );
             ui.add_space(20.0);
-            ui.horizontal(|ui| {
-                if danger_button(ui, aox::i18n::t("Confirm switch")).clicked() {
-                    req = Some(Mode::Full);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if flat_button(ui, aox::i18n::t("Cancel")).clicked() {
-                        keep = false;
-                    }
-                });
-            });
+            // Same footer as every dialog in the main window (Cancel left, the affirmative on the
+            // right) -- `dialog_footer` owns that rule; this one passes a `danger_button` because
+            // switching to full access is the one toggle that crosses every protection.
+            match crate::app::dialog_footer(ui, |ui| {
+                danger_button(ui, aox::i18n::t("Confirm switch")).clicked()
+            }) {
+                Some(true) => req = Some(Mode::Full),
+                Some(false) => keep = false,
+                None => {}
+            }
         });
 
     // Click background / Esc = cancel (`should_close` is the standard exit egui::Modal provides).

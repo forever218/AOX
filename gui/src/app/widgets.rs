@@ -219,6 +219,37 @@ pub(super) struct Btn {
 /// text first and the hover backdrop was then laid over the hot zone -- landing above the text
 /// layer, so the moment the mouse arrived the text vanished. Here it is backdrop first, text last,
 /// so in both themes and every state they naturally can't occlude each other.
+/// The footer of a dialog: **Cancel on the left, the affirmative action on the right**.
+///
+/// User request, 2026-10-25. Every dialog in this window had it the other way round -- confirm on the
+/// left, Cancel on the right -- which is the reverse of the rest of the desktop and of what the hand
+/// expects: the one you reach for last sat under the pointer's resting place, and the one that
+/// **commits** was the easy mis-click. Flipping it in one function rather than five places means the
+/// next dialog cannot quietly get it wrong again.
+///
+/// `confirm` draws the affirmative button and says whether it was pressed; the verb and its weight
+/// differ per dialog (`primary_button`, or `danger_button` for the one that crosses every
+/// protection), the **position** does not.
+///
+/// `None` = neither button was pressed this frame, `Some(true)` = go ahead, `Some(false)` = cancel.
+pub(crate) fn dialog_footer(ui: &mut Ui, confirm: impl FnOnce(&mut Ui) -> bool) -> Option<bool> {
+    let mut answer = None;
+    ui.horizontal(|ui| {
+        if flat_button(ui, aox::i18n::t("Cancel")).clicked() {
+            answer = Some(false);
+        }
+        // `right_to_left` takes the rest of the row, so the first thing added inside it lands flush
+        // with the right edge -- that is the whole trick, and the reason the affirmative button is
+        // drawn in here rather than before the Cancel.
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if confirm(ui) {
+                answer = Some(true);
+            }
+        });
+    });
+    answer
+}
+
 pub(super) fn text_button(ui: &mut Ui, text: &str, b: Btn) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),

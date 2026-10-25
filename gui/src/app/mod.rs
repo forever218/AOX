@@ -101,7 +101,9 @@ use transcript::*;
 use widgets::*;
 
 // The names other modules already reach in through `crate::app::`.
-pub(crate) use widgets::{column, danger_button, flat_button, menu_item, primary_button, MENU_W};
+pub(crate) use widgets::{
+    column, danger_button, dialog_footer, flat_button, menu_item, primary_button, MENU_W,
+};
 
 // ─────────────────────────── data model ───────────────────────────
 
@@ -295,6 +297,12 @@ pub struct App {
     /// remembering to reset both on every close path. The mode lives **inside** the struct rather
     /// than in a second `Option` beside it, so "open, but for what?" is answered in one place.
     name_dialog: Option<NameDialog>,
+    /// A destructive action held back until the user says yes — see [`Confirm`].
+    ///
+    /// `None` while no question is pending. The **action itself** is in here (the path, the root),
+    /// not just a flag: the tree can be refreshed, re-sorted and re-folded between the click and the
+    /// answer, and a confirmation must carry out the thing its sentence named.
+    confirm: Option<Confirm>,
 
     /// Demo mode (--demo): no LLM attached, just shows the layout and the shape of the
     /// event stream
@@ -458,6 +466,7 @@ impl App {
             hist_query: String::new(),
             hist_fold_loaded: false,
             name_dialog: None,
+            confirm: None,
             follow: true,
             force_follow: true,
             settings_open: false,
@@ -868,6 +877,8 @@ impl eframe::App for App {
         // Before the settings dialog, because it belongs to the history panel: the two are never
         // open at once, and a modal drawn later wins any overlap.
         self.name_dialog_overlay(ctx);
+        // Sits beside the name dialog: same layer, same "nothing happens until you answer" rule.
+        self.confirm_overlay(ctx);
         self.settings_overlay(ctx);
         self.auth_overlay(ctx);
         // Last, so the toast sits above everything: it reports something that has **already**

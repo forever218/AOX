@@ -343,7 +343,7 @@ pub(super) fn conversation_menu(
     move_targets: &[(String, String)],
     rename_conv: &mut Option<(String, String)>,
     move_conv: &mut Option<(String, String)>,
-    recycle: &mut Vec<PathBuf>,
+    delete: &mut Option<(PathBuf, String)>,
 ) {
     // Renaming is offered on **every** row, the current one included (unlike Delete below): the
     // current conversation is the one whose file the agent already has open, and the append is
@@ -375,7 +375,11 @@ pub(super) fn conversation_menu(
     if current {
         del.on_hover_text(aox::i18n::t("Cannot delete the conversation you are in"));
     } else if del.clicked() {
-        recycle.push(path.to_path_buf());
+        // **Asks first** (2026-10-25). The path *and* the label are handed over: the confirmation
+        // names the row it is about to lose, and the label is what the row was showing -- the file
+        // stem is a timestamp nobody reads and would make the question feel like it is about
+        // something else.
+        *delete = Some((path.to_path_buf(), title.to_string()));
         ui.close();
     }
 }
@@ -644,7 +648,7 @@ impl App {
         // destination rather than one enum because each lands somewhere different afterwards (a
         // message to the agent / a registry edit / a shell open / a dialog), and a single click can
         // only ever produce one of them.
-        let mut recycle: Vec<PathBuf> = Vec::new();
+        let mut delete: Option<(PathBuf, String)> = None;
         let mut forget_ws: Option<PathBuf> = None;
         let mut reveal_ws: Option<PathBuf> = None;
         let mut rename_ws: Option<PathBuf> = None;
@@ -796,7 +800,7 @@ impl App {
                                 &query,
                                 &mut open,
                                 &mut toggles,
-                                &mut recycle,
+                                &mut delete,
                                 &mut forget_ws,
                                 &mut reveal_ws,
                                 &mut rename_ws,
@@ -871,7 +875,12 @@ impl App {
             reveal_in_file_manager(&root);
         }
         if let Some(root) = forget_ws {
-            self.forget_workspace(&root);
+            // Same treatment as the delete above: the registry edit waits for a yes, and the text
+            // promises exactly what `forget_workspace` does -- unregister the root, leave the disk
+            // alone.
+            if self.confirm.is_none() {
+                self.confirm = Some(Confirm::RemoveWorkspace { root });
+            }
         }
         if let Some(root) = rename_ws {
             // Opens the dialog; nothing is written until the name is confirmed. Unlike the two above
@@ -896,12 +905,18 @@ impl App {
             // the click look like it did nothing.
             self.new_conversation_in(&root);
         }
-        if !recycle.is_empty() {
-            // Handed to the agent thread rather than recycled here: the move is a blocking shell
-            // call, and it also keeps one code path for "a conversation was deleted" -- the toast
-            // and the list refresh then come back through the same `AgentEvent::Recycled` the
-            // model's own deletions use.
-            let _ = self.tx.send(ToAgent::Recycle(recycle));
+        // Both of these used to act **here**, on the click. They now only open a question: a
+        // right-click menu is the one place in this window where a mis-aimed click costs nothing
+        // else, so the pair that loses something waits for a yes (`Confirm::*`, drawn in
+        // `overlays.rs`). The action travels inside the dialog -- by the time the answer comes the
+        // tree may have been refreshed and re-sorted under the pointer.
+        //
+        // Only one can be pending at a time (a menu closes on use), but the guard keeps a future
+        // second caller from silently replacing a question the user is already reading.
+        if let Some((path, title)) = delete {
+            if self.confirm.is_none() {
+                self.confirm = Some(Confirm::DeleteConversation { path, title });
+            }
         }
         if want_new_ws {
             // Just opens the dialog. The folder is not touched until the user has named it and hit
@@ -944,10 +959,11 @@ impl App {
     ///
     /// Takes `&self` -- the drawer's `SidePanel` closure only holds an immutable borrow -- and hands
     /// everything it wants to change back to the caller: `open` (switch to this conversation),
-    /// `toggles` (fold / unfold this group), and the seven right-click requests `recycle` /
-    /// `forget_ws` / `reveal_ws` / `rename_ws` / `new_conv_ws` / `rename_conv` / `move_conv` (delete
-    /// this conversation / drop this workspace / open its folder / rename it / start a conversation in
-    /// an existing workspace / rename a conversation / re-file a conversation into another group).
+    /// `toggles` (fold / unfold this group), and the seven right-click requests `delete` /
+    /// `forget_ws` / `reveal_ws` / `rename_ws` / `new_conv_ws` / `rename_conv` / `move_conv` (ask to
+    /// delete this conversation / ask to drop this workspace / open its folder / rename it / start a
+    /// conversation in an existing workspace / rename a conversation / re-file a conversation into
+    /// another group).
     ///
     /// The groups arrive from [`aox::space::group`] in a **fixed order** (Default, Full access, then
     /// the user's workspaces, most recently active first). Exactly one adjustment is made on top:
@@ -963,7 +979,7 @@ impl App {
         query: &str,
         open: &mut Option<String>,
         toggles: &mut Vec<String>,
-        recycle: &mut Vec<PathBuf>,
+        delete: &mut Option<(PathBuf, String)>,
         forget_ws: &mut Option<PathBuf>,
         reveal_ws: &mut Option<PathBuf>,
         rename_ws: &mut Option<PathBuf>,
@@ -1099,7 +1115,7 @@ impl App {
                         &move_targets,
                         rename_conv,
                         move_conv,
-                        recycle,
+                        delete,
                     );
                 };
                 row.context_menu(&mut menu);
