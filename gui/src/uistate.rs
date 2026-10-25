@@ -1,4 +1,5 @@
-//! The GUI's own little state file: **which workspace groups the user has folded or unfolded**.
+//! The GUI's own little state file: **which workspace groups the user has folded or unfolded**, plus
+//! **whether the history drawer was left open**.
 //!
 //! Why this is not part of the space registry (`src/space.rs`): that file answers "which workspaces
 //! exist, and what lives in them" — identity and membership. This one answers "what does the tree
@@ -33,31 +34,40 @@ const FILE_NAME: &str = "ui.json";
 /// `space.rs` makes: a newer layout read by an older build is the hardest class of bug to trace.
 const VERSION: u32 = 1;
 
-/// Which groups are **explicitly** open / closed, by [`aox::space::Group::id`].
+/// Which groups are **explicitly** open / closed, by [`aox::space::Group::id`], and the drawer's own
+/// position.
 ///
 /// The two sets mirror `App::hist_open` / `App::hist_closed` one-to-one: an id in neither set has no
 /// explicit choice and falls back to the tree's default (drawn open iff it holds the conversation
 /// being chatted in). **Only explicit choices are written**, so that default stays defined in exactly
 /// one place (`App::group_is_open`) instead of being frozen into the file.
 ///
-/// The drawer's own open/closed position is deliberately **not** here (user request, 2026-10-18):
-/// the sidebar always starts folded, every launch. It is a thing you open when you want it and put
-/// away when you are done, not a layout preference — remembering it meant that one launch where you
-/// left it open turned into "it is always there" for every launch after.
+/// The drawer is the third piece of the same "how the window looked" question, and it is here since
+/// 2026-10-25 (user request: "记住上次退出时的状态"). Between 2026-10-18 and then it was
+/// deliberately left out, on the argument that a sidebar you open when you want it should not come
+/// back by itself. A week of use showed the opposite reading: the first thing done on every launch
+/// was re-open it — the tree layout made the drawer the place the work happens, not an occasional
+/// reference, so "always folded" was never the state anyone wanted to start from.
 #[derive(Debug, Default, Clone)]
 pub struct FoldState {
     /// Groups the user has explicitly unfolded.
     pub open: HashSet<String>,
     /// Groups the user has explicitly folded.
     pub closed: HashSet<String>,
+    /// Whether the history drawer was open when this state was last written.
+    ///
+    /// A file written before 2026-10-18 may carry a `drawer` key with **exactly this meaning** (the
+    /// field was dropped on save for the week in between, so most files have no key at all). It is
+    /// read as-is rather than bumped away with a version change: rejecting the file would throw away
+    /// every fold along with one stale boolean.
+    pub drawer: bool,
 }
 
 /// The on-disk shape. Both lists are sorted on write, so the file is stable across saves (an
 /// unchanged tree rewrites the same bytes rather than shuffling `HashSet` order into the diff).
 ///
-/// Files written before 2026-10-18 also carry a `drawer` boolean. It is simply not declared here:
-/// serde ignores unknown fields by default, so an old file still loads and the stale field drops
-/// out on the next save. No version bump — the readable content did not change.
+/// `drawer` is missing in every file written between 2026-10-18 and 2026-10-25 (the field was
+/// dropped then), and `default` reads those as folded — which is exactly what those launches did.
 #[derive(Debug, Serialize, Deserialize)]
 struct Wire {
     version: u32,
@@ -65,6 +75,8 @@ struct Wire {
     open: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     closed: Vec<String>,
+    #[serde(default)]
+    drawer: bool,
 }
 
 impl FoldState {
@@ -79,7 +91,11 @@ impl FoldState {
         if wire.version != VERSION {
             return Self::default();
         }
-        Self { open: wire.open.into_iter().collect(), closed: wire.closed.into_iter().collect() }
+        Self {
+            open: wire.open.into_iter().collect(),
+            closed: wire.closed.into_iter().collect(),
+            drawer: wire.drawer,
+        }
     }
 
     /// Write the fold state back, **atomically**. See the module docs for why a rename rather than a
@@ -91,7 +107,7 @@ impl FoldState {
         let mut closed: Vec<String> = self.closed.iter().cloned().collect();
         open.sort();
         closed.sort();
-        let wire = Wire { version: VERSION, open, closed };
+        let wire = Wire { version: VERSION, open, closed, drawer: self.drawer };
         let tmp = dir.join(format!("{FILE_NAME}.tmp"));
         std::fs::write(&tmp, serde_json::to_string_pretty(&wire)?)?;
         // The rename over an existing file is the atomic step; nothing keeps this file open between
@@ -116,26 +132,50 @@ mod tests {
     }
 
     /// The two sets have to survive a round trip, or "fold a group, restart" — the whole point of
-    /// this file — would quietly do nothing.
+    /// this file — would quietly do nothing. Same for the drawer, both ways round: "open last time"
+    /// has to come back open, and a file that says folded must not be read as open.
     #[test]
-    fn round_trip_keeps_the_two_sets() {
+    fn round_trip_keeps_the_two_sets_and_the_drawer() {
         let dir = temp_dir("rt");
-        let fs = FoldState {
-            open: ["a".to_string(), "b".to_string()].into_iter().collect(),
-            closed: ["c".to_string()].into_iter().collect(),
-        };
-        fs.save(&dir).unwrap();
-        let back = FoldState::load(&dir);
-        assert_eq!(back.open, fs.open);
-        assert_eq!(back.closed, fs.closed);
+        for drawer in [true, false] {
+            let fs = FoldState {
+                open: ["a".to_string(), "b".to_string()].into_iter().collect(),
+                closed: ["c".to_string()].into_iter().collect(),
+                drawer,
+            };
+            fs.save(&dir).unwrap();
+            let back = FoldState::load(&dir);
+            assert_eq!(back.open, fs.open);
+            assert_eq!(back.closed, fs.closed);
+            assert_eq!(back.drawer, drawer, "the drawer position must survive the round trip");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A file written before the drawer stopped being persisted still loads, and the stale `drawer`
-    /// field is **dropped on the next save** rather than carried around. The sidebar itself is not
-    /// this file's business any more: it always starts folded (user request, 2026-10-18).
+    /// A file written while the drawer was **not** persisted (2026-10-18 .. 2026-10-25) has no
+    /// `drawer` key at all. It must still read as "folded" — that is what those launches did — and
+    /// the folds beside it must be intact: a version bump would have thrown them away with it.
     #[test]
-    fn a_legacy_file_with_a_drawer_field_still_reads_and_drops_it() {
+    fn a_file_without_a_drawer_key_reads_as_folded() {
+        let dir = temp_dir("nodrawer");
+        std::fs::create_dir_all(dir.join(AOX_DIR)).unwrap();
+        std::fs::write(
+            dir.join(AOX_DIR).join(FILE_NAME),
+            br#"{"version":1,"open":["x"],"closed":["y"]}"#,
+        )
+        .unwrap();
+        let fs = FoldState::load(&dir);
+        assert_eq!(fs.open.len(), 1, "the folds still read");
+        assert_eq!(fs.closed.len(), 1);
+        assert!(!fs.drawer, "no key means the drawer starts folded, like those builds did");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file from **before** 2026-10-18 carries a `drawer` key with the very same meaning, and it is
+    /// honoured — not dropped, and not a reason to reject the file. The value is written back on the
+    /// next save, so an open drawer stays open across a launch even from a stale file.
+    #[test]
+    fn a_pre_2026_10_18_drawer_key_is_honoured() {
         let dir = temp_dir("legacydrawer");
         std::fs::create_dir_all(dir.join(AOX_DIR)).unwrap();
         std::fs::write(
@@ -144,11 +184,11 @@ mod tests {
         )
         .unwrap();
         let fs = FoldState::load(&dir);
+        assert!(fs.drawer, "an old file that said open means open");
         assert_eq!(fs.open.len(), 1, "the rest of the file still reads");
-        assert_eq!(fs.closed.len(), 1);
         fs.save(&dir).unwrap();
-        let text = std::fs::read_to_string(file_path(&dir)).unwrap();
-        assert!(!text.contains("drawer"), "the stale field is not written back: {text}");
+        let back = FoldState::load(&dir);
+        assert!(back.drawer, "and it survives the rewrite");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -185,6 +225,7 @@ mod tests {
         let fs = FoldState {
             open: ["z".to_string(), "a".to_string(), "m".to_string()].into_iter().collect(),
             closed: HashSet::new(),
+            drawer: true,
         };
         fs.save(&dir).unwrap();
         let first = std::fs::read_to_string(file_path(&dir)).unwrap();

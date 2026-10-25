@@ -574,7 +574,11 @@ pub struct App {
     /// first so double-clicks can't bounce back and forth)
     switching: bool,
     /// The on/off state of the "history" button at the top-left. It is the drawer's
-    /// target state. **Not persisted**: every launch starts folded (see `uistate`).
+    /// target state.
+    ///
+    /// Persisted since 2026-10-25 (`.aox/ui.json`, see [`uistate::FoldState::drawer`]): a launch
+    /// starts with the drawer wherever the last session left it. Before that it was always folded,
+    /// and every session began with the same click to open it again.
     show_history: bool,
     /// Slide-out animation progress: `0` = fully collapsed, `1` = fully expanded.
     ///
@@ -936,6 +940,9 @@ impl App {
             history: Vec::new(),
             current_history: None,
             switching: false,
+            // Both start folded and are replaced by what `.aox/ui.json` says on the first refresh
+            // that knows the app root (see `App::hist_fold_loaded`): a fresh install — no file yet
+            // — keeps the drawer shut and gives the full width to the transcript.
             show_history: false,
             hist_t: 0.0,
             hist_groups: Vec::new(),
@@ -944,9 +951,6 @@ impl App {
             hist_query: String::new(),
             hist_fold_loaded: false,
             name_dialog: None,
-            // The drawer starts collapsed on a fresh install: the full width goes to the transcript,
-            // and you click the top-left icon when you want it. From then on the position is read
-            // back from `.aox/ui.json` (see `refresh_history`).
             follow: true,
             force_follow: true,
             settings_open: false,
@@ -1394,18 +1398,23 @@ impl App {
         // The registry is re-read every time (one small JSON file): a workspace can change while the
         // app runs, and a cached copy would keep drawing a tree that no longer matches the disk.
         let root = self.app_root();
-        // Fold state, read **once** — the first refresh that knows the root (see
-        // `App::hist_fold_loaded`). Doing it here rather than in the boot arm means the `--demo`
-        // constructor, which sets up its own synthetic boot and then refreshes, is covered too.
+        // Fold state and the drawer's position, read **once** — the first refresh that knows the
+        // root (see `App::hist_fold_loaded`). Doing it here rather than in the boot arm means the
+        // `--demo` constructor, which sets up its own synthetic boot and then refreshes, is covered
+        // too.
         //
-        // Only the folds come from the file. The drawer's own position is deliberately **not**
-        // remembered (user request, 2026-10-18): every launch starts folded, snapped rather than
-        // animated — a sidebar sliding open by itself on launch reads as a glitch, not as a welcome.
+        // The drawer comes back **the way it was left** (user request, 2026-10-25; for the week
+        // before that it always started folded). `hist_t` is set alongside `show_history` rather
+        // than left to the animation: `update` eases `hist_t` toward `show_history` every frame, so
+        // restoring one without the other would slide the panel open on launch — a wake-up animation
+        // nobody asked for. Snapped, the first painted frame is already the final layout.
         if !self.hist_fold_loaded {
             if let Some(root) = root.as_deref() {
                 let fs = uistate::FoldState::load(root);
                 self.hist_open = fs.open;
                 self.hist_closed = fs.closed;
+                self.show_history = fs.drawer;
+                self.hist_t = if fs.drawer { 1.0 } else { 0.0 };
                 self.hist_fold_loaded = true;
             }
         }
@@ -2163,9 +2172,11 @@ impl App {
             self.settings_open = true;
         }
         if want_close {
-            // Not persisted: the drawer always starts folded (see the fold-state load in
-            // `refresh_history`). Closing it is not a preference, it is "done with it for now".
+            // Closing the drawer with its own × is a choice, not an accident, so it is written down
+            // like the toolbar toggle: the next launch comes back folded if that is where you left
+            // it (see the fold-state load in `refresh_history`).
             self.show_history = false;
+            self.save_fold_state();
         }
         if let Some(id) = open {
             self.switch_history(&id);
@@ -2381,7 +2392,7 @@ impl App {
         self.save_fold_state();
     }
 
-    /// Write the two fold sets to `<app root>/.aox/ui.json`.
+    /// Write the two fold sets **and the drawer's position** to `<app root>/.aox/ui.json`.
     ///
     /// Best-effort, like the registry: a failure is logged, never surfaced. The tree keeps working
     /// with the in-memory sets either way, so a failure only costs "the fold is not remembered next
@@ -2393,6 +2404,7 @@ impl App {
         let fs = uistate::FoldState {
             open: self.hist_open.clone(),
             closed: self.hist_closed.clone(),
+            drawer: self.show_history,
         };
         if let Err(e) = fs.save(&root) {
             eprintln!("aox-gui: could not save the fold state: {e:#}");
@@ -3425,8 +3437,11 @@ impl App {
             if self.show_history {
                 self.refresh_history();
             }
-            // Nothing is written here: the drawer is not a persisted preference (see
-            // `save_fold_state`), so opening it costs no disk write at all.
+            // Opening or putting it away is a **choice about the next launch too** (see the
+            // fold-state load in `refresh_history`), so it goes to `ui.json` — the same file, and
+            // the same write, the group folds use. One small JSON per click is nothing next to the
+            // directory scan `refresh_history` just did.
+            self.save_fold_state();
             //
             // The drawer has already been drawn by the time this row runs (it is declared first),
             // so the flip needs one more pass to show — and an idle window doesn't repaint on its
@@ -3852,33 +3867,38 @@ impl App {
             }
         });
 
-        // The reasoning box: **fixed height and always present** (user, 2026-10-05: "the
-        // reasoning box at the bottom keeps growing and shrinking, which makes the whole screen
-        // jump up and down"). There were two sources of the resizing, both cured at once here:
-        //   ① during streaming it grew from one line to four;
-        //   ② at the end of every response `reasoning_live` went false and the text was cleared,
-        //      so the whole block flickered in and out.
-        // So the box is drawn once with a hard-coded height, and the text is drawn inside it and
-        // clipped to the box. The price is that non-reasoning models see this empty box too --
-        // trading "a stable patch of blank" for "the whole block bouncing up and down"; stable
-        // is worth more.
+        // The reasoning box, drawn **only when there is reasoning to read** (user request,
+        // 2026-10-25).
+        //
+        // It was built the other way round on 2026-10-05 -- fixed height, always present -- to stop
+        // the block bouncing: it used to grow from one line to four while streaming and then vanish
+        // at the end of the turn. The price of that fix is what this one reverses: a model that does
+        // not reason (or a provider that sends no `reasoning_content`) left an empty rounded
+        // rectangle on screen for the whole turn, looking like "thinking" while nothing was being
+        // thought.
+        //
+        // The old complaint stays solved: the box appears only on the first delta of a turn that
+        // actually reasons, it never grows past four lines (the text is clipped inside a fixed
+        // height below), and at the end of the turn the whole live block is replaced by the process
+        // card, which carries the reasoning in its own place. So the height still moves at most
+        // once, and only when there is something to show.
         const THINK_LINES: usize = 4;
         const THINK_LINE_H: f32 = 20.0;
-        ui.add_space(12.0);
-        let w = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(
-            Vec2::new(w, THINK_LINE_H * THINK_LINES as f32 + 26.0),
-            Sense::hover(),
-        );
-        let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(12), P::code_bg());
-        painter.rect_stroke(
-            rect,
-            CornerRadius::same(12),
-            Stroke::new(1.0, P::border()),
-            egui::StrokeKind::Inside,
-        );
-        if !l.reasoning.is_empty() {
+        if has_reasoning(&l.reasoning) {
+            ui.add_space(12.0);
+            let w = ui.available_width();
+            let (rect, _) = ui.allocate_exact_size(
+                Vec2::new(w, THINK_LINE_H * THINK_LINES as f32 + 26.0),
+                Sense::hover(),
+            );
+            let painter = ui.painter();
+            painter.rect_filled(rect, CornerRadius::same(12), P::code_bg());
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(12),
+                Stroke::new(1.0, P::border()),
+                egui::StrokeKind::Inside,
+            );
             let inner = rect.shrink2(Vec2::new(16.0, 13.0));
             let tail = tail_lines(&l.reasoning, THINK_LINES);
             // Clip first, then draw: text past four lines gets cut off rather than pushing the
@@ -3886,8 +3906,8 @@ impl App {
             let p = painter.with_clip_rect(inner);
             let g = p.layout(tail, theme::body_font(14.5), P::text_faint(), inner.width());
             p.galley(inner.left_top(), g, P::text_faint());
+            ui.add_space(16.0);
         }
-        ui.add_space(16.0);
     }
 
     /// Write a folder the user has just chosen into the registry, so it **survives a restart**.
@@ -8255,6 +8275,16 @@ fn tail_lines(s: &str, n: usize) -> String {
     clamp_str(&tail, 900)
 }
 
+/// Whether the live reasoning panel is worth drawing at all.
+///
+/// Whitespace does **not** count as reasoning: several providers open the field with a bare newline
+/// (or a run of them) before the first real token, and a card holding an empty line is exactly the
+/// blank rectangle this hides. The panel is 106 px of card — it earns that only once there is a
+/// sentence to read.
+fn has_reasoning(text: &str) -> bool {
+    !text.trim().is_empty()
+}
+
 fn compact_json(v: &serde_json::Value) -> String {
     let s = serde_json::to_string(v).unwrap_or_else(|_| v.to_string());
     clamp_str(&s, 300)
@@ -9058,6 +9088,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The live reasoning panel is drawn only when there is a sentence in it.
+    ///
+    /// Reported 2026-10-25: a model that does not reason (or a provider that sends no
+    /// `reasoning_content`) left an empty rounded card under the status row for the whole turn. The
+    /// box used to be unconditional **on purpose** (2026-10-05, "it keeps growing and shrinking, so
+    /// the whole screen jumps up and down"), so this pins the new rule from both sides: blank hides
+    /// it, one word shows it — and a stray leading newline does not get to hide real text.
+    #[test]
+    fn a_blank_reasoning_field_draws_no_card() {
+        assert!(!has_reasoning(""), "an absent field must not draw a card");
+        assert!(!has_reasoning("\n"), "providers that open with a bare newline must not draw one");
+        assert!(!has_reasoning(" \n\t\n"), "a field of nothing but whitespace is still nothing");
+        assert!(has_reasoning("Counting files by type"), "one sentence is enough to earn the card");
+        assert!(has_reasoning("\n\n先看一下目录结构"), "leading newlines must not hide real text");
     }
 
     /// The plan card belongs to the **conversation**, not to the window it is drawn in.
