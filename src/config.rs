@@ -85,6 +85,9 @@ pub struct Config {
     /// the "written but not in effect" class of problem that is hardest to track down.
     #[serde(default, rename = "workplace", alias = "workspace")]
     pub workplace: WorkplaceConfig,
+    /// The `[recovery]` section: task-level file checkpoints and rollback (see `src/recovery`).
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
     /// GUI-only appearance config. The CLI bin target compiles this file too, but cannot read this field.
     #[allow(dead_code)]
     #[serde(default)]
@@ -869,6 +872,87 @@ impl Default for WorkplaceConfig {
     }
 }
 
+// ─────────────────────────── Task recovery (checkpoints / rollback) ───────────────────────────
+
+/// How thoroughly an opaque tool call (`shell`, a writing plugin) is guarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellGuard {
+    /// Hash the whole scoped tree before and after; refuse the call if that cannot be done.
+    Strict,
+    /// Use metadata as a shortcut; a write discovered only afterwards leaves the node `partial`.
+    BestEffort,
+    /// Do not capture opaque writes at all.
+    Off,
+}
+
+/// Task-level file checkpoints under `<workspace>/.aox/backup`.
+///
+/// The defaults are deliberately conservative but cheap for read-only turns: no store is opened
+/// until the first file write.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RecoveryConfig {
+    pub enabled: bool,
+    /// How many `turn` nodes must remain undoable from the cursor.
+    pub keep: usize,
+    pub max_total_mb: u64,
+    pub max_file_mb: u64,
+    pub max_turn_mb: u64,
+    pub metadata_memory_mb: u64,
+    pub shell_guard: ShellGuard,
+    pub protect_plugins: bool,
+    /// Workspace-relative path patterns. A trailing `/` means a directory prefix; `*.ext` matches a suffix.
+    pub exclude: Vec<String>,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            keep: 30,
+            max_total_mb: 512,
+            max_file_mb: 64,
+            max_turn_mb: 256,
+            metadata_memory_mb: 32,
+            shell_guard: ShellGuard::Strict,
+            protect_plugins: true,
+            exclude: default_recovery_exclude(),
+        }
+    }
+}
+
+fn default_recovery_exclude() -> Vec<String> {
+    [
+        ".aox/",
+        ".git/",
+        ".hg/",
+        ".svn/",
+        "target/",
+        "node_modules/",
+        ".venv/",
+        "venv/",
+        "__pycache__/",
+        ".pytest_cache/",
+        // Downloaded toolchains and vendored runtimes: generated, large, and never the thing a
+        // rollback is for. This one came from a real report — a single-page HTML file ended up
+        // costing 45 MiB of baseline because the workspace also held an embedded Python runtime.
+        "runtime/",
+        // Agent housekeeping (this program's sibling tooling, session logs, blobs). Not the user's
+        // source, and it grows on its own.
+        ".workbuddy/",
+        "dist/",
+        "build/",
+        "out/",
+        "*.tmp",
+        "*.swp",
+        "*.lock",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 // ─────────────────────────── Appearance (GUI theme) ───────────────────────────
 //
 // This section describes **data** only and does not know about egui. Two reasons:
@@ -1160,6 +1244,7 @@ impl Config {
             plugins: PluginsConfig::default(),
             tools: ToolsConfig::default(),
             workplace: WorkplaceConfig::default(),
+            recovery: RecoveryConfig::default(),
             theme: ThemeConfig::default(),
         }
     }
@@ -1745,5 +1830,30 @@ api_key = "k"
             crate::compact::Policy::from_config(&small).unwrap().budget,
             crate::compact::SMALLEST_BUDGET
         );
+    }
+
+    #[derive(Deserialize)]
+    struct RecoveryWrap {
+        #[serde(default)]
+        recovery: RecoveryConfig,
+    }
+
+    #[test]
+    fn recovery_defaults_are_the_documented_ones() {
+        let w: RecoveryWrap = toml::from_str("").unwrap();
+        assert!(w.recovery.enabled);
+        assert_eq!(w.recovery.keep, 30);
+        assert_eq!(w.recovery.max_total_mb, 512);
+        assert_eq!(w.recovery.max_file_mb, 64);
+        assert_eq!(w.recovery.shell_guard, ShellGuard::Strict);
+        assert!(w.recovery.exclude.iter().any(|p| p == ".aox/"));
+    }
+
+    #[test]
+    fn a_bad_shell_guard_is_a_parse_error() {
+        let e = toml::from_str::<RecoveryWrap>("[recovery]\nshell_guard = \"mostly\"")
+            .err()
+            .expect("an unknown guard must not silently fall back");
+        assert!(format!("{e}").contains("shell_guard"), "{e}");
     }
 }

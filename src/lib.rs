@@ -29,6 +29,7 @@ pub mod paths;
 pub mod notes;
 pub mod plugin;
 pub mod prompt;
+pub mod recovery;
 pub mod recycle;
 pub mod repeat;
 pub mod runtime;

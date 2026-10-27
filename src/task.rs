@@ -282,6 +282,19 @@ impl TaskState {
     /// Deduplicated by path string; past [`FILES_MAX`] nothing more is appended — keeping the earliest
     /// beats keeping the latest: in a long-running task, "which files it started from" is usually the
     /// clue restore needs most.
+    /// Invalidate every host-collected fact after a workspace restore.
+    ///
+    /// A restore changes files behind the model's back. Keeping a `done` status or a check from the
+    /// pre-restore workspace would be a lie, so all proof is cleared. Human/model-authored progress
+    /// text is deliberately left alone.
+    pub fn invalidate_after_restore(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.checks.clear();
+        self.modified_files.clear();
+        self.status = Status::Open;
+        self.last_updated = crate::history::unix_now();
+    }
+
     pub fn note_modified(&mut self, path: &str) {
         if path.trim().is_empty() {
             return;

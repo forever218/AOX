@@ -901,6 +901,23 @@ impl App {
                         ui.add_space(3.0);
                         ui.horizontal(|ui| {
                             workplace_ui::button(ui, &mut self.ws, self.demo || !blocked);
+                            // The recovery chip: one step to the right of the workspace button,
+                            // because both answer "what can this conversation do to the tree".
+                            //
+                            // Hidden entirely when recovery is off, and in `full` mode — there is no
+                            // protected workspace there, so there is nothing to roll back and a chip
+                            // would only promise something that cannot happen.
+                            let show_rec = self.boot.as_ref().is_some_and(|b| b.recovery)
+                                && !matches!(
+                                    self.ws.view().map(|v| &v.mode),
+                                    Some(aox::workplace::Mode::Full)
+                                );
+                            if show_rec {
+                                ui.add_space(2.0);
+                                if let Some(req) = self.rec.chip(ui, true, self.busy) {
+                                    self.send_recovery(req);
+                                }
+                            }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 // While the host is folding old turns into a summary, the gauge has no
                                 // honest reading (the numbers only come back a round trip later), so

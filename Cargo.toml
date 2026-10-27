@@ -31,6 +31,8 @@ anyhow = "1"
 async-trait = "0.1"
 # Terminal Markdown rendering (headings / code blocks / lists / tables)
 termimad = "0.34"
+# Content-addressed file backup. BLAKE3 is a change/integrity hash, not a security boundary.
+blake3 = { version = "1", features = ["pure"] }
 
 [target.'cfg(windows)'.dependencies]
 # Let the legacy conhost support ANSI colours too (VT processing + UTF-8 output code page);

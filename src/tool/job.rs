@@ -204,7 +204,12 @@ async fn start(args: &Value, rt: &Arc<Runtime>) -> Result<String, String> {
     // A very short startup probe catches the common failures (missing binary, bad cwd, port already
     // in use) while the log is still small and the model can act on the message immediately. A
     // server that is still running after this is reported as started.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    //
+    // 600 ms, not 300: this window is the only thing that distinguishes "it exited" from "it is a
+    // server", so too small a number turns a busy machine into a wrong answer ("started" for a
+    // command that had already died). The cost of the wider window is paid once per `start`, and a
+    // real server start is dominated by the model turn around it.
+    tokio::time::sleep(Duration::from_millis(600)).await;
     let early_exit = bg.child.try_wait().ok().flatten();
     if let Some(status) = early_exit {
         if bg.fence.active_processes().unwrap_or(0) == 0 {
@@ -246,6 +251,7 @@ async fn start(args: &Value, rt: &Arc<Runtime>) -> Result<String, String> {
         log.clone(),
         bg,
     );
+    rt.recovery.note_background_job(&info.id);
     Ok(crate::tf!(
         "started background job {} (pid {}, {}).\nlog: {}\n\nUse shell_job {{\"action\":\"status\",\"id\":\"{}\"}} for state, \
          {{\"action\":\"logs\",\"id\":\"{}\"}} for output, and {{\"action\":\"stop\",\"id\":\"{}\"}} when finished.\n\

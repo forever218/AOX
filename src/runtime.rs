@@ -109,6 +109,11 @@ pub struct Runtime {
     /// decision runs on the tool-call path) — the same reason as `runtimes` /
     /// `prompt_segments`: the lock is never held across an `await`.
     pub workplace: crate::workplace::Workplace,
+    /// Task-level file checkpoints and rollback (see `src/recovery`).
+    ///
+    /// The active transaction lives here, not inside `run_turn`: a GUI abort drops that future, and
+    /// a local transaction would never get a chance to record its post-images.
+    pub recovery: crate::recovery::RecoveryManager,
     /// The **space registry** (see `src/space.rs`): which workspaces exist, what they are called, and
     /// which conversation sits where.
     ///
@@ -186,6 +191,7 @@ impl Runtime {
         // **at startup** — the same principle as `[store] backend` / `[loop] impl`
         // (something configured but not taking effect is the hardest to diagnose).
         let workplace = crate::workplace::Workplace::new(config.workplace.clone(), &root)?;
+        let recovery = crate::recovery::RecoveryManager::new(config.recovery.clone(), root.clone());
         let rt = Arc::new(Self {
             config,
             auth,
@@ -202,6 +208,7 @@ impl Runtime {
             loop_impl,
             sandbox,
             workplace,
+            recovery,
             spaces: std::sync::RwLock::new(spaces),
         });
         rt.start_job_reaper();

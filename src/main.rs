@@ -14,6 +14,7 @@ mod message;
 mod notes;
 mod plugin;
 mod prompt;
+mod recovery;
 mod recycle;
 mod repeat;
 mod runtime;
@@ -635,6 +636,20 @@ async fn main() -> Result<()> {
                     "no task checkpoint in this conversation yet — the model writes one with task_state on long tasks (goal, plan, acceptance).",
                 ).to_string())),
             },
+            _ if recovery::command::is_cmd(line) => {
+                match recovery::command::parse(line)
+                    .map_err(anyhow::Error::msg)
+                    .and_then(|cmd| recovery::command::run(&rt, cmd).map_err(anyhow::Error::msg))
+                {
+                    Ok(rep) => {
+                        ui.emit(AgentEvent::Info(rep.text));
+                        if let Some(report) = rep.restore {
+                            agent.note_workspace_restored(&report);
+                        }
+                    }
+                    Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
+                }
+            }
             "/sandbox" => ui.emit(AgentEvent::Info(sandbox::report(&rt))),
             // Workplace: `/workplace` shows the current state, `/workplace
             // full|default|<dir>` switches tiers. Both decision and execution live in
@@ -701,6 +716,22 @@ async fn main() -> Result<()> {
                     (
                         "/task",
                         crate::i18n::t("Show this conversation's task checkpoint: the goal, the plan with its ticks, and the acceptance criteria"),
+                    ),
+                    (
+                        "/checkpoints",
+                        crate::i18n::t("List task-level file recovery points in this workspace"),
+                    ),
+                    (
+                        "/rollback",
+                        crate::i18n::t("Preview the previous task's file changes; add --yes to restore, or a count / checkpoint id before the flags"),
+                    ),
+                    (
+                        "/redo",
+                        crate::i18n::t("Undo the most recent file rollback using its safety snapshot"),
+                    ),
+                    (
+                        "/backup",
+                        crate::i18n::t("Recovery status: /backup status | verify | prune (apply retention and free unused space)"),
                     ),
                     (
                         "/sandbox",

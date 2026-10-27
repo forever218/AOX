@@ -84,8 +84,10 @@ pub(crate) fn local_now() -> Local {
 }
 
 /// Unix seconds → year/month/day/hour/minute/second (Howard Hinnant's civil_from_days).
-#[cfg(not(windows))]
-pub(crate) fn civil_from_unix(secs: u64) -> (u16, u16, u16, u16, u16, u16) {
+///
+/// Available on every platform. On Windows it is a UTC civil conversion (local time still goes
+/// through `local_from_system`); recovery lists use it for a stable display value.
+pub fn civil_from_unix(secs: u64) -> (u16, u16, u16, u16, u16, u16) {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let z = days + 719_468;

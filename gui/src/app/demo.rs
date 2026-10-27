@@ -30,6 +30,7 @@ pub(super) fn seed_demo(app: &mut App) {
         model: app.model.clone(),
         context_window: DEFAULT_CONTEXT_WINDOW,
         provider_ready: true,
+        recovery: true,
         note: None,
         // Demo mode gets a real path listing as well: the settings page's "System" column is
         // exactly the kind of "one glance is enough" diagnostic data, so previewing it with fake

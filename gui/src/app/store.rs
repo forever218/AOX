@@ -510,7 +510,40 @@ impl App {
         if let Mode::Fixed(root) = &mode {
             self.adopt_workspace(root);
         }
+        // The recovery rows belong to the old root; a different workspace has different points.
+        self.rec.close();
         let _ = self.tx.send(ToAgent::Workplace(mode));
+    }
+
+    /// Re-read the recovery list (the chip's count, and the panel if it is open).
+    ///
+    /// Skipped in demo mode and when recovery is off: there would be nobody to answer, and the
+    /// panel's "no store behind this window" notice is for a click, not for every turn.
+    pub(super) fn refresh_recovery(&mut self) {
+        let on = self.boot.as_ref().is_some_and(|b| b.recovery);
+        if self.demo || !on {
+            return;
+        }
+        self.send_recovery(crate::bridge::RecoveryReq::List);
+    }
+
+    /// Send a recovery request to the agent thread.
+    ///
+    /// One door for all of them so the "busy" state is set exactly once, in one place: the panel
+    /// draws rows as non-clickable while a request is out, and a path that forgot to mark itself
+    /// would leave the user clicking a dead list.
+    pub(super) fn send_recovery(&mut self, req: crate::bridge::RecoveryReq) {
+        if self.demo {
+            // `--demo` has no agent thread behind it. Answering in place is better than a panel that
+            // sits on its skeleton forever: the layout is what demo mode is for.
+            self.rec.set_view(crate::bridge::RecoveryView::Notice {
+                text: aox::i18n::t("Demo mode: there is no recovery store behind this window.").into(),
+                ok: false,
+            });
+            return;
+        }
+        self.rec.mark_busy();
+        let _ = self.tx.send(ToAgent::Recovery(req));
     }
 }
 

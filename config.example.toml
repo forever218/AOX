@@ -384,6 +384,51 @@ keep = 200
 # be writing into jsonl, which is the hardest kind of problem to find).
 backend = "jsonl"
 
+[recovery]
+# ── task-level file checkpoints and /rollback ───────────────────────────────────
+#
+# Before a task overwrites/deletes a file, the old bytes are saved under
+# <workspace>/.aox/backup/. Identical content is stored once. No directory or store is created
+# until a task really writes a file.
+enabled = true
+
+# How many user tasks remain undoable from the current cursor.
+keep = 30
+
+# Hard caps. Reaching one refuses the next capture rather than deleting the current task's
+# pre-images.
+max_total_mb = 512
+max_file_mb = 64
+max_turn_mb = 256
+metadata_memory_mb = 32
+
+# How an opaque call is guarded — a shell command, and a plugin that declares write access.
+# "strict": hash the scoped tree before and after every call; the call is refused when the scan
+#           cannot finish (the one case where this system blocks work, and it is your budget to raise).
+# "best_effort": same scan, but only files that changed since the last call get a before-image stored;
+#           the recovery point is marked partial, and the call always runs.
+# "off": never scan. Shell and plugin writes are then outside the rollback guarantee entirely.
+shell_guard = "strict"
+
+# Scan a plugin call only when it declares write access (an undeclared plugin counts as write).
+# Read-only plugins are trusted, which is why this is worth keeping at `true` rather than scanning
+# every call: a full workspace scan per read is a lot to pay for a promise the plugin already made.
+protect_plugins = true
+
+# Workspace-relative exclusions: a trailing '/' is a directory prefix; '*.ext' is a suffix.
+#
+# This list is a **size** decision as much as a scope one: the first strict shell command caches a
+# copy of every trackable file so the command's writes can be undone. A workspace that also holds a
+# downloaded toolchain (`runtime/`, `.venv/`) or generated bundles can turn "one HTML file" into tens
+# of megabytes. Excluded paths are still protected by the workplace boundary — they are only outside
+# the rollback guarantee.
+exclude = [
+    ".aox/", ".git/", ".hg/", ".svn/",
+    "target/", "node_modules/", ".venv/", "venv/", "__pycache__/",
+    ".pytest_cache/", "runtime/", ".workbuddy/", "dist/", "build/", "out/",
+    "*.tmp", "*.swp", "*.lock",
+]
+
 [shell]
 # ── the built-in command line (the `bash` / `shell` tools) ───────────────────────
 #

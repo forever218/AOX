@@ -199,13 +199,20 @@ impl Tool for EditFileTool {
         }
 
         // ── One write: temp file in the same directory, then rename ──
+        let capture = match rt.recovery.capture_before(&path) {
+            Ok(c) => c,
+            Err(b) => return ToolOutput::err(b.model),
+        };
         if let Err(e) = write_atomically(&path, updated.as_bytes()) {
+            let note = rt.recovery.capture_after(capture);
             return ToolOutput::err(crate::tf!(
-                "failed to replace {}: {}. Nothing was written; the original file is intact.",
+                "failed to replace {}: {}. Nothing was written; the original file is intact.{}",
                 path.display(),
-                e
+                e,
+                note.map(|n| format!("\nrecovery: {n}")).unwrap_or_default()
             ));
         }
+        let recovery_note = rt.recovery.capture_after(capture);
 
         let (added, removed) = line_diff(&original, &updated);
         let new_hash = fingerprint::of_bytes(updated.as_bytes());
@@ -230,6 +237,9 @@ impl Tool for EditFileTool {
                 old_lines,
                 new_lines
             ));
+        }
+        if let Some(note) = recovery_note {
+            out.push_str(&format!("\nrecovery: {note}"));
         }
         // Reuses `write_file`'s diff rendering, so the workspace view and the tool row display it
         // with no changes on their side.

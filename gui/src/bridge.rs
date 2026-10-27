@@ -61,6 +61,12 @@ pub enum ToAgent {
     /// startup / at the end of every turn / after every tier switch the bridge proactively pushes a
     /// [`FromAgent::Workplace`].
     Workplace(aox::workplace::Mode),
+    /// The recovery panel: list points, preview a rollback, apply one, redo, verify, prune.
+    ///
+    /// Every variant is answered on **this** thread ([`recovery_request`]): the store lives inside
+    /// the workspace and the recovery API is synchronous, so the UI must never run it — a 100 MB
+    /// tree walk on the main thread is a frozen window, not a slow one.
+    Recovery(RecoveryReq),
     /// Move these paths to the system recycle bin and report the total.
     ///
     /// The main thread cannot do this itself: `recycle` is async and can block for a while on the
@@ -192,6 +198,8 @@ pub enum FromAgent {
     /// `PartialEq`, and parsing a string like "Picked workspace" is too brittle (a copy change silently breaks
     /// it), for the same reason as [`RuntimeView`].
     Workplace(Box<WorkplaceView>),
+    /// An answer for the recovery panel (see [`ToAgent::Recovery`]).
+    Recovery(Box<RecoveryView>),
     /// An unrecoverable error occurred this turn
     Fatal(String),
 }
@@ -208,6 +216,32 @@ pub struct WorkplaceView {
 
 /// Send the current workplace state to the UI.
 ///
+/// What the recovery panel asks the agent thread to do.
+#[derive(Clone, Debug)]
+pub enum RecoveryReq {
+    /// The list, plus how far back it can go. Sent when the panel opens and after every change.
+    List,
+    /// Resolve one point and describe what rolling back to it would do. Read-only.
+    Preview { target: String },
+    /// Apply it. `force` overwrites files changed outside AOX; `allow_partial` crosses points with
+    /// incomplete coverage. They are separate consents because they are separate questions.
+    Rollback { target: String, force: bool, allow_partial: bool },
+    Redo,
+    Verify,
+    Prune,
+}
+
+/// What comes back.
+#[derive(Clone, Debug)]
+pub enum RecoveryView {
+    Points(Box<aox::recovery::view::PointsView>),
+    Preview(Box<aox::recovery::view::PreviewView>),
+    /// Something to say inside the panel: the outcome of a rollback / verify / prune, or a refusal.
+    /// `ok == false` is shown in the danger colour and **is not a modal** — the panel is already
+    /// the place the user is looking.
+    Notice { text: String, ok: bool },
+}
+
 /// One lock acquisition takes both tier and root ([`aox::workplace::Workplace::snapshot`]), reading the
 /// same state as the CLI's `/workplace` — the two frontends do not each keep their own "what tier is it
 /// now" judgment.
@@ -245,6 +279,9 @@ pub struct BootInfo {
     /// The model's context window, for the ring in the input box. `0` = not configured.
     pub context_window: u64,
     pub provider_ready: bool,
+    /// Whether task recovery is on (`[recovery] enabled`). The panel's chip is **not drawn** when it
+    /// is off: a control for a feature that does not exist is a lie with a hover state.
+    pub recovery: bool,
     pub note: Option<String>,
     /// The paths and host info the "System" tab needs (see [`BootPaths`]).
     pub paths: BootPaths,
@@ -435,7 +472,8 @@ impl Ui for GuiUi {
                 | Some(ToAgent::Act(_))
                 | Some(ToAgent::RenameConversation { .. })
                 | Some(ToAgent::Recycle(_))
-                | Some(ToAgent::Workplace(_)) => continue,
+                | Some(ToAgent::Workplace(_))
+                | Some(ToAgent::Recovery(_)) => continue,
             }
         }
     }
@@ -531,6 +569,86 @@ fn send_runtime_status(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
     let _ = tx.send(FromAgent::Runtimes(view));
 }
 
+/// The GUI implementation of the recovery commands. Parsing and the actual work are shared with
+/// the CLI; the GUI only routes the report to its event stream and tells the Agent to invalidate
+/// stale task evidence after a successful restore.
+fn recovery_command(ui: &mut GuiUi, agent: &mut Agent, line: &str) {
+    let rt = agent.rt().clone();
+    let parsed = match aox::recovery::command::parse(line) {
+        Ok(c) => c,
+        Err(e) => {
+            ui.emit(AgentEvent::Error(e));
+            return;
+        }
+    };
+    match aox::recovery::command::run(&rt, parsed) {
+        Ok(rep) => {
+            ui.emit(AgentEvent::Info(rep.text));
+            if let Some(report) = rep.restore {
+                agent.note_workspace_restored(&report);
+            }
+        }
+        Err(e) => ui.emit(AgentEvent::Error(e)),
+    }
+}
+
+/// The recovery panel's backend: one request in, one view out.
+///
+/// The store work itself is [`aox::recovery::command`] — the same functions the CLI's `/checkpoints`,
+/// `/rollback` and `/backup` call. The GUI deliberately owns **no** recovery logic: it decides what
+/// it looks like, never what it means.
+fn recovery_request(agent: &mut Agent, tx: &mpsc::UnboundedSender<FromAgent>, req: RecoveryReq) {
+    use aox::recovery::command as cmd;
+    use aox::recovery::view;
+    let rt = agent.rt().clone();
+    let view = match req {
+        // `history_id()` is the conversation whose turn is running (or the one just opened): it is what
+        // makes "this point is mine" answerable. Without it every row would look foreign in a new
+        // conversation, and a row that belongs to someone else would look like the user's own work.
+        RecoveryReq::List => match view::points_view(&rt, agent.history_id()) {
+            Ok(v) => RecoveryView::Points(Box::new(v)),
+            Err(e) => RecoveryView::Notice { text: e, ok: false },
+        },
+        RecoveryReq::Preview { target } => match view::preview_view(&rt, &target) {
+            Ok(v) => RecoveryView::Preview(Box::new(v)),
+            Err(e) => RecoveryView::Notice { text: e, ok: false },
+        },
+        RecoveryReq::Rollback { target, force, allow_partial } => {
+            match view::rollback_to(&rt, &target, force, allow_partial) {
+                Ok(rep) => {
+                    // Same bookkeeping as `/rollback` typed into the input box: the task checkpoint's
+                    // evidence is stale after a restore, and the transcript gets a host note. Routing
+                    // both doors through this one call is what keeps them from diverging.
+                    if let Some(report) = &rep.restore {
+                        agent.note_workspace_restored(report);
+                    }
+                    RecoveryView::Notice { text: rep.text, ok: true }
+                }
+                Err(e) => RecoveryView::Notice { text: e, ok: false },
+            }
+        }
+        RecoveryReq::Redo => notice_from(cmd::run(&rt, cmd::RecoveryCmd::Redo)),
+        RecoveryReq::Verify => notice_from(cmd::run(&rt, cmd::RecoveryCmd::Verify)),
+        RecoveryReq::Prune => notice_from(cmd::run(&rt, cmd::RecoveryCmd::Prune)),
+    };
+    // A preview never changes the list; everything else might, so its answer is followed by a fresh
+    // one. Decided **before** the view is moved into the channel.
+    let refresh = !matches!(view, RecoveryView::Preview(_));
+    let _ = tx.send(FromAgent::Recovery(Box::new(view)));
+    if refresh {
+        if let Ok(v) = view::points_view(&rt, agent.history_id()) {
+            let _ = tx.send(FromAgent::Recovery(Box::new(RecoveryView::Points(Box::new(v)))));
+        }
+    }
+}
+
+fn notice_from(result: Result<aox::recovery::command::CommandReport, String>) -> RecoveryView {
+    match result {
+        Ok(rep) => RecoveryView::Notice { text: rep.text, ok: true },
+        Err(e) => RecoveryView::Notice { text: e, ok: false },
+    }
+}
+
 /// The GUI implementation of `/runtime`.
 ///
 /// Parsing, provisioning and copy all reuse `aox::runtimes`, shared with the CLI; here it only decides
@@ -587,6 +705,7 @@ fn boot(
     // didn't say.
     context_window: u64,
     ready: bool,
+    recovery: bool,
     note: Option<String>,
     store: Arc<dyn aox::store::Store>,
     // Which layers this config was composed from (low → high). An empty list when the config cannot be read — do not invent layers that don't exist.
@@ -599,6 +718,7 @@ fn boot(
         model: model.to_string(),
         context_window,
         provider_ready: ready,
+        recovery,
         note,
         paths,
         store,
@@ -703,6 +823,15 @@ async fn idle_until_shutdown(
                     aox::i18n::t("model not ready; the workplace cannot be switched right now.").into(),
                 )));
             }
+            // Recovery reads the workspace store, and the store lives inside the Runtime that never
+            // started. Answer with a view rather than silence: the panel would otherwise sit on its
+            // skeleton with no way to learn why.
+            ToAgent::Recovery(_) => {
+                let _ = tx.send(FromAgent::Recovery(Box::new(RecoveryView::Notice {
+                    text: aox::i18n::t("The model is not ready, so the recovery store cannot be read yet.").into(),
+                    ok: false,
+                })));
+            }
         }
     }
 }
@@ -786,6 +915,9 @@ async fn next_command(
                 // not write when nothing changed, so neither failure nor no-change leaves junk lines.
                 agent.persist_workplace();
             }
+            // The recovery panel. Nothing here enters the model conversation: like the workplace
+            // button, these are host actions about the workspace, not instructions to the model.
+            Some(ToAgent::Recovery(req)) => recovery_request(agent, tx, req),
             Some(ToAgent::Shutdown) | None => return Ok(None),
         }
     }
@@ -868,6 +1000,7 @@ async fn boot_and_run(
                 &config_path,
                 "",
                 0,
+                false,
                 false,
                 Some(format!("{e:#}")),
                 store,
@@ -954,6 +1087,7 @@ async fn boot_and_run(
                 &model,
                 ctx_window(&rt),
                 false,
+                rt.config.recovery.enabled,
                 Some(format!("{e:#}")),
                 rt.store.clone(),
                 config_layers.clone(),
@@ -975,7 +1109,18 @@ async fn boot_and_run(
     // Hand the session to the UI **before** touching plugins. The history sidebar reads off the store
     // that `boot` carries, so restoring plugins first used to blank it for the whole wait — up to
     // `INIT_TIMEOUT` (20 s) per cold-or-broken plugin. This order is the point of the fix.
-    boot(&tx, &config_path, &model, ctx_window(&rt), true, None, rt.store.clone(), config_layers, paths);
+    boot(
+        &tx,
+        &config_path,
+        &model,
+        ctx_window(&rt),
+        true,
+        rt.config.recovery.enabled,
+        None,
+        rt.store.clone(),
+        config_layers,
+        paths,
+    );
     send_history_current(&tx, &agent);
     // Now restore persisted plugins (the same path as the CLI). It is the one startup step that can
     // block, so it runs here — after the UI already has the session — and finishes before the driver
@@ -1013,7 +1158,11 @@ async fn boot_and_run(
         if line.is_empty() && files.is_empty() {
             continue;
         }
-        // Local command: /runtime is handled by the host itself, not sent to the model (same as the CLI)
+        // Local commands: these are handled by the host itself, not sent to the model (same as the CLI).
+        if aox::recovery::command::is_cmd(&line) {
+            recovery_command(&mut ui, &mut agent, &line);
+            continue;
+        }
         if aox::runtimes::is_cmd(&line) {
             runtime_command(&mut ui, &rt, &line).await;
             continue;
@@ -1047,6 +1196,14 @@ async fn boot_and_run(
                 // The attachment tray needs nothing here: the GUI clears it at send time
                 // (`app.rs`), which is already consistent with "this message was delivered".
                 agent.rollback_interrupted_turn(mark);
+                // The future was dropped, so `run_turn` cannot close the recovery transaction.
+                let rec = agent.finish_recovery_turn(aox::recovery::model::TurnStatus::Interrupted);
+                for w in rec.warnings {
+                    ui.emit(AgentEvent::Warn(aox::tf!("recovery: {}", w)));
+                }
+                if let Some(e) = rec.error {
+                    ui.emit(AgentEvent::Warn(aox::tf!("recovery checkpoint was not committed: {}", e)));
+                }
                 let _ = ui.tx.send(FromAgent::TurnAborted);
             }
         }

@@ -381,6 +381,9 @@ impl Agent {
     /// The full history is loaded. This makes "continue where we left off" a real continuation, at the cost of a larger context
     /// the longer the conversation; to start a new topic press "+", which is a different path.
     pub fn resume(&mut self, id: &str) -> Result<usize> {
+        // A conversation switch must not leave a recovery transaction belonging to the old
+        // workspace open.
+        let _ = self.rt.recovery.abort_turn();
         let items = self.rt.store.load(id)?;
         let log = self.rt.store.open(id)?;
         // Keep only the system prompt (entry 0); replace everything else with the archived messages.
@@ -481,6 +484,8 @@ impl Agent {
     /// in `history/`. Here we only null out the persister — the next turn lazily creates a new file,
     /// and so the previous conversation naturally falls into history.
     pub fn new_conversation(&mut self) {
+        // Same reason as `resume`: a new conversation is a different workspace context.
+        let _ = self.rt.recovery.abort_turn();
         self.messages.truncate(1);
         self.log = None;
         self.log_error_reported = false;
@@ -643,6 +648,33 @@ impl Agent {
         // On this first message, record "which dir this conversation works in" into the archive (`ensure_started` just fixed the root,
         // so this record carries that dir's real path). After that we only write again when the tier switches.
         self.persist_workplace();
+        // The recovery transaction starts after the workplace root is fixed and before any tool can
+        // write. It lives on the Runtime so the GUI's abort path (which drops this future) can still
+        // finish it explicitly.
+        if let Some(root) = self.rt.workplace.active_root() {
+            let label = input.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            if let Err(e) = self
+                .rt
+                .recovery
+                .begin_turn(&root, self.history_id(), label)
+            {
+                ui.emit(AgentEvent::Warn(crate::tf!(
+                    "task recovery had an unfinished previous transaction ({}); closing it and retrying once",
+                    e
+                )));
+                let _ = self.rt.recovery.abort_turn();
+                if let Err(e) = self
+                    .rt
+                    .recovery
+                    .begin_turn(&root, self.history_id(), label)
+                {
+                    ui.emit(AgentEvent::Warn(crate::tf!(
+                        "task recovery is unavailable this turn: {}",
+                        e
+                    )));
+                }
+            }
+        }
         self.push_message(self.user_message(input, files), None);
         // Wrap the whole turn: the UI shows a waiting animation and collapses the intermediate steps into one line at the end.
         ui.turn_start().await;
@@ -650,6 +682,17 @@ impl Agent {
         // Take the `Arc` out first: `run` needs `&mut self`, so we can't borrow `loop_impl` from `self` anymore.
         let lp = self.rt.loop_impl.clone();
         let result = lp.run(self, ui).await;
+        let rec = self.rt.recovery.finish_turn(if result.is_ok() {
+            crate::recovery::model::TurnStatus::Completed
+        } else {
+            crate::recovery::model::TurnStatus::Failed
+        });
+        for w in rec.warnings {
+            ui.emit(AgentEvent::Warn(crate::tf!("recovery: {}", w)));
+        }
+        if let Some(e) = rec.error {
+            ui.emit(AgentEvent::Warn(crate::tf!("recovery checkpoint was not committed: {}", e)));
+        }
         // Persist the checkpoint **before** the turn is closed out, and on both success and failure:
         // "the task died halfway" is precisely the moment the next `resume` needs to know where it got
         // to. Writes only when something actually changed (see `persist_task`).
@@ -741,6 +784,39 @@ impl Agent {
         }
         self.usage_log.push(rec.clone());
         Some(rec)
+    }
+
+    /// Close a recovery turn from outside `run_turn` (the GUI abort path).
+    ///
+    /// The GUI drops the `run_turn` future when the user aborts, so this has to be an explicit
+    /// call on the surviving `Agent`.
+    #[allow(dead_code)] // Only the GUI abort path calls this; the CLI goes through `run_turn`.
+    pub fn finish_recovery_turn(
+        &mut self,
+        status: crate::recovery::model::TurnStatus,
+    ) -> crate::recovery::RecoveryFinish {
+        self.rt.recovery.finish_turn(status)
+    }
+
+    /// Record that the workspace was restored behind the model's back.
+    ///
+    /// Chat is deliberately not truncated: the user's conversation and the files are two separate
+    /// audit trails. What must change is every host-held fact about the old file state.
+    pub fn note_workspace_restored(&mut self, report: &crate::recovery::model::RestoreReport) {
+        self.last_output = None;
+        if let Some(st) = self.task.as_mut() {
+            st.invalidate_after_restore();
+        }
+        self.task_saved = None;
+        self.persist_task();
+        let note = crate::tf!(
+            "{} the workspace was restored to {}. Old verification evidence and modified-file facts were invalidated. Re-read affected files and rerun acceptance before continuing. ({} path(s) restored, {} removed; chat history was not rolled back.)",
+            crate::history::HOST_PREFIX,
+            report.target.as_deref().unwrap_or("genesis"),
+            report.restored,
+            report.removed
+        );
+        self.push_ephemeral(Message::user(note));
     }
 
     // ───────── Task checkpoint (`crate::task`) ─────────
@@ -1076,7 +1152,46 @@ impl Agent {
             } else {
                 None
             };
-            let out = self.rt.execute(name, args).await;
+            // ── the recovery window for plugin writes ──
+            //
+            // A plugin is a black box: `access: read` is a declaration, not a boundary (see
+            // `docs/SANDBOX.md`). So a plugin that declared **write** gets the same bracket as a
+            // shell command — scan before, scan after — while one that declared **read** is taken at
+            // its word. Scanning every plugin call would make a read-only plugin as expensive as a
+            // shell command and buy nothing the declaration had not already promised.
+            //
+            // Like the shell window, a scan that cannot finish refuses the call *before* it runs
+            // (strict) or downgrades the point to partial (best effort); a broken store does neither.
+            let guard = if plugin_window(&kind, access, self.rt.config.recovery.protect_plugins) {
+                match self.rt.workplace.active_root() {
+                    Some(root) => match self.rt.recovery.begin_opaque(&root, &format!("plugin {name}")) {
+                        Ok(g) => g,
+                        Err(block) => return ToolOutput::err(block.model),
+                    },
+                    // `full` mode has no protected workspace, so there is nothing to scan against.
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let mut out = self.rt.execute(name, args).await;
+            if let Some(w) = guard.map(|g| self.rt.recovery.finish_opaque(g)) {
+                if !w.changed.is_empty() {
+                    out.content.push_str(&crate::tf!(
+                        "\nrecovery: this plugin changed {} file(s); they are recorded and can be rolled back\n",
+                        w.changed.len()
+                    ));
+                    for p in w.changed.iter().take(20) {
+                        out.content.push_str(&format!("  {p}\n"));
+                    }
+                    if w.changed.len() > 20 {
+                        out.content.push_str(&crate::tf!("  … and {} more\n", w.changed.len() - 20));
+                    }
+                }
+                if let Some(note) = w.note_text() {
+                    out.content.push_str(&format!("\n{note}\n"));
+                }
+            }
             if let Some(plugin) = built.filter(|_| !out.is_error) {
                 for t in self.rt.plugin_tool_names(&plugin).await {
                     self.tool_scope.enable(&t);
@@ -1190,6 +1305,20 @@ fn reject_text(kind: &ToolKind, reject: &crate::workplace::Reject) -> String {
 /// The wording must **clearly override** the generic error's "don't retry": that line is for "really wants to write out of bounds",
 /// this is a different matter (the tool is read-only to begin with); if unstated the model would give up following the previous line.
 const PLUGIN_READ_HINT: &str = "[If this tool is read-only, the \"do not retry\" line above does not apply]\nIf this plugin tool is only meant to **read** (scanning / counting / listing directories / parsing files), then what blocked you is not a permission, but the plugin not declaring itself read-only.\nAsk the plugin to add `\"read\"` as the 4th position of its tool declaration; after rebuilding the plugin it can access paths outside the workspace as usual. In the Python SDK you write the triple as a 4-tuple:\n  \"<tool name>\": (\"<description>\", <JSON Schema>, <handler>, \"read\")\nThe host then judges it as a **read** — the same tier as read_file / list_dir — and **no privilege escalation from the user is needed**.Conversely, tools that write files / delete things must **not** add this position.";
+
+/// Should this call be bracketed by a workspace scan?
+///
+/// Kept pure and separate from the call site so the decision can be tested without a `Runtime`: the
+/// three inputs are the whole rule, and getting it wrong is expensive in both directions — a missed
+/// window means silent unrollbackable writes, an extra one means a read-only plugin pays for a full
+/// tree scan on every call.
+///
+/// `access` comes from [`Runtime::tool_access`], i.e. from the plugin's own declaration. That is a
+/// declaration, not a boundary (see `docs/SANDBOX.md`), which is exactly why an *undeclared* plugin
+/// counts as `Write` and gets the window.
+fn plugin_window(kind: &ToolKind, access: crate::workplace::Access, protect: bool) -> bool {
+    matches!(kind, ToolKind::Plugin(_)) && access == crate::workplace::Access::Write && protect
+}
 
 #[cfg(test)]
 mod tests {
@@ -1704,5 +1833,114 @@ mod tests {
         assert!(out.is_error, "the buffer belongs to the conversation that produced it: {}", out.content);
 
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A plugin tool that writes a file, so the agent-level window can be observed end to end.
+    struct WritingPlugin {
+        name: String,
+        path: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for WritingPlugin {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn kind(&self) -> ToolKind {
+            ToolKind::Plugin("fake".into())
+        }
+        fn description(&self) -> &str {
+            "writes one file and claims to be a plugin"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn access(&self) -> crate::workplace::Access {
+            crate::workplace::Access::Write
+        }
+        async fn call(&self, _args: Value, _rt: &Arc<Runtime>) -> ToolOutput {
+            if let Some(parent) = self.path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&self.path, "written by a plugin") {
+                Ok(()) => ToolOutput::ok("wrote it"),
+                Err(e) => ToolOutput::err(e.to_string()),
+            }
+        }
+    }
+
+    struct RecordingUi;
+
+    #[async_trait::async_trait]
+    impl crate::ui::Ui for RecordingUi {
+        async fn read_user_input(&mut self) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn emit(&mut self, _event: crate::ui::AgentEvent) {}
+        async fn authorize(&mut self, _tool: &str, _args: &Value) -> crate::ui::AuthDecision {
+            crate::ui::AuthDecision::Allow
+        }
+    }
+
+    /// The whole point of W6: a plugin that declares `write` is bracketed by a scan, so what it wrote
+    /// is in the recovery point instead of being an invisible hole.
+    #[tokio::test]
+    async fn a_plugin_that_declares_write_lands_in_the_recovery_point() {
+        let ws = std::env::temp_dir().join("aox-plugin-window");
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("keep.txt"), "keep").unwrap();
+
+        let mut cfg = crate::config::Config::dummy();
+        cfg.workplace = crate::config::WorkplaceConfig {
+            mode: "fixed".into(),
+            root: Some(ws.to_string_lossy().into_owned()),
+        };
+        let rt = Runtime::new(cfg, ws.clone(), ws.join("plugins")).expect("runtime");
+        rt.workplace.ensure_started(&ws).expect("workspace");
+        rt.register(Arc::new(WritingPlugin {
+            name: "fs_write".into(),
+            path: ws.join("nested/made.txt"),
+        }))
+        .await
+        .expect("registered");
+
+        let llm: Arc<dyn LlmProvider> =
+            Arc::new(crate::llm::UnavailableProvider { reason: "test".into() });
+        let mut agent = Agent::new(llm, rt);
+        agent.rt.recovery.begin_turn(&ws, None, "plugin").expect("a turn");
+
+        let mut ui = RecordingUi;
+        let out = agent.authorize_and_execute(&mut ui, "fs_write", json!({})).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("recovery: this plugin changed 1 file"), "{}", out.content);
+
+        let id = agent.rt.recovery.finish_turn(crate::recovery::model::TurnStatus::Completed).point;
+        let store = agent.rt.recovery.open_store(&ws, false).unwrap();
+        let node = store.load_node(&id.expect("a recovery point")).unwrap();
+        let op = node.ops.iter().find(|o| o.path == "nested/made.txt").expect("recorded");
+        assert!(op.before.is_none(), "the file did not exist before the plugin ran");
+        assert!(op.after.as_ref().unwrap().stored);
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// The plugin window is decided by three things and nothing else. Pinned as a table because both
+    /// mistakes are silent: a missing window leaves writes that `/rollback` cannot undo, and an extra
+    /// one makes a read-only plugin pay for a full workspace scan on every single call.
+    #[test]
+    fn a_plugin_window_is_opened_only_for_a_declared_writer() {
+        use crate::workplace::Access;
+        let plugin = ToolKind::Plugin("fs".into());
+
+        // Declared write, protection on: scan it.
+        assert!(plugin_window(&plugin, Access::Write, true));
+        // Declared read is taken at its word — the declaration is the plugin's own promise.
+        assert!(!plugin_window(&plugin, Access::Read, true));
+        // `protect_plugins = false` is the documented opt-out.
+        assert!(!plugin_window(&plugin, Access::Write, false));
+        // Host tools are bracketed by their own capture, not by a scan.
+        assert!(!plugin_window(&ToolKind::Host, Access::Write, true));
+        assert!(!plugin_window(&ToolKind::Meta, Access::Write, true));
     }
 }

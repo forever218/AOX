@@ -36,6 +36,9 @@ impl App {
                     // refresh that landed first would build an empty history tree.
                     self.boot = Some(*b);
                     self.refresh_history();
+                    // The chip's number has to be right before anyone clicks it, so ask once at
+                    // startup rather than "the count appears after you open the panel once".
+                    self.refresh_recovery();
                     if ready {
                         // --prompt: send the first instruction automatically once the model is ready
                         if let Some(p) = self.pending_prompt.take() {
@@ -50,6 +53,9 @@ impl App {
                 // in the list both come from it. The bridge re-sends one at startup, at the
                 // end of every turn, and after every tier change.
                 FromAgent::Workplace(v) => self.ws.set_view(*v),
+                // The recovery panel. Rows are data, never text parsed back out of the CLI's output
+                // (see `bridge::RecoveryView`); the panel only decides how they look.
+                FromAgent::Recovery(v) => self.rec.set_view(*v),
                 FromAgent::HistoryCurrent(id) => {
                     // Keep counts/titles fresh while the sidebar is open; while it is closed
                     // only "the conversation file changed" is worth a directory scan
@@ -62,6 +68,14 @@ impl App {
                 }
                 FromAgent::Switched { opened, error } => {
                     self.switching = false;
+                    // The rows belonged to the conversation (and workspace) we just left. Keeping them
+                    // on screen would offer a rollback against a tree the user is no longer looking at.
+                    self.rec.close();
+                    // The *workspace* chain is still there, and "which of these are mine" is answered
+                    // per conversation — so re-read it for the conversation we just opened. Without
+                    // this the chip keeps the previous chat's count and every row keeps its old
+                    // attribution.
+                    self.refresh_recovery();
                     if let Some(e) = error {
                         // When loading fails the agent's context was never touched, so change
                         // nothing here either -- otherwise the UI has already "jumped" while
@@ -237,7 +251,18 @@ impl App {
                     }
                 }
                 FromAgent::Event(ev) => self.on_event(ev),
-                FromAgent::TurnEnd => self.finish_turn(false),
+                FromAgent::TurnEnd => {
+                    self.finish_turn(false);
+                    // A panel opened while the turn was running could not ask for its list (the
+                    // driver loop is not reading the queue during a turn). Now it can.
+                    if let Some(req) = self.rec.turn_ended() {
+                        self.send_recovery(req);
+                    } else {
+                        // Every turn that changed files just published a point; the count on the
+                        // chip has to follow even when the panel is shut.
+                        self.refresh_recovery();
+                    }
+                }
                 FromAgent::TurnAborted => {
                     self.finish_turn(true);
                 }

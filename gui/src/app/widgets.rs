@@ -61,7 +61,7 @@ pub(crate) const MENU_W: f32 = 178.0;
 /// Used instead of the built-in `ctx.animate_bool_with_time` (which interpolates **linearly**):
 /// constant-speed motion makes hard corners at both ends -- it kicks off as if flicked and stops
 /// as if it hit a wall.
-pub(super) fn ease_out_cubic(t: f32) -> f32 {
+pub(crate) fn ease_out_cubic(t: f32) -> f32 {
     let u = 1.0 - t.clamp(0.0, 1.0);
     1.0 - u * u * u
 }
@@ -180,7 +180,7 @@ pub(super) fn draw_flow_curve(painter: &egui::Painter, rect: Rect, fg: Color32) 
 /// button even turns the cursor into the text-selection I-beam -- giving you "an input cursor on
 /// top of a button". Route everything through this function and a clickable place is always a
 /// hand.
-pub(super) fn pointer_if(ui: &Ui, resp: &egui::Response) -> bool {
+pub(crate) fn pointer_if(ui: &Ui, resp: &egui::Response) -> bool {
     let hov = resp.hovered();
     if hov {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

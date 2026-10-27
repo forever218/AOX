@@ -1,0 +1,52 @@
+# recovery -- task-level file checkpoints under <workspace>/.aox/backup.
+#
+# The values equal the code defaults in `RecoveryConfig`. No store is opened until a task really
+# writes a file, so a read-only conversation pays nothing for this layer.
+
+[recovery]
+# Capture modified file contents before a write and expose /rollback. Disabling this removes the
+# commands and makes every tool behave exactly as it did before the feature existed.
+enabled = true
+
+# How many user tasks ("turn" nodes) must remain undoable from the current cursor.
+keep = 30
+
+# Hard caps. Reaching a cap refuses the next capture instead of deleting the current task's
+# pre-images.
+max_total_mb = 512
+max_file_mb = 64
+max_turn_mb = 256
+metadata_memory_mb = 32
+
+# How an opaque call (a shell command, or a plugin that declares write access) is guarded.
+# strict: hash the scoped tree before and after; refuse the call when the scan cannot finish.
+# best_effort: same scan, but only files that changed since the last call get a before-image stored;
+#   the point is marked partial. Note it does not read less than strict — it stores less.
+# off: no scan; those writes are outside the rollback guarantee.
+shell_guard = "strict"
+
+# Bracket a plugin call with a scan only when it declares write access (undeclared counts as write).
+# A plugin that declares "read" is taken at its word.
+protect_plugins = true
+
+# Workspace-relative patterns: trailing '/' is a directory prefix, '*.ext' is a suffix.
+exclude = [
+    ".aox/",
+    ".git/",
+    ".hg/",
+    ".svn/",
+    "target/",
+    "node_modules/",
+    ".venv/",
+    "venv/",
+    "__pycache__/",
+    ".pytest_cache/",
+    "runtime/",
+    ".workbuddy/",
+    "dist/",
+    "build/",
+    "out/",
+    "*.tmp",
+    "*.swp",
+    "*.lock",
+]

@@ -25,6 +25,7 @@ mod cache;
 mod gwin;
 mod markdown;
 mod open;
+mod recovery_ui;
 mod syntax;
 mod svg;
 mod tex;

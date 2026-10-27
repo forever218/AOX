@@ -442,20 +442,38 @@ impl Tool for WriteFileTool {
             return ToolOutput::err(crate::tf!("{} is a directory and cannot be written as a file.", path.display()));
         }
         let create_dirs = args.get("create_dirs").and_then(|v| v.as_bool()).unwrap_or(true);
+        // Validate the no-create branch before capture: a call that was going to fail must not
+        // create a journal entry.
+        if !create_dirs {
+            if let Some(parent) = path.parent() {
+                if !parent.is_dir() {
+                    return ToolOutput::err(crate::tf!(
+                        "parent directory {} does not exist (create_dirs = false, so it was not created automatically)",
+                        parent.display()
+                    ));
+                }
+            }
+        }
+        // Recovery capture happens before parent-directory creation: if the previous contents cannot
+        // be saved, the original write must not happen, and we should not leave a new empty directory
+        // behind either.
+        let capture = match rt.recovery.capture_before(&path) {
+            Ok(c) => c,
+            Err(b) => return ToolOutput::err(b.model),
+        };
         if create_dirs {
             if let Some(parent) = path.parent() {
                 if !parent.exists() {
                     if let Err(e) = std::fs::create_dir_all(parent) {
-                        return ToolOutput::err(crate::tf!("failed to create parent directory {}: {}", parent.display(), e));
+                        let note = rt.recovery.capture_after(capture);
+                        return ToolOutput::err(crate::tf!(
+                            "failed to create parent directory {}: {}{}",
+                            parent.display(),
+                            e,
+                            note.map(|n| format!("\nrecovery: {n}")).unwrap_or_default()
+                        ));
                     }
                 }
-            }
-        } else if let Some(parent) = path.parent() {
-            if !parent.is_dir() {
-                return ToolOutput::err(crate::tf!(
-                    "parent directory {} does not exist (create_dirs = false, so it was not created automatically)",
-                    parent.display()
-                ));
             }
         }
         let existed = path.exists();
@@ -464,15 +482,17 @@ impl Tool for WriteFileTool {
         // A file that is missing starts from empty (everything counts as added); one that is not
         // valid UTF-8 text yields `None`, and "no number" is the honest answer in that case.
         let previous = if existed { std::fs::read_to_string(&path).ok() } else { Some(String::new()) };
-        match std::fs::write(&path, content.as_bytes()) {
+        let written = std::fs::write(&path, content.as_bytes());
+        let recovery_note = rt.recovery.capture_after(capture);
+        match written {
             Ok(()) => {
-                let out = ToolOutput::ok(crate::tf!(
+                let mut out = ToolOutput::ok(crate::tf!(
                     "{} {} ({} bytes)",
                     if existed { crate::i18n::t("Overwrote") } else { crate::i18n::t("Created") },
                     path.display(),
                     content.len()
                 ));
-                match &previous {
+                out = match &previous {
                     Some(old) => {
                         let (added, removed) = line_diff(old, content);
                         out.with_diff(added, removed)
@@ -483,9 +503,18 @@ impl Tool for WriteFileTool {
                     // **was** written — so it still carries its path, and the workspace view lists
                     // it as a changed file with no numbers rather than hiding it.
                     None => out.with_path(path),
+                };
+                if let Some(note) = recovery_note {
+                    out.content.push_str(&format!("\nrecovery: {note}"));
                 }
+                out
             }
-            Err(e) => ToolOutput::err(crate::tf!("failed to write {}: {}", path.display(), e)),
+            Err(e) => ToolOutput::err(crate::tf!(
+                "failed to write {}: {}{}",
+                path.display(),
+                e,
+                recovery_note.map(|n| format!("\nrecovery: {n}")).unwrap_or_default()
+            )),
         }
     }
 }
@@ -924,16 +953,31 @@ impl Tool for RemoveTool {
         // walk, and the shell does not tell us how much it took (see `recycle::count_files`). That
         // number is what the UI turns into "N files moved to the recycle bin".
         let count = crate::recycle::count_files(&path);
+        // Capture the whole tree before the recycle call. A failure here must abort the delete: a
+        // half-backed-up directory is worse than a refused one.
+        let capture = match rt.recovery.capture_tree_before(&path) {
+            Ok(c) => c,
+            Err(b) => return ToolOutput::err(b.model),
+        };
         // The delete goes to the **recycle bin**, not to oblivion — see the module note in
         // `crate::recycle` for why it is the shell's own delete rather than `remove_file`, and for
         // the two cases where the shell can still erase outright.
-        match crate::recycle::recycle(&path).await {
-            Ok(()) => ToolOutput::ok(crate::tf!("Moved {} to the system recycle bin", path.display()))
-                .with_recycled(count),
+        let recycled = crate::recycle::recycle(&path).await;
+        let recovery_note = rt.recovery.finish_tree_after(capture);
+        match recycled {
+            Ok(()) => {
+                let mut out = ToolOutput::ok(crate::tf!("Moved {} to the system recycle bin", path.display()))
+                    .with_recycled(count);
+                if let Some(note) = recovery_note {
+                    out.content.push_str(&format!("\nrecovery: {note}"));
+                }
+                out
+            }
             Err(e) => ToolOutput::err(crate::tf!(
-                "failed to move {} to the system recycle bin: {}",
+                "failed to move {} to the system recycle bin: {}{}",
                 path.display(),
-                format!("{e:#}")
+                format!("{e:#}"),
+                recovery_note.map(|n| format!("\nrecovery: {n}")).unwrap_or_default()
             )),
         }
     }
@@ -1017,6 +1061,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The tool-level wiring: when a recovery turn is active, a write produces a node with the old
+    /// bytes captured before the write and the new bytes after it.
+    #[tokio::test]
+    async fn write_file_is_captured_by_an_active_recovery_turn() {
+        let d = tmp("recovery-write");
+        let rt = rt_with_ws(&d).await;
+        let f = d.join("a.txt");
+        std::fs::write(&f, "old").unwrap();
+        rt.recovery.begin_turn(&d, None, "test").unwrap();
+        let w = rt
+            .execute(HOST_FILE_TOOLS[1], json!({PATH_ARG: f.to_string_lossy(), "content": "new"}))
+            .await;
+        assert!(!w.is_error, "{}", w.content);
+        let fin = rt
+            .recovery
+            .finish_turn(crate::recovery::model::TurnStatus::Completed);
+        let id = fin.point.expect("a recovery point");
+        let store = rt.recovery.open_store(&d, false).unwrap();
+        let node = store.load_node(&id).unwrap();
+        assert_eq!(node.ops.len(), 1);
+        assert_eq!(node.ops[0].before.as_ref().unwrap().size, 3);
+        assert_eq!(node.ops[0].after.as_ref().unwrap().size, 3);
+        assert_ne!(
+            node.ops[0].before.as_ref().unwrap().hash,
+            node.ops[0].after.as_ref().unwrap().hash
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[tokio::test]

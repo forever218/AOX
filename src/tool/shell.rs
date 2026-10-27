@@ -174,7 +174,20 @@ pub(crate) async fn run_shell(
         lowil: false,
     };
 
-    let outcome = match runner::run(rt, &spec).await {
+    // ── the recovery window ──
+    //
+    // A shell command is opaque: it never says which paths it touches, so the host has to look. In
+    // strict mode a scan that cannot finish refuses the command *before* anything is written; that is
+    // deliberate, because running it anyway would silently break the rollback guarantee.
+    let guard = match rt.recovery.begin_opaque(&ws, "shell") {
+        Ok(g) => g,
+        Err(block) => return Err(block.model),
+    };
+    let outcome = runner::run(rt, &spec).await;
+    // Closed on **every** exit path, including a failed spawn: `finally` means finally.
+    let watched = guard.map(|g| rt.recovery.finish_opaque(g));
+
+    let outcome = match outcome {
         Ok(o) => o,
         // `NoBoundary` cannot happen while `lowil` is false, but the helper is a separate binary and a
         // mismatch between the two would otherwise surface as "no such variant" far from here.
@@ -182,7 +195,21 @@ pub(crate) async fn run_shell(
     };
 
     let mut text = format_outcome(&outcome, dialect, &cwd, boundary_note);
-    if cfg.track_changes && outcome.stopped.is_none() {
+    if let Some(w) = &watched {
+        // The scan already knows what changed; the mtime sweep would be a second, weaker answer.
+        if !w.changed.is_empty() {
+            text.push_str(&crate::tf!("\nchanged: {} file(s)\n", w.changed.len()));
+            for p in w.changed.iter().take(40) {
+                text.push_str(&format!("  {p}\n"));
+            }
+            if w.changed.len() > 40 {
+                text.push_str(&crate::tf!("  … and {} more\n", w.changed.len() - 40));
+            }
+        }
+        if let Some(note) = w.note_text() {
+            text.push_str(&format!("\n{note}\n"));
+        }
+    } else if cfg.track_changes && outcome.stopped.is_none() {
         let changed = changed_since(&ws, started);
         if !changed.is_empty() {
             text.push_str(&crate::tf!("\nchanged: {} file(s)\n", changed.len()));
@@ -826,6 +853,21 @@ pub fn report(rt: &Arc<Runtime>) -> String {
             "  bash: not found — [shell] bash, or a Git for Windows install, would enable the bash tool\n",
         )),
     }
+    // What a command's writes cost the rollback system, and what it does *not* cover. This is the
+    // question a user actually has when they read this report.
+    s.push_str(&match rt.config.recovery.shell_guard {
+        crate::config::ShellGuard::Strict => crate::i18n::t(
+            "  recovery: strict — each command is bracketed by a full workspace hash scan, so its writes \
+             can be rolled back; a command is refused (before it runs) when the scan cannot finish\n",
+        ),
+        crate::config::ShellGuard::BestEffort => crate::i18n::t(
+            "  recovery: best effort — only files that changed since the last command get a before-image; \
+             the recovery point is marked partial\n",
+        ),
+        crate::config::ShellGuard::Off => crate::i18n::t(
+            "  recovery: off — a command's writes are not recorded, so /rollback cannot undo them\n",
+        ),
+    });
     // What the model is actually told to reach for first — `[shell] prefer` is an instruction, and
     // this line exists so the user can check it without reading the prompt.
     s.push_str(&if crate::shell::prefers_bash(c) {
@@ -977,6 +1019,49 @@ mod tests {
         assert_eq!(tokenize(r#"echo "a b" | more"#), vec!["echo", "a b", "|", "more"]);
         assert_eq!(tokenize("a && b || c"), vec!["a", "&&", "b", "||", "c"]);
         assert_eq!(tokenize(r"x > out.txt"), vec!["x", ">", "out.txt"]);
+    }
+
+    /// The whole point of W5, end to end: a command the host knows nothing about writes a file, and
+    /// the recovery point still describes it well enough to roll back.
+    #[tokio::test]
+    async fn a_real_command_write_is_recorded_by_the_strict_scan() {
+        if !cfg!(windows) {
+            return;
+        }
+        let host = ["target/debug/aox.exe", "target/release/aox.exe"]
+            .iter()
+            .map(|rel| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel))
+            .find(|p| p.is_file());
+        let Some(host) = host else { return };
+        crate::shell::runner::use_test_host(host);
+
+        let dir = std::env::temp_dir().join("aox-shell-recovery-scan");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::Config::dummy();
+        cfg.workplace = crate::config::WorkplaceConfig {
+            mode: "fixed".into(),
+            root: Some(dir.to_string_lossy().into_owned()),
+        };
+        let rt = crate::runtime::Runtime::new(cfg.clone(), dir.clone(), dir.join("plugins"))
+            .expect("runtime");
+        rt.recovery.begin_turn(&dir, None, "shell").expect("a turn");
+        let tool = shell_tools(&cfg.shell).into_iter().next().expect("shell tool");
+
+        let out = tool
+            .call(json!({"command": "echo hello > out.txt", "purpose": "scan probe"}), &rt)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("changed: 1 file"), "{}", out.content);
+
+        let id = rt.recovery.finish_turn(crate::recovery::model::TurnStatus::Completed).point;
+        let store = rt.recovery.open_store(&dir, false).unwrap();
+        let node = store.load_node(&id.expect("a recovery point")).unwrap();
+        let op = node.ops.iter().find(|o| o.path == "out.txt").expect("out.txt is recorded");
+        assert!(op.before.is_none(), "the file did not exist before the command");
+        assert!(op.after.as_ref().unwrap().stored, "redo needs the bytes");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A one-shot call that detaches a child must say so. Without this sentence the model sees a

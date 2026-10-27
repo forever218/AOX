@@ -102,7 +102,8 @@ use widgets::*;
 
 // The names other modules already reach in through `crate::app::`.
 pub(crate) use widgets::{
-    column, danger_button, dialog_footer, flat_button, menu_item, primary_button, MENU_W,
+    column, danger_button, dialog_footer, ease_out_cubic, flat_button, menu_item, pointer_if,
+    primary_button, MENU_W,
 };
 
 // ─────────────────────────── data model ───────────────────────────
@@ -341,6 +342,8 @@ pub struct App {
     /// have to remember the mutual exclusions (see the "open one, close two" bit in
     /// `workplace_ui::button`).
     ws: workplace_ui::WorkplaceUi,
+    /// The recovery panel's state and the rows it was last given (see `crate::recovery_ui`).
+    rec: crate::recovery_ui::RecoveryUi,
 
     /// The transient toast currently on screen: how many files it accounts for, and the moment it
     /// stops being shown.
@@ -477,6 +480,7 @@ impl App {
             fit_tries: 0,
             native_theme: None,
             ws: workplace_ui::WorkplaceUi::new(),
+            rec: crate::recovery_ui::RecoveryUi::new(),
             toast: None,
             stream_calls: Vec::new(),
             attempt_mark: None,
@@ -736,6 +740,14 @@ impl eframe::App for App {
             None => {}
         }
 
+        // A recovery request is answered on a channel from the agent thread, and an idle window does
+        // not repaint on its own — so without this the panel sits on "reading…" until the pointer
+        // happens to move. Polling at ~30 ms is invisible next to the frame the answer arrives on,
+        // and it stops the moment `busy` clears.
+        if self.rec.is_waiting() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
+
         if self.native_theme != Some(theme::mode()) {
             self.native_theme = Some(theme::mode());
             theme::sync_native_theme(ctx);
@@ -873,12 +885,21 @@ impl eframe::App for App {
         if let Some(mode) = workplace_ui::picker(ctx, &mut self.ws) {
             self.send_ws(mode);
         }
+        // The recovery panel, drawn above the transcript for the same reason the menus above are:
+        // it overlaps the input card. Its confirmation dialog is a real modal, so it comes with the
+        // other dialog overlays below.
+        if let Some(req) = self.rec.panel(ctx) {
+            self.send_recovery(req);
+        }
 
         // Before the settings dialog, because it belongs to the history panel: the two are never
         // open at once, and a modal drawn later wins any overlap.
         self.name_dialog_overlay(ctx);
         // Sits beside the name dialog: same layer, same "nothing happens until you answer" rule.
         self.confirm_overlay(ctx);
+        if let Some(req) = self.rec.confirm(ctx) {
+            self.send_recovery(req);
+        }
         self.settings_overlay(ctx);
         self.auth_overlay(ctx);
         // Last, so the toast sits above everything: it reports something that has **already**
