@@ -10,33 +10,15 @@
 #    the layer list).
 #    To customize the layering: copy aox.example.toml to aox.toml.
 
-[provider]
-# OpenAI-compatible endpoint (DeepSeek / Kimi / OpenAI / vLLM / Ollama all work)
-base_url = "https://api.deepseek.com"
-model = "deepseek-flash"
-# Pick one: write the key directly, or name an environment variable
-api_key = "sk-..."
-# api_key_env = "DEEPSEEK_API_KEY"
-# Maximum output tokens for a single reply.
-# ⚠️ A reasoning model's "reasoning tokens" count against this budget too, so a value that is
-#    too small yields an empty body text, which shows up as "the task broke off for no reason".
-#    DeepSeek caps it at 384K (393216) server-side; exceeding that gets a flat 400.
-max_tokens = 32000
-temperature = 0.3
-# Whether to request as an SSE stream (default true).
-# With this on, a reasoning model's chain of thought scrolls live while you wait (and
-# disappears once the response ends).
-# If an endpoint doesn't accept the stream / stream_options parameters, set false to fall back
-# to waiting for the complete response.
-stream = true
-# The model's context window, in tokens.
-# Two readers: the input box's "how full is the context" ring, AND the compaction budget, which is
-#   context_window x compact_ratio - max_tokens
-# So this has to be the model's REAL window: too high and compaction never runs (an over-long
-# conversation then comes back from the endpoint as a 400), too low and usable context gets folded
-# away early. `[agent] context_budget_tokens` overrides the derived number outright.
-# Leave it out and the defaults are context_window = 600000, max_tokens = 32000.
-context_window = 600000
+# ── the model ──────────────────────────────────────────────────────────────────────────
+# There is deliberately **no [provider] section here**: since 2026-10-28 the endpoint, the key,
+# the model name and its parameters (context window / output cap / temperature / thinking) are
+# managed inside the program and stored in `.aox/models.json` — add or edit them in
+# **Settings → Model**, or in the chip under the input box. That file is the only place a key
+# lives, and it travels with this installation.
+#
+# A `[provider]` left here by an older version is **read once** at startup and moved into
+# `.aox/models.json`; after that it is inert, so delete it.
 
 [auth]
 # Meta tools (create_plugin / remove_plugin and other operations that change the system

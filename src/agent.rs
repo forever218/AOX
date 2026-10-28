@@ -32,7 +32,7 @@ struct TurnAcc {
 }
 
 pub struct Agent {
-    llm: Arc<dyn LlmProvider>,
+    llm: Arc<crate::provider_live::LiveProvider>,
     rt: Arc<Runtime>,
     messages: Vec<Message>,
     /// The persister for this conversation (the **write end** of the storage seam).
@@ -124,7 +124,24 @@ impl Agent {
     /// the project rules file, and whatever the user added/removed/edited under `config.toml [prompt]` — all synthesized there.
     /// This type **no longer reads `RULES.md`** — that "fetch the rules file" logic used to be in the CLI (`src/main.rs`)
     /// and the GUI (`gui/src/bridge.rs`) separately; now it lives in one place, `prompt`.
-    pub fn new(llm: Arc<dyn LlmProvider>, rt: Arc<Runtime>) -> Self {
+    pub fn new(rt: Arc<Runtime>) -> Self {
+        // The provider comes from the runtime, **not** from an argument: that is what makes
+        // "change the model in the GUI, the next request uses it" true for a conversation that is
+        // already open. See `src/provider_live.rs`.
+        let llm = rt.provider.clone();
+        Self::assemble(llm, rt)
+    }
+
+    /// Assemble an Agent around a **specific** provider handle, bypassing the runtime's.
+    ///
+    /// Only tests use this (a fake provider that counts tokens or refuses to answer), and the handle is
+    /// still wrapped in a `LiveProvider` so the loop has exactly one code path.
+    pub fn new_with(llm: Arc<dyn LlmProvider>, rt: Arc<Runtime>) -> Self {
+        let live = crate::provider_live::LiveProvider::with_handle(rt.provider.cfg(), llm);
+        Self::assemble(live, rt)
+    }
+
+    fn assemble(llm: Arc<crate::provider_live::LiveProvider>, rt: Arc<Runtime>) -> Self {
         let sys = crate::prompt::build(&rt);
         // Remember which workspace that prompt names, so `refresh_system_prompt` can tell when it
         // has gone stale (see the `prompt_ws` field docs).
@@ -217,7 +234,10 @@ impl Agent {
             return;
         }
         let at = self.rt.workplace.active_root();
-        match self.rt.store.create(Some(&self.rt.config.provider.model), at.as_deref()) {
+        // The model **in force**, which after a `/model` switch is no longer the one in `config.toml`:
+        // the file name (and the history header) should say which model the conversation ran on.
+        let model = self.rt.provider.cfg().model;
+        match self.rt.store.create(Some(&model), at.as_deref()) {
             Ok(log) => self.log = Some(log),
             Err(e) if !self.log_error_reported => {
                 self.log_error_reported = true;
@@ -726,8 +746,8 @@ impl Agent {
     }
 
     /// LLM Provider。
-    pub fn llm(&self) -> &Arc<dyn LlmProvider> {
-        &self.llm
+    pub fn llm(&self) -> Arc<dyn LlmProvider> {
+        self.llm.llm()
     }
 
     /// Read-only view of the current context (includes the system prompt at index 0). **Read-only** — to mutate, use `push_message`.
@@ -1372,7 +1392,7 @@ mod tests {
             .expect("registering the fake tool should succeed");
         let llm: Arc<dyn LlmProvider> =
             Arc::new(crate::llm::UnavailableProvider { reason: "test".into() });
-        Agent::new(llm, rt)
+        Agent::new_with(llm, rt)
     }
 
     fn tmp(tag: &str) -> std::path::PathBuf {
@@ -1907,7 +1927,7 @@ mod tests {
 
         let llm: Arc<dyn LlmProvider> =
             Arc::new(crate::llm::UnavailableProvider { reason: "test".into() });
-        let mut agent = Agent::new(llm, rt);
+        let mut agent = Agent::new_with(llm, rt);
         agent.rt.recovery.begin_turn(&ws, None, "plugin").expect("a turn");
 
         let mut ui = RecordingUi;

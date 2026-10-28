@@ -422,6 +422,7 @@ impl App {
                                 ui.set_width(content_w);
                                 match self.settings_tab {
                                     SettingsTab::Extra => self.tab_extra(ui),
+                                    SettingsTab::Model => self.tab_model(ui),
                                     SettingsTab::Appearance => self.tab_appearance(ui),
                                     SettingsTab::System => self.tab_system(ui),
                                     SettingsTab::About => self.tab_about(ui),
@@ -471,6 +472,18 @@ impl App {
         if wsview_open_button(ui, on).clicked() {
             wsview::open(ui.ctx(), &self.wsview);
         }
+    }
+
+    /// The "Model" column: the endpoint, the key, the scanned model list, and the two numbers that
+    /// decide how a conversation goes.
+    ///
+    /// This page has **no Save button** on purpose — see the module docs of `crate::model_ui`. A field
+    /// commits when it loses focus or on Enter, and the status line underneath says what happened. In
+    /// demo mode every control still draws (that is what demo mode is for); pressing one answers with
+    /// "there is no agent thread behind this window".
+    pub(super) fn tab_model(&mut self, ui: &mut Ui) {
+        let req = crate::model_ui::panel(ui, &mut self.mdl);
+        self.send_requests(req);
     }
 
     /// The "Appearance" column: three light/dark options (including follow system).

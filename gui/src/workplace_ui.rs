@@ -68,6 +68,11 @@ impl WorkplaceUi {
         Self { view: None, open: false, button_rect: None, confirm_full: false, picker: None }
     }
 
+    /// Collapse the list (another pop-up on the same row was opened).
+    pub fn close_menu(&mut self) {
+        self.open = false;
+    }
+
     /// Receive a "current state". Called by `App::pump` in the `FromAgent::Workplace` branch.
     pub fn set_view(&mut self, v: WorkplaceView) {
         self.view = Some(v);
@@ -172,7 +177,7 @@ impl Picker {
 /// It does only two things: paint the current tier name, and record the hot-rect into `st.button_rect` (the pop-up panel uses it for positioning).
 /// The click flips `st.open` in place here — the panel itself is drawn by [`menu`] (it needs an independent `Area`
 /// and cannot be trapped inside the input card clip region).
-pub fn button(ui: &mut Ui, st: &mut WorkplaceUi, enabled: bool) {
+pub fn button(ui: &mut Ui, st: &mut WorkplaceUi, enabled: bool) -> bool {
     let text = st.chip_text();
     let font = egui::FontId::proportional(13.0);
     let galley = ui.painter().layout_no_wrap(text, font, Color32::PLACEHOLDER);
@@ -210,13 +215,17 @@ pub fn button(ui: &mut Ui, st: &mut WorkplaceUi, enabled: bool) {
     paint_folder(painter, icon_rect, fg);
     painter.galley(Pos2::new(rect.left() + pad.x + icon + gap, rect.center().y - galley.size().y * 0.5), galley, fg);
 
-    if resp.clicked() && enabled {
+    let clicked = resp.clicked() && enabled;
+    if clicked {
         st.open = !st.open;
         // When opening the list, collapse the other two panels: nobody can stand three boxes popping up at once.
         st.confirm_full = false;
         st.picker = None;
     }
     st.button_rect = Some(rect);
+    // Returned so the caller can close **other** pop-ups anchored to the same row (the model chip's
+    // list): only one of them may be open, and neither module knows about the other.
+    clicked
 }
 
 // ─────────────────────────── Three-choice list ───────────────────────────

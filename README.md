@@ -10,18 +10,22 @@ it, the stronger it gets.
 
 ## Quick start
 
-1. Double-click `aox.exe` (the first run auto-generates `config.toml` in the program directory).
-2. Open `config.toml` in Notepad and fill in your model service:
+1. Double-click `aox-gui.exe`. The first run opens **Settings → Model** by itself (`config.toml` is
+   generated in the program directory too, but it has **no** `[provider]` section — the model is not
+   configured there).
+2. Press "Add model", fill in the endpoint and the key, press "Scan models" and pick one (or type the
+   name yourself), then save:
 
-   ```toml
-   [provider]
-   base_url = "https://api.deepseek.com/v1"   # any OpenAI-compatible service works
-   model    = "deepseek-chat"
-   api_key  = "sk-your-key"                   # or point api_key_env at an environment variable
-   ```
+   | Field | Example |
+   |---|---|
+   | Endpoint | `https://api.deepseek.com` (any OpenAI-compatible service works) |
+   | Key | `sk-your-key` |
+   | Model | pick from the scan, or type `deepseek-flash` |
 
-3. Double-click `aox.exe` again to enter the interactive interface.
-4. Just talk normally, for example:
+   The endpoint, the key, the model name and its parameters (context window / output cap /
+   temperature / thinking) all live in `<program dir>/.aox/models.json` — that is the **only** copy of
+   the model configuration, and the command-line `aox.exe` reads the same file. No restart needed.
+3. Just talk normally, for example:
 
    > Read config.toml and tell me which configuration options it contains
 
@@ -74,6 +78,7 @@ If you leave out `rustflags` the build does not fail, but both `build.rs` script
 | `/tools` | View all currently available tools |
 | `/plugins` | View the loaded plugins |
 | `/history` | View the conversation list (`/history show <n>` for the full text, `/history open <n>` to continue it, `/history dir` for the directory, `/history rm <n>` to delete) |
+| `/model` | List the saved models (the same list the GUI's Settings → Model edits); `/model <n\|name>` switches to one, effective on the next request |
 | `/new` | Start a new conversation (the current one is already on disk) |
 | `/runtime` | View how the interpreters resolved; `/runtime install python` assembles the bundled runtime |
 | `/demo` | Preview terminal layout and folding |
@@ -110,7 +115,8 @@ tells you which step the task is at:
 This reasoning is a **momentary echo that appears immediately and vanishes when the response
 ends** (the scrolling window keeps the last 4 lines); it doesn't pollute the output and doesn't
 enter the folded region. To turn streaming off (for example, an endpoint that doesn't support the
-`stream` parameter), add `stream = false` under `[provider]` in `config.toml`.
+`stream` parameter), set `"stream": false` on that model in `.aox/models.json` — or turn
+Streaming off in the model's edit dialog in the GUI.
 
 Once a task finishes, the intermediate model thinking and tool calls are folded automatically into
 a one-line summary, showing only the final output:

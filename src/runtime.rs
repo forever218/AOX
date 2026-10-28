@@ -114,6 +114,17 @@ pub struct Runtime {
     /// The active transaction lives here, not inside `run_turn`: a GUI abort drops that future, and
     /// a local transaction would never get a chance to record its post-images.
     pub recovery: crate::recovery::RecoveryManager,
+    /// The **live model provider** (see `src/provider_live.rs`).
+    ///
+    /// It lives on the runtime, not on `Agent`, for one reason: the GUI's Model tab has to be able to
+    /// change the model while a conversation is open, and the thing it changes must be the same thing
+    /// the next request reads. `Agent` therefore holds an `Arc` of this rather than its own provider.
+    ///
+    /// It also owns the config snapshot the request path reads — the context window (which feeds
+    /// `compact::Policy`'s budget **and** the GUI's context ring) and `max_tokens` — so a switch moves
+    /// all of them at once instead of leaving a mix of old and new.
+    pub provider: Arc<crate::provider_live::LiveProvider>,
+
     /// The **space registry** (see `src/space.rs`): which workspaces exist, what they are called, and
     /// which conversation sits where.
     ///
@@ -192,6 +203,20 @@ impl Runtime {
         // (something configured but not taking effect is the hardest to diagnose).
         let workplace = crate::workplace::Workplace::new(config.workplace.clone(), &root)?;
         let recovery = crate::recovery::RecoveryManager::new(config.recovery.clone(), root.clone());
+        // Before `config` is moved: the live provider keeps its own snapshot of `[provider]`, and it is
+        // built here (never at a front end) so the CLI and the GUI start from exactly the same state.
+        // Note it does **not** fail: an unusable `[provider]` (no key yet) yields a placeholder that
+        // reports itself, which is what lets a fresh install open the GUI and be configured in place.
+        //
+        // Since 2026-10-28 the model configuration lives in **`.aox/models.json`**, not in
+        // `config.toml`: the active record is the truth, and the layered `[provider]` is only the
+        // fallback for a book that has never been written (a fresh install). `adopt` moves a
+        // `[provider]` into the book once, so the fallback is used at most a single time; after that
+        // an edit to `config.toml`'s `[provider]` is inert by design.
+        let mut book = crate::modelbook::Book::load(&root);
+        book.adopt(&config.provider, &root);
+        let provider_cfg = book.active_config().unwrap_or_else(|| config.provider.clone());
+        let provider = crate::provider_live::LiveProvider::new(provider_cfg);
         let rt = Arc::new(Self {
             config,
             auth,
@@ -209,6 +234,7 @@ impl Runtime {
             sandbox,
             workplace,
             recovery,
+            provider,
             spaces: std::sync::RwLock::new(spaces),
         });
         rt.start_job_reaper();

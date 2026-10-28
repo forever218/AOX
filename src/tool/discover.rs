@@ -409,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn the_agent_interception_is_what_makes_a_lookup_stick() {
         let (rt, dir) = rt("agent", 6, 5).await;
-        let mut agent = Agent::new(Arc::new(NoLlm), rt.clone());
+        let mut agent = Agent::new_with(Arc::new(NoLlm), rt.clone());
 
         let out = agent
             .authorize_and_execute(&mut TestUi, FIND_TOOL, json!({"query": "demo ls"}))

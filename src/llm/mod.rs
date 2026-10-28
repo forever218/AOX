@@ -1,4 +1,6 @@
+pub mod catalog;
 pub mod failure;
+pub mod models;
 pub mod openai;
 
 use anyhow::Result;
@@ -377,6 +379,40 @@ pub trait StreamSink: Send + Sync {
     /// front end is free to ignore this (the default does): the conversation file was never
     /// polluted, so ignoring it costs only the visual duplication.
     fn on_attempt(&self, _attempt: u32, _delay: std::time::Duration) {}
+}
+
+/// A `reqwest` client for **one endpoint**, with the proxy decision made per endpoint.
+///
+/// Why this is not just `Client::builder()`: `reqwest` honours `HTTP_PROXY` / `HTTPS_PROXY` from the
+/// environment, and on a machine that sets one (a corporate laptop, a dev container, this project's own
+/// sandbox) every request to `http://127.0.0.1:11434` would be sent **to the proxy**, which cannot reach
+/// a server inside the same box — the answer is a 502 whose text blames the upstream, so it reads like
+/// "the local model is down" when it is running fine.
+///
+/// So a loopback endpoint never goes through a proxy. Everything else keeps the ambient behaviour,
+/// because for a remote endpoint the proxy may be the only way out.
+pub(crate) fn endpoint_client(base_url: &str) -> reqwest::ClientBuilder {
+    let b = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(failure::CONNECT_SECS));
+    if is_loopback(base_url) {
+        b.no_proxy()
+    } else {
+        b
+    }
+}
+
+/// Whether this endpoint lives on this machine (`127.0.0.1`, `localhost`, `::1`, `0.0.0.0`).
+pub(crate) fn is_loopback(base_url: &str) -> bool {
+    let s = base_url.trim();
+    let s = s.split_once("://").map_or(s, |(_, rest)| rest);
+    let host = s.split('/').next().unwrap_or(s);
+    // Strip a `:port`, keeping an IPv6 literal's brackets intact.
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
 }
 
 /// The model-provider abstraction. Wiring up Anthropic / local inference in the future just means

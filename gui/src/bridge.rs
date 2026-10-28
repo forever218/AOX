@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use aox::agent::Agent;
 use aox::history::UsageRecord;
-use aox::llm::{LlmProvider, StreamSink, Usage};
+use aox::llm::{StreamSink, Usage};
 use aox::runtime::Runtime;
 use aox::ui::{AgentEvent, AuthDecision, ChoiceReply, Ui};
 
@@ -75,8 +75,76 @@ pub enum ToAgent {
     /// identical to the user (one toast, same wording), instead of the GUI growing a second, subtly
     /// different notion of "delete".
     Recycle(Vec<PathBuf>),
+    /// The Model tab / the input-box switcher: put this configuration into force.
+    ///
+    /// Handled **on this thread**, for two reasons. The provider lives in `Runtime`, and only the agent
+    /// thread owns it — the UI physically cannot swap it. And the write to `config.toml` has to agree
+    /// with what is in memory: doing it here keeps "construct → apply → save" in one place and in the
+    /// right order, instead of the main thread writing a file the host may reject.
+    ApplyProvider(Box<ProviderEdit>),
+    /// Ask the endpoint which models it serves (`GET …/models`). Answered with [`FromAgent::Models`].
+    ///
+    /// It runs here rather than on the UI thread because it is a network call with a timeout, and the
+    /// UI thread draws the window: a slow endpoint there is a frozen window, not a slow panel.
+    ScanModels { base_url: String, api_key: Option<String> },
+    /// "Test connection": one tiny chat request to this endpoint + key + model (see
+    /// `aox::llm::models::probe`). Answered with [`FromAgent::TestResult`].
+    ///
+    /// A different question from a scan, which is why it is a different message: a key can list models
+    /// and still fail to chat, and a model name can be wrong in a way no list reveals.
+    TestModel { base_url: String, api_key: Option<String>, model: String },
     /// Exit: close the plugin child processes and end the driver thread
     Shutdown,
+}
+
+/// What the Model tab can change, as it arrives from the UI.
+///
+/// A struct of plain values rather than "the new `ProviderConfig`": the UI has no business knowing
+/// about `stream`, `api_key_env`, or which of the two key sources wins. It says what the person typed;
+/// the bridge merges that onto what is already in force (see [`edit_to_config`]).
+#[derive(Clone, Debug)]
+pub struct ProviderEdit {
+    pub base_url: String,
+    pub model: String,
+    /// `Some` = replace the stored key. `None` = **leave it alone** — the panel never displays the
+    /// stored key, so an empty field means "unchanged", not "delete it".
+    pub api_key: Option<String>,
+    pub context_window: u32,
+    pub max_tokens: u32,
+    pub temperature: Option<f32>,
+    pub thinking: aox::config::Thinking,
+    pub thinking_wire: aox::config::ThinkingWire,
+    /// Request by SSE streaming. Per model, because it is a property of the endpoint.
+    pub stream: bool,
+}
+
+/// Everything a front end shows about the model in force, pushed after every change.
+#[derive(Clone, Debug)]
+pub struct ProviderView {
+    pub base_url: String,
+    pub model: String,
+    pub context_window: u32,
+    pub max_tokens: u32,
+    pub temperature: Option<f32>,
+    pub thinking: aox::config::Thinking,
+    pub ready: bool,
+    /// Why the running model is not usable, when it is not — the one line the settings page shows at
+    /// the bottom when `ready` is false.
+    pub error: Option<String>,
+}
+
+/// The answer to [`ToAgent::ScanModels`].
+#[derive(Clone, Debug)]
+pub struct ModelsView {
+    pub base_url: String,
+    /// `(model id, window when the endpoint reported one)`.
+    pub entries: Vec<(String, Option<u32>)>,
+    /// The URL that answered — remembered so the next scan asks once.
+    pub url: Option<String>,
+    /// A scan that failed says why here; `entries` is then empty. Failure is **not** an error state for
+    /// the app: the model field stays hand-editable, which is the escape hatch for an endpoint that
+    /// cannot list at all.
+    pub error: Option<String>,
 }
 
 /// Move every path to the system recycle bin, reporting the total through `AgentEvent::Recycled`.
@@ -200,6 +268,22 @@ pub enum FromAgent {
     Workplace(Box<WorkplaceView>),
     /// An answer for the recovery panel (see [`ToAgent::Recovery`]).
     Recovery(Box<RecoveryView>),
+    /// The model in force changed (startup, and after every successful apply).
+    ///
+    /// Pushed rather than pulled: the ring's denominator, the "Model in use" row and the panel's form
+    /// all have to agree, and the authoritative values live on the agent thread. A UI that kept its
+    /// own copy would drift the first time an apply failed halfway.
+    Provider(Box<ProviderView>),
+    /// The answer to a scan (see [`ToAgent::ScanModels`]).
+    Models(Box<ModelsView>),
+    /// The answer to [`ToAgent::TestModel`]. `model` comes back so a slow reply cannot land in the
+    /// wrong dialog (the user may have moved on to another model by then).
+    TestResult { base_url: String, model: String, ok: bool, text: String },
+    /// One line about a model operation, for the panel's status line.
+    ///
+    /// Separate from [`AgentEvent`] on purpose: an apply failure is not a conversation event, and
+    /// putting it in the activity stream would file it under "things the model did".
+    ModelNotice { ok: bool, text: String },
     /// An unrecoverable error occurred this turn
     Fatal(String),
 }
@@ -282,6 +366,12 @@ pub struct BootInfo {
     /// Whether task recovery is on (`[recovery] enabled`). The panel's chip is **not drawn** when it
     /// is off: a control for a feature that does not exist is a lie with a hover state.
     pub recovery: bool,
+    /// This launch **created** `config.toml` (there was none before).
+    ///
+    /// Only then does the window open on Settings → Model by itself. Not "whenever the model is not
+    /// ready": someone whose key expired would get a dialog in the face on every launch, which is the
+    /// kind of help that becomes an obstacle.
+    pub first_run: bool,
     pub note: Option<String>,
     /// The paths and host info the "System" tab needs (see [`BootPaths`]).
     pub paths: BootPaths,
@@ -473,7 +563,12 @@ impl Ui for GuiUi {
                 | Some(ToAgent::RenameConversation { .. })
                 | Some(ToAgent::Recycle(_))
                 | Some(ToAgent::Workplace(_))
-                | Some(ToAgent::Recovery(_)) => continue,
+                | Some(ToAgent::Recovery(_))
+                // The model seam is handled by `next_command` / `idle_until_shutdown`, never here; a
+                // message arriving in this inert stub is simply left to them.
+                | Some(ToAgent::ApplyProvider(_))
+                | Some(ToAgent::ScanModels { .. })
+                | Some(ToAgent::TestModel { .. }) => continue,
             }
         }
     }
@@ -693,7 +788,137 @@ async fn runtime_command(ui: &mut GuiUi, rt: &Arc<Runtime>, line: &str) {
 /// A tiny wrapper so the two call sites that have a `Runtime` in hand don't each repeat the
 /// `Option → 0` dance; the GUI turns `0` into its own default (see `DEFAULT_CONTEXT_WINDOW`).
 fn ctx_window(rt: &Arc<Runtime>) -> u64 {
-    rt.config.provider.context_window.map(u64::from).unwrap_or(0)
+    // Read from the **live** provider, not from the config snapshot taken at startup: after a model
+    // switch the ring's denominator has to follow, and this is the one place that answers "how big is
+    // the window right now".
+    u64::from(rt.provider.info().context_window)
+}
+
+// ─────────────────────────── the model seam ───────────────────────────
+
+/// Push the model in force to the UI. One call site for "something about the model changed".
+fn push_provider(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
+    let i = rt.provider.info();
+    let _ = tx.send(FromAgent::Provider(Box::new(ProviderView {
+        base_url: i.base_url,
+        model: i.model,
+        context_window: i.context_window,
+        max_tokens: i.max_tokens,
+        temperature: i.temperature,
+        thinking: i.thinking,
+        ready: i.ready,
+        error: i.error,
+    })));
+}
+
+/// Merge what the panel typed onto what is already in force.
+///
+/// The fields the UI cannot see are **carried over** rather than defaulted: `stream` is a config-only
+/// preference, and `api_key_env` must survive as long as no new key was typed (an install that keeps
+/// its key in the environment must not lose that by pressing "apply" on the model name).
+fn edit_to_config(edit: &ProviderEdit, prev: &aox::config::ProviderConfig) -> aox::config::ProviderConfig {
+    let mut cfg = prev.clone();
+    cfg.base_url = edit.base_url.trim().to_string();
+    cfg.model = edit.model.trim().to_string();
+    if let Some(k) = edit.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        cfg.api_key = Some(k.to_string());
+        // The inline key wins in `resolve_key`, so leaving the variable in place would put a line in
+        // `config.toml` that no longer does anything.
+        cfg.api_key_env = None;
+    }
+    cfg.context_window = Some(edit.context_window.max(1));
+    cfg.max_tokens = Some(edit.max_tokens.max(1));
+    cfg.temperature = edit.temperature;
+    cfg.thinking = edit.thinking;
+    cfg.thinking_wire = edit.thinking_wire;
+    cfg.stream = edit.stream;
+    cfg
+}
+
+/// Put an edit into force **and** remember it, in that order.
+///
+/// The order is the contract: a configuration that cannot be built (empty key, unusable URL) must never
+/// reach the file, or the next launch starts from a config that cannot run. So: construct → swap →
+/// save. If the save fails after a successful swap, the session keeps working and says so — the
+/// alternative (roll the live provider back because a file write failed) would be strictly worse.
+fn apply_provider(
+    rt: &Runtime,
+    edit: &ProviderEdit,
+    tx: &mpsc::UnboundedSender<FromAgent>,
+) {
+    let prev = rt.provider.cfg();
+    let cfg = edit_to_config(edit, &prev);
+    if let Err(e) = rt.provider.apply(cfg.clone()) {
+        let _ = tx.send(FromAgent::ModelNotice {
+            ok: false,
+            text: aox::tf!("Could not use this configuration: {}", format!("{e:#}")),
+        });
+        return;
+    }
+    // Applied. The UI hears about the new state first, so the panel is correct even if the disk is not.
+    push_provider(tx, rt);
+    // Remember it: since 2026-10-28 the book's active record **is** the model configuration, so this
+    // replaces the old `config.toml` write. Same contract as before — the swap has already happened,
+    // so a failed save costs the memory of the choice and says so, rather than rolling the session back.
+    match remember_model(&rt.root, &cfg) {
+        Ok(()) => {
+            let _ = tx.send(FromAgent::ModelNotice {
+                ok: true,
+                text: aox::tf!("In effect · next request uses {}", cfg.model),
+            });
+        }
+        Err(e) => {
+            let _ = tx.send(FromAgent::ModelNotice {
+                ok: false,
+                text: aox::tf!(
+                    "In effect for this session, but saving the model list failed: {}",
+                    format!("{e:#}")
+                ),
+            });
+        }
+    }
+}
+
+/// Fold a configuration into `.aox/models.json` and mark it in force.
+///
+/// The GUI's half of `aox::modelbook::Book::remember`: loading and saving live here so the runtime
+/// does not have to hold a mutable copy of a file the panel also edits.
+fn remember_model(app_root: &std::path::Path, cfg: &aox::config::ProviderConfig) -> anyhow::Result<()> {
+    let mut book = aox::modelbook::Book::load(app_root);
+    book.remember(cfg);
+    book.save(app_root)
+}
+
+/// Answer a scan request. Never fails the app: a scan error is a line in the panel, and the model
+/// field stays hand-editable — that is the escape hatch for an endpoint that cannot list at all.
+/// Answer a "test connection" request.
+async fn test_model(
+    tx: &mpsc::UnboundedSender<FromAgent>,
+    base_url: String,
+    api_key: Option<String>,
+    model: String,
+) {
+    let (ok, text) = match aox::llm::models::probe(&base_url, api_key.as_deref(), &model).await {
+        Ok(msg) => (true, msg),
+        Err(e) => (false, format!("{e:#}")),
+    };
+    let _ = tx.send(FromAgent::TestResult { base_url, model, ok, text });
+}
+
+async fn scan_models(
+    tx: &mpsc::UnboundedSender<FromAgent>,
+    base_url: String,
+    api_key: Option<String>,
+) {
+    let mut view = ModelsView { base_url, entries: Vec::new(), url: None, error: None };
+    match aox::llm::models::list(&view.base_url, api_key.as_deref()).await {
+        Ok(scan) => {
+            view.url = Some(scan.url);
+            view.entries = scan.models.into_iter().map(|m| (m.id, m.window)).collect();
+        }
+        Err(e) => view.error = Some(format!("{e:#}")),
+    }
+    let _ = tx.send(FromAgent::Models(Box::new(view)));
 }
 
 fn boot(
@@ -711,6 +936,8 @@ fn boot(
     // Which layers this config was composed from (low → high). An empty list when the config cannot be read — do not invent layers that don't exist.
     layers: Vec<String>,
     paths: BootPaths,
+    // A fresh install: `config.toml` was written by this launch (see `BootInfo::first_run`).
+    first_run: bool,
 ) {
     let _ = tx.send(FromAgent::Boot(Box::new(BootInfo {
         config_path: config_path.display().to_string(),
@@ -719,6 +946,7 @@ fn boot(
         context_window,
         provider_ready: ready,
         recovery,
+        first_run,
         note,
         paths,
         store,
@@ -778,18 +1006,84 @@ fn send_history_current(tx: &mpsc::UnboundedSender<FromAgent>, agent: &Agent) {
     let _ = tx.send(FromAgent::HistoryCurrent(agent.history_id().map(str::to_string)));
 }
 
-/// The "only wait for shutdown" loop when startup is thwarted (config unreadable / model not ready).
+/// Why this loop stopped waiting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wait {
+    /// The window is closing.
+    Shutdown,
+    /// A model configuration arrived and was saved. The caller should re-check the provider.
+    Configured,
+}
+
+/// The "startup is thwarted" loop: keep answering the channel until either the window closes or the
+/// Model tab supplies a configuration that works.
 ///
-/// It must answer switch-session requests: after sending one the main thread greys out the list and
-/// waits for a receipt to unlock it, while those messages are doomed to do nothing in this state —
+/// Two very different states land here, and both must stay *usable* rather than exit:
+///
+/// * the config could not be read at all (`rt == None`) — the settings panel is still on screen, but
+///   there is no `Runtime` to apply anything to, so a save only writes the file and the caller starts
+///   over;
+/// * the config reads but has no usable `[provider]` (`rt == Some`) — the save is applied in place.
+///
+/// It must also answer switch-session requests: after sending one the main thread greys out the list
+/// and waits for a receipt to unlock it, while those messages are doomed to do nothing in this state —
 /// silence would freeze the sidebar forever.
 async fn idle_until_shutdown(
     rx: &mut mpsc::UnboundedReceiver<ToAgent>,
     tx: &mpsc::UnboundedSender<FromAgent>,
-) {
+    rt: Option<&Arc<Runtime>>,
+) -> Wait {
     while let Some(msg) = rx.recv().await {
         match msg {
-            ToAgent::Shutdown => break,
+            ToAgent::Shutdown => return Wait::Shutdown,
+            // ── the repair path ──
+            //
+            // This is why the state exists at all: a fresh install opens with nothing configured, and
+            // filling the panel in has to *work* rather than tell the user to restart.
+            ToAgent::ApplyProvider(edit) => {
+                match rt {
+                    Some(rt) => {
+                        apply_provider(rt, &edit, tx);
+                        if rt.provider.ready() {
+                            return Wait::Configured;
+                        }
+                    }
+                    None => {
+                        // No runtime to swap, so validate and persist only; the caller re-reads the
+                        // file and boots again.
+                        let cfg = edit_to_config(&edit, &blank_provider_config());
+                        match aox::llm::openai::OpenAiProvider::new(&cfg) {
+                            Ok(_) => match remember_model(&aox::paths::app_root(), &cfg) {
+                                Ok(()) => return Wait::Configured,
+                                Err(e) => {
+                                    let _ = tx.send(FromAgent::ModelNotice {
+                                        ok: false,
+                                        text: aox::tf!(
+                                            "Could not save the model list: {}",
+                                            format!("{e:#}")
+                                        ),
+                                    });
+                                }
+                            },
+                            Err(e) => {
+                                let _ = tx.send(FromAgent::ModelNotice {
+                                    ok: false,
+                                    text: aox::tf!(
+                                        "Could not use this configuration: {}",
+                                        format!("{e:#}")
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Scanning works in this state too — it is exactly when a person wants it, and it touches
+            // neither the provider nor the conversation.
+            ToAgent::ScanModels { base_url, api_key } => scan_models(tx, base_url, api_key).await,
+            ToAgent::TestModel { base_url, api_key, model } => {
+                test_model(tx, base_url, api_key, model).await
+            }
             ToAgent::Resume(_) | ToAgent::NewConversation => {
                 let _ = tx.send(FromAgent::Switched {
                     opened: None,
@@ -833,6 +1127,24 @@ async fn idle_until_shutdown(
                 })));
             }
         }
+    }
+    Wait::Shutdown
+}
+
+/// A `[provider]` with nothing filled in — the "previous" side of an edit made when no `Runtime` exists
+/// yet. The defaults are the same ones the config parser uses, so the edit's own values are what land.
+fn blank_provider_config() -> aox::config::ProviderConfig {
+    aox::config::ProviderConfig {
+        base_url: String::new(),
+        model: String::new(),
+        api_key: None,
+        api_key_env: None,
+        max_tokens: Some(aox::config::DEFAULT_MAX_TOKENS),
+        temperature: None,
+        stream: true,
+        context_window: Some(aox::config::DEFAULT_CONTEXT_WINDOW),
+        thinking: aox::config::Thinking::default(),
+        thinking_wire: aox::config::ThinkingWire::default(),
     }
 }
 
@@ -902,6 +1214,27 @@ async fn next_command(
             // file is moved to the recycle bin and the count comes back as an `AgentEvent`, exactly
             // as if a tool had deleted it.
             Some(ToAgent::Recycle(paths)) => recycle_all(paths, tx).await,
+            // ── the Model tab, while the session is running ──
+            //
+            // Deliberately **in place**: no rebuild of the Runtime, no new Agent. Changing the model
+            // mid-conversation keeps the messages, the history file and the token ledger exactly where
+            // they are; only the next request goes to a different model. Rebuilding here would look
+            // identical on screen and silently drop the conversation.
+            Some(ToAgent::ApplyProvider(edit)) => {
+                {
+                    let rt = agent.rt();
+                    apply_provider(rt, &edit, tx);
+                }
+                // The folded-history cache was computed against the **old** budget. Keeping it would
+                // mean one round still being requested at the previous window's size, which is either a
+                // 400 (the window shrank) or a needless re-fold (it grew). Dropping it costs one
+                // recomputation and removes the only way the two can disagree.
+                agent.set_view_cache(None);
+            }
+            Some(ToAgent::ScanModels { base_url, api_key }) => scan_models(tx, base_url, api_key).await,
+            Some(ToAgent::TestModel { base_url, api_key, model }) => {
+                test_model(tx, base_url, api_key, model).await
+            }
             // Workplace button: switch tier / query state. Done in place — `Workplace` lives inside
             // `Runtime`, and this thread is the only place that can reach the Agent (and through it its
             // `rt`). It does not enter the next turn: a tier switch is a pure host action, unrelated to
@@ -967,6 +1300,36 @@ async fn boot_and_run(
         ))));
     }
 
+    // ── a fresh install has no config.toml ────────────────────────────────────────────────
+    //
+    // The installer ships `config.example.toml` only, on purpose: no personal key is ever baked into
+    // an installer. The CLI has always written the template on its first run; the GUI never did, so a
+    // fresh install opened onto "config file not found" and the only way forward was to leave the
+    // program and edit a file by hand — exactly the friction the Model tab exists to remove. Now the
+    // template lands first (documentation included), the panel opens on top of it, and the two things
+    // that were missing get filled in there.
+    // "Nothing has been chosen yet" rather than "there is no config.toml": since the model
+    // configuration moved into `.aox/models.json`, a fresh install can perfectly well have a config
+    // file and still need the panel (and the other way round).
+    let first_run = aox::modelbook::Book::load(&root).active.is_none();
+    if first_run {
+        match std::fs::write(&config_path, aox::config::TEMPLATE) {
+            Ok(()) => {
+                let _ = tx.send(FromAgent::Event(AgentEvent::Info(aox::tf!(
+                    "Created a configuration template at {}. Fill in the endpoint and the key in Settings → Model; no restart needed.",
+                    config_path.display()
+                ))));
+            }
+            Err(e) => {
+                let _ = tx.send(FromAgent::Event(AgentEvent::Warn(aox::tf!(
+                    "No config file at {} and it could not be created ({}). Settings → Model still works for this session, but nothing can be saved until that directory is writable.",
+                    config_path.display(),
+                    e
+                ))));
+            }
+        }
+    }
+
     // Config goes through **layered composition** (stage 5): profile → bundle → patch → config.toml.
     // The same `aox::config::layer::resolve` as the CLI — the two frontends do not each keep a set of composition rules.
     let resolved = match aox::config::layer::resolve(
@@ -1006,15 +1369,20 @@ async fn boot_and_run(
                 store,
                 Vec::new(),
                 paths,
+                false,
             );
-            idle_until_shutdown(&mut rx, &tx).await;
+            // Config unreadable, and there is **no Runtime to apply anything to**. The panel is still
+            // on screen (a save lands in `config.toml` and reports success or failure through
+            // `ModelNotice`), but nothing can be applied in this process: the layers that failed are
+            // read once, at startup. So the window stays open rather than vanishing — the user has to
+            // see the reason and the file it points at.
+            let _ = idle_until_shutdown(&mut rx, &tx, None).await;
             return Ok(());
         }
     };
     let config_layers = resolved.composed.layer_labels();
     let config = resolved.config;
 
-    let model = config.provider.model.clone();
     let rt = Runtime::new(config, root.clone(), plugins_dir.clone())?;
     for t in aox::tool::meta::meta_tools() {
         rt.register(t).await?;
@@ -1073,38 +1441,57 @@ async fn boot_and_run(
         ui.emit(AgentEvent::Warn(hint));
     }
 
-    let llm: Arc<dyn LlmProvider> = match aox::llm::openai::OpenAiProvider::new(&rt.config.provider) {
-        Ok(p) => Arc::new(p),
-        Err(e) => {
-            ui.emit(AgentEvent::Error(aox::tf!("LLM not ready: {}", format!("{e:#}"))));
-            ui.emit(AgentEvent::Info(
-                aox::i18n::t("Fill in base_url and api_key (or api_key_env) under [provider] in config.toml, then restart.").into(),
-            ));
-            let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store, &rt.config.shell);
-            boot(
-                &tx,
-                &config_path,
-                &model,
-                ctx_window(&rt),
-                false,
-                rt.config.recovery.enabled,
-                Some(format!("{e:#}")),
-                rt.store.clone(),
-                config_layers.clone(),
-                paths,
-            );
-            // Even in the "not ready" state, fill the plugin panel with what is on disk.
-            restore_plugins(&mut ui, &rt).await;
-            // Still in "not ready" state, but send the workplace state anyway: if the button is visible, at least it shows the real tier.
-            sync_workplace(&tx, &rt);
-            idle_until_shutdown(&mut ui.rx, &tx).await;
-            return Ok(());
+    // ── model not configured yet: stay up, and wait for the Model tab ─────────────────────
+    //
+    // This used to be a dead end: report "LLM not ready", disable the input box, and idle until the
+    // window closed — with the fix being "edit config.toml and restart". On a fresh install that was
+    // the *first* thing a user met. The window is now fully usable in this state (history, plugins,
+    // settings), and a save from the Model tab comes back through the same channel, is applied here,
+    // and the session simply carries on into the code below.
+    let mut plugins_restored = false;
+    if let Some(reason) = rt.provider.error() {
+        ui.emit(AgentEvent::Error(aox::tf!("LLM not ready: {}", reason)));
+        ui.emit(AgentEvent::Info(
+            aox::i18n::t("Open Settings → Model, fill in the endpoint and the key, and the session starts right away — no restart.").into(),
+        ));
+        let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store, &rt.config.shell);
+        boot(
+            &tx,
+            &config_path,
+            &rt.provider.cfg().model,
+            ctx_window(&rt),
+            false,
+            rt.config.recovery.enabled,
+            Some(reason),
+            rt.store.clone(),
+            config_layers.clone(),
+            paths,
+            first_run,
+        );
+        // Even in the "not ready" state, fill the plugin panel with what is on disk.
+        restore_plugins(&mut ui, &rt).await;
+        plugins_restored = true;
+        // Still in "not ready" state, but send the workplace state anyway: if the button is visible, at least it shows the real tier.
+        sync_workplace(&tx, &rt);
+        push_provider(&tx, &rt);
+        // One iteration is the normal case; the loop is here so that a save which fails to make the
+        // provider usable (wrong key, unreachable host) leaves the window waiting instead of starting a
+        // session that cannot answer.
+        loop {
+            match idle_until_shutdown(&mut ui.rx, &tx, Some(&rt)).await {
+                Wait::Shutdown => return Ok(()),
+                Wait::Configured => {
+                    if rt.provider.ready() {
+                        break;
+                    }
+                }
+            }
         }
-    };
+    }
 
     // The project rules file (RULES.md) is now read centrally by `aox::prompt::build`, no longer once
     // each in the GUI and CLI (see src/prompt.rs).
-    let mut agent = Agent::new(llm, rt.clone());
+    let mut agent = Agent::new(rt.clone());
     let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store, &rt.config.shell);
     // Hand the session to the UI **before** touching plugins. The history sidebar reads off the store
     // that `boot` carries, so restoring plugins first used to blank it for the whole wait — up to
@@ -1112,7 +1499,7 @@ async fn boot_and_run(
     boot(
         &tx,
         &config_path,
-        &model,
+        &rt.provider.cfg().model,
         ctx_window(&rt),
         true,
         rt.config.recovery.enabled,
@@ -1120,12 +1507,19 @@ async fn boot_and_run(
         rt.store.clone(),
         config_layers,
         paths,
+        first_run,
     );
+    push_provider(&tx, &rt);
     send_history_current(&tx, &agent);
     // Now restore persisted plugins (the same path as the CLI). It is the one startup step that can
     // block, so it runs here — after the UI already has the session — and finishes before the driver
     // loop below, so the very first turn still sees every plugin tool.
-    restore_plugins(&mut ui, &rt).await;
+    //
+    // Skipped when the "not configured yet" branch already did it: `load_all` starts every plugin
+    // process, and running it twice would start each one twice for no reason.
+    if !plugins_restored {
+        restore_plugins(&mut ui, &rt).await;
+    }
     // Send the workplace state right at startup: both the button's initial "Workplace · <tier>" and which
     // item to tick in the three-way list depend on it.
     sync_workplace(&tx, &rt);
@@ -1224,4 +1618,100 @@ async fn boot_and_run(
         h.stop().await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aox::config::{ProviderConfig, Thinking, ThinkingWire};
+
+    /// The configuration already in force, with the key coming from the environment.
+    fn prev() -> ProviderConfig {
+        ProviderConfig {
+            base_url: "https://old.example".into(),
+            model: "old-model".into(),
+            api_key: None,
+            api_key_env: Some("MY_KEY".into()),
+            max_tokens: Some(8_000),
+            temperature: Some(0.2),
+            // A per-model switch: whatever this held, an edit replaces it with the panel's answer.
+            stream: false,
+            context_window: Some(128_000),
+            thinking: Thinking::Off,
+            thinking_wire: ThinkingWire::Auto,
+        }
+    }
+
+    fn edit(key: Option<&str>) -> ProviderEdit {
+        ProviderEdit {
+            base_url: " https://api.deepseek.com ".into(),
+            model: " deepseek-flash ".into(),
+            api_key: key.map(str::to_string),
+            context_window: 1_000_000,
+            max_tokens: 32_000,
+            temperature: Some(0.3),
+            thinking: Thinking::High,
+            thinking_wire: ThinkingWire::Deepseek,
+            stream: true,
+        }
+    }
+
+    /// The panel never shows the stored key, so an untouched key field must mean "keep using the
+    /// environment variable" — dropping it would silently break every install that keeps its key in
+    /// the environment, on the first press of any control.
+    #[test]
+    fn an_edit_without_a_key_keeps_the_environment_variable() {
+        let c = edit_to_config(&edit(None), &prev());
+        assert_eq!(c.api_key_env.as_deref(), Some("MY_KEY"));
+        assert!(c.api_key.is_none());
+        // And the visible fields did change, or the merge is doing nothing.
+        assert_eq!(c.model, "deepseek-flash");
+        assert_eq!(c.base_url, "https://api.deepseek.com", "whitespace is trimmed");
+    }
+
+    /// A typed key wins and takes the variable out with it: `resolve_key` prefers the inline value, so
+    /// leaving `api_key_env` set would leave a config line that no longer has any effect.
+    #[test]
+    fn a_typed_key_replaces_the_environment_variable() {
+        let c = edit_to_config(&edit(Some(" sk-new ")), &prev());
+        assert_eq!(c.api_key.as_deref(), Some("sk-new"));
+        assert!(c.api_key_env.is_none());
+    }
+
+    /// Streaming used to be a config-only preference that had to be carried over by hand. It is a
+    /// switch in the dialog now (a per-model field), so the edit **replaces** it — in both directions,
+    /// which is what makes "turn it off for this gateway" survivable: the setting belongs to the record,
+    /// not to the session.
+    #[test]
+    fn the_streaming_switch_comes_from_the_edit() {
+        let mut e = edit(None);
+        e.stream = true;
+        assert!(edit_to_config(&e, &prev()).stream, "on, even though the previous value was off");
+        e.stream = false;
+        assert!(!edit_to_config(&e, &prev()).stream, "and off, even starting from off");
+    }
+
+    /// A zero window or cap cannot work (and would divide by zero in the ring), so it is clamped rather
+    /// than written to the file.
+    #[test]
+    fn a_zero_is_clamped_before_it_reaches_the_file() {
+        let mut e = edit(None);
+        e.context_window = 0;
+        e.max_tokens = 0;
+        let c = edit_to_config(&e, &prev());
+        assert_eq!(c.context_window, Some(1));
+        assert_eq!(c.max_tokens, Some(1));
+    }
+
+    /// The "no Runtime yet" side of an edit starts from the code defaults, so what the user typed is
+    /// exactly what lands — no leftover from a config that could not be read.
+    #[test]
+    fn the_blank_side_of_a_first_run_edit_carries_no_leftovers() {
+        let b = blank_provider_config();
+        assert!(b.base_url.is_empty());
+        let c = edit_to_config(&edit(Some("sk-x")), &b);
+        assert_eq!(c.base_url, "https://api.deepseek.com");
+        assert_eq!(c.max_tokens, Some(32_000));
+        assert!(c.api_key_env.is_none());
+    }
 }

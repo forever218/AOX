@@ -8,18 +8,20 @@
 
 ## 快速开始
 
-1. 双击 `aox.exe`（首次运行会在程序目录自动生成 `config.toml`）。
-2. 用记事本打开 `config.toml`，填入你的模型服务信息：
+1. 双击 `aox-gui.exe`。首次启动会自动打开 **设置 → 模型**（`config.toml` 会在程序目录自动生成，
+   但里面**没有** `[provider]` 段，模型不写在那里）。
+2. 点「添加模型」，填端点与 key，再点「扫描模型」挑一个（也可以自己填模型名），保存：
 
-   ```toml
-   [provider]
-   base_url = "https://api.deepseek.com/v1"   # 任何 OpenAI 兼容服务都行
-   model    = "deepseek-chat"
-   api_key  = "sk-你的key"                    # 或者改用 api_key_env 指向环境变量
-   ```
+   | 字段 | 例子 |
+   |---|---|
+   | 端点 | `https://api.deepseek.com`（任何 OpenAI 兼容服务都行） |
+   | Key | `sk-你的key` |
+   | 模型 | 扫描列表里选，或手填 `deepseek-flash` |
 
-3. 再次双击 `aox.exe`，进入交互界面。
-4. 直接说人话，例如：
+   端点、key、模型名，以及上下文窗口 / 输出上限 / 温度 / 思考强度，全部存在
+   `<程序目录>/.aox/models.json` 里——那是**唯一**一份模型配置，命令行版 `aox.exe` 读的也是它。
+   填完不用重启，直接就能对话。
+3. 直接说人话，例如：
 
    > 读取 config.toml，告诉我里面有哪些配置项
 
@@ -69,6 +71,7 @@ INCLUDE = { value = "<MSVC>\\include;<WinSDK>\\Include\\<版本>\\um;<WinSDK>\\I
 | `/tools` | 查看当前所有可用工具 |
 | `/plugins` | 查看已加载的插件 |
 | `/history` | 查看历史对话列表（`/history show <序号>` 看全文、`/history open <序号>` 接着聊、`/history dir` 看目录、`/history rm <序号>` 删除） |
+| `/model` | 列出已保存的模型（和 GUI 的「设置 → 模型」是同一份）；`/model <序号\|名字>` 切换，下一个请求生效 |
 | `/new` | 开一段新对话（当前这段已经落盘） |
 | `/runtime` | 查看解释器解析结果；`/runtime install python` 自动装配内置运行时 |
 | `/demo` | 预览终端排版与折叠效果 |
@@ -101,7 +104,7 @@ INCLUDE = { value = "<MSVC>\\include;<WinSDK>\\Include\\<版本>\\um;<WinSDK>\\I
 
 这段推理过程是**即时出现、响应结束即消失**的临时回显（滚动窗口保留末尾 4 行），
 不会污染输出，也不会进入折叠区。想关掉流式（例如端点不支持 `stream` 参数），
-在 `config.toml` 的 `[provider]` 里加一行 `stream = false` 即可。
+在 `.aox/models.json` 里给那条模型记录加 `"stream": false`，或在 GUI 的模型编辑弹窗里关掉「流式输出」。
 
 任务完成后，中间的模型思考与工具调用会自动折叠成一行摘要，只显示最终输出：
 

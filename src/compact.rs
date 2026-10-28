@@ -80,19 +80,33 @@ impl Policy {
     /// config does compact — `None` here now only happens when a caller clears the window
     /// explicitly (tests, or a config whose model genuinely has no known limit).
     pub fn from_config(cfg: &crate::config::Config) -> Option<Self> {
-        let explicit = cfg.agent.context_budget_tokens;
+        Self::from_parts(&cfg.agent, &cfg.provider)
+    }
+
+    /// The same derivation, from the two sections separately.
+    ///
+    /// This is the form the request path uses: the **provider half comes from the live provider**
+    /// (`rt.provider.cfg()`), not from the config that was read at startup — otherwise switching to a
+    /// model with a smaller window in the GUI would keep compacting against the old denominator for
+    /// the rest of the session, which shows up as "the endpoint returns 400 on a long conversation
+    /// even though the window is set correctly".
+    pub fn from_parts(
+        agent: &crate::config::AgentConfig,
+        provider: &crate::config::ProviderConfig,
+    ) -> Option<Self> {
+        let explicit = agent.context_budget_tokens;
         if explicit > 0 {
             return Some(Self { budget: explicit });
         }
-        let window = cfg.provider.context_window? as u64;
+        let window = provider.context_window? as u64;
         // `compact_ratio` comes from config but is clamped to 0.3..=1.0: 0.1 would throw away most
         // of the window, and 1.0 squeezes out the reply's reservation.
-        let ratio = if cfg.agent.compact_ratio.is_finite() {
-            (cfg.agent.compact_ratio as f64).clamp(0.3, 1.0)
+        let ratio = if agent.compact_ratio.is_finite() {
+            (agent.compact_ratio as f64).clamp(0.3, 1.0)
         } else {
             0.8
         };
-        let reserve = cfg.provider.max_tokens.unwrap_or(crate::config::DEFAULT_MAX_TOKENS) as u64;
+        let reserve = provider.max_tokens.unwrap_or(crate::config::DEFAULT_MAX_TOKENS) as u64;
         let budget = (window as f64 * ratio) as u64;
         Some(Self { budget: budget.saturating_sub(reserve).max(SMALLEST_BUDGET) })
     }
@@ -334,7 +348,13 @@ fn summary_message(summary: &str) -> String {
 /// Called once per round inside `AgentLoop` (tool results grow the context, so checking only at the
 /// start of a turn would be wrong).
 pub async fn prepare(agent: &mut Agent, ui: &mut dyn Ui, schemas: &[Value]) -> Option<Vec<Message>> {
-    let policy = Policy::from_config(&agent.rt().config)?;
+    // The budget follows the **live** provider: a model switch (smaller window, larger reply
+    // reservation) takes effect on the next round without restarting anything. Both halves are copied
+    // out in one scope, so no borrow of `agent` is held (the rest of this function takes `&mut`).
+    let policy = {
+        let rt = agent.rt();
+        Policy::from_parts(&rt.config.agent, &rt.provider.cfg())?
+    };
     let key = cache_key(agent.messages());
 
     // One batch of messages is computed once: the tool loop re-enters many times within a turn.
@@ -385,7 +405,7 @@ pub async fn prepare(agent: &mut Agent, ui: &mut dyn Ui, schemas: &[Value]) -> O
         // problem anyway.
         if !agent.compact_warned() {
             ui.emit(AgentEvent::Warn(crate::tf!(
-                "the request cannot be brought under the context budget by folding history (~{} tokens vs budget {}): the system prompt, the tool definitions and the current turn already exceed it. Raise [agent] context_budget_tokens / [provider] context_window, or start a new conversation.",
+                "the request cannot be brought under the context budget by folding history (~{} tokens vs budget {}): the system prompt, the tool definitions and the current turn already exceed it. Raise [agent] context_budget_tokens, or the model's context window in Settings → Model, or start a new conversation.",
                 before,
                 policy.budget
             )));
@@ -655,7 +675,7 @@ mod tests {
         c.workplace = crate::config::WorkplaceConfig { mode: "fixed".into(), root: Some(dir.to_string_lossy().into()) };
         let rt = Runtime::new(c, dir.clone(), dir.join("plugins")).unwrap();
         let llm = Arc::new(CountingLlm { calls: AtomicUsize::new(0) });
-        let mut agent = Agent::new(llm.clone(), rt);
+        let mut agent = Agent::new_with(llm.clone(), rt);
         let id = {
             let log = agent.rt().store.create(None, None).unwrap();
             log.id().to_string()

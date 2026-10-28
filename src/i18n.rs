@@ -288,4 +288,46 @@ mod tests {
             assert!(!map().is_empty(), "the catalogue parsed to empty, which is as good as untranslated");
         }
     }
+
+    /// Every catalogue on disk must agree with the source on **how many placeholders there are**,
+    /// and no key may be made of placeholders only.
+    ///
+    /// Both halves are invisible at runtime and both are catastrophic, which is why they are pinned
+    /// here rather than left to review:
+    ///
+    /// * a key/value pair with different counts makes [`fill`] leave a `{}` in the output or drop an
+    ///   argument on the floor, and only on the strings a test happens to exercise;
+    /// * a key that is *only* placeholders — `"{}" = "…"` — hijacks the lookup for **every**
+    ///   `tf!("{}", x)` in the program, so one bad line in the catalogue replaces every bare number
+    ///   on screen with one sentence. That is not hypothetical: a truncated key sitting in
+    ///   `locales/zh.toml` printed `[selftest] 全部通过 ✔` in place of the workspace count, the
+    ///   context ring's numbers and every other `tf!("{}", …)` until 2026-10-28.
+    #[test]
+    fn every_catalogue_agrees_on_placeholders() {
+        for (code, text) in [("zh", include_str!("../locales/zh.toml"))] {
+            let table: std::collections::BTreeMap<String, String> =
+                toml::from_str(text).unwrap_or_else(|e| panic!("locales/{code}.toml does not parse: {e}"));
+            assert!(!table.is_empty(), "locales/{code}.toml is empty");
+            for (key, value) in &table {
+                // Something has to be left once the placeholders are taken out. `"{}"` (or `" {} "`)
+                // is not a sentence to translate: it is the shape of *every* `tf!("{}", x)` in the
+                // program, so translating it translates all of them at once. Punctuation is enough
+                // to tell a real format string apart — `"\n  {} {}. {}"` is a numbered list line.
+                assert!(
+                    key.replace("{}", "").chars().any(|c| !c.is_whitespace()),
+                    "locales/{code}.toml: the key {key:?} is placeholders only — it hijacks every tf!() with that shape"
+                );
+                let (k, v) = (placeholders(key), placeholders(value));
+                assert_eq!(
+                    k, v,
+                    "locales/{code}.toml: {key:?} has {k} placeholder(s) but its translation has {v}: {value:?}"
+                );
+            }
+        }
+    }
+
+    /// How many positional `{}` a string has (braces escaped as `{{` / `}}` are not placeholders).
+    fn placeholders(s: &str) -> usize {
+        s.replace("{{", "").replace("}}", "").matches("{}").count()
+    }
 }

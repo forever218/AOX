@@ -211,7 +211,7 @@ impl Composed {
         }
 
         s.push_str(
-            crate::i18n::t("\nKeys **absent** from the composed tree = not part of composition: either they have no factory value (required fields you supply in config.toml, such as [provider]'s base_url / model), or the code falls back for them at read time (such as [theme]'s various scale defaults).\n"),
+            crate::i18n::t("\nKeys **absent** from the composed tree = not part of composition: either they have no factory value (nothing writes them), or the code falls back for them at read time (such as [theme]'s various scale defaults). The model — endpoint, key, name and its parameters — is **not** part of this tree at all any more: it lives in `.aox/models.json`.\n"),
         );
         s
     }

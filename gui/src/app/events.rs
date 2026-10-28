@@ -31,10 +31,23 @@ impl App {
                     }
                     self.status = if b.provider_ready { aox::i18n::t("Ready").to_string() } else { aox::i18n::t("No model configured").to_string() };
                     let ready = b.provider_ready;
+                    // A fresh install lands here: `config.toml` was just written by the host, so the one
+                    // page that can make the window useful opens by itself, with the cursor in the key
+                    // field. Doing nothing would leave a first-time user looking at a disabled input box
+                    // and a sentence telling them to edit a file — the exact friction this removes.
+                    if b.first_run {
+                        self.settings_open = true;
+                        self.settings_tab = SettingsTab::Model;
+                        self.mdl.focus_key();
+                    }
+                    // The address book lives beside `ui.json` / `spaces.json` under the app root, and
+                    // the root is only known once `Boot` arrives — so the model UI is handed it here.
+                    let root = PathBuf::from(&b.paths.root);
                     // The boot info has to be in place **before** the first refresh: `refresh_history`
                     // reads the app root out of it (`App::app_root`) to find the space registry, and a
                     // refresh that landed first would build an empty history tree.
                     self.boot = Some(*b);
+                    self.mdl.attach_root(&root);
                     self.refresh_history();
                     // The chip's number has to be right before anyone clicks it, so ask once at
                     // startup rather than "the count appears after you open the panel once".
@@ -56,6 +69,33 @@ impl App {
                 // The recovery panel. Rows are data, never text parsed back out of the CLI's output
                 // (see `bridge::RecoveryView`); the panel only decides how they look.
                 FromAgent::Recovery(v) => self.rec.set_view(*v),
+                // The model in force. Three things read it, and all three must change together:
+                // the chip in the input box, the "Model in use" row on the System tab, and the
+                // context ring's denominator — switching to a smaller model has to shrink the ring.
+                FromAgent::Provider(v) => {
+                    self.model = v.model.clone();
+                    if v.context_window > 0 {
+                        self.context_window = u64::from(v.context_window);
+                    }
+                    self.status = if v.ready {
+                        aox::i18n::t("Ready").to_string()
+                    } else {
+                        aox::i18n::t("No model configured").to_string()
+                    };
+                    // The input box's "chat unavailable" state is driven by `Boot`'s `provider_ready`
+                    // one-shot. A model configured **after** boot has to unblock it, or the panel would
+                    // work while the box stayed greyed out until a restart — the exact bug this whole
+                    // feature is about.
+                    if let Some(b) = self.boot.as_mut() {
+                        b.provider_ready = v.ready;
+                    }
+                    self.mdl.set_view(*v);
+                }
+                FromAgent::Models(v) => self.mdl.set_models(*v),
+                FromAgent::TestResult { base_url, model, ok, text } => {
+                    self.mdl.set_test(base_url, model, ok, text)
+                }
+                FromAgent::ModelNotice { ok, text } => self.mdl.set_notice(ok, text),
                 FromAgent::HistoryCurrent(id) => {
                     // Keep counts/titles fresh while the sidebar is open; while it is closed
                     // only "the conversation file changed" is worth a directory scan

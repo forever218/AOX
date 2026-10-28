@@ -73,7 +73,7 @@ pub(crate) fn ease_out_cubic(t: f32) -> f32 {
 /// the sidebar / main-transcript divider -- which looks like the title escaping its bounds. Let
 /// `LayoutJob` decide where to cut from the actual rendered width, and it follows automatically
 /// when the panel is dragged wider or narrower.
-pub(super) fn elide(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<egui::Galley> {
+pub(crate) fn elide(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::single_section(
         text.to_owned(),
         egui::TextFormat { font_id: font, color, ..Default::default() },
@@ -208,6 +208,113 @@ pub(super) struct Btn {
     pub(super) fg_hover: Color32,
     pub(super) fill: Color32,
     pub(super) fill_hover: Color32,
+    /// `false` = disabled: no hand cursor, no hover, no click. The **shape** stays identical, so a
+    /// disabled action does not move the ones next to it (which is what hiding it would do).
+    pub(super) interactive: bool,
+}
+
+/// The one control metric: **every** button in the window is this tall, on this radius, with the
+/// same type size. A dialog's fields are built to the same height, so a row of
+/// `label + field + button` is one height and one baseline.
+///
+/// Before this existed the app had three heights (32 / 38 / 44) and three radii (6 / 8 / 10), all
+/// chosen one button at a time; the result was that the Model dialog's "Test" stood taller than the
+/// field beside it and shorter than "Save" under it.
+pub(crate) const BTN_H: f32 = 34.0;
+pub(crate) const BTN_RADIUS: u8 = 8;
+
+/// What a button **means**. Weight is communicated by fill and colour only — never by size — so a
+/// row of four different weights still reads as one row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Weight {
+    /// The one affirmative action of a surface.
+    Primary,
+    /// A real action that is not *the* action ("Test", "Scan models", "Use").
+    Secondary,
+    /// No chrome at rest; for the third-rate actions ("Cancel", "Done", "Manage models…").
+    Ghost,
+    /// Destructive, not armed yet. Outlined, so it does not compete with Primary.
+    Danger,
+    /// Destructive and confirmed — the second press of a two-step delete.
+    DangerSolid,
+}
+
+fn wash(c: Color32, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+fn btn_style(weight: Weight) -> Btn {
+    let base = Btn {
+        size: 13.5,
+        pad: Vec2::new(16.0, 0.0),
+        h: BTN_H,
+        min_w: 0.0,
+        radius: BTN_RADIUS,
+        stroke: Stroke::NONE,
+        fg: P::text(),
+        fg_hover: P::text(),
+        fill: Color32::TRANSPARENT,
+        fill_hover: P::surface_hi(),
+        interactive: true,
+    };
+    match weight {
+        Weight::Primary => Btn {
+            pad: Vec2::new(20.0, 0.0),
+            fg: P::on_reverse(),
+            fg_hover: P::on_reverse(),
+            fill: P::reverse_bg(),
+            fill_hover: P::ink_soft(),
+            ..base
+        },
+        Weight::Secondary => Btn {
+            stroke: Stroke::new(1.0, P::edge()),
+            fill_hover: P::surface_hi(),
+            ..base
+        },
+        Weight::Ghost => Btn { pad: Vec2::new(12.0, 0.0), fg: P::text_dim(), fg_hover: P::text(), ..base },
+        Weight::Danger => Btn {
+            stroke: Stroke::new(1.0, wash(P::danger(), 110)),
+            fg: P::danger(),
+            fg_hover: P::danger(),
+            fill: Color32::TRANSPARENT,
+            fill_hover: wash(P::danger(), 30),
+            ..base
+        },
+        Weight::DangerSolid => Btn {
+            pad: Vec2::new(20.0, 0.0),
+            fg: P::on_reverse(),
+            fg_hover: P::on_reverse(),
+            fill: P::danger(),
+            fill_hover: P::danger().gamma_multiply(0.82),
+            ..base
+        },
+    }
+}
+
+/// A text button of the given weight, sized from its label.
+pub(crate) fn button(ui: &mut Ui, text: &str, weight: Weight) -> egui::Response {
+    text_button(ui, text, btn_style(weight))
+}
+
+/// The same button, but **disabled** rather than hidden: identical geometry, faint label, no click.
+pub(crate) fn button_ex(ui: &mut Ui, text: &str, weight: Weight, enabled: bool) -> egui::Response {
+    if enabled {
+        return button(ui, text, weight);
+    }
+    let mut b = btn_style(weight);
+    b.fg = P::text_faint();
+    b.fg_hover = P::text_faint();
+    b.fill = Color32::TRANSPARENT;
+    b.fill_hover = Color32::TRANSPARENT;
+    b.stroke = Stroke::new(1.0, P::edge());
+    b.interactive = false;
+    text_button(ui, text, b)
+}
+
+/// The same button at a **fixed** width — for a column of two ("Test" / "Scan models") where the
+/// labels differ and the right edges still have to line up.
+pub(crate) fn button_sized(ui: &mut Ui, text: &str, weight: Weight, w: f32) -> egui::Response {
+    text_button(ui, text, Btn { min_w: w, ..btn_style(weight) })
 }
 
 /// A hand-drawn text button.
@@ -251,109 +358,123 @@ pub(crate) fn dialog_footer(ui: &mut Ui, confirm: impl FnOnce(&mut Ui) -> bool) 
 }
 
 pub(super) fn text_button(ui: &mut Ui, text: &str, b: Btn) -> egui::Response {
+    let size = btn_extent(ui, text, b);
+    let sense = if b.interactive { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    let hov = if b.interactive { pointer_if(ui, &resp) } else { resp.hovered() };
+    paint_text_button(ui, rect, text, b, hov);
+    resp
+}
+
+/// How big a text button with this label is, before anything is laid out.
+fn btn_extent(ui: &Ui, text: &str, b: Btn) -> Vec2 {
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
         egui::FontId::proportional(b.size),
         Color32::PLACEHOLDER,
     );
-    let w = (galley.size().x + b.pad.x * 2.0).max(b.min_w);
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, b.h), Sense::click());
-    let hov = pointer_if(ui, &resp);
+    Vec2::new((galley.size().x + b.pad.x * 2.0).max(b.min_w), b.h)
+}
 
-    let painter = ui.painter();
-    painter.rect_filled(
-        rect,
-        CornerRadius::same(b.radius),
-        if hov { b.fill_hover } else { b.fill },
+/// Paint a text button into a rect the caller owns.
+///
+/// Split out of [`text_button`] for rows that are drawn by hand: `model_ui`'s list has its content
+/// painted inside one allocated rect (a click anywhere means "edit"), so a real `ui.allocate` for its
+/// per-row action would push the row's own layout around. The **appearance** still comes from here, so
+/// a button inside a row is the same button as one in a dialog footer.
+fn paint_text_button(ui: &Ui, rect: Rect, text: &str, b: Btn, hov: bool) {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(b.size),
+        Color32::PLACEHOLDER,
     );
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(b.radius), if hov { b.fill_hover } else { b.fill });
     if b.stroke != Stroke::NONE {
-        painter.rect_stroke(
-            rect,
-            CornerRadius::same(b.radius),
-            b.stroke,
-            egui::StrokeKind::Inside,
-        );
+        painter.rect_stroke(rect, CornerRadius::same(b.radius), b.stroke, egui::StrokeKind::Inside);
     }
     // The layout is done with PLACEHOLDER and the real colours are applied here -- so a hover
     // recolour doesn't have to re-lay-out the text. Centred in both axes: with a fixed height the
     // baseline can no longer be derived from the padding.
-    let pos = Pos2::new(
-        rect.center().x - galley.size().x * 0.5,
-        rect.center().y - galley.size().y * 0.5,
+    painter.galley(
+        Pos2::new(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        if hov { b.fg_hover } else { b.fg },
     );
-    painter.galley(pos, galley, if hov { b.fg_hover } else { b.fg });
-
-    resp
 }
 
-/// A secondary button (e.g. "Close" in dialogs, "Refresh" in the history panel).
+/// The size a [`button`] with this label will take — for callers that have to reserve space first.
+pub(crate) fn button_size(ui: &Ui, text: &str, weight: Weight) -> Vec2 {
+    btn_extent(ui, text, btn_style(weight))
+}
+
+/// Paint a [`button`] into a rect the caller owns (see [`paint_text_button`]).
+pub(crate) fn paint_button(ui: &Ui, rect: Rect, text: &str, weight: Weight, hover: bool) {
+    paint_text_button(ui, rect, text, btn_style(weight), hover);
+}
+
+/// A ghost button: no chrome at rest, one fill step on hover ("Cancel", "Done", "Manage models…").
 ///
-/// Transparent at rest and **one fill step** on hover — the same hover language as a list row, a
-/// menu row and a toolbar icon, so "the pointer is on something clickable" always looks identical.
-/// 32 high: big enough to hit without aiming, which is what "the button is too small" was about.
+/// The same hover language as a list row, a menu row and a toolbar icon, so "the pointer is on
+/// something clickable" always looks identical — and, since 2026-10-28, the same **geometry** as
+/// every other button (see [`BTN_H`]).
 pub(crate) fn flat_button(ui: &mut Ui, text: &str) -> egui::Response {
-    text_button(
-        ui,
-        text,
-        Btn {
-            size: 14.0,
-            pad: Vec2::new(12.0, 0.0),
-            h: 32.0,
-            min_w: 0.0,
-            radius: 8,
-            stroke: Stroke::NONE,
-            fg: P::text_dim(),
-            fg_hover: P::text(),
-            fill: Color32::TRANSPARENT,
-            fill_hover: P::surface_hi(),
-        },
-    )
+    text_button(ui, text, btn_style(Weight::Ghost))
 }
 
 /// The primary action: a reversed block (ink-black with white text in the light theme), which
-/// carries more weight than an outline.
+/// carries more weight than an outline — and, unlike before, no more *height* than an outline.
 pub(crate) fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
-    text_button(
-        ui,
-        text,
-        Btn {
-            size: 14.5,
-            pad: Vec2::new(20.0, 0.0),
-            h: 38.0,
-            min_w: 88.0,
-            radius: 10,
-            stroke: Stroke::NONE,
-            fg: P::on_reverse(),
-            fg_hover: P::on_reverse(),
-            fill: P::reverse_bg(),
-            fill_hover: P::ink_soft(),
-        },
-    )
+    text_button(ui, text, btn_style(Weight::Primary))
 }
 
-/// The dangerous-action button (currently only used for the "full access" confirmation).
+/// The dangerous-action button (the "full access" confirmation, a confirmed delete).
 ///
 /// [`P::danger`] is the backdrop and the text colour is still [`P::on_reverse`] -- not a
 /// coincidence: `danger` is a deep brick red in the light theme (needing light text) and a pale
 /// brick red in the dark theme (needing dark text), which matches the reversed block's light/dark
 /// direction exactly, so no separate foreground colour has to be computed for it.
+///
+/// For the *first* press of a two-step delete use [`Weight::Danger`], which is only outlined: the
+/// colour goes solid on the second press, so "armed" looks different from "about to".
 pub(crate) fn danger_button(ui: &mut Ui, text: &str) -> egui::Response {
-    text_button(
-        ui,
-        text,
-        Btn {
-            size: 14.5,
-            pad: Vec2::new(20.0, 0.0),
-            h: 38.0,
-            min_w: 88.0,
-            radius: 10,
-            stroke: Stroke::NONE,
-            fg: P::on_reverse(),
-            fg_hover: P::on_reverse(),
-            fill: P::danger(),
-            fill_hover: P::danger().gamma_multiply(0.82),
-        },
-    )
+    text_button(ui, text, btn_style(Weight::DangerSolid))
+}
+
+/// The primary button with a leading `＋`, drawn as two strokes.
+///
+/// The plus is **not** a character: a font's "＋" changes shape and weight with whichever face the
+/// build picked, and a text button with one glyph inline cannot be centred against it. Two strokes at
+/// the label's optical centre can. Everything else — size, radius, fill, hover — is the primary
+/// button's, so it sits in a row with the others without a second metric.
+pub(crate) fn primary_plus_button(ui: &mut Ui, text: &str) -> egui::Response {
+    let b = btn_style(Weight::Primary);
+    let galley =
+        ui.painter().layout_no_wrap(text.to_owned(), egui::FontId::proportional(b.size), Color32::PLACEHOLDER);
+    let arm = 4.5;
+    let gap = 9.0;
+    let w = galley.size().x + arm * 2.0 + gap + b.pad.x * 2.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, b.h), Sense::click());
+    let hov = pointer_if(ui, &resp);
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(b.radius), if hov { b.fill_hover } else { b.fill });
+    let cx = rect.left() + b.pad.x + arm;
+    let cy = rect.center().y;
+    let stroke = Stroke::new(1.5, b.fg);
+    painter.line_segment([Pos2::new(cx - arm, cy), Pos2::new(cx + arm, cy)], stroke);
+    painter.line_segment([Pos2::new(cx, cy - arm), Pos2::new(cx, cy + arm)], stroke);
+    painter.galley(
+        Pos2::new(
+            cx + arm + gap,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        if hov { b.fg_hover } else { b.fg },
+    );
+    resp
 }
 
 /// The × on the right of a chip. Returns `true` if it was clicked.
@@ -378,7 +499,7 @@ pub(super) fn close_x(ui: &mut Ui) -> bool {
 /// Why cut the middle rather than the tail: the most useful bit in this information is the
 /// **extension** (`.png` or `.pdf`, which decides whether the user has to compress it first), and
 /// the tail is exactly that. `keep` is the number of characters retained (ellipsis included).
-pub(super) fn middle_elide(s: &str, keep: usize) -> String {
+pub(crate) fn middle_elide(s: &str, keep: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     // Too short, no need to elide; and when `keep` is too small to fit "head + ellipsis + tail",
     // don't force it either (it renders as a smear)

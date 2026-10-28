@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -12,6 +12,14 @@ pub mod layer;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    /// The **fallback** model configuration, from the layer stack (bundle / patch / `config.toml`).
+    ///
+    /// Since 2026-10-28 this is no longer where the model lives: `.aox/models.json` is (see
+    /// `crate::modelbook`), and every front end reads the book first. The layered `[provider]` is
+    /// what a fresh install starts from before anything has been chosen, and what a `[provider]` in
+    /// an older `config.toml` is imported from, once. Hence `default`: a config file without the
+    /// section is not an error, it is the normal case now.
+    #[serde(default)]
     pub provider: ProviderConfig,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -96,7 +104,13 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConfig {
+    /// Empty = not configured yet. Since the section became optional (2026-10-28) an empty
+    /// `[provider]` — or one carrying only a default like `stream` — has to be a *state*, not a
+    /// parse error: "nothing chosen" is exactly what a fresh install starts in, and the GUI's job is
+    /// to fill it in.
+    #[serde(default)]
     pub base_url: String,
+    #[serde(default)]
     pub model: String,
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
@@ -129,7 +143,193 @@ pub struct ProviderConfig {
     /// reason about.
     #[serde(default = "default_context_window")]
     pub context_window: Option<u32>,
+    /// How hard the model should think before answering (the Model tab's "thinking strength").
+    ///
+    /// Omitted ⇒ [`Thinking::Default`], which means **not a single thinking-related field is sent**:
+    /// the decision stays with the endpoint. That is the only value that can never earn a 400 from an
+    /// endpoint that does not know the field, which is why it, and not "high", is the default.
+    ///
+    /// ⚠️ An unrecognized name **errors at startup** (serde lists the accepted words) rather than
+    /// quietly meaning "default" — the same call as `[store] backend` / `[loop] impl`.
+    #[serde(default)]
+    pub thinking: Thinking,
+    /// Which wire format the thinking fields are written in. See [`ThinkingWire`].
+    ///
+    /// `auto` infers it from the endpoint's host; an unknown host resolves to [`ThinkingWire::None`],
+    /// i.e. "send nothing" — guessing that a stranger's gateway accepts OpenAI's `reasoning_effort`
+    /// is exactly how the first message of a session ends up as a 400.
+    #[serde(default)]
+    pub thinking_wire: ThinkingWire,
 }
+
+impl Default for ProviderConfig {
+    /// Mirrors the serde defaults exactly (a `[provider]` with no keys at all and a
+    /// `ProviderConfig::default()` have to mean the same thing — otherwise "not configured" would
+    /// differ depending on which path produced it).
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            model: String::new(),
+            api_key: None,
+            api_key_env: None,
+            max_tokens: Some(DEFAULT_MAX_TOKENS),
+            temperature: None,
+            stream: true,
+            context_window: Some(DEFAULT_CONTEXT_WINDOW),
+            thinking: Thinking::default(),
+            thinking_wire: ThinkingWire::default(),
+        }
+    }
+}
+
+/// Thinking strength, as the **user** states it (not as any one endpoint spells it).
+///
+/// The mapping to actual request fields lives in [`ThinkingWire::apply`]; this enum only says how
+/// much thinking is wanted. Keeping the two apart is what lets one setting drive DeepSeek's
+/// `reasoning_effort`, OpenAI's `reasoning_effort`, and Qwen's `enable_thinking` without the config
+/// file having to name a vendor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Thinking {
+    /// Send nothing; the endpoint decides (DeepSeek's own default today is on, at high effort).
+    #[default]
+    Default,
+    /// Turn thinking off. Worth having as its own word: DeepSeek ships with it **on**, so "off" is a
+    /// real cost decision, not a nicety.
+    Off,
+    Low,
+    High,
+    Max,
+}
+
+impl Thinking {
+    pub const ALL: [Thinking; 5] =
+        [Thinking::Default, Thinking::Off, Thinking::Low, Thinking::High, Thinking::Max];
+
+    /// The word written in `config.toml` and the one the GUI compares against.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Thinking::Default => "default",
+            Thinking::Off => "off",
+            Thinking::Low => "low",
+            Thinking::High => "high",
+            Thinking::Max => "max",
+        }
+    }
+
+    /// The value sent as `reasoning_effort`. `Max` degrades to `high` on wires that have no such
+    /// word (OpenAI), which is stated in the GUI next to the choice instead of being hidden.
+    pub fn effort(self) -> Option<&'static str> {
+        match self {
+            Thinking::Low => Some("low"),
+            Thinking::High => Some("high"),
+            Thinking::Max => Some("max"),
+            Thinking::Off | Thinking::Default => None,
+        }
+    }
+}
+
+/// Which vendor dialect the thinking fields follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingWire {
+    /// Infer from the host (see [`ThinkingWire::resolve`]).
+    #[default]
+    Auto,
+    /// `thinking: {type: "enabled"|"disabled"}` + `reasoning_effort` (DeepSeek, and the many
+    /// gateways that copy it).
+    Deepseek,
+    /// `reasoning_effort` only; there is no way to switch thinking off.
+    Openai,
+    /// `enable_thinking: true|false` (DashScope / Qwen).
+    Qwen,
+    /// Send nothing at all.
+    None,
+}
+
+impl ThinkingWire {
+    pub const ALL: [ThinkingWire; 5] = [
+        ThinkingWire::Auto,
+        ThinkingWire::Deepseek,
+        ThinkingWire::Openai,
+        ThinkingWire::Qwen,
+        ThinkingWire::None,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingWire::Auto => "auto",
+            ThinkingWire::Deepseek => "deepseek",
+            ThinkingWire::Openai => "openai",
+            ThinkingWire::Qwen => "qwen",
+            ThinkingWire::None => "none",
+        }
+    }
+
+    /// Turn `auto` into a concrete wire, from the endpoint's host alone.
+    ///
+    /// An unrecognized host resolves to [`ThinkingWire::None`] **on purpose**: a gateway nobody has
+    /// heard of may reject unknown fields outright, and "the first message of the session 400s" is a
+    /// far worse outcome than "thinking strength had no effect, and the panel says so".
+    pub fn resolve(self, base_url: &str) -> ThinkingWire {
+        if self != ThinkingWire::Auto {
+            return self;
+        }
+        let host = host_of(base_url);
+        if host.contains("deepseek") {
+            ThinkingWire::Deepseek
+        } else if host.contains("dashscope") || host.contains("aliyun") {
+            ThinkingWire::Qwen
+        } else if host.contains("openai.com") {
+            ThinkingWire::Openai
+        } else {
+            ThinkingWire::None
+        }
+    }
+
+    /// Write this level's fields into a request body.
+    ///
+    /// One entry point for every wire, so "which field did this endpoint get" has exactly one answer
+    /// to read. Levels a wire cannot express are **omitted rather than approximated**: OpenAI has no
+    /// "off", so `off` there sends nothing (the panel already greys it out).
+    pub fn apply(self, level: Thinking, body: &mut serde_json::Value) {
+        use serde_json::json;
+        if level == Thinking::Default || self == ThinkingWire::None {
+            return;
+        }
+        match (self, level) {
+            (ThinkingWire::Deepseek, Thinking::Off) => {
+                body["thinking"] = json!({ "type": "disabled" });
+            }
+            (ThinkingWire::Deepseek, l) => {
+                body["thinking"] = json!({ "type": "enabled" });
+                if let Some(e) = l.effort() {
+                    body["reasoning_effort"] = json!(e);
+                }
+            }
+            // No way to disable it on this wire → `off` sends nothing, and the GUI says so.
+            (ThinkingWire::Openai, Thinking::Off) => {}
+            (ThinkingWire::Openai, l) => {
+                // `max` has no OpenAI equivalent; `high` is its ceiling.
+                let e = if l == Thinking::Max { "high" } else { l.effort().unwrap_or("high") };
+                body["reasoning_effort"] = json!(e);
+            }
+            (ThinkingWire::Qwen, Thinking::Off) => body["enable_thinking"] = json!(false),
+            (ThinkingWire::Qwen, _) => body["enable_thinking"] = json!(true),
+            (ThinkingWire::None | ThinkingWire::Auto, _) => {}
+        }
+    }
+}
+
+/// The bare host+port of a base URL, lowercased. Hand-rolled because `reqwest::Url` is overkill for
+/// "which vendor is this" and would drag a parse failure into a decision that must never fail.
+fn host_of(base_url: &str) -> String {
+    let s = base_url.trim();
+    let s = s.split_once("://").map_or(s, |(_, rest)| rest);
+    let s = s.split('/').next().unwrap_or(s);
+    s.to_ascii_lowercase()
+}
+
 
 /// Default reply-token cap: generous enough that a normal answer, a diff or a file write fits in one
 /// call, far below what any current endpoint considers "too many".
@@ -154,6 +354,15 @@ fn default_true() -> bool {
     true
 }
 
+/// The shipped configuration template, embedded **once**.
+///
+/// It is the file a first run needs (`config.toml` is deliberately not packaged, so no personal key
+/// is ever baked into an installer) and it is also, byte for byte, the documentation of every key.
+/// Both front ends take it from here: the CLI writes it when no config exists, and the GUI does the
+/// same on its first launch — a second `include_str!` in `gui/` would put a second copy of 30 KB of
+/// comments into the binary and could drift from this one.
+pub const TEMPLATE: &str = include_str!("../config.example.toml");
+
 impl ProviderConfig {
     pub fn resolve_key(&self) -> Result<String> {
         if let Some(k) = &self.api_key {
@@ -169,7 +378,7 @@ impl ProviderConfig {
             }
         }
         Err(anyhow!(
-            crate::i18n::t("no API key configured: set api_key or api_key_env under [provider] in config.toml")
+            crate::i18n::t("no API key configured for the model in force: fill it in under Settings → Model (it is stored in .aox/models.json)")
         ))
     }
 
@@ -181,6 +390,98 @@ impl ProviderConfig {
             format!("{base}/chat/completions")
         }
     }
+
+    /// The `…/models` URLs to try when scanning, **in order**.
+    ///
+    /// OpenAI-compatible endpoints disagree about where the list lives, and there is no way to know
+    /// from the URL alone:
+    ///
+    /// * a base that already names a version (`/v1`, `/compatible-mode/v1`, `/api/v3`) means the list
+    ///   hangs directly off it — that is the only candidate worth trying;
+    /// * a bare host (`https://api.deepseek.com`, `http://localhost:11434`) is ambiguous, so both
+    ///   shapes are tried, `/v1/models` first (the OpenAI convention, far more common).
+    ///
+    /// The GUI remembers which one answered, so the second scan asks once.
+    pub fn models_urls(&self) -> Vec<String> {
+        let mut base = self.base_url.trim().trim_end_matches('/').to_string();
+        if let Some(b) = base.strip_suffix("/chat/completions") {
+            base = b.trim_end_matches('/').to_string();
+        }
+        if let Some(b) = base.strip_suffix("/completions") {
+            base = b.trim_end_matches('/').to_string();
+        }
+        let versioned = base
+            .rsplit('/')
+            .next()
+            .is_some_and(|last| last.strip_prefix('v').is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())));
+        if versioned {
+            vec![format!("{base}/models")]
+        } else {
+            vec![format!("{base}/v1/models"), format!("{base}/models")]
+        }
+    }
+
+    /// The wire this config's thinking fields follow, with `auto` already resolved.
+    pub fn wire(&self) -> ThinkingWire {
+        self.thinking_wire.resolve(&self.base_url)
+    }
+
+    /// Whether this config looks **filled in**.
+    ///
+    /// Not "is the key non-empty": the shipped template carries the literal placeholder `sk-...`,
+    /// which is non-empty and would sail through, turning "not configured yet" into a 401 on the
+    /// user's first message. The placeholder is treated as "still empty" instead.
+    pub fn is_configured(&self) -> bool {
+        if !self.base_url.trim().is_empty() && is_placeholder(self.base_url.trim()) {
+            return false;
+        }
+        if !self.model.trim().is_empty() && is_placeholder(self.model.trim()) {
+            return false;
+        }
+        self.key_state() != KeyState::Missing
+    }
+
+    /// Where the key comes from, for both the readiness check and the panel's hint line.
+    pub fn key_state(&self) -> KeyState {
+        if let Some(k) = &self.api_key {
+            let k = k.trim();
+            if !k.is_empty() && !is_placeholder(k) {
+                return KeyState::Inline;
+            }
+        }
+        if let Some(name) = &self.api_key_env {
+            match std::env::var(name) {
+                Ok(v) if !v.trim().is_empty() => return KeyState::Env(name.clone()),
+                _ => return KeyState::EnvUnset(name.clone()),
+            }
+        }
+        KeyState::Missing
+    }
+}
+
+/// Where the API key in force comes from (see [`ProviderConfig::key_state`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyState {
+    /// Written in `config.toml` (or supplied by the panel).
+    Inline,
+    /// Taken from this environment variable, which is set and non-empty.
+    Env(String),
+    /// The variable is named but not set — worth saying out loud, because the config *looks* done.
+    EnvUnset(String),
+    Missing,
+}
+
+/// Values that mean "nobody has filled this in yet".
+///
+/// `sk-...` and friends ship inside `config.example.toml`; `your-key` / `changeme` / `<...>` are what
+/// people type when they mean "later". Treating them as real is worse than useless: everything looks
+/// configured until the first request 401s.
+fn is_placeholder(s: &str) -> bool {
+    let l = s.trim().to_ascii_lowercase();
+    l.is_empty()
+        || l.contains("...")
+        || l.contains('<')
+        || matches!(l.as_str(), "sk-" | "your-key" | "your_api_key" | "changeme" | "none" | "todo")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1229,6 +1530,8 @@ impl Config {
                 temperature: None,
                 stream: false,
                 context_window: None,
+                thinking: Thinking::default(),
+                thinking_wire: ThinkingWire::default(),
             },
             auth: AuthConfig::default(),
             agent: AgentConfig::default(),
@@ -1262,6 +1565,35 @@ mod tests {
 
     fn color(src: &str) -> Option<RgbColor> {
         toml::from_str::<W>(&format!("c = {src}")).ok().map(|w| w.c)
+    }
+
+    /// A plausible-looking provider configuration, for the tests that only ask about parsing.
+    fn provider() -> ProviderConfig {
+        ProviderConfig {
+            base_url: "https://api.deepseek.com".into(),
+            model: "deepseek-flash".into(),
+            api_key: Some("sk-test".into()),
+            api_key_env: None,
+            max_tokens: Some(32_000),
+            temperature: Some(0.3),
+            stream: true,
+            context_window: Some(1_000_000),
+            thinking: Thinking::High,
+            thinking_wire: ThinkingWire::Deepseek,
+        }
+    }
+
+    /// The placeholder the installer ships (`sk-...`) is **not** a configured key: treating it as one is
+    /// what turns "not set up yet" into a 401 on the first message.
+    #[test]
+    fn the_shipped_placeholder_does_not_count_as_configured() {
+        let mut p = provider();
+        p.api_key = Some("sk-...".into());
+        assert!(!p.is_configured());
+        p.api_key = Some("   ".into());
+        assert!(!p.is_configured());
+        p.api_key = Some("sk-real-looking".into());
+        assert!(p.is_configured());
     }
 
     #[test]

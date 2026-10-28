@@ -900,7 +900,24 @@ impl App {
                         // want to **know**.
                         ui.add_space(3.0);
                         ui.horizontal(|ui| {
-                            workplace_ui::button(ui, &mut self.ws, self.demo || !blocked);
+                            // The model chip comes **first**, before the workplace chip: it answers
+                            // "who is answering", which is the more fundamental of the two questions
+                            // this row asks, and the eye starts at the left.
+                            //
+                            // It is clickable even when the model is not configured (`!blocked` is
+                            // false then): on a fresh install this chip *is* the way to configure it,
+                            // so greying it out would leave the one reachable control dead.
+                            let model_clicked = crate::model_ui::chip(ui, &mut self.mdl, true);
+                            if model_clicked {
+                                // One pop-up list at a time: the two panels anchor to the same row
+                                // and would sit on top of each other.
+                                self.ws.close_menu();
+                            }
+                            ui.add_space(2.0);
+                            let ws_clicked = workplace_ui::button(ui, &mut self.ws, self.demo || !blocked);
+                            if ws_clicked {
+                                self.mdl.close_menu();
+                            }
                             // The recovery chip: one step to the right of the workspace button,
                             // because both answer "what can this conversation do to the tree".
                             //

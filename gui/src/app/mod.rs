@@ -102,8 +102,10 @@ use widgets::*;
 
 // The names other modules already reach in through `crate::app::`.
 pub(crate) use widgets::{
-    column, danger_button, dialog_footer, ease_out_cubic, flat_button, menu_item, pointer_if,
-    primary_button, MENU_W,
+    button, button_ex, button_sized, column, danger_button, dialog_footer, ease_out_cubic, elide,
+    flat_button, menu_item, middle_elide, pointer_if, primary_button, primary_plus_button,
+    paint_button, button_size, Weight,
+    BTN_H, MENU_W,
 };
 
 // ─────────────────────────── data model ───────────────────────────
@@ -342,6 +344,12 @@ pub struct App {
     /// have to remember the mutual exclusions (see the "open one, close two" bit in
     /// `workplace_ui::button`).
     ws: workplace_ui::WorkplaceUi,
+    /// State of the model chip at the bottom-left of the input box, the list it opens, and the
+    /// Settings → Model form (see `crate::model_ui`).
+    ///
+    /// Same reasoning as `ws`: one handle rather than half a dozen loose booleans and strings, and the
+    /// address book lives with the UI that owns it.
+    mdl: crate::model_ui::ModelUi,
     /// The recovery panel's state and the rows it was last given (see `crate::recovery_ui`).
     rec: crate::recovery_ui::RecoveryUi,
 
@@ -480,6 +488,7 @@ impl App {
             fit_tries: 0,
             native_theme: None,
             ws: workplace_ui::WorkplaceUi::new(),
+            mdl: crate::model_ui::ModelUi::new(),
             rec: crate::recovery_ui::RecoveryUi::new(),
             toast: None,
             stream_calls: Vec::new(),
@@ -885,6 +894,16 @@ impl eframe::App for App {
         if let Some(mode) = workplace_ui::picker(ctx, &mut self.ws) {
             self.send_ws(mode);
         }
+        // The model list, drawn in the same layer for the same reason: it overlaps the input card.
+        // Scheduled **after** the workplace's three overlays so that if both were somehow open (a
+        // frame where the click order crossed), the model list is the one on top — it is anchored to
+        // the leftmost chip, so it covers less of the row.
+        let model_req = crate::model_ui::menu(ctx, &mut self.mdl);
+        self.send_requests(model_req);
+        // The add/edit dialog. Drawn here rather than from the settings tab: a modal inside the
+        // settings card's scroll area would be clipped by it.
+        let dialog_req = crate::model_ui::dialog(ctx, &mut self.mdl);
+        self.send_requests(dialog_req);
         // The recovery panel, drawn above the transcript for the same reason the menus above are:
         // it overlaps the input card. Its confirmation dialog is a real modal, so it comes with the
         // other dialog overlays below.

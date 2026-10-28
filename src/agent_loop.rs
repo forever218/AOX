@@ -415,7 +415,7 @@ impl AgentLoop for StandardLoop {
                 if reply.truncated() {
                     ui.emit(AgentEvent::Warn(crate::tf!(
                         "model output was truncated by max_tokens={} and the content is empty (reasoning tokens filled the output budget).",
-                        rt.config.provider.max_tokens.unwrap_or(0)
+                        rt.provider.cfg().max_tokens.unwrap_or(0)
                     )));
                 }
                 if empty_retries < MAX_EMPTY_RETRY {
@@ -444,7 +444,7 @@ impl AgentLoop for StandardLoop {
             if reply.truncated() {
                 ui.emit(AgentEvent::Warn(crate::tf!(
                     "model output was truncated by max_tokens={} ({}); this round's content may be incomplete. Consider raising max_tokens in config.toml (a thinking model's reasoning tokens count against the quota too).",
-                    rt.config.provider.max_tokens.unwrap_or(0),
+                    rt.provider.cfg().max_tokens.unwrap_or(0),
                     reply.diag(),
                 )));
             }
@@ -859,7 +859,7 @@ mod tests {
             .expect("the test runtime should not fail");
         let llm: Arc<dyn crate::llm::LlmProvider> =
             Arc::new(crate::llm::UnavailableProvider { reason: "test".into() });
-        Agent::new(llm, rt)
+        Agent::new_with(llm, rt)
     }
 
     /// ⚠️ This one pins the **direction** specifically: trimming must go through

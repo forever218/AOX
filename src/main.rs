@@ -1,3 +1,14 @@
+//! The command-line front end. See `src/lib.rs`: **both crate roots compile the same modules**, and
+//! this one does not depend on the library, so every item that only the GUI or the tests use is
+//! unreachable *here* — which is what `dead_code` reports, thirty times over, on a clean build.
+//!
+//! Silenced at the crate root rather than item by item, because the two targets are the same source:
+//! anything *genuinely* dead (a private function nobody calls) is still dead in the **library** build,
+//! which reports it. So the signal is not lost, it just moves to the target that can see it. The
+//! alternative — an `#[allow]` on each of the GUI-only APIs — needs a new one every time a GUI feature
+//! lands, and rots into a lie ("why is this allowed?").
+#![allow(dead_code)]
+
 mod agent;
 mod agent_loop;
 mod attach;
@@ -11,9 +22,11 @@ mod i18n;
 mod jobs;
 mod llm;
 mod message;
+mod modelbook;
 mod notes;
 mod plugin;
 mod prompt;
+mod provider_live;
 mod recovery;
 mod recycle;
 mod repeat;
@@ -25,12 +38,10 @@ mod selftest;
 // integrity-level primitives. Declared here as well as in `lib.rs` because this bin compiles its
 // own copy of every module (see the trap note in TRAPS.md).
 mod shell;
-// Silenced **here** rather than in `space.rs`, because the two targets genuinely differ: the space
-// registry's tree-building half (`group`, `Group`, the writers) exists for the GUI's history panel,
-// and this CLI links the module only to call `Registry::load` / `workspace_roots` when it sets up
-// storage. With the attribute on the `mod` item the silence covers exactly the target that needs it,
-// so the library keeps its dead-code signal (see the note at the top of `src/space.rs`).
-#[allow(dead_code)]
+// The space registry's tree-building half (`group`, `Group`, the writers) exists for the GUI's
+// history panel; this CLI links the module only to call `Registry::load` / `workspace_roots` when it
+// sets up storage. Covered by the crate-root `allow(dead_code)` above — the library build keeps the
+// signal (see the note at the top of `src/space.rs`).
 mod space;
 mod store;
 // Task checkpoints (`src/task.rs`): the CLI has no surface that shows one, but the agent writes and
@@ -47,8 +58,6 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::agent::Agent;
-use crate::llm::openai::OpenAiProvider;
-use crate::llm::LlmProvider;
 use crate::runtime::Runtime;
 use crate::tool::{ask, hostfs, meta};
 use crate::ui::cli::CliUi;
@@ -327,7 +336,7 @@ async fn main() -> Result<()> {
             if !config_path.exists() {
                 // First run: auto-generate the template, so double-clicking the exe
                 // doesn't just flash a window
-                match std::fs::write(&config_path, include_str!("../config.example.toml")) {
+                match std::fs::write(&config_path, config::TEMPLATE) {
                     Ok(()) => {
                         println!("{}", crate::tf!("No config file found; created a template for you: {}", config_path.display()));
                         println!("{}", crate::i18n::t("Open it in an editor, fill in base_url and api_key (or api_key_env), then restart this program."));
@@ -427,7 +436,10 @@ async fn main() -> Result<()> {
     println!(
         "  {} {}",
         ui::style::dim(crate::i18n::t("Model")),
-        ui::style::bold(&rt.config.provider.model)
+        // The live provider, not `rt.config.provider`: since the model is chosen in
+        // `.aox/models.json`, the config snapshot in the runtime is only the fallback and is empty on
+        // a fresh install — which is how the banner came to print "Model" and nothing after it.
+        ui::style::bold(&rt.provider.cfg().model)
     );
     ui.emit(AgentEvent::Info(crate::tf!(
         "Config {}   plugins dir {}",
@@ -462,22 +474,22 @@ async fn main() -> Result<()> {
         )));
     }
 
-    let llm: Arc<dyn LlmProvider> = match OpenAiProvider::new(&rt.config.provider) {
-        Ok(p) => Arc::new(p),
-        Err(e) => {
-            ui.emit(AgentEvent::Error(crate::tf!("LLM not ready: {}", format!("{e:#}"))));
-            ui.emit(AgentEvent::Info(
-                crate::i18n::t("Set base_url / api_key in config.toml (or point api_key_env at an environment variable); local commands /tools /plugins /demo still work.")
-                    .into(),
-            ));
-            Arc::new(llm::UnavailableProvider { reason: format!("{e:#}") })
-        }
-    };
+    // The provider was built by `Runtime::new` and lives on the runtime (see `src/provider_live.rs`),
+    // so "not ready" is a state to report, not a value to construct here. A missing key is no longer
+    // fatal either: the session still runs (local commands, history, plugins), and `/model` or the
+    // GUI's Model tab can fill it in without a restart.
+    if let Some(reason) = rt.provider.error() {
+        ui.emit(AgentEvent::Error(crate::tf!("LLM not ready: {}", reason)));
+        ui.emit(AgentEvent::Info(
+            crate::i18n::t("Set base_url / api_key in config.toml (or point api_key_env at an environment variable), or configure it in the GUI's Settings -> Model; local commands /tools /plugins /demo still work.")
+                .into(),
+        ));
+    }
 
     // The project rules file (RULES.md) is no longer read here: it is now the `rules`
     // segment of the prompt, taken uniformly from `config.agent.rules_file` by
     // `prompt::build` — the CLI and GUI share one implementation.
-    let mut agent = Agent::new(llm, rt.clone());
+    let mut agent = Agent::new(rt.clone());
 
     // Runtime hint: only an extra line when Python is missing; when runtimes are
     // complete the startup output stays clean.
@@ -666,6 +678,14 @@ async fn main() -> Result<()> {
                 Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
             },
             "/config" => ui.emit(AgentEvent::Info(layer_summary.clone())),
+            // `/model` — the saved models and switching between them. The file is
+            // `.aox/models.json` (the GUI's Model tab edits the same one), and the switch is the same
+            // path the GUI uses: mark the record active, then hand it to `LiveProvider::apply`. No
+            // restart, no new conversation.
+            _ if modelbook::is_cmd(line) => match modelbook::command(&rt, line) {
+                Ok(text) => ui.emit(AgentEvent::Info(text)),
+                Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
+            },
             "/shell" => ui.emit(AgentEvent::Info(tool::shell::report(&rt))),
             "/new" => {
                 // The same path as the "+" button on the GUI top bar. The old
@@ -748,6 +768,10 @@ async fn main() -> Result<()> {
                     (
                         "/config",
                         crate::i18n::t("Show which layers this config is composed of (aox.toml under the app root can customize it; --dump-config shows where each value comes from)"),
+                    ),
+                    (
+                        "/model",
+                        crate::i18n::t("List the saved models; /model <number|name> switches to one (the same list the GUI edits; effective on the next request)"),
                     ),
                     ("/quit", crate::i18n::t("Quit the program (/exit is equivalent)")),
                 ] {

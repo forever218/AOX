@@ -27,6 +27,13 @@ pub struct OpenAiProvider {
     /// echoed live; if an endpoint doesn't accept stream/stream_options, set this
     /// to false in config.toml to fall back.
     stream: bool,
+    /// How much thinking to ask for, and **which vendor's spelling** to say it in.
+    ///
+    /// Both are resolved once, when the provider is built (an `auto` wire becomes a concrete one from
+    /// the host). That is deliberate: rebuilding the provider is exactly what the GUI's model switch
+    /// does, so "the endpoint changed" and "the wire changed" are the same event.
+    thinking: crate::config::Thinking,
+    wire: crate::config::ThinkingWire,
 }
 
 impl OpenAiProvider {
@@ -37,22 +44,43 @@ impl OpenAiProvider {
             // mid-sentence and, with retries on, pays for it twice. What replaces it is a silence
             // watchdog inside `chat_stream`; the non-streaming path sets its own per-request
             // deadline, where "the whole response" is the right unit.
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(failure::CONNECT_SECS))
-                .build()?,
+            client: super::endpoint_client(&cfg.base_url).build()?,
             url: cfg.chat_url(),
             api_key: cfg.resolve_key()?,
             model: cfg.model.clone(),
             max_tokens: cfg.max_tokens,
             temperature: cfg.temperature,
             stream: cfg.stream,
+            thinking: cfg.thinking,
+            wire: cfg.wire(),
         })
+    }
+
+    /// The `messages` array for the request body.
+    ///
+    /// The only change from "just serialise them" is `reasoning_content`: as long as a message with
+    /// tool calls exists, DeepSeek **requires** that field back and 400s without it, so it is always
+    /// sent when the wire is DeepSeek. Every other endpoint may treat an unknown message field as a
+    /// bad request, and "switched models mid-conversation and the next message 400s" is exactly the
+    /// failure that would come of sending it there — so on any other wire it is stripped.
+    fn body_messages(&self, messages: &[Message]) -> Value {
+        let mut v = json!(messages);
+        if self.wire != crate::config::ThinkingWire::Deepseek {
+            if let Some(arr) = v.as_array_mut() {
+                for m in arr.iter_mut() {
+                    if let Some(o) = m.as_object_mut() {
+                        o.remove("reasoning_content");
+                    }
+                }
+            }
+        }
+        v
     }
 
     fn build_body(&self, messages: &[Message], tools: &[Value], stream: bool) -> Value {
         let mut body = json!({
             "model": self.model,
-            "messages": messages,
+            "messages": self.body_messages(messages),
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
@@ -64,6 +92,8 @@ impl OpenAiProvider {
         if let Some(m) = self.max_tokens {
             body["max_tokens"] = json!(m);
         }
+        // Thinking strength: one call, every wire. `default` and `none` write nothing at all.
+        self.wire.apply(self.thinking, &mut body);
         if stream {
             body["stream"] = json!(true);
             // Have the server include usage in the last chunk (reasoning-token

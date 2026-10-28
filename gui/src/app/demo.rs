@@ -31,6 +31,9 @@ pub(super) fn seed_demo(app: &mut App) {
         context_window: DEFAULT_CONTEXT_WINDOW,
         provider_ready: true,
         recovery: true,
+        // Demo mode is not a fresh install: opening the settings dialog over the preview would hide
+        // the very layout `--demo` exists to show.
+        first_run: false,
         note: None,
         // Demo mode gets a real path listing as well: the settings page's "System" column is
         // exactly the kind of "one glance is enough" diagnostic data, so previewing it with fake
@@ -60,6 +63,20 @@ pub(super) fn seed_demo(app: &mut App) {
     // `FromAgent::Workplace`, so one is stuffed in locally, letting `--demo` show the tier name
     // on the button and the ticked row in the list.
     app.ws.set_view(WorkplaceView { mode: Mode::Default, root: None });
+
+    // The model chip's initial value, for the same reason: no `FromAgent::Provider` is ever sent in
+    // demo mode, and a chip reading "not configured" in every preview screenshot would hide the state
+    // that matters — a model with a window, and a list behind it.
+    app.mdl.set_view(crate::bridge::ProviderView {
+        base_url: "https://api.deepseek.com".into(),
+        model: app.model.clone(),
+        context_window: u32::try_from(DEFAULT_CONTEXT_WINDOW).unwrap_or(1_000_000),
+        max_tokens: 32_000,
+        temperature: Some(0.3),
+        thinking: aox::config::Thinking::Default,
+        ready: true,
+        error: None,
+    });
 
     // The "Σ usage" chip **is only drawn when there is a ledger**, and `--demo` has no real
     // calls -- so two records are added, letting the preview show it and the breakdown panel it

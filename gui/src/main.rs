@@ -24,6 +24,7 @@ mod bridge;
 mod cache;
 mod gwin;
 mod markdown;
+mod model_ui;
 mod open;
 mod recovery_ui;
 mod syntax;

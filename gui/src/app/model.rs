@@ -312,6 +312,12 @@ pub(super) enum Tex {
 pub(super) enum SettingsTab {
     /// Extra: things like the activity-stream entrance that "belong to no setting"
     Extra,
+    /// Model: endpoint, key, model list, window, thinking strength.
+    ///
+    /// Second, right after "Extra": it is the one page a **fresh install** has to visit before
+    /// anything else can happen, and hunting for it under "System" was the friction this page exists
+    /// to remove.
+    Model,
     /// Appearance: light/dark / follow system
     Appearance,
     /// System: paths and runtime diagnostics
@@ -321,12 +327,18 @@ pub(super) enum SettingsTab {
 }
 
 impl SettingsTab {
-    pub(super) const ALL: [SettingsTab; 4] =
-        [SettingsTab::Extra, SettingsTab::Appearance, SettingsTab::System, SettingsTab::About];
+    pub(super) const ALL: [SettingsTab; 5] = [
+        SettingsTab::Extra,
+        SettingsTab::Model,
+        SettingsTab::Appearance,
+        SettingsTab::System,
+        SettingsTab::About,
+    ];
 
     pub(super) fn label(self) -> &'static str {
         match self {
             SettingsTab::Extra => aox::i18n::t("Extra"),
+            SettingsTab::Model => aox::i18n::t("Model"),
             SettingsTab::Appearance => aox::i18n::t("Appearance"),
             SettingsTab::System => aox::i18n::t("System"),
             SettingsTab::About => aox::i18n::t("About"),

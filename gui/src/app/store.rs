@@ -545,5 +545,60 @@ impl App {
         self.rec.mark_busy();
         let _ = self.tx.send(ToAgent::Recovery(req));
     }
+
+    /// Send a model request (apply / scan) to the agent thread.
+    ///
+    /// One door for both, for the reason `send_recovery` exists: the "a save is in flight" state and the
+    /// validation of "an endpoint is needed before scanning" belong in one place, not in each of the four
+    /// controls that can ask for one (the panel's Scan button, the pop-up's Rescan, the pop-up's rows and
+    /// the panel's commits).
+    /// Hand back everything one frame's worth of the Model UI asked for.
+    ///
+    /// Apply first, then scan: the scan reads the endpoint from the form but the **saved** book entry is
+    /// only written when an apply succeeds, so a scan that arrives first would have nowhere to hang its
+    /// result if the endpoint is brand new.
+    pub(super) fn send_requests(&mut self, req: crate::model_ui::Requests) {
+        if let Some(edit) = req.apply {
+            self.send_model(crate::model_ui::Request::Apply(edit));
+        }
+        if let Some(scan) = req.scan {
+            self.send_model(crate::model_ui::Request::Scan(scan));
+        }
+        if let Some(probe) = req.test {
+            self.send_model(crate::model_ui::Request::Test(probe));
+        }
+        if req.open_settings {
+            self.settings_open = true;
+            self.settings_tab = SettingsTab::Model;
+        }
+    }
+
+    pub(super) fn send_model(&mut self, req: crate::model_ui::Request) {
+        if self.demo {
+            self.mdl.set_notice(
+                false,
+                aox::i18n::t("Demo mode: there is no agent thread behind this window.").into(),
+            );
+            return;
+        }
+        match req {
+            crate::model_ui::Request::Apply(edit) => {
+                let _ = self.tx.send(ToAgent::ApplyProvider(edit));
+            }
+            crate::model_ui::Request::Test(probe) => {
+                let _ = self.tx.send(ToAgent::TestModel {
+                    base_url: probe.base_url,
+                    api_key: probe.api_key,
+                    model: probe.model,
+                });
+            }
+            crate::model_ui::Request::Scan(req) => {
+                let _ = self.tx.send(ToAgent::ScanModels {
+                    base_url: req.base_url,
+                    api_key: req.api_key,
+                });
+            }
+        }
+    }
 }
 
