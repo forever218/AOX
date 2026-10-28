@@ -1131,7 +1131,13 @@ fn table(ui: &mut Ui, width: f32, header: &[String], rows: &[Vec<String>], base:
             // The column gap is controlled with add_space ourselves. `horizontal` would additionally
             // insert the style's item_spacing.x, and without zeroing it the whole table would exceed
             // its budget by (columns - 1) gaps and push out of the column.
-            ui.style_mut().spacing.item_spacing.x = 0.0;
+            //
+            // `item_spacing.y` goes to zero for the same reason, one step further: the separators
+            // below are drawn at `ui.cursor().min.y`, which is the top of the row **after** this one.
+            // With the default gap still in place that y sits a few pixels below the row's real
+            // bottom, so the line floats between the header and the first row and reads as an empty
+            // band. Zeroing it puts the line exactly on the boundary it is meant to mark.
+            ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
 
             for (ri, row) in std::iter::once(header)
                 .chain(rows.iter().map(|r| r.as_slice()))

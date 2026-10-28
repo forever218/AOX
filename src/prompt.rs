@@ -870,11 +870,16 @@ mod tests {
     }
 
     /// A disabled built-in segment must no longer appear in the final prompt.
+    ///
+    /// The positive half used to name `[Core Facts]`, a heading that the i18n rewrite had already
+    /// replaced with `[Work]` — so this test was failing for a reason that had nothing to do with
+    /// `disable`. It is pinned against the heading that really exists now: the point is "disabling
+    /// `protocol` removes that block and leaves `core` intact".
     #[test]
     fn disabled_builtin_text_is_gone() {
         let rt = rt_with(PromptConfig { disable: vec![PROTOCOL.into()], ..Default::default() });
         let out = build(&rt);
         assert!(!out.contains("[Plugin Protocol]"));
-        assert!(out.contains("[Core Facts]"));
+        assert!(out.contains("[Work]"), "the core segment must survive:\n{out}");
     }
 }
