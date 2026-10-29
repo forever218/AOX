@@ -68,6 +68,22 @@ const CLOSE_SECS: f32 = 0.15;
 /// How far the panel travels while it arrives and leaves: straight down, toward the chip it belongs
 /// to. Six pixels is enough to read as direction and small enough not to be seen as a slide.
 const SINK: f32 = 6.0;
+/// The foot's metric. All four actions share these, which is the whole point of them: the row used
+/// to be two ghost buttons (13.5 pt, 34 pt hot zone) followed by two bare labels (11 pt, text height
+/// only), so it changed type size, height and hover behaviour halfway along.
+///
+/// `FOOT_H` is [`crate::app::BTN_H`] so the panel's height is exactly what it was — the row got
+/// *narrower*, not taller.
+const FOOT_H: f32 = crate::app::BTN_H;
+/// 12 pt: a step under the 13.5 of a real button, because these are the panel's third-rate actions,
+/// and a step over the 11 of the meta text, because they are still things you click.
+const FOOT_SIZE: f32 = 12.0;
+/// Horizontal padding. Doubles as the **gap** between two neighbours (`item_spacing.x` is zeroed),
+/// so the row stays even however long one label is: 8 + 8 = 16 pt between them, whatever the text.
+/// The gutter in front of the row is `CARD_INSET + 2 - FOOT_PAD_X`, so the first label starts on
+/// `CARD_INSET + 2` — the same vertical line as the panel's own title and its caption lines.
+const FOOT_PAD_X: f32 = 8.0;
+const FOOT_RADIUS: u8 = 6;
 
 /// A rollback waiting for the second click.
 struct Ask {
@@ -116,6 +132,10 @@ pub struct RecoveryUi {
     /// The preview for `expanded`, once it arrives.
     plan: Option<PreviewView>,
     confirm: Option<Ask>,
+    /// "Clear every point in this workspace" is waiting for its answer. A separate flag rather than a
+    /// variant of [`Ask`]: that one carries per-row hazards (overwrite / partial / foreign) which mean
+    /// nothing here, and reusing it would make the rollback dialog's promises appear on a delete.
+    clear_ask: bool,
     /// The last thing that happened, shown inside the panel. `true` = it is a failure.
     notice: Option<(String, bool)>,
     /// A request is in flight.
@@ -147,6 +167,7 @@ impl RecoveryUi {
             detail_full_h: 0.0,
             plan: None,
             confirm: None,
+            clear_ask: false,
             notice: None,
             busy: false,
             waiting_turn: false,
@@ -587,33 +608,44 @@ impl RecoveryUi {
         }
 
         // ── foot ──
+        //
+        // Four actions, one shape (2026-10-28). They used to be two ghost buttons and two bare
+        // 11 pt labels: two type sizes, two hot-zone heights (34 pt vs. the text's own ~14), and two
+        // answers to "the pointer is on me" — a wash for the first pair, nothing at all for the
+        // second. A foot that changes shape halfway along reads as two groups, and the second group
+        // then reads as inert text that happened to be clickable.
+        //
+        // `horizontal_wrapped` rather than `horizontal`: on a narrow window the four labels are the
+        // first thing in this panel that can run out of width, and wrapping keeps the last one
+        // reachable where clipping would simply hide it.
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add_space(CARD_INSET - 2.0);
-            if flat_button(ui, aox::i18n::t("Verify")).clicked() {
+        ui.horizontal_wrapped(|ui| {
+            // The gap is each action's own padding, not `item_spacing`: that is what keeps the row
+            // even when one label is twice as long as its neighbour.
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.add_space(CARD_INSET + 2.0 - FOOT_PAD_X);
+            if foot_action(ui, aox::i18n::t("Verify"), Foot::Quiet).clicked() {
                 self.busy = true;
                 *out = Some(RecoveryReq::Verify);
             }
-            dot(ui);
-            if flat_button(ui, aox::i18n::t("Prune old points")).clicked() {
+            if foot_action(ui, aox::i18n::t("Prune old points"), Foot::Quiet).clicked() {
                 self.busy = true;
                 *out = Some(RecoveryReq::Prune);
             }
-            dot(ui);
             // The redo door is only lit when a safety snapshot is actually waiting; a permanently
-            // clickable "undo the undo" that answers "nothing to redo" teaches nothing.
-            let redo = ui.add_enabled(
-                self.view.redoable,
-                egui::Label::new(
-                    RichText::new(aox::i18n::t("Redo last rollback"))
-                        .size(11.0)
-                        .color(if self.view.redoable { P::text_dim() } else { P::quiet() }),
-                )
-                .sense(Sense::click()),
-            );
-            if redo.clicked() && self.view.redoable {
+            // clickable "undo the undo" that answers "nothing to redo" teaches nothing. Disabled,
+            // not hidden: the four actions must stay in one row, at one height, when one of them is
+            // not available.
+            if foot_action_ex(ui, aox::i18n::t("Redo last rollback"), Foot::Quiet, self.view.redoable)
+                .clicked()
+            {
                 self.busy = true;
                 *out = Some(RecoveryReq::Redo);
+            }
+            // Destructive, so it is the one item here in a colour: red at rest, and it opens a
+            // question instead of firing (see [`Self::clear_confirm`]).
+            if foot_action_ex(ui, aox::i18n::t("Clear history"), Foot::Danger, !self.busy).clicked() {
+                self.clear_ask = true;
             }
         });
         ui.add_space(9.0);
@@ -667,11 +699,13 @@ impl RecoveryUi {
         }
         let text_left = card.left() + 12.0;
         let title = if row.label.is_empty() { kind_word(row.kind).to_string() } else { row.label.clone() };
-        ui.painter().galley(
-            Pos2::new(text_left, card.top() + 9.0),
-            ui.painter().layout_no_wrap(elide(&title, 46), theme::body_font(13.0), P::text()),
-            P::text(),
-        );
+        // Elided by **width**, not by character count: `elide(&title, 46)` was eliding 46 *chars*,
+        // which is 46 Latin letters (~300 px) but 46 Chinese ones (~600 px) — so every Chinese message
+        // painted straight through the panel's right edge (user report, 2026-10-28). `crate::app::elide`
+        // measures with the same font that will be drawn.
+        let text_w = (card.right() - 12.0 - text_left).max(40.0);
+        let title_g = crate::app::elide(ui, &title, theme::body_font(13.0), P::text(), text_w);
+        ui.painter().galley(Pos2::new(text_left, card.top() + 9.0), title_g, P::text());
         let meta = if selected && self.busy {
             // The wait is reported **on the row's second line**, not under it: same height, same
             // width, no layout change — so the panel does not move while the store is read.
@@ -694,11 +728,8 @@ impl RecoveryUi {
                 status_word(row.status)
             )
         };
-        ui.painter().galley(
-            Pos2::new(text_left, card.top() + 30.0),
-            ui.painter().layout_no_wrap(meta, theme::body_font(11.0), P::text_dim()),
-            P::text_dim(),
-        );
+        let meta_g = crate::app::elide(ui, &meta, theme::body_font(11.0), P::text_dim(), text_w);
+        ui.painter().galley(Pos2::new(text_left, card.top() + 30.0), meta_g, P::text_dim());
         if hov {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
@@ -909,6 +940,62 @@ impl RecoveryUi {
         (ui.min_rect().bottom() - top + 8.0).max(0.0)
     }
 
+    /// The "clear every point" question. Nothing is deleted until this returns the request.
+    ///
+    /// A second modal rather than an inline confirm: the rows behind it are the thing being deleted,
+    /// and deleting them under a mis-click is not recoverable by a "cancel" that arrives 200 ms late.
+    pub fn clear_confirm(&mut self, ctx: &egui::Context) -> Option<RecoveryReq> {
+        if !self.clear_ask {
+            return None;
+        }
+        let mut answer = None;
+        let resp = egui::Modal::new(Id::new("aox-recovery-clear"))
+            .backdrop_color(P::scrim())
+            .frame(theme::raised(theme::card_radius()).inner_margin(Margin::symmetric(22, 18)))
+            .show(ctx, |ui| {
+                ui.set_width(430.0);
+                ui.label(
+                    RichText::new(aox::i18n::t(
+                        "This clears every rollback point in this workspace. Are you sure?",
+                    ))
+                    .color(P::text())
+                    .size(16.0)
+                    .strong(),
+                );
+                ui.add_space(6.0);
+                // The promise, and it is true: `gc::clear_all` moves the directories to the recycle
+                // bin through `SHFileOperationW` instead of erasing them.
+                ui.label(
+                    RichText::new(aox::i18n::t(
+                        "What it removes goes to the system recycle bin, so it can be restored from there.",
+                    ))
+                    .color(P::text_faint())
+                    .size(12.5),
+                );
+                ui.add_space(18.0);
+                if let Some(yes) =
+                    dialog_footer(ui, |ui| danger_button(ui, aox::i18n::t("Clear")).clicked())
+                {
+                    answer = Some(yes);
+                }
+            });
+        if resp.should_close() {
+            answer.get_or_insert(false);
+        }
+        match answer {
+            Some(true) => {
+                self.clear_ask = false;
+                self.busy = true;
+                Some(RecoveryReq::Clear)
+            }
+            Some(false) => {
+                self.clear_ask = false;
+                None
+            }
+            None => None,
+        }
+    }
+
     /// The second click. Returns the rollback request when the user really means it.
     pub fn confirm(&mut self, ctx: &egui::Context) -> Option<RecoveryReq> {
         let mut ask = self.confirm.take()?;
@@ -1078,8 +1165,71 @@ fn ring_shape(center: Pos2, box_size: f32) -> RingShape {
     }
 }
 
-fn dot(ui: &mut Ui) {
-    ui.label(RichText::new("·").size(11.0).color(P::edge_raised()));
+/// Which of the foot's two weights an action wears. Weight is in the **colour only** — the height,
+/// the type size, the padding and the hover wash are shared — so four different weights still read
+/// as one row. Same rule as [`crate::app::Weight`], at the panel's own scale.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Foot {
+    /// A third-rate action ("Verify", "Prune old points", "Redo last rollback").
+    Quiet,
+    /// Destructive, not armed yet ("Clear history").
+    Danger,
+}
+
+/// One action in the panel's foot: no chrome at rest, one fill step on hover, a hand cursor — the
+/// same language as a row and a toolbar icon, at one height for all four.
+///
+/// Hand-drawn instead of [`crate::app::flat_button`] for one measured reason: a ghost button is
+/// 13.5 pt with 12 pt of side padding, and four of those plus the gaps come to ~410 pt inside a
+/// 420 pt panel — the row would silently wrap or clip. These are 12 pt with 8, which fits with room
+/// to spare, and the different padding is invisible because the *height* is still [`FOOT_H`].
+fn foot_action(ui: &mut Ui, text: &str, kind: Foot) -> egui::Response {
+    foot_action_ex(ui, text, kind, true)
+}
+
+/// [`foot_action`], disabled rather than hidden: identical geometry, faint label, no click. Hiding
+/// one of four would re-space the other three on the frames a redo appears and disappears.
+fn foot_action_ex(ui: &mut Ui, text: &str, kind: Foot, enabled: bool) -> egui::Response {
+    // Measure first, then allocate from that size, then paint the backdrop, then the text — the
+    // order matters (see `app::widgets::paint_text_button`): painting the text first puts the hover
+    // wash **over** it and the label vanishes the moment the pointer arrives.
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        theme::body_font(FOOT_SIZE),
+        Color32::PLACEHOLDER,
+    );
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(galley.size().x + FOOT_PAD_X * 2.0, FOOT_H),
+        if enabled { Sense::click() } else { Sense::hover() },
+    );
+    let hov = enabled && pointer_if(ui, &resp);
+    if hov {
+        ui.painter().rect_filled(rect, CornerRadius::same(FOOT_RADIUS), P::hover_fill());
+    }
+    let (rest, lit) = match kind {
+        Foot::Quiet => (P::text_dim(), P::text()),
+        // Danger does not get louder on hover: a second shade of the same red would read as two
+        // different amounts of danger for one action.
+        Foot::Danger => (P::danger(), P::danger()),
+    };
+    let fg = if !enabled {
+        P::quiet()
+    } else if hov {
+        lit
+    } else {
+        rest
+    };
+    // Centred in both axes, so all four share one baseline — the same reason the buttons have a
+    // fixed height rather than growing from their padding.
+    ui.painter().galley(
+        Pos2::new(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        fg,
+    );
+    resp
 }
 
 fn count(ui: &mut Ui, word: &str, n: usize, color: Color32) {

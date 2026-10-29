@@ -722,12 +722,28 @@ pub fn chip(ui: &mut Ui, st: &mut ModelUi, enabled: bool) -> bool {
     clicked
 }
 
-/// The chip's mark: a rounded square with a smaller square inside — "a model is a box you talk to".
+/// The chip's mark: a **wireframe cube** — "a model is a box you talk to", drawn as an isometric box.
+///
+/// Outline only, on purpose: at 15pt a filled cube is a blob, and two squares (what this used to be)
+/// is not a box at all. The hexagon is the silhouette; the three edges meeting at the middle are what
+/// turn it into a box, and they are also what survives at this size when everything else mushes.
 fn paint_model_mark(p: &egui::Painter, r: Rect, fg: Color32) {
-    let outer = Rect::from_center_size(r.center(), Vec2::new(r.width() * 0.92, r.height() * 0.78));
-    p.rect_stroke(outer, CornerRadius::same(3), Stroke::new(1.3, fg), egui::StrokeKind::Inside);
-    let inner = Rect::from_center_size(r.center(), Vec2::splat(r.width() * 0.30));
-    p.rect_filled(inner, CornerRadius::same(1), fg);
+    let c = r.center();
+    let s = r.width() * 0.42;
+    let wx = s * 0.92;
+    let wy = s * 0.55;
+    let top = Pos2::new(c.x, c.y - s);
+    let ur = Pos2::new(c.x + wx, c.y - wy);
+    let lr = Pos2::new(c.x + wx, c.y + wy);
+    let bot = Pos2::new(c.x, c.y + s);
+    let ll = Pos2::new(c.x - wx, c.y + wy);
+    let ul = Pos2::new(c.x - wx, c.y - wy);
+    let st = Stroke::new(1.15, fg);
+    p.add(egui::Shape::closed_line(vec![top, ur, lr, bot, ll, ul], st));
+    // The front-top corner and its three edges: up-left, up-right, straight down.
+    p.line_segment([c, ul], st);
+    p.line_segment([c, ur], st);
+    p.line_segment([c, bot], st);
 }
 
 // ─────────────────────────── the pop-up (switch + tune) ───────────────────────────
@@ -1099,19 +1115,36 @@ fn config_row(ui: &mut Ui) -> egui::Response {
     resp
 }
 
-/// A small pencil: "this row opens the editor". Two strokes — at 12pt a drawn glyph would fill in,
-/// and the font may not have a pencil at all.
+/// A pen writing a line: "this row is where models are edited" (the reference glyph).
+///
+/// Outline, not a filled pencil: at 13pt the only thing that reads is the **diagonal body plus the
+/// line under it**, so those are drawn first and the cap/nib are one short stroke each — enough to
+/// say "pen", nothing that turns into a smudge at this size.
 fn paint_pencil(p: &egui::Painter, r: Rect) {
-    let st = Stroke::new(1.2, P::text_faint());
+    let st = Stroke::new(1.15, P::text_faint());
+    let k = r.width();
+    let at = |fx: f32, fy: f32| Pos2::new(r.left() + fx * k, r.top() + fy * k);
+    // The body runs lower-left → upper-right; `off` is its half width, perpendicular to that axis.
+    let off = Vec2::new(0.085 * k, 0.085 * k);
+    let nib = at(0.20, 0.74);
+    let cap = at(0.80, 0.14);
+    let body = vec![
+        Pos2::new(nib.x + off.x, nib.y + off.y),
+        Pos2::new(cap.x + off.x, cap.y + off.y),
+        Pos2::new(cap.x - off.x, cap.y - off.y),
+        Pos2::new(nib.x - off.x, nib.y - off.y),
+    ];
+    p.add(egui::Shape::closed_line(body, st));
+    // The ferrule: the line across the top end, which is what makes it a pen rather than a stick.
     p.line_segment(
-        [Pos2::new(r.left() + 2.0, r.bottom() - 2.0), Pos2::new(r.right() - 1.5, r.top() + 1.5)],
+        [
+            Pos2::new(cap.x + off.x - 0.10 * k, cap.y + off.y + 0.10 * k),
+            Pos2::new(cap.x - off.x - 0.10 * k, cap.y - off.y + 0.10 * k),
+        ],
         st,
     );
-    // The nib, at the lower-left end: without it the first stroke reads as a slash mark.
-    p.line_segment(
-        [Pos2::new(r.left() + 1.0, r.bottom() - 5.0), Pos2::new(r.left() + 5.0, r.bottom() - 1.0)],
-        st,
-    );
+    // What it just wrote.
+    p.line_segment([at(0.42, 0.92), at(0.94, 0.92)], st);
 }
 
 /// The green check: the only coloured mark in the model UI, and the one that answers "which one is in

@@ -23,6 +23,8 @@ pub enum RecoveryCmd {
     Status,
     Verify,
     Prune,
+    /// Drop every point in this workspace (into the recycle bin).
+    Clear,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -110,6 +112,7 @@ pub fn run(rt: &Arc<Runtime>, cmd: RecoveryCmd) -> Result<CommandReport, String>
         RecoveryCmd::Status => status(&root, &cfg),
         RecoveryCmd::Verify => verify(&root, &cfg),
         RecoveryCmd::Prune => prune(&root, &cfg),
+        RecoveryCmd::Clear => clear(&root, &cfg),
         RecoveryCmd::Rollback { target, yes, force, allow_partial } => {
             rollback(&root, &cfg, target.as_deref(), yes, force, allow_partial)
         }
@@ -326,6 +329,27 @@ fn verify(root: &std::path::Path, cfg: &crate::config::RecoveryConfig) -> Result
 /// mid-apply, which is the precondition GC has. Nothing here deletes a *current* before-image —
 /// `keep` bounds which undo steps exist, and the sweep only removes what no surviving node, baseline,
 /// safety snapshot or journal mentions.
+/// `clear` — drop every point in this workspace, into the recycle bin.
+fn clear(root: &std::path::Path, cfg: &crate::config::RecoveryConfig) -> Result<CommandReport, String> {
+    let store = match open(root, cfg, false) {
+        Ok(s) => s,
+        Err(e) if e.starts_with("no recovery points") => {
+            return Ok(CommandReport { text: e, restore: None })
+        }
+        Err(e) => return Err(e),
+    };
+    let _lock = store.lock().map_err(|e| e.to_string())?;
+    let (points, files) = super::gc::clear_all(&store).map_err(|e| format!("{e:#}"))?;
+    Ok(CommandReport {
+        text: crate::tf!(
+            "Cleared {} recovery point(s) and {} stored file(s). Both are in the system recycle bin and can be restored from there.",
+            points,
+            files
+        ),
+        restore: None,
+    })
+}
+
 fn prune(root: &std::path::Path, cfg: &crate::config::RecoveryConfig) -> Result<CommandReport, String> {
     let store = match open(root, cfg, false) {
         Ok(s) => s,

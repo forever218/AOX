@@ -313,6 +313,8 @@ pub enum RecoveryReq {
     Redo,
     Verify,
     Prune,
+    /// Drop every point in this workspace (into the recycle bin).
+    Clear,
 }
 
 /// What comes back.
@@ -725,6 +727,7 @@ fn recovery_request(agent: &mut Agent, tx: &mpsc::UnboundedSender<FromAgent>, re
         RecoveryReq::Redo => notice_from(cmd::run(&rt, cmd::RecoveryCmd::Redo)),
         RecoveryReq::Verify => notice_from(cmd::run(&rt, cmd::RecoveryCmd::Verify)),
         RecoveryReq::Prune => notice_from(cmd::run(&rt, cmd::RecoveryCmd::Prune)),
+        RecoveryReq::Clear => notice_from(cmd::run(&rt, cmd::RecoveryCmd::Clear)),
     };
     // A preview never changes the list; everything else might, so its answer is followed by a fresh
     // one. Decided **before** the view is moved into the channel.
@@ -1311,7 +1314,11 @@ async fn boot_and_run(
     // "Nothing has been chosen yet" rather than "there is no config.toml": since the model
     // configuration moved into `.aox/models.json`, a fresh install can perfectly well have a config
     // file and still need the panel (and the other way round).
-    let first_run = aox::modelbook::Book::load(&root).active.is_none();
+    //
+    // `mut` because it is **spent** by the first `boot` below: the "not configured" branch announces
+    // itself, and the `boot` that follows a successful save must not announce it a second time (see
+    // the reset after that first boot).
+    let mut first_run = aox::modelbook::Book::load(&root).active.is_none();
     if first_run {
         match std::fs::write(&config_path, aox::config::TEMPLATE) {
             Ok(()) => {
@@ -1468,6 +1475,10 @@ async fn boot_and_run(
             paths,
             first_run,
         );
+        // The "add your model" prompt has been handed to the UI. Spending the flag here is what
+        // stops the *second* `boot` (below, after the save makes the provider usable) from asking
+        // again — the "saved it, and now there is another one" report of 2026-10-28.
+        first_run = false;
         // Even in the "not ready" state, fill the plugin panel with what is on disk.
         restore_plugins(&mut ui, &rt).await;
         plugins_restored = true;

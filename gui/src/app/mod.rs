@@ -312,8 +312,23 @@ pub struct App {
     demo: bool,
     /// Whether the transcript auto-follows to the bottom
     follow: bool,
-    /// Force a scroll to the bottom for this message (right after the user sends a command)
+    /// A **lock** that holds the transcript at the bottom until it gets there.
+    ///
+    /// Set when the view must end up at the end no matter where it was: the user just sent a
+    /// message, a conversation was switched, the model asked something. It is **not** cleared on
+    /// the next frame — the scroll is animated and the content keeps growing while it runs (see
+    /// `App::transcript`), so a one-frame flag would be released half-way up. It clears itself once
+    /// the view is actually at the bottom, or as soon as the user pulls up, whichever comes first.
     force_follow: bool,
+    /// Where the view sat last frame, to notice "the user pulled up" (see [`Self::force_follow`]).
+    last_scroll_y: f32,
+    /// The "add your model" dialog has been offered once this launch.
+    ///
+    /// A second `Boot` carrying `first_run` (there are two on the not-configured path: one before the
+    /// save and one after it) must not open a second dialog. The bridge already spends the flag
+    /// before the second one; this is the local guarantee, so that the dialog cannot be stacked even
+    /// if the host starts sending it again.
+    setup_asked: bool,
     /// Whether the activity stream auto-follows
     /// Whether the settings dialog is open (the top bar's three buttons -- activity stream /
     /// theme / about -- have all been folded into it).
@@ -480,6 +495,8 @@ impl App {
             confirm: None,
             follow: true,
             force_follow: true,
+            last_scroll_y: 0.0,
+            setup_asked: false,
             settings_open: false,
             settings_tab: SettingsTab::Extra,
             log_error: None,
@@ -917,6 +934,12 @@ impl eframe::App for App {
         // Sits beside the name dialog: same layer, same "nothing happens until you answer" rule.
         self.confirm_overlay(ctx);
         if let Some(req) = self.rec.confirm(ctx) {
+            self.send_recovery(req);
+        }
+        // The other question the same panel can ask (clear every point). Drawn after the rollback
+        // one so it wins if both were somehow open; they never are, since each closes the other's
+        // trigger.
+        if let Some(req) = self.rec.clear_confirm(ctx) {
             self.send_recovery(req);
         }
         self.settings_overlay(ctx);

@@ -32,11 +32,22 @@ impl App {
                     self.status = if b.provider_ready { aox::i18n::t("Ready").to_string() } else { aox::i18n::t("No model configured").to_string() };
                     let ready = b.provider_ready;
                     // A fresh install lands here: `config.toml` was just written by the host, so the one
-                    // page that can make the window useful opens by itself, with the cursor in the key
+                    // thing that can make the window useful opens by itself, with the cursor in the key
                     // field. Doing nothing would leave a first-time user looking at a disabled input box
                     // and a sentence telling them to edit a file — the exact friction this removes.
-                    if b.first_run {
-                        self.settings_open = true;
+                    //
+                    // The **dialog alone** (2026-10-28, user request). It used to also open the settings
+                    // page, so an install's first screen was a modal on top of another modal saying the
+                    // same thing — two windows for one question. The page is one keystroke away if it is
+                    // ever wanted; the tab is still preselected, so opening Settings later lands on Model
+                    // rather than on whichever tab was last visited.
+                    //
+                    // Offered **once** per launch: the not-configured path boots twice (once before the
+                    // save, once after it), and both used to carry `first_run`, which is why saving left
+                    // a second, empty dialog on screen. The bridge now spends the flag on the first of
+                    // the two; this latch makes it impossible to stack the dialog even if it comes back.
+                    if b.first_run && !self.setup_asked {
+                        self.setup_asked = true;
                         self.settings_tab = SettingsTab::Model;
                         self.mdl.focus_key();
                     }
@@ -73,6 +84,9 @@ impl App {
                 // the chip in the input box, the "Model in use" row on the System tab, and the
                 // context ring's denominator — switching to a smaller model has to shrink the ring.
                 FromAgent::Provider(v) => {
+                    // Read before the update below overwrites it: "the window could not talk until
+                    // now" is the condition for dropping the notices that say so.
+                    let was_ready = self.boot.as_ref().is_some_and(|b| b.provider_ready);
                     self.model = v.model.clone();
                     if v.context_window > 0 {
                         self.context_window = u64::from(v.context_window);
@@ -88,6 +102,34 @@ impl App {
                     // feature is about.
                     if let Some(b) = self.boot.as_mut() {
                         b.provider_ready = v.ready;
+                    }
+                    // The window can talk for the first time: drop everything that said it could not.
+                    //
+                    // Those rows describe a **state**, not an event in a conversation — the template
+                    // notice, "LLM not ready: …", "Open Settings → Model and fill in the endpoint" and
+                    // the `log_error` card drawn by the empty state. Left in place they outlive their
+                    // truth: the user fills the dialog in, the session starts, and the first screen
+                    // still reads "no endpoint configured" (2026-10-28, user request).
+                    //
+                    // Guarded by `!was_ready` on purpose: switching models in the middle of a long
+                    // conversation also arrives here with `ready == true`, and that conversation's own
+                    // error rows are history, not a stale caption. Note that `Warn` rows survive —
+                    // "python is missing" has nothing to do with the model being configured.
+                    //
+                    // The two shapes are both here because the host says it twice: `Boot`'s `note`
+                    // becomes an `Item::Error` card, while `AgentEvent::Error` ("LLM not ready: …")
+                    // becomes an `Item::Note(Error)` line — clearing only one of them left half the
+                    // screen still claiming the model was unconfigured (seen in the first run of
+                    // this fix).
+                    if v.ready && !was_ready {
+                        self.log_error = None;
+                        self.items.retain(|i| {
+                            !matches!(
+                                i,
+                                Item::Error(_)
+                                    | Item::Note(NoteKind::Info | NoteKind::Error, _)
+                            )
+                        });
                     }
                     self.mdl.set_view(*v);
                 }
@@ -196,14 +238,16 @@ impl App {
                         // overwrite the grid would paint blocks the last request never sent.
                         cache::lock(&self.cache).observe_turn(&rec);
                         // The breakdown goes right after this turn's reply (by now the turn has
-                        // ended and the tail of `items` is exactly that), and drag the view to the
-                        // bottom while we're at it -- nobody goes looking for a row that appeared
-                        // out of nowhere.
+                        // ended and the tail of `items` is exactly that).
                         self.items.push(Item::Usage(usage_line(&rec)));
                         self.usage_log.push(*rec);
                         // A real reading is in: the post-compaction placeholder has done its job.
                         self.ctx_reset = None;
-                        self.force_follow = true;
+                        // No `force_follow`: the row lands at the tail, which the sticky scroll
+                        // already follows whenever the view is at the bottom. When it is not, the
+                        // user is reading history, and appending a line off-screen must not drag
+                        // them away from it (2026-10-28: forcing here is what made "read back, then
+                        // get yanked to the end when the turn finished" possible).
                     }
                 }
                 FromAgent::CallUsage { usage, last_prompt } => {
@@ -716,7 +760,6 @@ impl App {
                     // below the conversation instead of pretending it belongs to a call.
                     self.items.push(Item::Images(paths));
                 }
-                self.force_follow = true;
             }
             AgentEvent::Error(m) => {
                 self.note_act(ActKind::Error, aox::i18n::t("Error"), &m);
@@ -802,7 +845,10 @@ impl App {
         if !pending.is_empty() {
             let _ = self.tx.send(ToAgent::Act(pending));
         }
-        self.force_follow = true;
+        // The turn's rows are being swapped in for the live block here, so the content height
+        // changes either way; the sticky scroll keeps a view that is at the bottom at the bottom.
+        // Deliberately **not** `force_follow`: the user may be half-way up re-reading what the turn
+        // said, and finishing the turn must not yank them to the end.
     }
 }
 

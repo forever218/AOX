@@ -826,14 +826,40 @@ impl App {
                         // The viewport already ends above the card; this is breathing room for its
                         // top edge and shadow, not a second copy of the composer's height.
                         ui.add_space(TRANSCRIPT_BOTTOM_GAP);
+                        // `stick_to_bottom` **cannot** put a view that has scrolled up back at the
+                        // bottom: egui only honours the sticky flag while its own
+                        // `scroll_stuck_to_end` latch is set, and that latch drops the moment the
+                        // user scrolls away from the end (`scroll_area.rs`, "Once unstuck (false)
+                        // it remains false until the scroll touches the end position"). So after
+                        // "scroll up, then send a message" the row was appended below the viewport
+                        // and nothing followed it — reported 2026-10-28.
+                        //
+                        // Asking for the bottom explicitly is what actually moves it. `Some(BOTTOM)`
+                        // rather than `None`: `None` only scrolls "enough to be visible", which for
+                        // a viewport-tall block means the top of it, not the end of the column.
+                        if self.force_follow {
+                            ui.scroll_to_rect(ui.min_rect(), Some(Align::BOTTOM));
+                        }
                     });
                 });
             });
         let max = (out.content_size.y - out.inner_rect.height()).max(0.0);
-        self.follow = out.state.offset.y >= max - 48.0;
+        let y = out.state.offset.y;
+        // Did the user pull **up** this frame? A decrease in the offset can only come from them
+        // (our own `scroll_to_rect` and the sticky growth both push it down), and it has to be able
+        // to break the lock below -- otherwise a lock that never reaches the bottom (a wheel event
+        // racing the animation, a content height that keeps changing under it) would fight the
+        // wheel every frame and the list would feel frozen.
+        let pulled_up = y < self.last_scroll_y - 1.0;
+        self.last_scroll_y = y;
+        let at_bottom = y >= max - 48.0;
         if self.force_follow {
             self.follow = true;
-            self.force_follow = false;
+            if at_bottom || pulled_up {
+                self.force_follow = false;
+            }
+        } else {
+            self.follow = at_bottom;
         }
     }
 

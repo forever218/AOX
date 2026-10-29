@@ -213,6 +213,36 @@ pub fn collect(store: &RecoveryStore) -> RecoveryResult<Report> {
 }
 
 /// Trim, then sweep — what `/backup prune` means, and what a turn does when the store is filling up.
+/// Drop **every** point in this workspace's store, into the system recycle bin.
+///
+/// "Clear all" has no reference-counting question: nothing is kept, so `nodes/`, `objects/` and
+/// `baseline/` all go as whole directories. They are **recycled**, not erased (`SHFileOperationW`),
+/// which is what makes a mis-click recoverable from the desktop instead of final. The three
+/// directories are re-created immediately — `RecoveryStore::open` expects them to exist.
+///
+/// Returns `(points, stored files)` for the message the user reads.
+pub fn clear_all(store: &RecoveryStore) -> anyhow::Result<(usize, usize)> {
+    let dir = store.dir();
+    let points = std::fs::read_dir(dir.join("nodes"))
+        .map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().is_file()).count())
+        .unwrap_or(0);
+    let mut files = 0usize;
+    for sub in ["nodes", "objects", "baseline"] {
+        let p = dir.join(sub);
+        if !p.exists() {
+            continue;
+        }
+        files += crate::recycle::count_files(&p);
+        crate::recycle::recycle_blocking(&p)?;
+        std::fs::create_dir_all(&p)?;
+    }
+    // The head must forget itself too, or the next read follows an id whose node is in the bin.
+    let mut cursor = store.cursor().map_err(|e| anyhow::anyhow!("{e}"))?;
+    cursor.head = None;
+    store.save_cursor(&cursor).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok((points, files))
+}
+
 pub fn prune(store: &RecoveryStore, keep: usize) -> RecoveryResult<Report> {
     let mut report = trim(store, keep)?;
     let mut swept = collect(store)?;

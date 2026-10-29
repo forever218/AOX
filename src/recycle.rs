@@ -67,7 +67,7 @@ pub async fn recycle(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn recycle_blocking(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn recycle_blocking(path: &Path) -> anyhow::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::Foundation::S_OK;
@@ -118,7 +118,7 @@ fn recycle_blocking(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn recycle_blocking(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn recycle_blocking(path: &Path) -> anyhow::Result<()> {
     // No recycle bin to reach, so this is exactly the pre-2026-10-11 behaviour. Kept rather than
     // made into an error so that the crate still builds and its tests still run off-Windows; the
     // module note says so out loud rather than letting it surprise someone.
