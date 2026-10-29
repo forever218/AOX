@@ -61,6 +61,14 @@ pub struct Config {
     /// did not have before** — a command line, confined to the workspace by the host's command check.
     #[serde(default)]
     pub shell: ShellConfig,
+    /// The `[web]` section of `config.toml` (the built-in fetch tool, see `src/tool/web.rs`).
+    ///
+    /// The sixth distinct "how much", and the only one that points **outward**: `[sandbox]` limits
+    /// how a plugin process runs, `[workplace]` which files may be touched, `[plugins]` how long a
+    /// process lives, `[tools]` what the model is told exists, `[shell]` grants a command line, and
+    /// **this one grants one HTTP request** — with the reach limited by `[web] egress`.
+    #[serde(default)]
+    pub web: WebConfig,
     /// The `[plugins]` section of `config.toml` (lazy loading of plugin subprocesses, see
     /// `src/plugin/mod.rs`).
     ///
@@ -503,6 +511,14 @@ pub struct AuthConfig {
     /// read every file the user can read). Default `ask`, which after one "allow for this session"
     /// stops nagging — see the authorisation policy in `src/auth.rs`.
     pub shell: String,
+    /// ask | auto | deny — the **web tools** (`web_fetch`, and anything else in `NET_TOOLS`).
+    ///
+    /// A tier of its own rather than riding `plugin_tools`, for the same reason as `shell`: it is
+    /// the only capability that leaves the machine, so a user who wants to watch it should be able
+    /// to say so once. Default `auto` — `[web] egress` already keeps it narrower than the shell
+    /// (public internet only, no loopback), so a prompt on every page would buy little and cost a
+    /// click each time.
+    pub web: String,
     #[serde(default)]
     pub overrides: HashMap<String, String>,
 }
@@ -513,6 +529,7 @@ impl Default for AuthConfig {
             meta_tools: "ask".into(),
             plugin_tools: "auto".into(),
             shell: "ask".into(),
+            web: "auto".into(),
             overrides: HashMap::new(),
         }
     }
@@ -578,7 +595,7 @@ pub struct ToolsConfig {
     /// Registry size at or below which the whole list is sent (old behaviour). `0` = never hide
     /// plugin tools, ever — the permanent escape hatch.
     ///
-    /// The default (24) is picked so that the 16 host tools plus a handful of plugins stay fully
+    /// The default (24) is picked so that the 17 host tools plus a handful of plugins stay fully
     /// inline: discovery costs a round trip, and paying it to save a few hundred tokens is a bad
     /// trade. It starts paying when a registry holds dozens of tools.
     pub inline_max: usize,
@@ -1067,6 +1084,86 @@ impl Default for ShellConfig {
     }
 }
 
+/// The built-in **web tool** (`config.toml`'s `[web]`, see `src/tool/web.rs` + `src/web/`).
+///
+/// # What this section is, and is not
+///
+/// It governs the first capability the host hands the model that points **outward**: one URL in, some
+/// text out. It is deliberately not called a boundary. The shell tool can already reach every host
+/// this machine can reach; `web_fetch` narrows the *easy* path (a prompt-free GET to
+/// `http://127.0.0.1:<port>/admin` is exactly what the shell's `ask` tier exists to prevent), which
+/// is why [`egress`](WebConfig::egress) defaults to `public` rather than `any`.
+///
+/// # Why so many keys
+///
+/// Every one of them answers a failure that has a *readable* fix: a GB18030 page that came back as
+/// mojibake, an intranet CA rustls does not know, a 40 MB PDF behind `save`, a page that needs a
+/// browser. The tool's error text names the key, so the config is part of the interface.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Master switch. `false` = the tool is never registered, so the model never sees it.
+    pub enabled: bool,
+    /// Which hosts may be reached: `public` (default) | `any` | `allowlist`.
+    ///
+    /// - `public` refuses loopback, RFC1918, link-local, CGNAT, multicast and unspecified addresses;
+    /// - `any` refuses nothing (the shell's effective reach, minus non-http schemes);
+    /// - `allowlist` refuses everything except [`hosts`](WebConfig::hosts).
+    ///
+    /// `hosts` doubles as the exception list for `public`: a local dev server needs its host there.
+    pub egress: String,
+    /// Exceptions (`public`) or the whole list (`allowlist`).
+    ///
+    /// Matching is on label boundaries: `example.com` also matches `www.example.com`;
+    /// `*.example.com` matches subdomains only; `127.0.0.1` matches the literal address only.
+    /// Ports are not part of the match.
+    pub hosts: Vec<String>,
+    /// Default per-result character budget.
+    pub max_chars: usize,
+    /// Ceiling for an explicit `max_chars` in the call.
+    pub hard_max_chars: usize,
+    /// Body cap for text-ish responses, counted **after** decompression.
+    pub max_bytes: usize,
+    /// Body cap for `save = true` (PDFs, images, archives).
+    pub max_save_bytes: usize,
+    /// Default total deadline for one call, in seconds.
+    pub timeout_secs: u64,
+    /// Ceiling for the call's own `timeout_secs`.
+    pub max_timeout_secs: u64,
+    /// How many redirect hops are followed before giving up.
+    pub max_redirects: u32,
+    /// The `User-Agent` sent with every request. Empty = the built-in default.
+    pub user_agent: String,
+    /// What to try when nothing declares an encoding: `gb18030` (default) | `windows-1252` | `none`.
+    pub charset_fallback: String,
+    /// Extra PEM roots for an intranet CA. `rustls` uses the bundled webpki roots, not the Windows
+    /// certificate store, so a corporate root has to be pointed at explicitly.
+    pub ca_bundle: String,
+    /// Accept invalid certificates. A last resort, and documented as one.
+    pub insecure_tls: bool,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            egress: "public".into(),
+            hosts: Vec::new(),
+            max_chars: 12_000,
+            hard_max_chars: 48_000,
+            max_bytes: 4 * 1024 * 1024,
+            max_save_bytes: 32 * 1024 * 1024,
+            timeout_secs: 30,
+            max_timeout_secs: 60,
+            max_redirects: 5,
+            user_agent: String::new(),
+            charset_fallback: "gb18030".into(),
+            ca_bundle: String::new(),
+            insecure_tls: false,
+        }
+    }
+}
+
 /// **Lazy loading of plugin subprocesses** (`config.toml`'s `[plugins]`, see `src/plugin/mod.rs`).
 ///
 /// # What problem it solves
@@ -1544,6 +1641,7 @@ impl Config {
             loop_config: LoopConfig::default(),
             sandbox: SandboxConfig::default(),
             shell: ShellConfig::default(),
+            web: WebConfig::default(),
             plugins: PluginsConfig::default(),
             tools: ToolsConfig::default(),
             workplace: WorkplaceConfig::default(),

@@ -50,6 +50,7 @@ mod store;
 mod task;
 mod tool;
 mod ui;
+mod web;
 mod workplace;
 
 use std::path::{Path, PathBuf};
@@ -426,6 +427,16 @@ async fn main() -> Result<()> {
         }
     }
 
+    // The built-in web tool (`src/tool/web.rs`). Registered like the file tools: the host owns the
+    // schema and the execution, so "one charset decision, one byte cap, one envelope" is the same in
+    // the CLI and the GUI. `[web] enabled = false` leaves it unregistered — the difference between
+    // "not advertised" and "advertised then refused".
+    if rt.config.web.enabled {
+        for t in tool::web::web_tools(&rt.config.web) {
+            rt.register(t).await?;
+        }
+    }
+
     let mut ui = CliUi::new();
 
     // Print the banner **before** restoring plugins. Restore is the one startup step that can
@@ -687,6 +698,7 @@ async fn main() -> Result<()> {
                 Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
             },
             "/shell" => ui.emit(AgentEvent::Info(tool::shell::report(&rt))),
+            "/web" => ui.emit(AgentEvent::Info(tool::web::report(&rt))),
             "/new" => {
                 // The same path as the "+" button on the GUI top bar. The old
                 // conversation needs no save action — it has been appended to all
@@ -760,6 +772,10 @@ async fn main() -> Result<()> {
                     (
                         "/shell",
                         crate::i18n::t("Show the built-in command line: dialects, boundary, limits (config.toml's [shell])"),
+                    ),
+                    (
+                        "/web",
+                        crate::i18n::t("Show the built-in fetch tool: reach, budget, timeout (config.toml's [web])"),
                     ),
                     (
                         "/workplace",

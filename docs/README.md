@@ -21,6 +21,7 @@ about to change code.
 | [`SANDBOX.md`](SANDBOX.md) | **The fence line** — what a plugin subprocess is actually blocked from doing right now, and what blocking more would cost (the ①/②a/②b/③/④ option comparison) | ① Job Object + ③ workplace boundary implemented, awaiting acceptance; ②a / ②b / ④ not built | [✓](SANDBOX.zh-CN.md) |
 | [`COMPONENT-CONTRIBUTIONS.md`](COMPONENT-CONTRIBUTIONS.md) | **Stage 6b** — plugins are no longer just "add a tool": how components contribute hooks, themes, prompts and tools | shipped | [✓](COMPONENT-CONTRIBUTIONS.zh-CN.md) |
 | [`I18N.md`](I18N.md) | **Internationalisation** — one language, one distribution: the `t()` / `tf!` pipeline, `AOX_LANG`, the catalogue rules | shipped (copy phase complete) | [✓](I18N.zh-CN.md) |
+| [`WEB.md`](WEB.md) | **The web tool** — `web_fetch`: reach (`[web] egress`), readable extraction, cursors, and what it is *not* (a network boundary) | M2 + prompt shipped; finished — the cache, the JS renderer and `web_search` were each scoped and dropped (D5, D10, D11) | [✓](WEB.zh-CN.md) |
 | [`UI-CUSTOMIZATION.md`](UI-CUSTOMIZATION.md) | **Charter**: the UI seam — element ids, property overrides, named slots, sandboxed patches | **chartered, deferred** (2026-10-03) | [✓](UI-CUSTOMIZATION.zh-CN.md) |
 | [`SUBAGENT.md`](SUBAGENT.md) | **Charter**: subagents — self-spawning a headless instance, the protocol, the three isolation axes, the auth policy | **chartered, deferred** (2026-10-09) | [✓](SUBAGENT.zh-CN.md) |
 

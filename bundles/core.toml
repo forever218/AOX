@@ -14,6 +14,7 @@
 bundles = [
     "llm-openai",     # model endpoint: the OpenAI-compatible protocol
     "tools",          # tools, the plugin runtime, and their default authorization tiers
+    "web",            # the built-in fetch tool: reach, budget, escape hatches
     "store-jsonl",    # storage: one file per conversation
     "recovery",       # task-level file checkpoints and /rollback
     "loop-standard",  # loop: the standard main loop, with no hooks at all

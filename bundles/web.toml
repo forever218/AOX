@@ -1,0 +1,54 @@
+# web -- the built-in fetch tool (`web_fetch`): reach, budget, and the escape hatches.
+#
+# Every value written here **equals the default in the code** (the `#[serde(default)]` on
+# `WebConfig`). The reason is the same as tools.toml's: `aox --dump-config` can then show
+# "which layer this value came from" instead of labelling everything "default (code)".
+# `core_equals_code_defaults` in `src/config/layer.rs` compares them field by field, so a change
+# that is not kept in sync goes red.
+#
+# What this section is *not*: a network boundary. The shell tool can reach every host this machine
+# can reach. What `egress` does is keep the new, prompt-free path from being wider than the old,
+# prompt-gated one -- see docs/WEB.md.
+
+[web]
+# false = the tool is never registered, so the model never sees it (not "registered then refused").
+enabled = true
+
+# public | any | allowlist
+#   public    -- refuse loopback, RFC1918, link-local, CGNAT, multicast, unspecified
+#   any       -- refuse nothing (the shell's effective reach, minus non-http schemes)
+#   allowlist -- refuse everything except `hosts`
+egress = "public"
+
+# Exceptions for `public`, or the whole list for `allowlist`.
+# Matching is on label boundaries: "example.com" also matches "www.example.com";
+# "*.example.com" matches subdomains only. Ports are not part of the match.
+# A local dev server is one line: hosts = ["127.0.0.1"]
+hosts = []
+
+# Default per-result character budget, and the ceiling an explicit max_chars may ask for.
+# Both are still clamped by [agent] max_result_chars (see the tool's own note).
+max_chars = 12000
+hard_max_chars = 48000
+
+# Body caps, counted after decompression: text-ish responses, then save = true.
+max_bytes = 4194304
+max_save_bytes = 33554432
+
+# One call's deadline; a call may ask for less, never more than the ceiling.
+timeout_secs = 30
+max_timeout_secs = 60
+
+# Redirect hops followed before giving up. Every hop is checked against `egress` again.
+max_redirects = 5
+
+# Empty = the built-in "AOX/0.1 (local agent)". Change it if a site blocks the default.
+user_agent = ""
+
+# What to try when nothing declares an encoding: gb18030 | windows-1252 | none.
+charset_fallback = "gb18030"
+
+# Extra PEM roots, for an intranet CA. rustls uses the bundled webpki roots, NOT the Windows
+# certificate store, so a corporate root has to be named here (or install with insecure_tls).
+ca_bundle = ""
+insecure_tls = false

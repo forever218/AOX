@@ -1237,3 +1237,27 @@
 "This clears every rollback point in this workspace. Are you sure?" = "这会清理当前工作空间的所有回滚点，确认吗"
 "What it removes goes to the system recycle bin, so it can be restored from there." = "清掉的内容会进系统回收站，可以从回收站找回。"
 "Cleared {} recovery point(s) and {} stored file(s). Both are in the system recycle bin and can be restored from there." = "已清空 {} 个还原点和 {} 个内容文件。它们都进了系统回收站，可以从那里恢复。"
+
+# ── /web（内置抓取工具）─────────────────────────────────────────────
+"Web (config.toml's [web])\n\n" = "Web（config.toml 的 [web]）\n\n"
+"  status: off — the tool is not registered, the model never sees it\n" = "  状态：已关闭 —— 工具不注册，模型看不到它\n"
+"不做地址分类（含内网地址）" = "任意 http(s) 主机，含内网地址"
+"允许 {} 个主机，其余全拒" = "白名单 —— {} 个主机，其余全拒"
+"回环 / RFC1918 / 链路本地一律拒绝；[web] hosts 里有 {} 个例外" = "公网 —— 回环 / RFC1918 / 链路本地一律拒绝；[web] hosts 里有 {} 个例外"
+"  tools: {}\n" = "  工具：{}\n"
+"  egress: {} — {}\n" = "  出口：{} —— {}\n"
+"  budget: {} chars per result (ceiling {} — [agent] max_result_chars − {}), body {} (save {})\n" = "  预算：单次结果 {} 字符（上限 {} = [agent] max_result_chars − {}），正文 {}（save {}）\n"
+"  timeout: {} s per call (cap {}) | redirects {}\n" = "  超时：单次 {} 秒（上限 {}）｜重定向 {}\n"
+"  charset: {} fallback | TLS: {}\n" = "  编码：兜底 {}｜TLS：{}\n"
+"verification OFF (insecure_tls)" = "已关闭证书校验（insecure_tls）"
+"bundled roots + [web] ca_bundle ({})" = "内置根证书 + [web] ca_bundle（{}）"
+"bundled roots (the Windows store is not read)" = "内置根证书（不读 Windows 证书库）"
+"  downloads: {} ({} cap)\n" = "  下载目录：{}（上限 {}）\n"
+"  no search tool (D11): a results page is HTML — fetch it, e.g. https://cn.bing.com/search?q=...\n" = "  没有搜索工具（D11）：结果页本身就是 HTML —— 直接抓，例如 https://cn.bing.com/search?q=…\n"
+"  modes: readable (default) / text / links / json / raw\n" = "  模式：readable（默认）/ text / links / json / raw\n"
+"  This is a guard rail, not a network boundary: shell reaches the same hosts. See docs/WEB.md.\n" = "  这是护栏，不是网络边界：shell 本来就能到同样的主机。见 docs/WEB.md。\n"
+"Show the built-in fetch tool: reach, budget, timeout (config.toml's [web])" = "查看内置抓取工具：可达范围、预算、超时（config.toml 的 [web]）"
+
+# ── JavaScript 页面 ────────────────────────────────────────────────
+"  JavaScript: not run — a client-rendered page comes back nearly empty (use mode=\"text\" there)\n" = "  JavaScript：不执行 —— 客户端渲染的页面会几乎是空的（这种页面用 mode=\"text\"）\n"
+"[the page looks empty — it may be rendered by JavaScript, which this tool does not run; try mode=\"text\" to see the raw body, or fetch a different source]" = "[这一页看起来是空的 —— 它可能是由 JavaScript 渲染的，而本工具不执行脚本；用 mode=\"text\" 看原始正文，或者换一个来源]"

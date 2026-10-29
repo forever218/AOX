@@ -10,6 +10,7 @@ pub mod scope;
 pub mod shell;
 pub mod task;
 pub mod verify;
+pub mod web;
 
 use std::sync::Arc;
 
@@ -313,7 +314,7 @@ mod tests {
     /// executes is a comment, not a fact. Adding a host tool now breaks this test first.
     #[test]
     fn the_quoted_host_tool_count_matches_reality() {
-        const DOCUMENTED: usize = 16;
+        const DOCUMENTED: usize = 17;
         let n = meta::meta_tools().len()
             + hostfs::host_file_tools().len()
             + ask::ask_tools().len()
@@ -321,7 +322,8 @@ mod tests {
             + task::task_tools().len()
             + verify::verify_tools().len()
             + shell::shell_tools(&crate::config::ShellConfig::default()).len()
-            + job::job_tools().len();
+            + job::job_tools().len()
+            + web::web_tools(&crate::config::WebConfig::default()).len();
         assert_eq!(n, DOCUMENTED, "update every doc that quotes the host tool count");
     }
 }

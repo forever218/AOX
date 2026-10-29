@@ -63,6 +63,14 @@ const SHELL_TOOLS: [&str; 3] = [
     crate::tool::job::JOB_TOOL,
 ];
 
+/// The host's **network** tools — the names `[auth] web` governs.
+///
+/// Same shape and the same reasoning as [`SHELL_TOOLS`]: a name list, not "every `ToolKind::Host`
+/// tool", because one switch for "reach the internet" must not also gate `read_file`. It is a list
+/// of one, and it stays a list: a tier now means a second network tool inherits it instead of
+/// needing an override per tool name later.
+const NET_TOOLS: [&str; 1] = [crate::tool::web::WEB_TOOL];
+
 /// The policy decided by `config.toml [auth]`: overrides win (by tool name, then
 /// by plugin name), otherwise the tool's category default applies.
 ///
@@ -81,6 +89,8 @@ pub struct ConfigPolicy {
     /// gates is not "a tool that does one job" but "arbitrary programs, plus the ability to read
     /// every file the user can read". See [`SHELL_TOOLS`].
     shell: AuthLevel,
+    /// The **network** tools' own tier (`[auth] web`). See [`NET_TOOLS`].
+    web: AuthLevel,
     overrides: HashMap<String, AuthLevel>,
     /// The overrides carrying a `*` (stored as the prefix with `*` stripped),
     /// sorted by prefix **longest first** — the more specific one hits first:
@@ -110,6 +120,7 @@ impl ConfigPolicy {
             meta: AuthLevel::parse(&cfg.meta_tools),
             plugin: AuthLevel::parse(&cfg.plugin_tools),
             shell: AuthLevel::parse(&cfg.shell),
+            web: AuthLevel::parse(&cfg.web),
             overrides,
             wildcards,
         }
@@ -175,6 +186,9 @@ impl Policy for ConfigPolicy {
             // The command line gets its own tier: it is neither "modify the host" nor "one designed
             // job". `[auth.overrides] shell = "auto"` (step ①) still wins over this.
             ToolKind::Host if SHELL_TOOLS.contains(&tool_name) => self.shell,
+            // The network's own tier, for the same reason: one HTTP request is not "a designed job"
+            // in the plugin sense, and it is the only capability that leaves the machine.
+            ToolKind::Host if NET_TOOLS.contains(&tool_name) => self.web,
             ToolKind::Host | ToolKind::Plugin(_) => self.plugin,
         }
     }
@@ -189,6 +203,7 @@ mod tests {
             meta_tools: "ask".into(),
             plugin_tools: "deny".into(),
             shell: "ask".into(),
+            web: "auto".into(),
             overrides: [
                 ("create_plugin".to_string(), "auto".to_string()),
                 ("myplugin".to_string(), "ask".to_string()),
@@ -250,6 +265,7 @@ mod tests {
             meta_tools: "ask".into(),
             plugin_tools: "auto".into(),
             shell: "ask".into(),
+            web: "auto".into(),
             overrides: pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect(),
         }
     }

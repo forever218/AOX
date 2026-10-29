@@ -447,6 +447,44 @@ track_changes = true      # report which workspace files the call changed
 # There is deliberately no `boundary` switch: the only layer is the host's command scan, and
 # docs/SHELL.md records why a kernel-enforced version was measured not to hold.
 
+[web]
+# ── the built-in fetch tool (`web_fetch`) ─────────────────────────────────────────
+#
+# One URL in, text out. Read `docs/WEB.md` before tightening anything here: the short version is
+# that this is a **guard rail, not a network boundary** — the shell tool reaches the same hosts.
+# What `egress` buys is that the new, prompt-free path is never wider than the old, prompt-gated one.
+
+enabled = true            # false = the tool is never registered; the model never sees it
+
+# public | any | allowlist
+#   public    = refuse loopback, RFC1918, link-local, CGNAT, multicast, unspecified (the default)
+#   any       = refuse nothing (what the shell can effectively reach)
+#   allowlist = refuse everything except `hosts`
+egress = "public"
+
+# Exceptions for `public`, or the whole list for `allowlist`.
+# Matching is on label boundaries: "example.com" also matches "www.example.com",
+# "*.example.com" matches subdomains only. A local dev server is one line:
+#   hosts = ["127.0.0.1"]
+hosts = []
+
+max_chars = 12000         # default per-result budget (still clamped by [agent] max_result_chars)
+hard_max_chars = 48000    # ceiling for an explicit max_chars
+max_bytes = 4194304       # text/HTML body cap, counted after decompression
+max_save_bytes = 33554432 # save = true cap (PDFs, images, archives)
+timeout_secs = 30         # total per call; a call may ask for less, never more than the ceiling
+max_timeout_secs = 60
+max_redirects = 5         # every hop is checked against `egress` again
+
+
+user_agent = ""           # empty = "AOX/0.1 (local agent)"; set it if a site blocks the default
+charset_fallback = "gb18030"  # gb18030 | windows-1252 | none — tried when nothing declares one
+
+# rustls uses the bundled roots, NOT the Windows certificate store. An intranet root has to be
+# named here (PEM), or accepted with insecure_tls — which is a last resort, not a setting.
+ca_bundle = ""
+insecure_tls = false
+
 [runtimes]
 # Plugin runtime commands (the python plugin / node plugin / rust plugin compiler).
 #

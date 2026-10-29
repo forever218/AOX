@@ -23,6 +23,8 @@ meta_tools = "deny"
 # Tools from plugins the model built for itself are no longer allowed automatically; every one
 # of them needs your nod.
 plugin_tools = "ask"
+# Reaching the network is not automatic either: every fetch asks once, then the session remembers.
+web = "ask"
 
 [agent]
 # Tool timeout tightened from the factory 60 seconds to 30.

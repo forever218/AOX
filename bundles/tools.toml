@@ -19,6 +19,10 @@
 meta_tools = "ask"
 # Tools from plugins the model built for itself: ask | auto | deny
 plugin_tools = "auto"
+# The built-in web tool (web_fetch): ask | auto | deny
+# It has its own tier because it is the only capability that leaves the machine; `[web] egress`
+# already keeps it narrower than the shell, so the default is auto rather than ask.
+web = "auto"
 # To allow or block by tool name / plugin name, write under [auth.overrides]:
 #   shell_exec = "ask"    exact match
 #   fs_*       = "deny"   prefix wildcard (prefix only, so `fs*` hits fsx as well)

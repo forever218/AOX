@@ -430,6 +430,7 @@ fn builtin(name: &str) -> Option<&'static str> {
         "core" => include_str!("../../bundles/core.toml"),
         "llm-openai" => include_str!("../../bundles/llm-openai.toml"),
         "tools" => include_str!("../../bundles/tools.toml"),
+        "web" => include_str!("../../bundles/web.toml"),
         "store-jsonl" => include_str!("../../bundles/store-jsonl.toml"),
         "recovery" => include_str!("../../bundles/recovery.toml"),
         "loop-standard" => include_str!("../../bundles/loop-standard.toml"),
@@ -879,7 +880,7 @@ api_key = "k"
         let s = compose(&dir, &dir.join("config.toml"), None, None).unwrap().layer_summary();
         assert!(s.contains("bundle:loop-standard (0 values)"), "an empty bundle should show 0: {s}");
         assert!(s.contains("bundle:core (0 values)"), "an aggregator carries no values itself: {s}");
-        assert!(s.contains("8 layers in total"), "six leaves + core + config.toml: {s}");
+        assert!(s.contains("9 layers in total"), "seven leaves + core + config.toml: {s}");
         assert!(!s.contains("no aox.toml"), "that sentence must not appear when aox.toml exists: {s}");
 
         let one = compose(&dir, &dir.join("config.toml"), Some(&dir.join("nope.toml")), None);

@@ -34,8 +34,8 @@ profile = "default"
 
 [profiles.default]
 # The factory choice. `core` is an aggregator name: it carries no values of its own and expands
-# into five leaf bundles:
-#     llm-openai + tools + store-jsonl + loop-standard + prompt-core
+# into seven leaf bundles:
+#     llm-openai + tools + web + store-jsonl + recovery + loop-standard + prompt-core
 # The contents live in bundles/*.toml as plain text you can read directly.
 #
 # **To change the factory choice, don't edit core** -- swap the list here, or stack a patch.

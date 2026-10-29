@@ -1433,6 +1433,13 @@ async fn boot_and_run(
             rt.register(t).await?;
         }
     }
+    // The built-in web tool (`aox::tool::web`): same schema, same envelope, same limits as the CLI.
+    // `[web] enabled = false` leaves it unregistered.
+    if rt.config.web.enabled {
+        for t in aox::tool::web::web_tools(&rt.config.web) {
+            rt.register(t).await?;
+        }
+    }
     for t in aox::tool::verify::verify_tools() {
         rt.register(t).await?;
     }

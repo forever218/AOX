@@ -45,4 +45,5 @@ pub mod sysinfo;
 pub mod task;
 pub mod tool;
 pub mod ui;
+pub mod web;
 pub mod workplace;

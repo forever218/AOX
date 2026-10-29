@@ -58,6 +58,13 @@ impl Guard {
     /// workplace boundary, not a promise that calling twice is harmless — and shell tools are
     /// excluded outright (they have side effects nobody can see).
     pub async fn eligible(rt: &Arc<Runtime>, name: &str) -> bool {
+        // `web_fetch` is a read by the workplace's definition (it touches no model-chosen path), but
+        // "the same URL twice returns the same thing" is false: a page changes between two calls, and
+        // the whole point of fetching it again is to see the new version. Suppressing the second call
+        // would silently replace a fresh result with a stale "you already asked that".
+        if name == crate::tool::web::WEB_TOOL {
+            return false;
+        }
         matches!(rt.tool_kind(name).await, Some(ToolKind::Host)) && rt.tool_access(name).await == Access::Read
     }
 
