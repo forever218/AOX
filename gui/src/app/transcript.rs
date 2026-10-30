@@ -753,6 +753,33 @@ pub(super) fn has_reasoning(text: &str) -> bool {
     !text.trim().is_empty()
 }
 
+/// Is the reasoning band (the four faint lines at the bottom of the live area) on screen?
+///
+/// Only while the model is **thinking and not yet writing** (2026-10-30). `typing` is "there is body
+/// text on screen right now", and the moment it is true the band goes: what it still holds is the
+/// tail of the reasoning that *led to* this answer, i.e. the last thoughts before the model decided
+/// to write — sitting under a reply that is already being printed. Reported with a screenshot: one
+/// leftover thinking line plus a "Thinking 16.4s · ~2,637 tok" head below a finished-looking answer.
+///
+/// It comes back on its own during a tool run: narration clears the body text (`InterimText`), so the
+/// band reappears next to the calls it explains — where it is not stale and nothing is streaming past
+/// it.
+pub(super) fn thinking_band_visible(reasoning: bool, typing: bool) -> bool {
+    reasoning && !typing
+}
+
+/// Does the live area draw the spinner-and-"Thinking" head above its readouts?
+///
+/// Two ways to earn it, and **both are about telling the truth**:
+///
+/// - the reasoning band is on screen — the head is then its caption;
+/// - or the status says something that is not the default "Thinking" ("Running shell_exec",
+///   "Retrying in 3 s", "Waiting for your approval"…). Those are facts, and hiding them would leave
+///   a stalled turn with nothing to explain it.
+pub(super) fn thinking_head_visible(status: &str, thinking: bool) -> bool {
+    thinking || (!status.is_empty() && status != aox::i18n::t("Thinking"))
+}
+
 pub(super) fn compact_json(v: &serde_json::Value) -> String {
     let s = serde_json::to_string(v).unwrap_or_else(|_| v.to_string());
     clamp_str(&s, 300)
@@ -991,16 +1018,38 @@ impl App {
             ui.add_space(14.0);
         }
 
+        // The spinner, the "Thinking" line and the reasoning band all belong to **actual** thinking.
+        //
+        // ① A model that sends no `reasoning_content` sat behind a spinning ring and the word
+        //    "Thinking" for the whole turn — an animation claiming work that never happened.
+        // ② Once the answer starts typing, they are **stale**: the band still showed the tail of the
+        //    reasoning (the last thoughts before the model decided to write) underneath the answer
+        //    that is already being printed — reported 2026-10-30 with a screenshot: one leftover
+        //    thinking line plus "Thinking 16.4s ~2,637 tok" below a finished-looking reply.
+        // ③ Both are the **last** things in the live area, so every delta of a fast answer pushed
+        //    them one line further down: they shook for the length of the reply.
+        //
+        // So the band (and its caption) is drawn only while the model is **thinking and not yet
+        // writing**: there is reasoning text and no body text on screen. The moment the first body
+        // delta lands, thinking leaves the stage — the answer is the thing to read then. A status
+        // that is not the default still shows its head regardless ("Running shell_exec",
+        // "Retrying in 3 s" are facts, not decoration); those never coincide with a body stream,
+        // because a retry clears it and a running call has narration, not typing.
+        let reasoning = has_reasoning(&l.reasoning);
+        let thinking = thinking_band_visible(reasoning, !l.streaming.trim().is_empty());
+        let show_head = thinking_head_visible(&l.status, thinking);
         // waiting animation + status
         ui.horizontal(|ui| {
-            spinner_dot(ui, spin, P::ink());
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(if l.status.is_empty() { aox::i18n::t("Thinking") } else { &l.status })
-                    .color(P::text_dim())
-                    .size(15.0),
-            );
-            ui.add_space(8.0);
+            if show_head {
+                spinner_dot(ui, spin, P::ink());
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(if l.status.is_empty() { aox::i18n::t("Thinking") } else { &l.status })
+                        .color(P::text_dim())
+                        .size(15.0),
+                );
+                ui.add_space(8.0);
+            }
             // The **call's** clock while a call is running, the turn's otherwise. A running call is
             // the one case where "how long has this been going" has an answer the user can act on,
             // and it needs its ceiling right next to it: `0:47 / 2:00` says "fine", `1:58 / 2:00`
@@ -1058,28 +1107,26 @@ impl App {
         // height below), and at the end of the turn the whole live block is replaced by the process
         // card, which carries the reasoning in its own place. So the height still moves at most
         // once, and only when there is something to show.
+        // The reasoning band is a **transparent** enclosure (2026-10-30): the card (`code_bg` fill
+        // plus a 1px `border` stroke) is gone, and only the text is left. Everything else is
+        // untouched on purpose -- the band's height (4 lines + 26), the 16/13 inner inset (so the
+        // text keeps its indent and its left/right width), the clipping, the font and the faint
+        // colour all stay exactly as they were, and so does the 12/16 spacing around it. What is
+        // gone is only the box drawn *behind* the words.
         const THINK_LINES: usize = 4;
         const THINK_LINE_H: f32 = 20.0;
-        if has_reasoning(&l.reasoning) {
+        if thinking {
             ui.add_space(12.0);
             let w = ui.available_width();
             let (rect, _) = ui.allocate_exact_size(
                 Vec2::new(w, THINK_LINE_H * THINK_LINES as f32 + 26.0),
                 Sense::hover(),
             );
-            let painter = ui.painter();
-            painter.rect_filled(rect, CornerRadius::same(theme::R2), P::code_bg());
-            painter.rect_stroke(
-                rect,
-                CornerRadius::same(theme::R2),
-                Stroke::new(1.0, P::border()),
-                egui::StrokeKind::Inside,
-            );
             let inner = rect.shrink2(Vec2::new(16.0, 13.0));
             let tail = tail_lines(&l.reasoning, THINK_LINES);
             // Clip first, then draw: text past four lines gets cut off rather than pushing the
-            // box taller.
-            let p = painter.with_clip_rect(inner);
+            // band taller.
+            let p = ui.painter().with_clip_rect(inner);
             let g = p.layout(tail, theme::body_font(14.5), P::text_faint(), inner.width());
             p.galley(inner.left_top(), g, P::text_faint());
             ui.add_space(16.0);
@@ -1185,5 +1232,47 @@ mod tests {
         assert!(!has_reasoning(" \n\t\n"), "a field of nothing but whitespace is still nothing");
         assert!(has_reasoning("Counting files by type"), "one sentence is enough to earn the card");
         assert!(has_reasoning("\n\n先看一下目录结构"), "leading newlines must not hide real text");
+    }
+
+    /// The spinner-and-"Thinking" head is a claim about the model, so it may only appear when that
+    /// claim is true — or when the line under it says something else worth reading.
+    ///
+    /// Reported 2026-10-30: a model that returns no reasoning sat behind a spinning ring and the
+    /// word "Thinking" for the whole turn, and both shook violently while the final answer streamed
+    /// in (they are the last two things in the live area, so every delta pushed them down a line).
+    #[test]
+    fn the_thinking_head_needs_either_a_band_or_a_real_status() {
+        let thinking = aox::i18n::t("Thinking");
+        assert!(
+            !thinking_head_visible(thinking, false),
+            "no band + the default line = no head at all"
+        );
+        assert!(thinking_head_visible(thinking, true), "a visible band earns its caption");
+        assert!(
+            thinking_head_visible("Running shell_exec", false),
+            "a running call must still say what it is doing"
+        );
+        assert!(
+            thinking_head_visible("Retrying in 3.0 s", false),
+            "a backoff is exactly the moment the head has to stay"
+        );
+        assert!(!thinking_head_visible("", false), "an empty status is not a claim either");
+    }
+
+    /// The band itself steps aside once the answer starts typing.
+    ///
+    /// Reported 2026-10-30 (screenshot): after the final answer had printed, one leftover thinking
+    /// line was still hanging under it together with the "Thinking" head. The tail it showed was the
+    /// reasoning *before* the model started writing — stale by then, and it is the last block in the
+    /// live area, so it also shook on every delta.
+    #[test]
+    fn the_reasoning_band_leaves_the_stage_when_the_answer_types() {
+        assert!(thinking_band_visible(true, false), "thinking, nothing written yet = it belongs");
+        assert!(
+            !thinking_band_visible(true, true),
+            "the first body delta retires the band: the answer is what to read now"
+        );
+        assert!(!thinking_band_visible(false, false), "no reasoning, no band");
+        assert!(!thinking_band_visible(false, true), "still no reasoning, still no band");
     }
 }
