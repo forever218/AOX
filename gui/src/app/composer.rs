@@ -227,9 +227,33 @@ pub(super) fn usage_line(r: &UsageRecord) -> String {
 /// The token breakdown line in the transcript. Deliberately lighter than the body text: it is a
 /// footnote, not content, so it isn't even given a bullet -- a row of numbers says what it is on
 /// its own.
-pub(super) fn usage_row(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).color(P::text_faint()).size(12.5));
+///
+/// `back` = "this turn's reply starts above the viewport", i.e. the "back to the start of this
+/// reply" chip belongs on this row. Returns whether that chip was clicked.
+///
+/// The chip's slot is reserved **whether or not** it is drawn, and that is not an oversight: the
+/// flag is true or false depending on where the view is scrolled, so a row whose height changed with
+/// it would make the content jump (and the very reply being read would flicker) every time the head
+/// of a long answer crossed the top edge.
+pub(super) fn usage_row(ui: &mut Ui, text: &str, back: bool) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        // Right-to-left so the chip owns a fixed slot at the right end and the numbers get whatever
+        // is left: the usage line is the longest footnote in the transcript and must not be pushed
+        // onto a second line by the chip.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if back {
+                clicked = jump_chip(ui);
+            } else {
+                ui.allocate_space(Vec2::new(JUMP_CHIP + 4.0, JUMP_CHIP));
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.label(RichText::new(text).color(P::text_faint()).size(12.5));
+            });
+        });
+    });
     ui.add_space(10.0);
+    clicked
 }
 
 /// The breakdown unfolded from the "Σ total tokens" chip: **this conversation's totals**.

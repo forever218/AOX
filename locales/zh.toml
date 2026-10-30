@@ -1261,3 +1261,6 @@
 # ── JavaScript 页面 ────────────────────────────────────────────────
 "  JavaScript: not run — a client-rendered page comes back nearly empty (use mode=\"text\" there)\n" = "  JavaScript：不执行 —— 客户端渲染的页面会几乎是空的（这种页面用 mode=\"text\"）\n"
 "[the page looks empty — it may be rendered by JavaScript, which this tool does not run; try mode=\"text\" to see the raw body, or fetch a different source]" = "[这一页看起来是空的 —— 它可能是由 JavaScript 渲染的，而本工具不执行脚本；用 mode=\"text\" 看原始正文，或者换一个来源]"
+
+# ── 对话内的「回到开头」 ────────────────────────────────────────────
+"Back to the start of this reply" = "回到本条回复的开头"

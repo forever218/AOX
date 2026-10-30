@@ -785,6 +785,45 @@ pub(super) fn compact_json(v: &serde_json::Value) -> String {
     clamp_str(&s, 300)
 }
 
+// ────────────── "back to the start of this reply" ──────────────
+
+/// Breathing room above a reply after a jump: its first line lands this far below the viewport's top
+/// edge instead of butting against it.
+const JUMP_MARGIN: f32 = 12.0;
+
+/// The chip's box on the usage line. Also the slot the line reserves for it — see [`usage_row`] for
+/// why the slot is reserved even when the chip is not drawn.
+pub(super) const JUMP_CHIP: f32 = 18.0;
+
+/// "To the top": a bar with an arrow climbing into it, painted from line segments.
+///
+/// Drawn rather than set as a character, the same reason as [`call_glyph`]: `↑` / `⇱` are not in
+/// every face this app ships with, and a missing glyph in an 18-pixel chip is a box with a hex
+/// number in it.
+fn jump_arrow(p: &egui::Painter, c: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.5, color);
+    // The bar the arrow arrives at.
+    p.line_segment([Pos2::new(c.x - 4.6, c.y - 5.6), Pos2::new(c.x + 4.6, c.y - 5.6)], stroke);
+    // Shaft, then the two sides of the head. The head is drawn slightly wide of the shaft so the
+    // join does not look thicker than the rest at 1.5 px.
+    p.line_segment([Pos2::new(c.x, c.y + 5.4), Pos2::new(c.x, c.y - 3.4)], stroke);
+    p.line_segment([Pos2::new(c.x - 3.6, c.y - 0.4), Pos2::new(c.x, c.y - 4.2)], stroke);
+    p.line_segment([Pos2::new(c.x + 3.6, c.y - 0.4), Pos2::new(c.x, c.y - 4.2)], stroke);
+}
+
+/// The chip itself: invisible until reached for, exactly like the copy button on a code block.
+pub(super) fn jump_chip(ui: &mut Ui) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(JUMP_CHIP), Sense::click());
+    let hot = resp.hovered();
+    if hot {
+        ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
+    }
+    jump_arrow(ui.painter(), rect.center(), if hot { P::text() } else { P::text_faint() });
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(aox::i18n::t("Back to the start of this reply"))
+        .clicked()
+}
+
 // ────────────── settings dialog ──────────────
 
 impl App {
@@ -804,11 +843,38 @@ impl App {
         crate::open::set_workspace_root(
             &self.ws.view().and_then(|v| v.root.clone()).unwrap_or_else(aox::paths::app_root),
         );
-        let out = ScrollArea::vertical()
+        // Jump plumbing (`App::jump`), all read or written through **locals**: the item loop holds
+        // `&mut self.items`, and reaching for a field from inside it while the closure already
+        // borrows most of `self` is exactly the kind of thing that stops compiling later.
+        //
+        // - `jump_to` is this frame's assignment, copied out before the builder;
+        // - `last_reply` is the most recent assistant block, for the usage line's chip: the flag says
+        //   its first line is off-screen, so the chip only appears where it can do something;
+        // - `jump` is what a click this frame asks for, applied to `self` after `show` returns.
+        let jump_to = self.jump;
+        // This frame's scroll offset, i.e. the value the content is being painted at: `begin()`
+        // loaded it from the state saved at the end of the previous frame, which is exactly what
+        // `last_scroll_y` holds. Turning a screen y into a content y needs it.
+        let offset_now = self.last_scroll_y;
+        let mut last_reply: Option<(f32, bool)> = None;
+        let mut jump: Option<f32> = None;
+        // One frame of `vertical_scroll_offset` is what performs a jump. It replaces the offset
+        // **before** layout, so the frame that jumps already paints in the new place.
+        //
+        // The alternative — `ui.scroll_to_rect` from inside the content — is what the first version
+        // used, and it did nothing: it only records a *target* that egui animates in from the
+        // following frame (`ScrollArea::animated` is on by default), and in between the sticky
+        // correction runs with its latch still set and drags the view back to the bottom. Verified
+        // by instrumenting the click: the target was accepted, the offset never moved.
+        let mut area = ScrollArea::vertical()
             .max_height(viewport_h)
             .min_scrolled_height(viewport_h)
-            .auto_shrink([false, false])
-            .stick_to_bottom(self.follow || self.force_follow)
+            .auto_shrink([false, false]);
+        area = match jump_to {
+            Some(y) => area.vertical_scroll_offset(y),
+            None => area.stick_to_bottom(self.follow || self.force_follow),
+        };
+        let out = area
             .show(ui, |ui| {
                 // Top padding = the old top bar's 50 + the original 26. With the bar gone the
                 // buttons float above the content, and without the padding the first line of text
@@ -837,19 +903,54 @@ impl App {
                         if self.on_empty_state() {
                             self.empty_state(ui);
                         }
+                        // Jump plumbing (`App::jump`), all read or written through **locals**: the
+                        // item loop holds `&mut self.items`, and a disjoint field is easy to get
+                        // wrong in a closure that already borrows most of `self`.
+                        //
+                        // - `view_top` is the viewport's top edge in screen space (the ScrollArea
+                        //   starts exactly at the column's cursor, and its height is `viewport_h`);
+                        // - `last_reply` / `jump` are filled in by the loop below.
+                        let view_top = viewport_top;
                         // Image rendering has to consult the texture cache. `self.items` and
                         // `self.tex` are **two unrelated fields**, so take a reference that borrows
                         // only `tex` first, and borrowing `items` in the loop no longer conflicts
                         // (borrowing all of `&mut self` would not work).
                         let tex = &self.tex;
-                        for item in &mut self.items {
+                        for item in self.items.iter_mut() {
+                            // The item's own top edge, taken before anything is drawn: the vertical
+                            // layout's cursor is where this item starts.
+                            let top = ui.cursor().min.y;
                             match item {
-                                Item::User(t, files) => user_bubble(ui, t, files, inner * 0.80),
-                                Item::Assistant(t) => assistant_block(ui, t, inner),
+                                Item::User(t, files) => {
+                                    // A new question starts a new turn, so the reply the usage line
+                                    // would point at is no longer "the one above it": a turn that dies
+                                    // before writing any answer (an early failure, an abort) still
+                                    // emits its usage row, and without this reset that row's chip
+                                    // would jump into the *previous* turn's reply.
+                                    last_reply = None;
+                                    user_bubble(ui, t, files, inner * 0.80)
+                                }
+                                Item::Assistant(t) => {
+                                    assistant_block(ui, t, inner);
+                                    // The reply's first line in the scroll area's **own** coordinates
+                                    // (the origin of the content, not of the window): recorded while
+                                    // the layout is in hand, so a jump later never has to guess where
+                                    // a heading, a table or a code card put it.
+                                    let y = top - view_top + offset_now;
+                                    last_reply = Some((y, top < view_top - 1.0));
+                                }
                                 Item::Process(p) => process_block(ui, p, inner, tex),
                                 Item::Note(k, t) => note_row(ui, *k, t),
                                 Item::Images(paths) => images_block(ui, paths, inner, tex),
-                                Item::Usage(t) => usage_row(ui, t),
+                                Item::Usage(t) => {
+                                    // The chip belongs to the reply above it, and only when that
+                                    // reply's head is off-screen — otherwise "jump to the start" is a
+                                    // button that does nothing visible.
+                                    let back = last_reply.and_then(|(y, above)| above.then_some(y));
+                                    if usage_row(ui, t, back.is_some()) {
+                                        jump = back;
+                                    }
+                                }
                                 Item::Error(t) => error_card(ui, t, inner),
                             }
                         }
@@ -870,7 +971,7 @@ impl App {
                         // Asking for the bottom explicitly is what actually moves it. `Some(BOTTOM)`
                         // rather than `None`: `None` only scrolls "enough to be visible", which for
                         // a viewport-tall block means the top of it, not the end of the column.
-                        if self.force_follow {
+                        if self.force_follow && self.jump.is_none() {
                             ui.scroll_to_rect(ui.min_rect(), Some(Align::BOTTOM));
                         }
                     });
@@ -893,6 +994,26 @@ impl App {
             }
         } else {
             self.follow = at_bottom;
+        }
+
+        // The jump asked for on the **previous** frame has just been carried out by the builder
+        // above, so it is spent.
+        if jump_to.is_some() {
+            self.jump = None;
+        }
+        // What the two controls ask for this frame. The move itself happens on the **next** frame:
+        // whether the view follows the end is decided before the content is laid out, and a control
+        // clicked while sitting at the bottom cannot be honoured in that same frame.
+        if let Some(y) = jump {
+            // `JUMP_MARGIN` of breathing room above the first line, and never a negative offset.
+            self.jump = Some((y - JUMP_MARGIN).max(0.0));
+            self.follow = false;
+            self.force_follow = false;
+            // That next frame has to actually happen. An idle egui window only repaints when
+            // something asks it to, and a click asks for its own frame and nothing more — which is
+            // exactly why the first version of this button looked dead: the request was queued and
+            // then sat there until the pointer happened to move.
+            ui.ctx().request_repaint();
         }
     }
 
@@ -1137,6 +1258,39 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The usage line keeps the **same height** whether or not the jump chip is on it.
+    ///
+    /// The chip's flag is "the reply's head is above the viewport", which is a property of the
+    /// scroll position — so a row that grew or shrank with it would re-lay the whole transcript out
+    /// every time a long answer's head crossed the top edge: the content would jump under the
+    /// pointer, and the very reply the chip belongs to would flicker. Its slot is therefore reserved
+    /// unconditionally (see `composer::usage_row`), and this pins that.
+    #[test]
+    fn the_jump_chip_never_changes_the_usage_row_height() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let text = "#1 · 3 calls · Input 11,798 · Output 7,754 · Total 19,552 · Reasoning 3,723 · Cache hit 11,648 · Cache miss 150";
+        let mut h = [0.0_f32; 2];
+        for (k, back) in [false, true].into_iter().enumerate() {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 400.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = usage_row(ui, text, back);
+                    h[k] = ui.min_rect().height();
+                });
+            });
+        }
+        assert!(
+            (h[0] - h[1]).abs() < 0.01,
+            "the row must not change height with the chip: without = {}, with = {}",
+            h[0],
+            h[1]
+        );
+    }
 
     /// History replay must hide the host's attachment sentence and put each picture under the
     /// `attach_file` call that produced it.
