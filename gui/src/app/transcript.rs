@@ -181,7 +181,7 @@ pub(super) fn user_bubble(ui: &mut Ui, text: &str, files: &[String], max_w: f32)
     ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
         Frame::NONE
             .fill(P::user_bg())
-            .corner_radius(CornerRadius::same(16))
+            .corner_radius(CornerRadius::same(theme::R3))
             .stroke(Stroke::new(1.0, P::edge()))
             .inner_margin(Margin::symmetric(20, 15))
             .show(ui, |ui| {
@@ -308,14 +308,14 @@ pub(super) fn error_card(ui: &mut Ui, text: &str, width: f32) {
         .fill(P::surface())
         .corner_radius(CornerRadius::same(theme::card_radius()))
         .stroke(Stroke::new(1.0, P::edge_raised()))
-        .shadow(theme::card_shadow())
+        .shadow(theme::float_shadow())
         .inner_margin(Margin::symmetric(20, 18))
         .show(ui, |ui| {
             ui.set_width(inner_w);
             ui.set_max_width(inner_w);
             Frame::NONE
                 .fill(P::reverse_bg())
-                .corner_radius(CornerRadius::same(7))
+                .corner_radius(CornerRadius::same(theme::R0))
                 .inner_margin(Margin::symmetric(11, 4))
                 .show(ui, |ui| {
                     ui.label(RichText::new(aox::i18n::t("Failed")).color(P::on_reverse()).size(14.0));
@@ -361,14 +361,23 @@ pub(super) fn process_block(ui: &mut Ui, p: &mut Process, width: f32, tex: &Hash
     let row_w = width.min(620.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(row_w, 30.0), Sense::click());
     if pointer_if(ui, &resp) {
-        ui.painter().rect_filled(rect, CornerRadius::same(9), P::surface());
+        // Hover lifts the row: a 1 px shade under it before the fill, which is the same "touched,
+        // not selected" move list rows make. A bare fill on a page this close in value read as a
+        // slightly paler stripe rather than as a row being pointed at (2026-10-29).
+        let p = ui.painter();
+        p.rect_filled(
+            rect.translate(egui::vec2(0.0, 1.0)),
+            CornerRadius::same(theme::R1),
+            P::shade(0.06),
+        );
+        p.rect_filled(rect, CornerRadius::same(theme::R1), P::surface());
     }
     paint_tri(
         ui.painter(),
         Pos2::new(rect.left() + 11.0, rect.center().y),
         4.6,
         p.expanded,
-        P::text_faint(),
+        if pointer_if(ui, &resp) { P::text_dim() } else { P::text_faint() },
     );
     ui.painter().text(
         Pos2::new(rect.left() + 26.0, rect.center().y),
@@ -535,7 +544,7 @@ pub(super) fn step_row_inner(ui: &mut Ui, st: &mut StepView, tex: &HashMap<PathB
                 ui.add_space(2.0);
                 Frame::NONE
                     .fill(P::surface_hi())
-                    .corner_radius(CornerRadius::same(20))
+                    .corner_radius(CornerRadius::same(theme::pill(22.0)))
                     .inner_margin(Margin::symmetric(9, 2))
                     .show(ui, |ui| {
                         ui.label(
@@ -622,7 +631,7 @@ pub(super) fn step_diff(ui: &mut Ui, diff: &str) {
     ui.add_space(6.0);
     Frame::NONE
         .fill(P::code_bg())
-        .corner_radius(CornerRadius::same(8))
+        .corner_radius(CornerRadius::same(theme::R1))
         .stroke(Stroke::new(1.0, P::edge()))
         .inner_margin(Margin::symmetric(12, 9))
         .show(ui, |ui| {
@@ -668,10 +677,7 @@ pub(super) fn step_diff(ui: &mut Ui, diff: &str) {
 /// the process card puts everything in a single card -- the row rendering is shared, only the
 /// grouping differs.
 pub(super) fn calls_card(ui: &mut Ui, steps: &mut [StepView], tex: &HashMap<PathBuf, Tex>) {
-    Frame::NONE
-        .fill(P::surface())
-        .corner_radius(CornerRadius::same(theme::card_radius()))
-        .stroke(Stroke::new(1.0, P::border()))
+    theme::card(theme::card_radius())
         .inner_margin(Margin::symmetric(20, 16))
         .show(ui, |ui| {
             // Use the available width inside the frame, so the content can't push the card out of the
@@ -921,7 +927,7 @@ impl App {
                         ui.set_max_width(w);
                         Frame::NONE
                             .fill(P::reverse_bg())
-                            .corner_radius(CornerRadius::same(7))
+                            .corner_radius(CornerRadius::same(theme::R0))
                             .inner_margin(Margin::symmetric(11, 4))
                             .show(ui, |ui| {
                                 ui.label(
@@ -1062,10 +1068,10 @@ impl App {
                 Sense::hover(),
             );
             let painter = ui.painter();
-            painter.rect_filled(rect, CornerRadius::same(12), P::code_bg());
+            painter.rect_filled(rect, CornerRadius::same(theme::R2), P::code_bg());
             painter.rect_stroke(
                 rect,
-                CornerRadius::same(12),
+                CornerRadius::same(theme::R2),
                 Stroke::new(1.0, P::border()),
                 egui::StrokeKind::Inside,
             );

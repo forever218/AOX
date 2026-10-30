@@ -740,7 +740,7 @@ fn text_label(ui: &mut Ui, job: LayoutJob, hots: &[Hot]) -> egui::Response {
         for r in run_rects(&galley, hots[i].start, hots[i].end) {
             ui.painter().rect_filled(
                 r.translate(origin.to_vec2()).expand2(egui::vec2(2.0, 0.0)),
-                CornerRadius::same(4),
+                CornerRadius::same(theme::R0),
                 P::hover_fill(),
             );
         }
@@ -1145,9 +1145,11 @@ fn table(ui: &mut Ui, width: f32, header: &[String], rows: &[Vec<String>], base:
             {
                 let head = ri == 0;
                 if head {
-                    // Header band: one strip for the whole row, rounded only on top, so it hugs the outer frame
+                    // Header band: one strip for the whole row, rounded only on top, so it hugs the outer frame.
+                    // `band()` (4% ink) rather than `surface_hi`: the latter is the hover step, and a
+                    // header painted with it read as one wide disabled button (2026-10-29).
                     Frame::NONE
-                        .fill(P::surface_hi())
+                        .fill(P::band())
                         .corner_radius(CornerRadius { nw: TABLE_R, ne: TABLE_R, sw: 0, se: 0 })
                         .show(ui, |ui| {
                             ui.set_width(inner);
@@ -1239,7 +1241,7 @@ impl egui::Widget for CopyButton {
         // button is invisible until you reach for it.
         let bg = if hot { P::surface_hi() } else { P::code_bg() };
         if hot {
-            ui.painter().rect_filled(rect, CornerRadius::same(7), bg);
+            ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), bg);
         }
         let color = if self.copied {
             P::add_green()
@@ -1257,9 +1259,9 @@ impl egui::Widget for CopyButton {
         } else {
             let back = egui::Rect::from_min_size(egui::pos2(c.x - 6.5, c.y - 6.5), egui::vec2(9.5, 9.5));
             let front = egui::Rect::from_min_size(egui::pos2(c.x - 3.0, c.y - 3.0), egui::vec2(9.5, 9.5));
-            p.rect_stroke(back, CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
-            p.rect_filled(front, CornerRadius::same(2), bg);
-            p.rect_stroke(front, CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            p.rect_stroke(back, CornerRadius::same(theme::R_XS), stroke, egui::StrokeKind::Inside);
+            p.rect_filled(front, CornerRadius::same(theme::R_XS), bg);
+            p.rect_stroke(front, CornerRadius::same(theme::R_XS), stroke, egui::StrokeKind::Inside);
         }
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
@@ -1284,7 +1286,7 @@ fn code_block(ui: &mut Ui, width: f32, lang: &str, lines: &[String]) {
 
     Frame::NONE
         .fill(P::code_bg())
-        .corner_radius(CornerRadius::same(12))
+        .corner_radius(CornerRadius::same(theme::R2))
         .stroke(Stroke::new(1.0, P::edge()))
         .inner_margin(Margin::symmetric(16, 14))
         .show(ui, |ui| {

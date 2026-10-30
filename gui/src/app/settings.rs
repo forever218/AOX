@@ -59,7 +59,7 @@ pub(super) fn tab_row(ui: &mut Ui, tab: SettingsTab, selected: bool) -> egui::Re
     // Two different greys for "you are here" and "the pointer is here" read as two different
     // states of the same thing, which they are not.
     if selected || resp.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(10), P::surface_hi());
+        painter.rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
     }
     if selected {
         painter.rect_filled(
@@ -67,7 +67,7 @@ pub(super) fn tab_row(ui: &mut Ui, tab: SettingsTab, selected: bool) -> egui::Re
                 Pos2::new(rect.left() + 6.0, rect.center().y - 8.0),
                 Vec2::new(3.0, 16.0),
             ),
-            CornerRadius::same(2),
+            CornerRadius::same(theme::R_XS),
             fg,
         );
     }
@@ -91,7 +91,7 @@ pub(super) fn choice_row(ui: &mut Ui, label: &str, selected: bool) -> egui::Resp
 
     let painter = ui.painter();
     if resp.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(10), P::surface_hi());
+        painter.rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
     }
     let fg = if selected { P::text() } else { P::text_dim() };
     let g = painter.layout_no_wrap(label.to_string(), egui::FontId::proportional(14.5), fg);
@@ -147,7 +147,7 @@ pub(super) fn entry_row(ui: &mut Ui, on: bool, mark: EntryMark, label: &str) -> 
 
     let painter = ui.painter();
     if hot {
-        painter.rect_filled(rect, CornerRadius::same(10), P::surface_hi());
+        painter.rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
     }
     let icon =
         Rect::from_center_size(Pos2::new(rect.left() + 20.0, rect.center().y), Vec2::splat(20.0));
@@ -211,7 +211,7 @@ pub(super) fn draw_tree_mark(p: &egui::Painter, r: Rect, fg: Color32) {
     // A folder at the root end: a small open rectangle, which is what separates "a tree" from "a
     // fork in the road".
     let f = Rect::from_min_size(Pos2::new(x0 + 4.5, cy - 2.6), Vec2::new(8.0, 5.6));
-    p.rect_stroke(f, CornerRadius::same(1), Stroke::new(1.2, fg), egui::StrokeKind::Inside);
+    p.rect_stroke(f, CornerRadius::same(theme::R_XS), Stroke::new(1.2, fg), egui::StrokeKind::Inside);
 }
 
 /// The 4×4 mark for the cache-hit button: ten cells filled, the rest outlined.
@@ -228,11 +228,11 @@ pub(super) fn draw_grid_mark(p: &egui::Painter, r: Rect, fg: Color32) {
             let at = Pos2::new(r.left() + x as f32 * (cell + gap), r.top() + y as f32 * (cell + gap));
             let cr = Rect::from_min_size(at, Vec2::splat(cell));
             if y * N + x < 10 {
-                p.rect_filled(cr, CornerRadius::same(1), fg);
+                p.rect_filled(cr, CornerRadius::same(theme::R_XS), fg);
             } else {
                 p.rect_stroke(
                     cr,
-                    CornerRadius::same(1),
+                    CornerRadius::same(theme::R_XS),
                     Stroke::new(1.0, fg.gamma_multiply(0.45)),
                     egui::StrokeKind::Inside,
                 );
@@ -343,7 +343,7 @@ impl App {
         let resp = egui::Modal::new(egui::Id::new("aox-settings"))
             .backdrop_color(P::scrim())
             .frame(
-                theme::raised(theme::card_radius())
+                theme::floating(theme::card_radius())
                     .inner_margin(Margin::symmetric(20, 18)),
             )
             .show(ctx, |ui| {
@@ -670,7 +670,7 @@ impl App {
         // copy it directly instead of retyping it off the screen.
         Frame::NONE
             .fill(P::code_bg())
-            .corner_radius(CornerRadius::same(12))
+            .corner_radius(CornerRadius::same(theme::R2))
             .stroke(Stroke::new(1.0, P::edge()))
             .inner_margin(Margin::symmetric(14, 12))
             .show(ui, |ui| {

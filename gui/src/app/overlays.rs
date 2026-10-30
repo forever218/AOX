@@ -15,7 +15,7 @@ pub(super) const TOAST_FADE_SECS: f32 = 0.6;
 
 /// Corner radius of the toast. Deliberately larger than a card's: the notice is a small rounded
 /// capsule, not a piece of page furniture.
-pub(super) const TOAST_RADIUS: u8 = 14;
+pub(super) const TOAST_RADIUS: u8 = theme::R2;
 
 /// The name dialog's state while it is open (see [`App::name_dialog`]).
 pub(super) struct NameDialog {
@@ -140,7 +140,7 @@ pub(super) fn name_dialog_modal(
     let resp = egui::Modal::new(egui::Id::new(("aox-name", st.mode.tag())))
         .backdrop_color(P::scrim())
         .frame(
-            theme::raised(theme::card_radius())
+            theme::floating(theme::card_radius())
                 .inner_margin(Margin::symmetric(22, 18)),
         )
         .show(ctx, |ui| {
@@ -237,7 +237,7 @@ pub(super) fn name_dialog_modal(
                 // blank, which is the state that means "use the folder's own name".
                 (_, Some(ws), _) => {
                     let path = ws.display().to_string();
-                    theme::well(8)
+                    theme::well(theme::R1)
                         .inner_margin(Margin::symmetric(10, 7))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -262,7 +262,7 @@ pub(super) fn name_dialog_modal(
                         Ok(name) => base.join(name),
                         Err(_) => base,
                     };
-                    theme::well(8)
+                    theme::well(theme::R1)
                         .inner_margin(Margin::symmetric(10, 7))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -463,7 +463,7 @@ pub(super) fn confirm_modal(ctx: &egui::Context, what: &Confirm) -> Option<bool>
     let mut answer = None;
     let resp = egui::Modal::new(egui::Id::new("aox-confirm"))
         .backdrop_color(P::scrim())
-        .frame(theme::raised(theme::card_radius()).inner_margin(Margin::symmetric(22, 18)))
+        .frame(theme::floating(theme::card_radius()).inner_margin(Margin::symmetric(22, 18)))
         .show(ctx, |ui| {
             ui.set_width(430.0);
             // Not in `danger`: that hue is reserved for the one toggle that crosses every protection
@@ -475,7 +475,7 @@ pub(super) fn confirm_modal(ctx: &egui::Context, what: &Confirm) -> Option<bool>
             ui.add_space(10.0);
             // **Which one**. A confirmation that does not name its subject is the "…was that the one I
             // meant?" dialog; the row is gone from view the moment the menu closes.
-            theme::well(8).inner_margin(Margin::symmetric(10, 7)).show(ui, |ui| {
+            theme::well(theme::R1).inner_margin(Margin::symmetric(10, 7)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
                     RichText::new(subject)
@@ -604,7 +604,7 @@ impl App {
                     ..Default::default()
                 },
             );
-            theme::well(8)
+            theme::well(theme::R1)
                 .inner_margin(Margin::symmetric(10, 8))
                 .show(ui, |ui| {
                     ui.add(Label::new(job));

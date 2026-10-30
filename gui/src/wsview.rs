@@ -661,9 +661,9 @@ fn change_row(
     }
     let p = ui.painter();
     if on {
-        p.rect_filled(rect, CornerRadius::same(6), P::active_fill());
+        p.rect_filled(rect, CornerRadius::same(theme::R0), P::active_fill());
     } else if resp.hovered() {
-        p.rect_filled(rect, CornerRadius::same(6), P::hover_fill());
+        p.rect_filled(rect, CornerRadius::same(theme::R0), P::hover_fill());
     }
 
     // The counts are measured first, because the name is elided against what is left: a path is the
@@ -713,9 +713,9 @@ fn tree_row(ui: &mut Ui, row: &Row, on: bool) -> egui::Response {
     }
     let p = ui.painter();
     if on {
-        p.rect_filled(rect, CornerRadius::same(6), P::active_fill());
+        p.rect_filled(rect, CornerRadius::same(theme::R0), P::active_fill());
     } else if resp.hovered() {
-        p.rect_filled(rect, CornerRadius::same(6), P::hover_fill());
+        p.rect_filled(rect, CornerRadius::same(theme::R0), P::hover_fill());
     }
 
     let x = rect.left() + 6.0 + row.depth as f32 * INDENT;

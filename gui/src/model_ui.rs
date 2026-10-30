@@ -689,7 +689,7 @@ pub fn chip(ui: &mut Ui, st: &mut ModelUi, enabled: bool) -> bool {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let painter = ui.painter();
-    let radius = CornerRadius::same(8);
+    let radius = CornerRadius::same(theme::R1);
     let fg = if !enabled {
         P::text_faint()
     } else if !ready {
@@ -789,7 +789,7 @@ pub fn menu(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
         .fixed_pos(anchor)
         .pivot(Align2::LEFT_BOTTOM)
         .show(ctx, |ui| {
-            theme::raised(12)
+            theme::floating(theme::R2)
                 .inner_margin(Margin::symmetric(10, 10))
                 .show(ui, |ui| {
                     ui.set_width(MENU_W);
@@ -847,7 +847,7 @@ pub fn menu(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
                 .fixed_pos(Pos2::new(left, y))
                 .pivot(Align2::LEFT_CENTER)
                 .show(ctx, |ui| {
-                    theme::raised(12)
+                    theme::floating(theme::R2)
                         .inner_margin(Margin::symmetric(12, 12))
                         .show(ui, |ui| {
                             ui.set_width(CARD_W);
@@ -1015,7 +1015,7 @@ fn model_row(ui: &mut Ui, name: &str, sub: &str, current: bool) -> egui::Respons
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        ui.painter().rect_filled(rect, CornerRadius::same(9), P::surface_hi());
+        ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
     }
     let fg = if current { P::ink() } else { P::text() };
     let check_w = if current { 26.0 } else { 10.0 };
@@ -1045,7 +1045,7 @@ fn pick_row(ui: &mut Ui, rec: &ModelRecord, active: bool, picked: bool) -> egui:
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if hov || picked {
-        ui.painter().rect_filled(rect, CornerRadius::same(9), P::surface_hi());
+        ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
     }
 
     // Right side first, so the name can be elided against what is left: window, then the check.
@@ -1091,7 +1091,7 @@ fn config_row(ui: &mut Ui) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        ui.painter().rect_filled(rect, CornerRadius::same(9), P::surface_hi());
+        ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
     }
     paint_pencil(
         ui.painter(),
@@ -1201,7 +1201,7 @@ fn think_chip(ui: &mut Ui, t: Thinking, on: bool) -> egui::Response {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let painter = ui.painter();
-    let radius = CornerRadius::same(6);
+    let radius = CornerRadius::same(theme::R1);
     if on {
         painter.rect_filled(rect, radius, P::surface_hi());
         painter.rect_stroke(rect, radius, Stroke::new(1.0, P::edge_raised()), egui::StrokeKind::Inside);
@@ -1269,7 +1269,7 @@ fn row_label(ui: &mut Ui, w: f32, text: &str) {
 /// clone and copied it back only on focus loss, so the next frame refilled the box from the old string
 /// and every keystroke (and every backspace) looked inert.
 fn compact_field(ui: &mut Ui, text: &mut String, w: f32, id: &str) -> egui::Response {
-    theme::well(6)
+    theme::well(theme::R0)
         // Same height as a button: `text + 2 × FIELD_PAD` = `BTN_H`, so a field and the 确定 under it
         // are the same control in two skins.
         .inner_margin(Margin::symmetric(8, FIELD_PAD))
@@ -1534,7 +1534,7 @@ fn model_list_row(
     }
     let painter = ui.painter();
     if hov || selected {
-        painter.rect_filled(rect, CornerRadius::same(10), P::surface_hi());
+        painter.rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
     }
 
     // The right side is laid out first so the text can be elided against what is left.
@@ -1641,11 +1641,11 @@ fn paint_switch(p: &egui::Painter, r: Rect, on: bool, hover: bool) {
     } else {
         P::surface_hi()
     };
-    p.rect_filled(r, CornerRadius::same(11), fill);
+    p.rect_filled(r, CornerRadius::same(theme::pill(22.0)), fill);
     if !on {
         p.rect_stroke(
             r,
-            CornerRadius::same(11),
+            CornerRadius::same(theme::pill(22.0)),
             Stroke::new(1.0, P::edge()),
             egui::StrokeKind::Inside,
         );
@@ -1656,7 +1656,7 @@ fn paint_switch(p: &egui::Painter, r: Rect, on: bool, hover: bool) {
 }
 
 fn paint_checkbox(p: &egui::Painter, r: Rect, on: bool, hover: bool) {
-    let radius = CornerRadius::same(5);
+    let radius = CornerRadius::same(theme::R0);
     if on {
         p.rect_filled(r, radius, P::ink());
         // A tick, drawn as two strokes (the glyph may not exist in the hand-picked font).
@@ -1698,7 +1698,7 @@ pub fn dialog(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
 
     egui::Modal::new(egui::Id::new("aox-model-editor"))
         .backdrop_color(P::scrim())
-        .frame(theme::raised(theme::card_radius()).inner_margin(Margin::symmetric(22, 18)))
+        .frame(theme::floating(theme::card_radius()).inner_margin(Margin::symmetric(22, 18)))
         .show(ctx, |ui| {
             ui.set_width(DIALOG_W);
             ui.label(RichText::new(title).color(P::text()).size(16.0).strong());
@@ -1791,7 +1791,7 @@ pub fn dialog(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
             // The dropdown, under the field (the reference's combo, spelled out).
             if ed.combo && !ed.scanned.is_empty() {
                 ui.add_space(4.0);
-                theme::raised(10)
+                theme::floating(theme::R2)
                     .inner_margin(Margin::symmetric(6, 6))
                     .show(ui, |ui| {
                         ui.set_width(DIALOG_W - 106.0);

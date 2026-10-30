@@ -70,7 +70,7 @@ pub const HEADER_H: f32 = 52.0;
 
 /// DWM's standard corner radius, matching the main window. The unit is egui points, which grow
 /// with scaling.
-pub const CORNER_RADIUS: u8 = 8;
+pub const CORNER_RADIUS: u8 = theme::R1;
 
 /// Grab thickness for border resizing (the four edges). An undecorated window has no native border,
 /// so these pixels must be reserved by us: too narrow is hard to grab, too wide eats into the top
@@ -743,7 +743,7 @@ pub fn header(ui: &mut Ui, ctx: &egui::Context, gw: &mut Gwin, title: &str, info
 pub fn win_button(ui: &mut Ui, r: Rect, id: &str, glyph: Glyph) -> bool {
     let resp = ui.interact(r, ui.id().with(id), Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(r, CornerRadius::same(8), P::surface_hi());
+        ui.painter().rect_filled(r, CornerRadius::same(theme::R1), P::surface_hi());
     }
     // "Pinned" is a **persistent state** and must stay visible: give it the deepest foreground
     // colour even when not hovered, otherwise a grey pushpin on a grey background leaves the user
@@ -801,7 +801,7 @@ pub fn win_button(ui: &mut Ui, r: Rect, id: &str, glyph: Glyph) -> bool {
             // Head
             p.rect_filled(
                 Rect::from_center_size(c + rot(Vec2::new(0.0, -4.2)), swap(Vec2::new(10.0, 2.6))),
-                CornerRadius::same(1),
+                CornerRadius::same(theme::R_XS),
                 fg,
             );
             // Needle shaft
@@ -855,7 +855,7 @@ pub fn pill(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
     let r = Rect::from_center_size(rect.center(), size);
     p.rect_filled(
         r,
-        CornerRadius::same(10),
+        CornerRadius::same(theme::R1),
         if on {
             P::reverse_bg()
         } else if hov {
@@ -867,7 +867,7 @@ pub fn pill(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
     if !on {
         p.rect_stroke(
             r,
-            CornerRadius::same(10),
+            CornerRadius::same(theme::R1),
             Stroke::new(1.0, if hov { P::edge_raised() } else { P::edge() }),
             egui::StrokeKind::Inside,
         );

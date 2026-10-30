@@ -1281,7 +1281,7 @@ fn stats_card(ui: &mut Ui, st: &CacheView) {
         }
     };
 
-    theme::card(10)
+    theme::card(theme::R2)
         .inner_margin(Margin { left: 12, right: 12, top: 11, bottom: 10 })
         .show(ui, |ui| {
             ui.set_width(SIDE_W - 24.0);
@@ -1376,7 +1376,7 @@ fn rule(ui: &mut Ui, w: f32) {
 
 fn legend_card(ui: &mut Ui) {
     let pal = palette();
-    theme::card(10)
+    theme::card(theme::R2)
         .inner_margin(Margin { left: 12, right: 12, top: 11, bottom: 10 })
         .show(ui, |ui| {
             ui.set_width(SIDE_W - 24.0);
@@ -1541,7 +1541,7 @@ fn section_col(ui: &mut Ui, label: &'static str, tokens: u64, hit: u64, w: f32) 
     for i in 0..N {
         let on = (i as f32 + 0.5) / N as f32 <= ratio;
         let cr = Rect::from_min_size(Pos2::new(rect.left() + i as f32 * (cw + gap), y), Vec2::new(cw, 8.0));
-        p.rect_filled(cr, CornerRadius::same(2), if on { pal.hit } else { pal.faint });
+        p.rect_filled(cr, CornerRadius::same(theme::R_XS), if on { pal.hit } else { pal.faint });
     }
 
     p.text(
@@ -1642,7 +1642,7 @@ fn tooltip(ctx: &egui::Context, st: &CacheView, tile: u32, at: Pos2, full: Rect)
                         Pos2::new(head.right() - bw, head.center().y - 8.0),
                         Vec2::new(bw, 16.0),
                     );
-                    p.rect_filled(br, CornerRadius::same(4), badge_bg);
+                    p.rect_filled(br, CornerRadius::same(theme::R0), badge_bg);
                     p.text(br.center(), Align2::CENTER_CENTER, badge, FontId::proportional(11.0), badge_fg);
 
                     ui.add_space(8.0);

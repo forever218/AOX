@@ -196,7 +196,7 @@ pub fn button(ui: &mut Ui, st: &mut WorkplaceUi, enabled: bool) -> bool {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let painter = ui.painter();
-    let radius = CornerRadius::same(8);
+    let radius = CornerRadius::same(theme::R1);
     painter.rect_filled(
         rect,
         radius,
@@ -259,7 +259,7 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
         .fixed_pos(anchor)
         .pivot(Align2::LEFT_BOTTOM)
         .show(ctx, |ui| {
-            theme::raised(12)
+            theme::floating(theme::R2)
                 .inner_margin(Margin::symmetric(6, 6))
                 .show(ui, |ui| {
                     ui.set_width(276.0);
@@ -346,7 +346,7 @@ fn row(ui: &mut Ui, label: &str, hint: &str, checked: bool, danger: bool) -> egu
 
     let painter = ui.painter();
     if resp.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(8), P::surface_hi());
+        painter.rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
     }
 
     // Check: drawn only for the current tier. The slot is reserved so unchecked rows do not shift the title left.
@@ -390,7 +390,7 @@ fn dir_row(ui: &mut Ui, name: &str) -> egui::Response {
     }
     let painter = ui.painter();
     if resp.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(8), P::surface_hi());
+        painter.rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
     }
     let icon = Rect::from_center_size(Pos2::new(rect.left() + 13.0, rect.center().y), Vec2::new(13.0, 11.0));
     paint_folder(painter, icon, P::text_faint());
@@ -416,7 +416,7 @@ pub fn confirm(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     let resp = egui::Modal::new(Id::new("aox-workplace-confirm"))
         .backdrop_color(P::scrim())
         .frame(
-            theme::raised(theme::card_radius())
+            theme::floating(theme::card_radius())
                 .inner_margin(Margin::symmetric(26, 22)),
         )
         .show(ctx, |ui| {
@@ -475,7 +475,7 @@ pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     let resp = egui::Modal::new(Id::new("aox-workplace-picker"))
         .backdrop_color(P::scrim())
         .frame(
-            theme::raised(theme::card_radius())
+            theme::floating(theme::card_radius())
                 .inner_margin(Margin::symmetric(22, 18)),
         )
         .show(ctx, |ui| {
@@ -492,7 +492,7 @@ pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
             ui.add_space(12.0);
 
             // Current path: monospace + middle-elide when too long (keep the head drive letter and tail dir name — the two ends with the most information).
-            theme::well(8)
+            theme::well(theme::R1)
                 .inner_margin(Margin::symmetric(10, 7))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -663,6 +663,6 @@ pub(crate) fn paint_folder(painter: &egui::Painter, rect: Rect, color: Color32) 
         Pos2::new(rect.left(), rect.top() + rect.height() * 0.28),
         Pos2::new(rect.right(), rect.bottom()),
     );
-    painter.rect_filled(tab, CornerRadius::same(1), color);
-    painter.rect_filled(body, CornerRadius::same(2), color);
+    painter.rect_filled(tab, CornerRadius::same(theme::R_XS), color);
+    painter.rect_filled(body, CornerRadius::same(theme::R_XS), color);
 }

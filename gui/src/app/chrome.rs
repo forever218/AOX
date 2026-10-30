@@ -78,7 +78,7 @@ pub(super) fn sidebar_button(ui: &mut Ui, open: bool, floating: bool) -> egui::R
     if floating || hov {
         painter.rect_filled(
             rect,
-            CornerRadius::same(9),
+            CornerRadius::same(theme::R1),
             if hov { P::surface_hi() } else { P::panel() },
         );
     }
@@ -86,7 +86,7 @@ pub(super) fn sidebar_button(ui: &mut Ui, open: bool, floating: bool) -> egui::R
     let r = Rect::from_center_size(rect.center(), Vec2::new(14.0, 12.0));
     painter.rect_stroke(
         r,
-        CornerRadius::same(2),
+        CornerRadius::same(theme::R_XS),
         Stroke::new(1.3, fg),
         egui::StrokeKind::Inside,
     );
@@ -179,7 +179,7 @@ pub(super) fn gear_button(ui: &mut Ui) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BAR_BTN), Sense::click());
     let hov = pointer_if(ui, &resp);
     if hov {
-        ui.painter().rect_filled(rect, CornerRadius::same(9), P::hover_fill());
+        ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), P::hover_fill());
     }
     let fg = if hov { P::ink() } else { P::text_dim() };
     draw_gear(ui.painter(), rect.center(), 7.8, 5.5, 1.3, fg);

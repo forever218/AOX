@@ -212,7 +212,7 @@ pub(super) fn step_mark(ui: &mut Ui, done: bool) -> Rect {
     } else {
         painter.rect_stroke(
             Rect::from_center_size(c, Vec2::splat(8.4)),
-            CornerRadius::same(2),
+            CornerRadius::same(theme::R_XS),
             Stroke::new(1.0, P::text_dim()),
             egui::StrokeKind::Inside,
         );
@@ -243,16 +243,38 @@ pub(super) fn plan_segment_spans(w: f32, total: usize) -> Vec<(f32, f32)> {
 /// says — `5/10` is five green cells and five grey ones — in a form the eye takes in before it reads
 /// the digits. Same 10 px band as the rule it replaces, so no layout number moved.
 ///
-/// Colour is the only difference between done and to-come; there is no fill animation, because the
-/// count changes only when a checkpoint arrives and a bar that animates on its own would be claiming
-/// progress between them.
+/// Colour is the only difference between done and to-come — plus, since 2026-10-29, a **breathing
+/// half-strength cell** on the step being worked on right now. Without it a plan mid-run is
+/// indistinguishable from one that has stalled at the same count: the bar shows "3 of 5" either way,
+/// and the only thing that says "still moving" was the number, which nobody watches.
+///
+/// The pulse is deliberately slow (1.7 s) and shallow (α 45%→100%); anything faster reads as an
+/// alarm. It is also the one place in the UI that animates without being touched, so it stops the
+/// moment there is no current step.
 pub(super) fn plan_segments(ui: &Ui, rect: Rect, w: f32, view: &PlanView) {
     let painter = ui.painter();
-    let radius = CornerRadius::same((PLAN_SEG_H * 0.5) as u8);
+    let radius = CornerRadius::same(theme::pill(PLAN_SEG_H));
     let y = rect.top() + (PLAN_DIV_H - PLAN_SEG_H) * 0.5;
+    let moving = view.done < view.total;
+    if moving {
+        // ~12 fps is enough for a 1.7 s sine and costs far less than a full-rate repaint.
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(80));
+    }
+    let t = ui.input(|i| i.time);
+    let pulse = 0.62 + 0.38 * ((t * std::f64::consts::TAU / 1.7).sin() * 0.5 + 0.5);
     for (i, (x, cell_w)) in plan_segment_spans(w, view.total).into_iter().enumerate() {
         let cell = Rect::from_min_size(Pos2::new(rect.left() + x, y), Vec2::new(cell_w, PLAN_SEG_H));
-        let color = if i < view.done { P::add_green() } else { P::edge() };
+        let color = if i < view.done {
+            P::add_green()
+        } else if i == view.done && moving {
+            // Alpha, not `gamma_multiply`: the latter would darken the green into a different hue
+            // family, and this cell has to read as "the same green, not all the way there yet".
+            let c = P::add_green();
+            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (255.0 * pulse) as u8)
+        } else {
+            P::edge()
+        };
         painter.rect_filled(cell, radius, color);
     }
 }

@@ -83,7 +83,7 @@ const FOOT_SIZE: f32 = 12.0;
 /// The gutter in front of the row is `CARD_INSET + 2 - FOOT_PAD_X`, so the first label starts on
 /// `CARD_INSET + 2` — the same vertical line as the panel's own title and its caption lines.
 const FOOT_PAD_X: f32 = 8.0;
-const FOOT_RADIUS: u8 = 6;
+const FOOT_RADIUS: u8 = theme::R1;
 
 /// A rollback waiting for the second click.
 struct Ask {
@@ -272,7 +272,7 @@ impl RecoveryUi {
         if lit {
             ui.painter().rect_filled(
                 rect,
-                CornerRadius::same(7),
+                CornerRadius::same(theme::R1),
                 if self.open { P::hover_fill() } else { P::surface_hi() },
             );
         }
@@ -354,7 +354,7 @@ impl RecoveryUi {
                 ui.set_opacity(t);
                 egui::Frame::popup(ui.style())
                     .fill(P::surface())
-                    .corner_radius(CornerRadius::same(12))
+                    .corner_radius(CornerRadius::same(theme::R2))
                     .stroke(Stroke::new(1.0, P::edge_raised()))
                     .inner_margin(Margin::same(0))
                     .show(ui, |ui| {
@@ -685,7 +685,7 @@ impl RecoveryUi {
         // selected list item or a scrollbar track, and neither is what this is.
         let card = rect.shrink2(Vec2::new(ROW_INSET, 2.0));
         if hov || selected || row.head {
-            ui.painter().rect_filled(card, CornerRadius::same(8), P::hover_fill());
+            ui.painter().rect_filled(card, CornerRadius::same(theme::R1), P::hover_fill());
         }
         // The head marker is a bar, not a second fill: hover would otherwise erase the difference
         // between "this is current" and "the pointer is here". Inset with the card so it cannot be
@@ -695,7 +695,7 @@ impl RecoveryUi {
                 Pos2::new(card.right() - 4.0, card.top() + 10.0),
                 Pos2::new(card.right() - 2.0, card.bottom() - 10.0),
             );
-            ui.painter().rect_filled(bar, CornerRadius::same(1), P::ink());
+            ui.painter().rect_filled(bar, CornerRadius::same(theme::R_XS), P::ink());
         }
         let text_left = card.left() + 12.0;
         let title = if row.label.is_empty() { kind_word(row.kind).to_string() } else { row.label.clone() };
@@ -819,7 +819,7 @@ impl RecoveryUi {
             ui.add_space(CARD_INSET);
             egui::Frame::NONE
                 .fill(P::surface_hi())
-                .corner_radius(CornerRadius::same(10))
+                .corner_radius(CornerRadius::same(theme::R1))
                 .inner_margin(Margin::symmetric(14, 13))
                 .show(ui, |ui| {
                     ui.set_width((card_w - 28.0).max(80.0));
@@ -951,7 +951,7 @@ impl RecoveryUi {
         let mut answer = None;
         let resp = egui::Modal::new(Id::new("aox-recovery-clear"))
             .backdrop_color(P::scrim())
-            .frame(theme::raised(theme::card_radius()).inner_margin(Margin::symmetric(22, 18)))
+            .frame(theme::floating(theme::card_radius()).inner_margin(Margin::symmetric(22, 18)))
             .show(ctx, |ui| {
                 ui.set_width(430.0);
                 ui.label(
@@ -1003,7 +1003,7 @@ impl RecoveryUi {
         let mut answer = None;
         let resp = egui::Modal::new(Id::new("aox-recovery-confirm"))
             .backdrop_color(P::scrim())
-            .frame(theme::raised(theme::card_radius()).inner_margin(Margin::symmetric(22, 18)))
+            .frame(theme::floating(theme::card_radius()).inner_margin(Margin::symmetric(22, 18)))
             .show(ctx, |ui| {
                 ui.set_width(430.0);
                 ui.label(
@@ -1036,7 +1036,7 @@ impl RecoveryUi {
                 };
                 ui.label(RichText::new(body).color(P::text_faint()).size(12.5));
                 ui.add_space(10.0);
-                theme::well(8).inner_margin(Margin::symmetric(10, 7)).show(ui, |ui| {
+                theme::well(theme::R1).inner_margin(Margin::symmetric(10, 7)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(
                         RichText::new(elide(&ask.label, 60))
@@ -1246,7 +1246,7 @@ fn skeleton(ui: &mut Ui) {
             ui.allocate_exact_size(Vec2::new(ui.available_width() - ROW_INSET * 2.0, 34.0), Sense::hover());
         ui.painter().rect_filled(
             rect.translate(egui::vec2(ROW_INSET, 0.0)),
-            CornerRadius::same(8),
+            CornerRadius::same(theme::R1),
             P::surface_hi(),
         );
         ui.add_space(6.0);

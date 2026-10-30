@@ -85,7 +85,7 @@ pub(super) fn history_group_header(
     let hov = ui.rect_contains_pointer(rect);
     if hov {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        ui.painter().rect_filled(rect, CornerRadius::same(8), P::hover_fill());
+        ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), P::hover_fill());
     }
     let fg = if hov { P::text() } else { P::text_dim() };
     let cy = rect.center().y;
@@ -166,7 +166,7 @@ pub(super) fn history_group_header(
         if on {
             // One more step than the row's own fill, so a second hoverable thing inside a hovered
             // row is still readable as "this, specifically, is the target".
-            ui.painter().rect_filled(plus_rect, CornerRadius::same(6), P::active_fill());
+            ui.painter().rect_filled(plus_rect, CornerRadius::same(theme::R0), P::active_fill());
         }
         let pfg = if on { P::ink() } else { P::text_dim() };
         let s = 3.8;
@@ -209,12 +209,12 @@ pub(super) fn new_chat_row(ui: &mut Ui, width: f32, enabled: bool) -> egui::Resp
     let p = ui.painter();
     p.rect_filled(
         rect,
-        CornerRadius::same(9),
+        CornerRadius::same(theme::R1),
         if hov { P::active_fill() } else { P::hover_fill() },
     );
     p.rect_stroke(
         rect,
-        CornerRadius::same(9),
+        CornerRadius::same(theme::R1),
         Stroke::new(1.0, P::border()),
         egui::StrokeKind::Inside,
     );
@@ -260,11 +260,11 @@ pub(super) fn search_row(ui: &mut Ui, width: f32, query: &mut String) {
     let p = ui.painter();
     // `bg`, not `code_bg`: on the drawer's `surface` this is the same one-step sunken well the
     // reference has, and it is already a token that exists in both themes.
-    p.rect_filled(rect, CornerRadius::same(9), P::bg());
+    p.rect_filled(rect, CornerRadius::same(theme::R1), P::bg());
     if focused {
         p.rect_stroke(
             rect,
-            CornerRadius::same(9),
+            CornerRadius::same(theme::R1),
             Stroke::new(1.0, P::border_strong()),
             egui::StrokeKind::Inside,
         );
@@ -410,7 +410,7 @@ pub(super) fn foot_row(ui: &mut Ui, width: f32, enabled: bool, icon: FootIcon, l
     if hov {
         // The same one-step fill the list rows use, so the foot reads as part of the same list
         // rather than as a second kind of control.
-        ui.painter().rect_filled(rect, CornerRadius::same(8), P::hover_fill());
+        ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), P::hover_fill());
     }
     let fg = if !enabled {
         P::quiet()
@@ -464,6 +464,18 @@ pub(super) fn reveal_in_file_manager(dir: &Path) {
 /// shifts the text right so the row sits nested under its workspace row (the fill still spans the
 /// full width, so the clickable strip doesn't shrink with the depth).
 ///
+/// # One line, and the metadata on demand (2026-10-29)
+///
+/// The row used to be two lines — title on top, `time · N msgs` under it — at 48 px each. Twenty of
+/// them turned the drawer into a wall of numbers, and the numbers were never what anyone scans a
+/// conversation list for. The title is now the whole row (36 px, vertically centred), and the time
+/// and message count **fade in on hover only**: the pointer is already on the row it belongs to, so
+/// they arrive exactly when they can be about something, and never take space from the title at rest.
+///
+/// The title gives up width to them as they arrive (`meta_w` is interpolated with the same 0.12 s
+/// budget as the alpha), so the two never overlap — without that the metadata would either land on
+/// top of the title or push it in one frame, and both read as a glitch rather than a reveal.
+///
 /// Returns the row's response plus the "⋯" child response — the second is the anchor for the row's
 /// menu (`Popup::menu`), so the same menu can be opened by right-clicking the row or by clicking the
 /// glyph. It is only a *click* target while the glyph is drawn; the rest of the time it senses hover,
@@ -477,7 +489,7 @@ pub(super) fn history_row(
     indent: f32,
 ) -> (egui::Response, egui::Response) {
     let w = (width - 6.0).max(60.0); // leave room for the scroll bar
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 48.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::click());
     // Asked of the rect rather than of `resp`: the "⋯" below is a child interact target, and on the
     // frames the pointer is over it the row is no longer the *hovered widget* -- which would make
     // the fill (and, since the glyph is only drawn while the row reads as hovered, the glyph with
@@ -496,7 +508,7 @@ pub(super) fn history_row(
         None
     };
     if let Some(fill) = fill {
-        ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
+        ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), fill);
     }
 
     let x = rect.left() + 10.0 + indent;
@@ -507,24 +519,45 @@ pub(super) fn history_row(
     } else {
         P::text_dim()
     };
+
     // The "⋯" gutter is always taken off the title's width, so the title does not reflow the moment
     // the pointer arrives and the glyph appears.
     let more_w = 22.0;
-    let max_w = (rect.right() - 6.0 - more_w - x).max(24.0);
+    let right_edge = rect.right() - 6.0 - more_w;
+
+    // ── the metadata, faded in ──
+    let meta_text = aox::tf!("{} · {} msgs", s.time, s.messages);
+    let reveal = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("meta"), hov && !locked, 0.12);
+    let meta_full = ui
+        .painter()
+        .layout_no_wrap(meta_text.clone(), theme::body_font(10.5), P::text_faint())
+        .size()
+        .x
+        + 10.0;
+    let meta_w = meta_full * reveal;
+
+    let max_w = (right_edge - x - meta_w).max(24.0);
     let title = elide(ui, &s.title, theme::body_font(13.5), title_color, max_w);
-    let sub = elide(
-        ui,
-        &aox::tf!("{} · {} msgs", s.time, s.messages),
-        theme::body_font(10.5),
-        P::text_faint(),
-        max_w,
-    );
+    let cy = rect.center().y;
     let painter = ui.painter();
-    // A galley is positioned by its top-left, so half its own height is subtracted here to get the
-    // "vertically centred on its line" placement. Two lines at 15 and 32 in a 48-high row: the block
-    // reads as centred without either line touching the fill's edge.
-    painter.galley(Pos2::new(x, rect.top() + 16.0 - title.size().y * 0.5), title, title_color);
-    painter.galley(Pos2::new(x, rect.top() + 33.0 - sub.size().y * 0.5), sub, P::text_faint());
+    painter.galley(Pos2::new(x, cy - title.size().y * 0.5), title, title_color);
+
+    if reveal > 0.01 {
+        // Fade by **alpha**, not `gamma_multiply`: that helper multiplies the alpha channel too, so
+        // it would both thin the ink and dim the colour, and a mid-fade would read as "a darker
+        // grey appearing" rather than "the text arriving". A flat alpha blend keeps the ink value
+        // and only changes how much of it is there.
+        let base = P::text_faint();
+        let c = Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), (255.0 * reveal) as u8);
+        let g = painter.layout_no_wrap(meta_text, theme::body_font(10.5), c);
+        painter.galley(
+            Pos2::new(right_edge - g.size().x, cy - g.size().y * 0.5),
+            g,
+            c,
+        );
+    }
 
     // ── the "⋯" ──
     // Drawn on hover and on the current row, and never at rest: twenty rows each wearing three dots
@@ -532,7 +565,7 @@ pub(super) fn history_row(
     // a font's "…" sits on the baseline and would be off-centre against the title's optical middle.
     let show_more = hov || current;
     let more_rect = Rect::from_center_size(
-        Pos2::new(rect.right() - 6.0 - more_w * 0.5, rect.top() + 16.0),
+        Pos2::new(rect.right() - 6.0 - more_w * 0.5, cy),
         Vec2::splat(20.0),
     );
     let more = ui.interact(
@@ -543,7 +576,8 @@ pub(super) fn history_row(
     if show_more {
         let on = pointer_if(ui, &more);
         if on {
-            ui.painter().rect_filled(more_rect, CornerRadius::same(6), P::active_fill());
+            ui.painter()
+                .rect_filled(more_rect, CornerRadius::same(theme::R0), P::active_fill());
         }
         let p = ui.painter();
         let fg = if on { P::text() } else { P::text_faint() };

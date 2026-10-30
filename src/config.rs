@@ -1514,7 +1514,7 @@ impl Default for MetricsConfig {
             button_size: 15.0,
             small_size: 13.0,
             mono_size: 14.5,
-            card_radius: 14,
+            card_radius: 12,
             item_spacing: [10.0, 10.0],
             button_padding: [14.0, 9.0],
             interact_height: 30.0,
@@ -1755,7 +1755,7 @@ mod tests {
         assert_eq!(m.button_size, 15.0);
         assert_eq!(m.small_size, 13.0);
         assert_eq!(m.mono_size, 14.5);
-        assert_eq!(m.card_radius, 14);
+        assert_eq!(m.card_radius, 12);
         assert_eq!(m.item_spacing, [10.0, 10.0]);
         assert_eq!(m.button_padding, [14.0, 9.0]);
         assert_eq!(m.interact_height, 30.0);

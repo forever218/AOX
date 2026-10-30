@@ -33,6 +33,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::ShellConfig;
+use crate::plugin::ProcessFlags as _;
 
 /// A usable bash-like shell.
 #[derive(Debug, Clone)]
@@ -72,12 +73,26 @@ impl Bash {
     /// the whole tool call with nothing counting down. Five seconds is ~20× the measured cost of a
     /// real bash (`uname -s` ≈ 270 ms including the Git Bash start).
     pub fn check(&self) -> Result<(), String> {
-        let mut child = std::process::Command::new(&self.exe)
-            .args(&self.prefix)
+        let mut cmd = std::process::Command::new(&self.exe);
+        cmd.args(&self.prefix)
             .args(["-c", "uname -s"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // 🚨 `CREATE_NO_WINDOW` is **not optional here**, and leaving it out is what produced the
+        // "a black console flashes the first time the model runs bash, then never again" report
+        // (2026-10-29).
+        //
+        // The GUI host is built as the `windows` subsystem, so it owns no console. Launching
+        // `bash.exe` — a console program — makes Windows **allocate a fresh console window** for it,
+        // which shows up, paints, and dies within a few hundred ms. It only happens once because
+        // `check` runs once per process (the result is cached by the caller), so the flash lives in
+        // the one path nobody exercises twice and is nearly invisible while debugging.
+        //
+        // Every other spawn in the tree already sets this (plugins, `certutil`/`tar`/`powershell`,
+        // `rustc`, the shell helper); this was the last one missing.
+        cmd.hide_console();
+        let mut child = cmd
             .spawn()
             .map_err(|e| crate::tf!("could not run {}: {}", self.exe.display(), e))?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

@@ -106,7 +106,7 @@ pub(crate) fn menu_item(ui: &mut Ui, label: &str, w: f32, enabled: bool, strong:
     let hov = pointer_if(ui, &resp) && enabled;
     if hov {
         // Hover raises the surface one step -- the same language as list rows and the top-bar icons.
-        ui.painter().rect_filled(rect, CornerRadius::same(7), P::surface_hi());
+        ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
     }
     let fg = if !enabled {
         P::quiet()
@@ -567,7 +567,7 @@ pub(super) fn paint_square(painter: &egui::Painter, rect: egui::Rect, color: Col
     let s = rect.width() * 0.20;
     painter.rect_filled(
         egui::Rect::from_center_size(c, Vec2::splat(s * 1.5)),
-        CornerRadius::same(2),
+        CornerRadius::same(theme::R_XS),
         color,
     );
 }
@@ -652,7 +652,7 @@ pub(super) fn chip_width(ui: &Ui, name: &str) -> f32 {
 pub(super) fn sent_chip(ui: &mut Ui, name: &str) {
     Frame::NONE
         .fill(P::surface())
-        .corner_radius(CornerRadius::same(13))
+        .corner_radius(CornerRadius::same(theme::pill(24.0)))
         .stroke(Stroke::new(1.0, P::edge()))
         .inner_margin(Margin::symmetric(11, 4))
         .show(ui, |ui| {

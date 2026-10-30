@@ -19,6 +19,27 @@ pub(super) const COMPOSER_FIRST_FRAME_H: f32 = 118.0;
 /// Gap between the composer card and the window's bottom edge.
 pub(super) const COMPOSER_BOTTOM_GAP: f32 = 18.0;
 
+/// How tall the input box may get before it starts **scrolling instead of growing**.
+///
+/// The card lives in an auto-height bottom panel, so an uncapped `TextEdit::multiline` grows the
+/// panel until it swallows the window — a pasted document left the transcript with zero height
+/// (2026-10-29). Seven rows is where the card stops reading as an input and starts reading as a
+/// document; it is also still shorter than the transcript on a small window, so the conversation
+/// never disappears entirely.
+pub(super) const COMPOSER_MAX_ROWS: f32 = 7.0;
+
+/// The height the input box takes **this** frame.
+///
+/// `measured` is the text's own height as reported by last frame's `ScrollArea::content_size`, or
+/// `None` on the very first frame (before anything has been laid out).
+///
+/// Clamped to `[row_h, 7 rows]`: never shorter than one line (an empty box still has to look like a
+/// box), never taller than the cap — past that the content scrolls instead. The lower clamp also
+/// absorbs a stale small reading, which can happen on the frame right after the text is cleared.
+pub(super) fn input_box_height(measured: Option<f32>, row_h: f32) -> f32 {
+    measured.unwrap_or(row_h).clamp(row_h, row_h * COMPOSER_MAX_ROWS)
+}
+
 /// The example-question chip in the empty state.
 /// One attachment chip (a cell in the pending-upload bar). Returns `true` if the user clicked the
 /// × on the right.
@@ -39,7 +60,7 @@ pub(super) const COMPOSER_BOTTOM_GAP: f32 = 18.0;
 /// shouldn't be forced to touch the keyboard.
 pub(super) fn ask_input_row(ui: &mut Ui, w: f32, text: &mut String) -> Option<String> {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(10), P::surface());
+    ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), P::surface());
 
     // The send button on the right (same drawing as the one on the main input box, one size down)
     let btn = Rect::from_center_size(
@@ -75,11 +96,15 @@ pub(super) fn ask_input_row(ui: &mut Ui, w: f32, text: &mut String) -> Option<St
     let hot = can && pointer_if(ui, &bresp);
     let p = ui.painter();
     if can {
-        p.circle_filled(
-            btn.center(),
-            btn.width() * 0.5,
-            if hot { P::ink().gamma_multiply(0.75) } else { P::ink() },
-        );
+        // Hover **lifts** the disc instead of dimming it. The old `gamma_multiply(0.75)` made the
+        // button darker on hover, which on an ink disc reads as "pressed" — the opposite of what the
+        // pointer is doing. A shadow 2 px down plus a half-pixel of growth is the same move the cards
+        // make, so the button belongs to the same physical world (2026-10-29).
+        let r = btn.width() * 0.5;
+        if hot {
+            p.circle_filled(btn.center() + egui::vec2(0.0, 2.0), r + 0.5, P::shade(0.16));
+        }
+        p.circle_filled(btn.center(), r + if hot { 0.6 } else { 0.0 }, P::ink());
     } else {
         // Draw a hollow circle while it's empty, so it's clear "there's a button here, you just have
         // to write something first"
@@ -113,7 +138,7 @@ pub(super) fn ask_chip(ui: &mut Ui, w: f32, idx: usize, text: &str) -> bool {
     let p = ui.painter();
     p.rect_filled(
         rect,
-        CornerRadius::same(10),
+        CornerRadius::same(theme::R1),
         if resp.hovered() { P::surface_hi() } else { P::surface() },
     );
     // A stroke on hover, but `edge_raised` — a full-ink ring made the row look selected rather than
@@ -121,7 +146,7 @@ pub(super) fn ask_chip(ui: &mut Ui, w: f32, idx: usize, text: &str) -> bool {
     if resp.hovered() {
         p.rect_stroke(
             rect,
-            CornerRadius::same(10),
+            CornerRadius::same(theme::R1),
             Stroke::new(1.0, P::edge_raised()),
             egui::StrokeKind::Inside,
         );
@@ -156,7 +181,7 @@ pub(super) fn attach_chip(ui: &mut Ui, name: &str) -> bool {
     let mut removed = false;
     Frame::NONE
         .fill(P::surface_hi())
-        .corner_radius(CornerRadius::same(13))
+        .corner_radius(CornerRadius::same(theme::pill(24.0)))
         .stroke(Stroke::new(1.0, P::edge()))
         .inner_margin(Margin::symmetric(11, 4))
         .show(ui, |ui| {
@@ -350,7 +375,7 @@ impl App {
         // The question the model is waiting on: a **raised** card, unlike everything else in the
         // transcript. It is the one block that wants an answer, so it is allowed to sit above the
         // page instead of in it — that is what the shadow and the brighter edge are saying.
-        theme::raised(theme::card_radius())
+        theme::floating(theme::card_radius())
             .inner_margin(Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 let w = ui.available_width();
@@ -643,7 +668,7 @@ impl App {
         let lit = hov || self.usage_open;
         if lit {
             ui.painter()
-                .rect_filled(rect, CornerRadius::same(7), P::hover_fill());
+                .rect_filled(rect, CornerRadius::same(theme::R0), P::hover_fill());
         }
         let fg = if lit { P::ink() } else { P::text_dim() };
         let galley = ui
@@ -678,7 +703,7 @@ impl App {
             .show(&ctx, |ui| {
                 Frame::popup(ui.style())
                     .fill(P::surface())
-                    .corner_radius(CornerRadius::same(12))
+                    .corner_radius(CornerRadius::same(theme::R2))
                     .stroke(Stroke::new(1.0, P::edge_raised()))
                     .inner_margin(Margin::symmetric(16, 13))
                     .show(ui, |ui| usage_detail(ui, log))
@@ -801,7 +826,7 @@ impl App {
                 // where the "hollowed-out background" look comes from).
                 Frame::NONE
                     .fill(P::surface())
-                    .corner_radius(CornerRadius::same(20))
+                    .corner_radius(CornerRadius::same(theme::R3))
                     .stroke(Stroke::new(
                         if self.dragging_files { 1.5 } else { 1.0 },
                         // While files are being dragged over the window, brighten the stroke one step:
@@ -855,7 +880,60 @@ impl App {
                                 .desired_width(edit_w)
                                 .frame(false)
                                 .hint_text(RichText::new(hint).color(P::quiet()).size(16.0));
-                            let resp = ui.add(text_edit);
+                            // ── Height cap: grows to seven rows, then scrolls ──
+                            //
+                            // A bare `TextEdit::multiline` grows with its content, and the input card
+                            // sits in an **auto-height** bottom panel — so pasting a few dozen lines
+                            // made the panel eat the whole window and squeeze the transcript to
+                            // nothing (reported 2026-10-29).
+                            //
+                            // `desired_rows(1)` only sets the *minimum*; the cap has to come from
+                            // outside. Measured alternatives (2026-10-30, inside `ui.horizontal`):
+                            //
+                            // | form                                   | height with 1 / 5 / 12 lines |
+                            // |----------------------------------------|------------------------------|
+                            // | `ScrollArea::max_height(h)`            | 64 / **64** / **64**         |
+                            // | `+ auto_shrink([false, true])`         | 64 / **64** / **64**         |
+                            // | `+ min_scrolled_height(1.0)`           | 30 / **30** / **30**         |
+                            // | `allocate_ui_with_layout` + that h     | 64 / 94 / 128 (capped)       |
+                            //
+                            // So inside a *horizontal* layout the scroll area's own auto-shrink does
+                            // not track the content — it pins itself to whatever height it measured
+                            // first, which is exactly the "height is now fixed, it no longer grows"
+                            // report. Allocating the box explicitly is the only form that follows.
+                            //
+                            // The box height comes from the **previous frame's** `content_size` (the
+                            // natural height of the text), clamped to [one row, seven rows]. That
+                            // costs one frame of lag while the content changes; the alternative was
+                            // hard-coding TextEdit's internal minimum (measured 64 pt at a 16 pt
+                            // body, ~3.5 rows), which would drift the moment the font size changed.
+                            let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                            let hid = ui.id().with("composer-input-h");
+                            let prev_h = ui
+                                .ctx()
+                                .data(|d| d.get_temp::<f32>(hid))
+                                .unwrap_or(row_h);
+                            let box_h = input_box_height(Some(prev_h), row_h);
+                            let area = ui.allocate_ui_with_layout(
+                                egui::vec2(edit_w, box_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_width(edit_w);
+                                    ui.set_max_width(edit_w);
+                                    egui::ScrollArea::vertical()
+                                        // Stable id: rebuilding it every frame would reset the
+                                        // scroll offset on every keystroke.
+                                        .id_salt("aox-composer-input")
+                                        .max_height(box_h)
+                                        .show(ui, |ui| ui.add(text_edit))
+                                },
+                            );
+                            // Record the natural height for the *next* frame to size the box with.
+                            // Taken before the scroll area clamped it, so a long document still
+                            // reports "this much text" rather than "this much viewport".
+                            ui.ctx()
+                                .data_mut(|d| d.insert_temp(hid, area.inner.content_size.y));
+                            let resp = area.inner.inner;
                             if self.focus_input {
                                 resp.request_focus();
                                 self.focus_input = false;
@@ -965,3 +1043,23 @@ impl App {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_input_box_grows_until_seven_rows_then_scrolls() {
+        let row_h = 20.0;
+        // First frame: nothing measured yet, so exactly one row.
+        assert_eq!(input_box_height(None, row_h), row_h);
+        // A short document: the box follows the text.
+        assert_eq!(input_box_height(Some(60.0), row_h), 60.0);
+        // Exactly at the cap: still the cap.
+        assert_eq!(input_box_height(Some(row_h * 7.0), row_h), row_h * 7.0);
+        // Past the cap: the box stops growing and the rest scrolls.
+        assert_eq!(input_box_height(Some(row_h * 40.0), row_h), row_h * 7.0);
+        // A stale tiny reading (text just cleared) cannot collapse the box.
+        assert_eq!(input_box_height(Some(1.0), row_h), row_h);
+    }
+}

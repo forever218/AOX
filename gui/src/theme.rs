@@ -58,6 +58,46 @@ pub fn card_radius() -> u8 {
     metrics().card_radius
 }
 
+// ─────────────────────────── Radius scale ───────────────────────────
+//
+// Before 2026-10-29 the project used fourteen different radii (1/2/4/5/6/7/8/9/10/11/12/
+// 13/16/20) with no rule behind which went where: three sibling controls in the drawer alone
+// took three values (6 for a conversation row, 9 for "New conversation", 7 for a menu row),
+// which is what made the surface read as "unfinished" rather than "quiet".
+//
+// There are now five steps, and one rule for using them:
+//
+//   * the radius follows the element's **size** — a big card with a small radius looks square,
+//     a small chip with a big radius looks swollen;
+//   * **concentric**: an inner box takes `outer − padding` (never less than [`R_XS`]), so the two
+//     corners share a centre point instead of running parallel at different curvatures.
+//
+// Everything that used to be an ad-hoc number now names one of these.
+
+/// Hairline pills, 1–2 px bars, checkboxes, the 15×12 glyph box in the drawer's icon.
+/// Small enough that anything larger reads as "rounded rectangle" instead of "dot".
+pub const R_XS: u8 = 2;
+
+/// Chips, inline code, small icon backdrops, 20 px icon buttons.
+pub const R0: u8 = 4;
+
+/// The workhorse: buttons, inputs, menu rows, list rows, tool rows, small panels.
+pub const R1: u8 = 8;
+
+/// Cards, code blocks, tables, popups, dialogs.
+pub const R2: u8 = 12;
+
+/// The largest sheet: the input card and a user message bubble.
+pub const R3: u8 = 18;
+
+/// A capsule of height `h` — progress segments, attachment chips, the plugin tag.
+///
+/// Half the height, exactly: a pill is defined by its ends being semicircles, so this is derived
+/// from the box rather than chosen, and it can never drift out of sync with the height.
+pub fn pill(h: f32) -> u8 {
+    (h * 0.5).round().clamp(1.0, 127.0) as u8
+}
+
 /// Custom bold font-family name.
 const BOLD_FAMILY: &str = "aox-strong";
 /// Custom serif font-family name (for sub-headings like blockquotes; falls back to the plain family if not found).
@@ -519,6 +559,32 @@ impl P {
     pub fn border() -> Color32 {
         pal().border
     }
+
+    /// A neutral shadow tint at `a` opacity, for hand-drawn shadows under round or custom shapes.
+    ///
+    /// Not `gamma_multiply`: that multiplies the ink colour's own alpha as well, so on an opaque
+    /// colour it yields a *lighter grey* instead of a translucent black — a hand-drawn shadow made
+    /// with it turns grey and stops reading as shade.
+    pub fn shade(a: f32) -> Color32 {
+        let a = (a.clamp(0.0, 1.0) * 255.0) as u8;
+        match mode() {
+            Mode::Light => Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, a),
+            Mode::Dark => Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, a),
+        }
+    }
+
+    /// A band **sunk into** a card: table headers, diff headers, inert section strips.
+    ///
+    /// Not [`P::surface_hi`]: that is a full lightness step, sized for a control under the pointer,
+    /// so a table header painted with it reads as one big disabled button. This is 4% ink over
+    /// whatever is underneath — enough to say "this row is a label, not data", quiet enough that the
+    /// header still looks like part of the sheet rather than a block laid on top of it.
+    pub fn band() -> Color32 {
+        match mode() {
+            Mode::Light => Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x0A),
+            Mode::Dark => Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x0A),
+        }
+    }
     pub fn border_strong() -> Color32 {
         pal().border_strong
     }
@@ -655,24 +721,47 @@ impl P {
     }
 }
 
-/// The shadow under a **raised card** — dialogs, the history panel, the floating sub-windows.
+/// L2 — the shadow under a sheet **lifted off** the page: the input card, the drawer, popovers.
 ///
-/// A card on the page gets [`P::edge`] and nothing else: it is printed *on* the sheet, so a shadow
-/// would be a lie. Only what actually floats above the page casts one, and the size of that shadow
-/// is how the UI says "this is on top" without a single extra line.
+/// The single-layer shadow this replaces (`offset 4 / blur 16 / α14%`) was the mechanical cause of
+/// "everything looks flat": a shadow that is short *and* sharp reads as a **smudge under the edge**,
+/// not as distance — the eye gets no gradient to measure. What sells height is a long, soft falloff
+/// with a small offset: the sheet stays close to the page, but the darkness under it spreads far
+/// enough to be read as ambient occlusion.
 pub fn card_shadow() -> egui::Shadow {
     match mode() {
         Mode::Light => egui::Shadow {
-            offset: [0, 4],
-            blur: 16,
-            spread: 0,
-            color: Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x24),
-        },
-        Mode::Dark => egui::Shadow {
-            offset: [0, 5],
+            offset: [0, 6],
             blur: 20,
             spread: 0,
-            color: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0x8C),
+            color: Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x2E),
+        },
+        Mode::Dark => egui::Shadow {
+            offset: [0, 6],
+            blur: 22,
+            spread: 0,
+            color: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0x90),
+        },
+    }
+}
+
+/// L3 — floating **above** everything: dialogs, menus, the usage popover.
+///
+/// Further out than [`card_shadow`] in both offset and blur, so a dialog and the input card are
+/// distinguishable by depth alone, without a second border weight or a different fill.
+pub fn float_shadow() -> egui::Shadow {
+    match mode() {
+        Mode::Light => egui::Shadow {
+            offset: [0, 12],
+            blur: 36,
+            spread: 0,
+            color: Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x38),
+        },
+        Mode::Dark => egui::Shadow {
+            offset: [0, 14],
+            blur: 40,
+            spread: 0,
+            color: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 0xB0),
         },
     }
 }
@@ -683,13 +772,13 @@ pub fn card_shadow() -> egui::Shadow {
 /// Not a drop shadow — nothing is floating, so it must not look lifted. What it does is darken the
 /// one pixel right under the bottom edge. On a warm paper base that is what turns the outline into a
 /// clean line; a grey border on its own keeps dissolving into the page, however dark it is made.
-fn contact_shadow() -> egui::Shadow {
+pub fn contact_shadow() -> egui::Shadow {
     match mode() {
         Mode::Light => egui::Shadow {
             offset: [0, 2],
-            blur: 6,
+            blur: 7,
             spread: 0,
-            color: Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x40),
+            color: Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x46),
         },
         Mode::Dark => egui::Shadow {
             offset: [0, 2],
@@ -700,7 +789,7 @@ fn contact_shadow() -> egui::Shadow {
     }
 }
 
-/// A card that lies **on** the page: surface fill + a clear edge + a contact shadow.
+/// A card that lies **on** the page (L1): surface fill + a clear edge + a contact shadow.
 pub fn card(radius: u8) -> egui::Frame {
     egui::Frame::NONE
         .fill(P::surface())
@@ -709,13 +798,13 @@ pub fn card(radius: u8) -> egui::Frame {
         .shadow(contact_shadow())
 }
 
-/// A card that is **raised above** the page: brighter edge + shadow + the top light.
-pub fn raised(radius: u8) -> egui::Frame {
+/// A sheet **floating above** the page (L3): dialogs, menus, popovers.
+pub fn floating(radius: u8) -> egui::Frame {
     egui::Frame::NONE
         .fill(P::surface())
         .corner_radius(CornerRadius::same(radius))
         .stroke(Stroke::new(1.0, P::edge_raised()))
-        .shadow(card_shadow())
+        .shadow(float_shadow())
 }
 
 /// A **well**: a block sunk *into* a card (code, quotes, inert insets).
@@ -969,10 +1058,10 @@ fn build_style() -> egui::style::Style {
     v.window_stroke = Stroke::new(1.0, P::edge_raised());
     v.window_corner_radius = CornerRadius::same(card_radius());
     // Everything egui builds for itself (popups, combo boxes, tooltips, modal backdrops) is raised
-    // above the page, so it all uses the one shadow. Set here rather than at each call site: a
+    // **above** the page, so it takes the L3 shadow. Set here rather than at each call site: a
     // hand-drawn dialog and a built-in one then look like the same kind of object.
-    v.window_shadow = card_shadow();
-    v.popup_shadow = card_shadow();
+    v.window_shadow = float_shadow();
+    v.popup_shadow = float_shadow();
     v.hyperlink_color = P::ink();
     v.warn_fg_color = P::warn();
     v.error_fg_color = P::text();
@@ -981,7 +1070,7 @@ fn build_style() -> egui::style::Style {
     v.selection.bg_fill = P::ink().gamma_multiply(0.20);
     v.selection.stroke = Stroke::new(1.0, P::ink_soft());
 
-    let radius = CornerRadius::same(10);
+    let radius = CornerRadius::same(R1);
     widget(&mut v, |w| {
         w.corner_radius = radius;
         w.bg_stroke = Stroke::new(1.0, P::border());
@@ -1005,8 +1094,11 @@ fn build_style() -> egui::style::Style {
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, P::edge());
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, P::text());
 
-    v.widgets.active.bg_fill = P::surface_hi();
-    v.widgets.active.weak_bg_fill = P::surface_hi();
+    // Press must be **darker than hover**, not equal to it. Both used to be `surface_hi`, so a
+    // click produced no visual change at all — the button looked identical while being pushed,
+    // which is most of why the UI felt unresponsive (reported 2026-10-29).
+    v.widgets.active.bg_fill = P::active_fill();
+    v.widgets.active.weak_bg_fill = P::active_fill();
     v.widgets.active.bg_stroke = Stroke::new(1.0, P::edge_raised());
     v.widgets.active.fg_stroke = Stroke::new(1.0, P::text());
 
@@ -1016,8 +1108,19 @@ fn build_style() -> egui::style::Style {
 
     style.visuals = v;
 
-    // Turn off "text in labels is selectable".
+    // ── Motion ──
     //
+    // egui's default is 0.083 s, which is **below the threshold where a change reads as motion**:
+    // at that speed a hover fill looks switched on rather than touched, and the whole UI felt like
+    // it had no transitions at all (reported 2026-10-29). 0.12 s is the shortest duration that
+    // still registers as a transition while staying out of the way of a fast pointer.
+    //
+    // Deliberately global: every `animate_bool` in the app (drawer push, plan unfold, chip removal)
+    // was already tuned against egui's default, and most of them divide the same budget, so raising
+    // it here keeps them in proportion instead of needing twenty call sites re-tuned.
+    style.animation_time = 0.12;
+
+    // Turn off "text in labels is selectable".    //
     // This flag is on by default, at the cost of **every ui.label grabbing the mouse**: on hover
     // the cursor becomes the text-selection I-beam and a press can drag out a selection. Any
     // button built from labels (the "clear" / "close" / "allow once" buttons and the example

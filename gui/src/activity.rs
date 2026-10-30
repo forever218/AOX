@@ -1223,10 +1223,10 @@ fn timeline(
                     continue; // skip drawing when they crowd together, so they don't pile up
                 }
                 last_right = r.right();
-                p.rect_filled(r, CornerRadius::same(6), P::surface());
+                p.rect_filled(r, CornerRadius::same(theme::R0), P::surface());
                 p.rect_stroke(
                     r,
-                    CornerRadius::same(6),
+                    CornerRadius::same(theme::R0),
                     Stroke::new(1.0, P::border()),
                     egui::StrokeKind::Inside,
                 );
@@ -1574,12 +1574,12 @@ fn lanes(
         if r.right() < visible.left() || r.left() > visible.right() {
             continue;
         }
-        p.rect_filled(r, CornerRadius::same(4), b.fill);
+        p.rect_filled(r, CornerRadius::same(theme::R0), b.fill);
         // Still running: stroke a ring + a bright dot at the right end, so "not finished" is obvious at a glance
         if a.open() {
             p.rect_stroke(
                 r,
-                CornerRadius::same(4),
+                CornerRadius::same(theme::R0),
                 Stroke::new(1.2, P::text()),
                 egui::StrokeKind::Inside,
             );
@@ -1588,7 +1588,7 @@ fn lanes(
         if sel == Some(a.seq) {
             p.rect_stroke(
                 r.expand(1.5),
-                CornerRadius::same(5),
+                CornerRadius::same(theme::R0),
                 Stroke::new(1.8, P::ink()),
                 egui::StrokeKind::Outside,
             );
@@ -1600,7 +1600,7 @@ fn lanes(
         if hovered {
             p.rect_stroke(
                 r.expand(1.0),
-                CornerRadius::same(5),
+                CornerRadius::same(theme::R0),
                 Stroke::new(1.2, P::ink_soft()),
                 egui::StrokeKind::Inside,
             );
@@ -1860,7 +1860,7 @@ fn popover(ui: &mut Ui, st: &mut Activity, full: Rect) {
                         let br = Rect::from_min_size(head.min, Vec2::new(tw + 16.0, 20.0));
                         let meta = aox::tf!("Round {}", round);
                         let p = ui.painter();
-                        p.rect_filled(br, CornerRadius::same(5), label.color());
+                        p.rect_filled(br, CornerRadius::same(theme::R0), label.color());
                         p.text(br.center(), Align2::CENTER_CENTER, label.label(), font, P::bg());
                         p.text(
                             Pos2::new(br.right() + 10.0, head.center().y),
@@ -1877,7 +1877,7 @@ fn popover(ui: &mut Ui, st: &mut Activity, full: Rect) {
                     );
                     let cresp = ui.interact(cr, ui.id().with("aox-pop-close"), Sense::click());
                     if cresp.hovered() {
-                        ui.painter().rect_filled(cr, CornerRadius::same(5), P::surface_hi());
+                        ui.painter().rect_filled(cr, CornerRadius::same(theme::R0), P::surface_hi());
                     }
                     let fg = if cresp.hovered() { P::ink() } else { P::text_dim() };
                     let c = cr.center();
