@@ -325,9 +325,10 @@ pub struct App {
     /// Where the transcript should be scrolled to on the next frame — a **content-space** y, i.e.
     /// the reply's first line measured in the scroll area's own coordinates.
     ///
-    /// Set by the two "jump to the start of this reply" controls (the chip on the usage line and the
-    /// floating arrow). One-shot: `App::transcript` hands it to `ScrollArea::vertical_scroll_offset`
-    /// and clears it in the same frame.
+    /// Set by the "back to the start of this reply" chip on the usage line, and by the conversation
+    /// rail on the right edge (a tick under the pointer, or `Ctrl+↑` / `Ctrl+↓`). One-shot:
+    /// `App::transcript` hands it to `ScrollArea::vertical_scroll_offset` and clears it in the same
+    /// frame.
     ///
     /// Why an offset rather than "scroll item 7 into view": the scroll target has to be applied
     /// **before** the content is laid out, and `ui.scroll_to_rect` only records a target that egui
@@ -335,6 +336,12 @@ pub struct App {
     /// between, which put the view straight back at the end. Measured, not guessed: the first
     /// version of this button accepted the target and never moved.
     jump: Option<f32>,
+    /// How far the conversation rail has slid in: `0.0` = absent, `1.0` = fully out.
+    ///
+    /// Stepped frame by frame rather than derived from a start time, exactly like `hist_t`: the
+    /// third question can arrive in the middle of a turn, and the rail then has to carry on from
+    /// wherever it already is instead of restarting at zero.
+    rail_t: f32,
     /// The "add your model" dialog has been offered once this launch.
     ///
     /// A second `Boot` carrying `first_run` (there are two on the not-configured path: one before the
@@ -510,6 +517,7 @@ impl App {
             force_follow: true,
             last_scroll_y: 0.0,
             jump: None,
+            rail_t: 0.0,
             setup_asked: false,
             settings_open: false,
             settings_tab: SettingsTab::Extra,

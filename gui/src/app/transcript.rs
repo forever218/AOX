@@ -824,6 +824,324 @@ pub(super) fn jump_chip(ui: &mut Ui) -> bool {
         .clicked()
 }
 
+// ────────────── the conversation rail ──────────────
+
+/// How long the rail takes to slide in — or out — in seconds.
+///
+/// Short on purpose. It is not a transition anyone should watch; it exists so a third question
+/// does not make a column of marks appear out of nowhere while the reader is mid-sentence.
+const RAIL_SECS: f32 = 0.22;
+
+/// How many questions a conversation needs before the rail is drawn at all.
+///
+/// Two ticks are not a map, they are a pair of dots, and the reader can already see both ends of a
+/// two-turn conversation. Three is where "where am I in this thing" starts being a real question.
+const RAIL_MIN: usize = 3;
+
+/// Space between the track's ends and the edges it runs between (the title bar's bottom edge, and
+/// the composer's top edge).
+const RAIL_INSET: f32 = 16.0;
+
+/// How far inside the scroll area's right edge the track must stay, clear of the scroll bar
+/// (8 wide + 3 inner margin + 4 outer).
+///
+/// Only a ceiling: the track's x is the **middle of the gutter** between the text and the right
+/// edge, which moves with the window (2026-10-31: a fixed offset from the column put the rail in the
+/// same spot at every width, and at 1080 it hugged the text while ~130 points of margin sat empty on
+/// its right).
+const RAIL_FROM_BAR: f32 = 16.0;
+
+/// A tick's size at rest, and while it is under the pointer.
+const RAIL_H: f32 = 3.0;
+const RAIL_W: f32 = 10.0;
+const RAIL_W_CUR: f32 = 16.0;
+
+/// The box that marks the turn being read: hollow, `RAIL_W_CUR` wide and this tall.
+///
+/// It used to be the same 3-point bar, just wider and darker — which at a glance was no different
+/// from a tick under the pointer (2026-10-31: "只是那个节点条变宽一点，不太明显"). A hollow rectangle
+/// is a different *shape*, not a different weight, so the eye picks it out of the column without
+/// making it heavier than the text beside it.
+const RAIL_BOX_H: f32 = 9.0;
+
+/// Vertical pitch between two questions, i.e. the height of one row of the index.
+///
+/// The rail went through two earlier shapes before this: proportional to the whole document (which
+/// scattered three ticks over 500 points of empty margin — "太丑了"), then proportional *within* a
+/// centred band (better, but the gaps still differed: "间距还是不一样，应该是等间距的"). Even
+/// spacing is what a list of turns actually wants: it is an index you click, not a minimap, and the
+/// filled tick — not the position — is what says which turn you are in.
+const RAIL_STEP: f32 = 34.0;
+
+/// Where each tick sits, in screen y: `RAIL_STEP` apart, the list centred in the track.
+///
+/// Evenly spaced, deliberately. The ticks used to be proportional to the conversation (first to the
+/// whole document, then to the questions' own span), which made two neighbouring questions look
+/// misaligned when one reply happened to be long — "间距还是不一样". Equal spacing is what makes the
+/// column read as a list, and a list is the right metaphor for a set of jumps: the position says
+/// nothing, the filled tick says everything.
+///
+/// The pitch is capped so a long conversation still fits the track; past that the ticks pack
+/// tighter instead of running out over the composer.
+fn rail_tick_ys(n: usize, top: f32, len: f32) -> Vec<f32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![top + len * 0.5];
+    }
+    let pitch = RAIL_STEP.min(len / (n as f32 - 1.0));
+    let height = pitch * (n as f32 - 1.0);
+    let first = top + (len - height) * 0.5;
+    (0..n).map(|i| first + pitch * i as f32).collect()
+}
+
+/// Which question the viewport is sitting in: the last one whose head is at or above the top edge.
+///
+/// The `unwrap_or(0)` is not a fallback for an empty list (there is none — the rail needs three) but
+/// for the very top of the document, where the first question is a few points *below* the top edge
+/// (the transcript starts with 76 points of padding) and is unmistakably the one being read.
+fn rail_current(qy: &[f32], offset: f32) -> usize {
+    qy.iter().rposition(|y| *y <= offset + 8.0).unwrap_or(0)
+}
+
+/// The question, flattened to one run of text for the hover card.
+///
+/// Newlines and runs of spaces are collapsed, because a bubble may well start with an indented
+/// code block and the card is two lines tall — a leading `    ` would eat the whole card. The cap
+/// is generous (the galley elides by pixels); it exists only so a pasted log cannot be laid out
+/// hundreds of rows deep just to be cut off.
+fn rail_question_text(t: &str) -> String {
+    const MAX: usize = 160;
+    let mut out = String::new();
+    let mut space = false;
+    let mut n = 0usize;
+    for ch in t.chars() {
+        if ch.is_whitespace() {
+            space = true;
+            continue;
+        }
+        if space && !out.is_empty() {
+            out.push(' ');
+        }
+        space = false;
+        out.push(ch);
+        n += 1;
+        if n >= MAX {
+            break;
+        }
+    }
+    out
+}
+
+/// How much work the turn behind a question took: tool calls made, and how long they ran.
+///
+/// Walked from that question to the next one, so it can only ever report the turn it was asked
+/// about. `None` for the seconds when they were never recorded (history files carry no timing),
+/// which is also why the card omits the duration rather than printing `0.0s`.
+fn rail_turn(items: &[Item], start: usize) -> (usize, Option<f32>) {
+    let mut calls = 0;
+    let mut secs: Option<f32> = None;
+    for it in items.get(start + 1..).unwrap_or(&[]) {
+        match it {
+            Item::User(..) => break,
+            Item::Process(p) => {
+                calls += p.steps.len();
+                if let Some(e) = p.elapsed {
+                    *secs.get_or_insert(0.0) += e;
+                }
+            }
+            _ => {}
+        }
+    }
+    (calls, secs)
+}
+
+/// Lay out `rows` lines of text, elided by **pixels** at the last row — [`elide`] for a block that
+/// is allowed to wrap once.
+///
+/// `break_anywhere` is **off** here, unlike [`elide`]: that flag is what lets a Chinese sentence be
+/// cut, but it also breaks at the glyph that fits rather than at the space before it, so a Latin
+/// question came out as "…files by type i / n the current directory". The price is that one
+/// unbroken run (a path, a URL) overflows its row — which is why the caller clips the card: a path
+/// cut off at the card's edge reads as "there is more", while a word split in half reads as a bug.
+fn rail_text(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32, rows: usize) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat { font_id: font, color, ..Default::default() },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: max_w,
+        max_rows: rows,
+        break_anywhere: false,
+        overflow_character: Some('…'),
+    };
+    ui.painter().layout_job(job)
+}
+
+/// The card that names a turn while its tick is under the pointer.
+///
+/// Opaque and bordered like every other card in the window, and it opens to the **left** of the
+/// rail: the rail lives in the margin, so the card grows back over the text, which is the only
+/// direction with room. Clamped to the viewport on all four sides — a tick near the last line must
+/// not push its card under the composer.
+fn rail_card(ui: &Ui, x: f32, cy: f32, title: &str, meta: &str, bounds: Rect, alpha: f32) {
+    let pad = 13.0;
+    let w = 268.0_f32.min((bounds.width() - 32.0).max(140.0));
+    let inner_w = w - pad * 2.0;
+    let head = rail_text(ui, title, theme::body_font(13.5), P::text().gamma_multiply(alpha), inner_w, 2);
+    let foot = elide(ui, meta, theme::body_font(11.5), P::text_faint().gamma_multiply(alpha), inner_w);
+    let gap = 5.0;
+    let h = pad * 2.0 + head.size().y + gap + foot.size().y;
+    let mut rect = Rect::from_min_size(Pos2::new(x - RAIL_FROM_BAR - w, cy - h * 0.5), Vec2::new(w, h));
+    // Nudge, never squash: the top edge wins first, then the bottom, so a card taller than the
+    // viewport still starts at the top rather than being pushed above it. The top limit is the
+    // title bar's bottom edge for the same reason the track starts there — a card clamped to the
+    // viewport's own top would slide under the caption buttons.
+    let ceiling = bounds.top().max(TITLEBAR_H) + 8.0;
+    let dy = (ceiling - rect.top()).max(0.0) + (bounds.bottom() - 8.0 - rect.bottom()).min(0.0);
+    rect = rect.translate(Vec2::new(0.0, dy));
+    if rect.left() < bounds.left() + 8.0 {
+        rect = rect.translate(Vec2::new(bounds.left() + 8.0 - rect.left(), 0.0));
+    }
+    let p = ui.painter();
+    p.rect_filled(
+        rect.translate(Vec2::new(0.0, 2.0)),
+        CornerRadius::same(theme::R2),
+        P::shade(0.05 * alpha),
+    );
+    p.rect_filled(rect, CornerRadius::same(theme::R2), P::surface().gamma_multiply(alpha));
+    p.rect_stroke(
+        rect,
+        CornerRadius::same(theme::R2),
+        Stroke::new(1.0, P::border().gamma_multiply(alpha)),
+        egui::StrokeKind::Inside,
+    );
+    let at = Pos2::new(rect.left() + pad, rect.top() + pad);
+    // The title may hold one unbreakable run (see `rail_text`), so it is clipped to the card rather
+    // than allowed to paint over the margin.
+    let p = p.with_clip_rect(rect.shrink(1.0));
+    p.galley(at, head.clone(), P::text());
+    p.galley(
+        Pos2::new(at.x, at.y + head.size().y + gap),
+        foot,
+        P::text_faint(),
+    );
+}
+
+/// One tick per question on the right edge of the column — the conversation as a map.
+///
+/// The track starts **below the title bar**, not at the viewport's top edge: the bar is a
+/// `Foreground` area laid over the window's first 52 points while the central panel (and with it the
+/// scroll area) begins at 0 behind it, so a track measured from `bounds.top()` puts its first tick
+/// under the caption buttons — measured, at y = 39.7, invisible.
+///
+/// Returns the content y the reader asked to be taken to (a click on a tick, or `Ctrl+↑` / `Ctrl+↓`,
+/// which walk the same list); `None` when nothing was asked. `alpha` is the slide-in progress, so
+/// the rail fades and drifts in from the edge instead of appearing.
+fn conversation_rail(
+    ui: &mut Ui,
+    items: &[Item],
+    qs: &[(usize, f32)],
+    x: f32,
+    bounds: Rect,
+    offset: f32,
+    alpha: f32,
+) -> Option<f32> {
+    let top = bounds.top().max(TITLEBAR_H) + RAIL_INSET;
+    let len = bounds.bottom() - RAIL_INSET - top;
+    if len < 48.0 || qs.is_empty() {
+        return None;
+    }
+    let qy: Vec<f32> = qs.iter().map(|(_, y)| *y).collect();
+    let ys = rail_tick_ys(qs.len(), top, len);
+    let cur = rail_current(&qy, offset);
+    // Below half-opacity the rail is on its way in or out; it must not be clickable while it cannot
+    // really be seen.
+    let live = alpha > 0.5;
+    let mut asked: Option<f32> = None;
+    let mut hot: Option<usize> = None;
+    for (i, cy) in ys.iter().copied().enumerate() {
+        let is_cur = i == cur;
+        let mut hovered = false;
+        if live {
+            // A 24×12 target around a 3-point mark: the tick is the thing you aim at, not the thing
+            // the pointer has to hit.
+            let hit = Rect::from_center_size(Pos2::new(x, cy), Vec2::new(24.0, 12.0));
+            let r = ui
+                .interact(hit, ui.id().with(("aox-rail", i)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            hovered = r.hovered();
+            if hovered {
+                hot = Some(i);
+            }
+            if r.clicked() {
+                asked = Some(qs[i].1);
+            }
+        }
+        // Centred on the rail's axis, not right-aligned: a mark that grows only to the left made the
+        // current turn sit off-axis from its neighbours.
+        let cx = x + (1.0 - alpha) * 10.0;
+        if is_cur {
+            ui.painter().rect_stroke(
+                Rect::from_center_size(Pos2::new(cx, cy), Vec2::new(RAIL_W_CUR, RAIL_BOX_H)),
+                CornerRadius::same(2),
+                Stroke::new(1.0, P::text().gamma_multiply(alpha)),
+                egui::StrokeKind::Inside,
+            );
+        } else {
+            let w = if hovered { RAIL_W_CUR } else { RAIL_W };
+            let color = if hovered { P::text() } else { P::text_faint() };
+            ui.painter().rect_filled(
+                Rect::from_center_size(Pos2::new(cx, cy), Vec2::new(w, RAIL_H)),
+                CornerRadius::same(2),
+                color.gamma_multiply(alpha),
+            );
+        }
+    }
+
+    if let Some(i) = hot {
+        let (q, _) = qs[i];
+        let title = match &items[q] {
+            Item::User(t, _) => rail_question_text(t),
+            _ => String::new(),
+        };
+        let (calls, secs) = rail_turn(items, q);
+        let mut meta = format!("#{} / {}", i + 1, qs.len());
+        if calls > 0 {
+            meta.push_str(&format!(" · {}", aox::tf!("{} calls", calls)));
+        }
+        if let Some(s) = secs {
+            meta.push_str(&format!(" · {s:.1}s"));
+        }
+        rail_card(ui, x, ys[i], &title, &meta, bounds, alpha);
+    }
+
+    // `Ctrl+↑` / `Ctrl+↓`: the same walk, without having to find a 3-point mark first. Skipped while
+    // anything holds keyboard focus — inside the input box these keys move the caret.
+    if live && qs.len() >= 2 && ui.memory(|m| m.focused().is_none()) {
+        let step = ui.input(|i| {
+            if !i.modifiers.command {
+                0
+            } else if i.key_pressed(egui::Key::ArrowUp) {
+                -1
+            } else if i.key_pressed(egui::Key::ArrowDown) {
+                1
+            } else {
+                0
+            }
+        });
+        if step != 0 {
+            let t = (cur as i32 + step).clamp(0, qs.len() as i32 - 1) as usize;
+            if t != cur {
+                asked = Some(qs[t].1);
+            }
+        }
+    }
+
+    asked
+}
+
 // ────────────── settings dialog ──────────────
 
 impl App {
@@ -850,6 +1168,8 @@ impl App {
         // - `jump_to` is this frame's assignment, copied out before the builder;
         // - `last_reply` is the most recent assistant block, for the usage line's chip: the flag says
         //   its first line is off-screen, so the chip only appears where it can do something;
+        // - `questions` is every user message with its content y — that is the whole input the rail
+        //   on the right edge needs, and it is only knowable *here*, while the layout is in hand;
         // - `jump` is what a click this frame asks for, applied to `self` after `show` returns.
         let jump_to = self.jump;
         // This frame's scroll offset, i.e. the value the content is being painted at: `begin()`
@@ -857,6 +1177,7 @@ impl App {
         // `last_scroll_y` holds. Turning a screen y into a content y needs it.
         let offset_now = self.last_scroll_y;
         let mut last_reply: Option<(f32, bool)> = None;
+        let mut questions: Vec<(usize, f32)> = Vec::new();
         let mut jump: Option<f32> = None;
         // One frame of `vertical_scroll_offset` is what performs a jump. It replaces the offset
         // **before** layout, so the frame that jumps already paints in the new place.
@@ -916,12 +1237,14 @@ impl App {
                         // only `tex` first, and borrowing `items` in the loop no longer conflicts
                         // (borrowing all of `&mut self` would not work).
                         let tex = &self.tex;
-                        for item in self.items.iter_mut() {
+                        for (i, item) in self.items.iter_mut().enumerate() {
                             // The item's own top edge, taken before anything is drawn: the vertical
                             // layout's cursor is where this item starts.
                             let top = ui.cursor().min.y;
                             match item {
                                 Item::User(t, files) => {
+                                    // The rail's only input: a question's head, in content space.
+                                    questions.push((i, top - view_top + offset_now));
                                     // A new question starts a new turn, so the reply the usage line
                                     // would point at is no longer "the one above it": a turn that dies
                                     // before writing any answer (an early failure, an abort) still
@@ -1001,10 +1324,55 @@ impl App {
         if jump_to.is_some() {
             self.jump = None;
         }
-        // What the two controls ask for this frame. The move itself happens on the **next** frame:
+
+        // ── the conversation rail ───────────────────────────────────────────────
+        // Drawn **after** the scroll area, so it paints over the text rather than under it, and so
+        // the card it opens is never buried by a paragraph. `out.inner_rect` (not the panel's rect)
+        // is the viewport: it already excludes the scroll bar, which is what keeps the ticks from
+        // sitting on the strip the pointer uses to drag the view.
+        //
+        // Where it goes: the **middle of the gutter** between the text and the window's right edge,
+        // so it moves with the window instead of tracking the column at a fixed offset. Neither edge
+        // works on its own — glued to the column it looked cramped at 1080 while half the margin sat
+        // empty on its right, and pinned to the window edge it would read as chrome on a 1920 screen.
+        // Mid-gutter is the one place that is "beside the text" at every width. The clamp keeps it
+        // clear of the scroll bar, and `fits` gives up when the margin is too thin to hold it without
+        // touching the text.
+        let column_right = out.inner_rect.left() + pad + inner;
+        let rail_x = ((column_right + out.inner_rect.right()) * 0.5)
+            .min(out.inner_rect.right() - RAIL_FROM_BAR);
+        let rail_fits = rail_x - RAIL_W_CUR * 0.5 >= column_right + 6.0;
+        let want = if rail_fits && questions.len() >= RAIL_MIN { 1.0 } else { 0.0 };
+        // Stepped by frame, the same way `hist_t` is: a conversation that grows its third question
+        // while the reader watches has to continue from wherever the rail already is, and a window
+        // narrowed until the margin disappears has to slide it back out.
+        if (self.rail_t - want).abs() > f32::EPSILON {
+            let step = (ui.input(|i| i.stable_dt).min(0.1) / RAIL_SECS).max(0.0);
+            self.rail_t = if self.rail_t < want {
+                (self.rail_t + step).min(want)
+            } else {
+                (self.rail_t - step).max(want)
+            };
+            ui.ctx().request_repaint();
+        }
+        let rail_jump = if self.rail_t > 0.0 {
+            conversation_rail(
+                ui,
+                &self.items,
+                &questions,
+                rail_x,
+                out.inner_rect,
+                offset_now,
+                crate::app::ease_out_cubic(self.rail_t),
+            )
+        } else {
+            None
+        };
+
+        // What the controls ask for this frame. The move itself happens on the **next** frame:
         // whether the view follows the end is decided before the content is laid out, and a control
         // clicked while sitting at the bottom cannot be honoured in that same frame.
-        if let Some(y) = jump {
+        if let Some(y) = rail_jump.or(jump) {
             // `JUMP_MARGIN` of breathing room above the first line, and never a negative offset.
             self.jump = Some((y - JUMP_MARGIN).max(0.0));
             self.follow = false;
@@ -1428,5 +1796,112 @@ mod tests {
         );
         assert!(!thinking_band_visible(false, false), "no reasoning, no band");
         assert!(!thinking_band_visible(false, true), "still no reasoning, still no band");
+    }
+
+    // ── the conversation rail ────────────────────────────────────────────────
+
+    fn step(name: &str) -> StepView {
+        StepView {
+            name: name.into(),
+            plugin: None,
+            purpose: None,
+            subject: None,
+            args: "{}".into(),
+            result: None,
+            diff: None,
+            diff_detail: None,
+            expanded: false,
+            images: Vec::new(),
+        }
+    }
+
+    fn proc(calls: usize, elapsed: Option<f32>) -> Item {
+        Item::Process(Process {
+            steps: (0..calls).map(|_| step("bash")).collect(),
+            interim: Vec::new(),
+            reasoning: String::new(),
+            elapsed,
+            expanded: false,
+            aborted: false,
+        })
+    }
+
+    /// The track is a miniature of the document, not a ladder.
+    ///
+    /// Even spacing would say "three questions, three equal chunks" about a conversation whose
+    /// third reply is ten times the first — which is exactly the case the rail exists to answer, so
+    /// A list, not a minimap: every gap is the same, and the list is centred.
+    ///
+    /// Two earlier shapes were proportional to the conversation, and both were rejected on sight —
+    /// first because three ticks scattered over half a page of margin ("太丑了"), then because the
+    /// gaps still came out unequal ("间距还是不一样，应该是等间距的"). Equal rows is the only shape
+    /// that reads as an index of turns rather than as a broken ruler.
+    #[test]
+    fn rail_ticks_are_evenly_spaced_and_centred() {
+        let len = 400.0;
+        let ys = rail_tick_ys(3, 0.0, len);
+        assert_eq!(ys, vec![166.0, 200.0, 234.0], "one RAIL_STEP apart, centred on 200");
+        assert!(
+            (ys[1] - ys[0] - (ys[2] - ys[1])).abs() < 0.01,
+            "equal gaps or it is not a list: {ys:?}"
+        );
+        // Nine questions still centre, and still step by the full pitch.
+        let ys = rail_tick_ys(9, 0.0, len);
+        assert!((ys[0] + ys[8]) * 0.5 - len * 0.5 < 0.01, "centred: {ys:?}");
+        assert!((ys[1] - ys[0] - 34.0).abs() < 0.01, "full pitch while it fits: {ys:?}");
+    }
+
+    /// A long conversation packs tighter instead of running out of the track.
+    #[test]
+    fn rail_ticks_compress_when_the_list_is_longer_than_the_track() {
+        let len = 100.0;
+        let ys = rail_tick_ys(40, 0.0, len);
+        assert_eq!(ys.len(), 40);
+        assert!((ys[0] - 0.0).abs() < 0.01 && (ys[39] - len).abs() < 0.01, "fills the track: {ys:?}");
+        assert!(ys.windows(2).all(|w| w[1] > w[0]), "still in order and distinct");
+        // Degenerate inputs must not divide by zero or panic.
+        assert!(rail_tick_ys(0, 0.0, 100.0).is_empty(), "no questions, no ticks");
+        assert_eq!(rail_tick_ys(1, 0.0, 100.0), vec![50.0], "one question sits in the middle");
+        assert_eq!(rail_tick_ys(2, 10.0, 20.0), vec![10.0, 30.0], "two: one step, still centred");
+    }
+
+    /// Which tick is the filled one: the question whose head is at or above the top edge.
+    #[test]
+    fn the_rail_marks_the_question_you_are_reading() {
+        let qy = [76.0, 900.0, 2400.0];
+        assert_eq!(rail_current(&qy, 0.0), 0, "at the very top, the first question is the one on screen");
+        assert_eq!(rail_current(&qy, 300.0), 0, "inside the first reply");
+        assert_eq!(rail_current(&qy, 900.0), 1, "the head of the second question is exactly at the top");
+        assert_eq!(rail_current(&qy, 2300.0), 1, "still inside the second turn's answer");
+        assert_eq!(rail_current(&qy, 5000.0), 2, "past every question = the last one");
+    }
+
+    /// The card's title is one flattened run, capped — a bubble may start with an indented block.
+    #[test]
+    fn the_rail_card_flattens_a_question_into_one_run() {
+        assert_eq!(rail_question_text("  where does\n\n\tthe config  live?  "), "where does the config live?");
+        assert_eq!(rail_question_text(""), "", "an empty question stays empty");
+        let long: String = "字".repeat(400);
+        let out = rail_question_text(&long);
+        assert_eq!(out.chars().count(), 160, "the cap keeps a pasted log out of the layout pass");
+    }
+
+    /// A rail tick reports its own turn, never the next one's work.
+    #[test]
+    fn a_rail_tick_counts_only_its_own_turn() {
+        let items = vec![
+            Item::User("first".into(), Vec::new()),
+            proc(2, Some(5.0)),
+            Item::Assistant("done".into()),
+            proc(1, None),
+            Item::User("second".into(), Vec::new()),
+            proc(3, None),
+        ];
+        let (calls, secs) = rail_turn(&items, 0);
+        assert_eq!(calls, 3, "both process cards of the first turn, and nothing from the second");
+        assert_eq!(secs, Some(5.0), "the only card that recorded a duration");
+        let (calls, secs) = rail_turn(&items, 4);
+        assert_eq!(calls, 3, "the second turn is on its own");
+        assert_eq!(secs, None, "history carries no timing, so the card prints no duration");
     }
 }
