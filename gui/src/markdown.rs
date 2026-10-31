@@ -1,8 +1,8 @@
 //! Lightweight Markdown rendering: draw the model's Markdown reply as egui widgets.
 //!
-//! Supports: headings, paragraphs, unordered/ordered lists, block quotes, fenced code blocks,
-//! inline code, **bold**, *italic*, links and tables. The goal is "good-looking and loses nothing",
-//! not spec completeness.
+//! Supports: headings, paragraphs, unordered/ordered lists (including `- [x]` task lists), block
+//! quotes, fenced code blocks, inline code, **bold**, *italic*, links and tables. The goal is
+//! "good-looking and loses nothing", not spec completeness.
 //!
 //! **Clickable targets.** A run of text that names a URL or an absolute local path is clickable: it
 //! goes through `open` on click (see that module for what a click is allowed to do). Detecting them
@@ -49,7 +49,7 @@ struct Hot {
 enum Block {
     Heading { level: u8, text: String },
     Para(String),
-    Bullet { indent: usize, marker: Option<String>, text: String },
+    Bullet { indent: usize, marker: Option<String>, text: String, task: Option<bool> },
     Quote(String),
     Code { lang: String, lines: Vec<String> },
     Rule,
@@ -78,6 +78,25 @@ fn bullet_prefix(s: &str) -> Option<(usize, Option<String>, String)> {
         }
     }
     None
+}
+
+/// A task-list item: `- [ ] todo` / `- [x] done`. Returns the state and the text **without** the
+/// brackets.
+///
+/// GitHub's flavour, because that is what models write when a user asks for a checklist. The brackets
+/// must be followed by whitespace — `- [x]done` is a link-ish sentence, not a checkbox, and turning it
+/// into one would eat text the user never asked to hide.
+fn task_prefix(text: &str) -> Option<(bool, String)> {
+    let rest = text.trim_start().strip_prefix('[')?;
+    let mut chars = rest.chars();
+    let done = match chars.next()? {
+        ' ' => false,
+        'x' | 'X' => true,
+        _ => return None,
+    };
+    let body = chars.as_str().strip_prefix(']')?;
+    let body = body.strip_prefix(' ').or_else(|| body.strip_prefix('\t'))?;
+    Some((done, body.trim_start().to_string()))
 }
 
 fn is_table_sep(s: &str) -> bool {
@@ -174,7 +193,13 @@ fn parse(md: &str) -> Vec<Block> {
         }
 
         if let Some((indent, marker, text)) = bullet_prefix(raw) {
-            out.push(Block::Bullet { indent, marker, text });
+            // A checkbox is only a checkbox while something follows it; otherwise the brackets stay
+            // in the sentence and the reader sees exactly what the model wrote.
+            let (task, text) = match task_prefix(&text) {
+                Some((done, rest)) => (Some(done), rest),
+                None => (None, text),
+            };
+            out.push(Block::Bullet { indent, marker, text, task });
             i += 1;
             continue;
         }
@@ -937,6 +962,52 @@ fn exists_on_hover(ui: &Ui, widget: egui::Id, index: usize, t: &Target) -> bool 
     yes
 }
 
+/// A task-list checkbox, painted from a rounded rect and two line segments.
+///
+/// Drawn rather than set as `☐` / `☑`: the app ships no icon font, and a missing glyph in the marker
+/// column is a box with a hex number in it — the same reason as `call_glyph` and `jump_arrow`. The
+/// mark is knocked out in the page colour rather than fixed to white, so a checked item stays legible
+/// in both themes.
+///
+/// The slot is the same 20 points the bullet glyph gets, so a task list and a plain list line up on
+/// the same axis even when they are mixed.
+fn task_box(ui: &mut Ui, done: bool) {
+    const SIDE: f32 = 13.0;
+    // The height of one body line, so the box centres on the first row of the item rather than on the
+    // top of the widget — a two-line task would otherwise hang its checkbox above the text.
+    let row_h = ui
+        .painter()
+        .layout_no_wrap("x".into(), theme::body_font(theme::body_size()), P::text())
+        .size()
+        .y;
+    let (slot, _) =
+        ui.allocate_exact_size(egui::vec2(20.0, row_h.max(SIDE)), egui::Sense::hover());
+    let r = egui::Rect::from_center_size(
+        egui::pos2(slot.left() + SIDE * 0.5, slot.center().y),
+        egui::vec2(SIDE, SIDE),
+    );
+    let p = ui.painter();
+    if done {
+        p.rect_filled(r, CornerRadius::same(3), P::ink());
+        let w = Stroke::new(1.6, P::bg());
+        p.line_segment(
+            [egui::pos2(r.left() + 3.1, r.center().y + 0.4), egui::pos2(r.left() + 5.6, r.bottom() - 3.5)],
+            w,
+        );
+        p.line_segment(
+            [egui::pos2(r.left() + 5.6, r.bottom() - 3.5), egui::pos2(r.right() - 3.1, r.top() + 3.7)],
+            w,
+        );
+    } else {
+        p.rect_stroke(
+            r,
+            CornerRadius::same(3),
+            Stroke::new(1.2, P::text_faint()),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
 pub fn render(ui: &mut Ui, md: &str, base: Color32) {
     // Right-edge boundary: fixed at the available width when entering this column, and not changed for the rest of the render.
     let width = ui.available_width().max(160.0);
@@ -975,15 +1046,20 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                 ui.add_space(BLOCK_GAP);
             }
 
-            Block::Bullet { indent, marker, text } => {
+            Block::Bullet { indent, marker, text, task } => {
                 let pad = (indent.min(3) as f32) * 20.0;
                 let inner_w = (width - pad - 30.0).max(80.0);
                 ui.horizontal_top(|ui| {
                     ui.add_space(pad);
                     ui.allocate_ui(egui::vec2(20.0, 0.0), |ui| {
                         ui.set_min_width(20.0);
-                        let m = marker.clone().unwrap_or_else(|| "•".to_string());
-                        ui.label(RichText::new(m).color(P::ink()).size(17.5));
+                        match task {
+                            Some(done) => task_box(ui, done),
+                            None => {
+                                let m = marker.clone().unwrap_or_else(|| "•".to_string());
+                                ui.label(RichText::new(m).color(P::ink()).size(17.5));
+                            }
+                        }
                     });
                     let (job, hots) = job_of(inline(&text), theme::body_size(), base, inner_w, false);
                     text_label(ui, job, &hots);
@@ -1607,5 +1683,52 @@ a code line long enough that it must wrap rather than widen the card beyond the 
         assert!(hot_texts("wrote notes/todo.md just now").is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── task lists ────────────────────────────────────────────────────────────
+
+    /// `- [x] done` becomes a checkbox, and the brackets leave the text.
+    ///
+    /// Models write GitHub checklists whenever a user asks for a plan or a todo list, and until now
+    /// the reader got a bullet with a literal `[x]` in front of it (reported 2026-10-31, with a
+    /// screenshot of a "今日清单").
+    #[test]
+    fn task_items_become_checkboxes() {
+        let blocks = parse("- [x] 手写 block_on\n- [ ] 用 io_uring 重写\n- [X] upper case counts\n- plain item");
+        let mut it = blocks.iter();
+        for (done, text) in [
+            (true, "手写 block_on"),
+            (false, "用 io_uring 重写"),
+            (true, "upper case counts"),
+        ] {
+            match it.next() {
+                Some(Block::Bullet { task, text: t, .. }) => {
+                    assert_eq!(*task, Some(done), "state of {text:?}");
+                    assert_eq!(t, text, "the brackets must not survive into the sentence");
+                }
+                other => panic!("expected a task bullet, got {other:?}"),
+            }
+        }
+        match it.next() {
+            Some(Block::Bullet { task, text, .. }) => {
+                assert_eq!(*task, None, "a plain bullet stays a bullet");
+                assert_eq!(text, "plain item");
+            }
+            other => panic!("expected a plain bullet, got {other:?}"),
+        }
+    }
+
+    /// Brackets that are not followed by a space are part of the sentence.
+    ///
+    /// `- [x]done` and `see [x] here` must keep every character — eating text the model wrote is a
+    /// worse failure than showing a checkbox one time too few.
+    #[test]
+    fn a_bracket_run_without_a_trailing_space_is_not_a_checkbox() {
+        assert_eq!(task_prefix("[x]done"), None);
+        assert_eq!(task_prefix("[y] nope"), None, "only x/X/space mark a state");
+        assert_eq!(task_prefix("plain"), None);
+        assert_eq!(task_prefix("[x]"), None, "nothing follows, so nothing to tick");
+        assert_eq!(task_prefix("[x]   spaced"), Some((true, "spaced".to_string())));
+        assert_eq!(task_prefix("  [ ] indented"), Some((false, "indented".to_string())));
     }
 }
