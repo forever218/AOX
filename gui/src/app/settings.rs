@@ -15,7 +15,11 @@ pub(super) const SETTINGS_W: f32 = 700.0;
 
 /// Height hard-coded, the reason being "the card shouldn't grow and shrink when switching columns"
 /// -- see the comment on `settings_overlay`.
-pub(super) const SETTINGS_H: f32 = 470.0;
+///
+/// Raised from 470 on 2026-10-31: "Appearance" now carries the theme choice **and** the whole
+/// first-screen block (source, two colours, two switches, the folder link). The column scrolls
+/// anyway; this just lets the block be read without scrolling on the default window.
+pub(super) const SETTINGS_H: f32 = 540.0;
 
 /// Width of the left column (the list of columns).
 pub(super) const SETTINGS_NAV_W: f32 = 132.0;
@@ -322,6 +326,251 @@ pub(super) fn link_row(ui: &mut Ui, key_w: f32, key: &str, url: &str) {
     ui.add_space(4.0);
 }
 
+/// A hairline across the column.
+///
+/// Only one is used (between the theme choice and the first-screen block), and it exists because
+/// those two groups answer different questions — "what does the interface look like" versus "what
+/// does the first screen say". Without a line the switch row reads as one more theme option.
+fn rule(ui: &mut Ui) {
+    let w = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(0), P::edge());
+}
+
+/// A segmented control: one pill per option, the chosen one filled.
+///
+/// Hand-drawn rather than three `choice_row`s because this is a **one-of-three value on one row**,
+/// not a list of destinations: three stacked radio rows would take 90pt of a panel that already
+/// scrolls, and would read like a second theme selector.
+fn segmented(ui: &mut Ui, salt: &str, items: &[(&str, bool)]) -> Option<usize> {
+    if items.is_empty() {
+        return None;
+    }
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(theme::R2), P::surface_hi());
+    let seg_w = rect.width() / items.len() as f32;
+    let mut hit = None;
+    for (i, (label, on)) in items.iter().enumerate() {
+        let seg = Rect::from_min_size(
+            Pos2::new(rect.left() + seg_w * i as f32, rect.top()),
+            Vec2::new(seg_w, rect.height()),
+        );
+        let resp = ui.interact(seg, egui::Id::new((salt, i)), Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if *on {
+            ui.painter().rect_filled(
+                seg.shrink2(Vec2::new(2.0, 2.0)),
+                CornerRadius::same(theme::R2),
+                P::surface(),
+            );
+        }
+        let color = if *on { P::ink() } else { P::text_dim() };
+        let g = ui.painter().layout_no_wrap(
+            (*label).to_string(),
+            egui::FontId::proportional(13.0),
+            color,
+        );
+        ui.painter().galley(seg.center() - g.size() * 0.5, g, color);
+        if resp.clicked() {
+            hit = Some(i);
+        }
+    }
+    hit
+}
+
+/// A full-width row: label on the left, switch on the right. **The whole row** is the hit target.
+fn toggle_row(ui: &mut Ui, on: &mut bool, label: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let sw = Rect::from_center_size(
+        Pos2::new(rect.right() - 20.0, rect.center().y),
+        Vec2::new(40.0, 22.0),
+    );
+    switch_mark(ui.painter(), sw, *on, resp.hovered());
+    let g = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(13.5),
+        P::text(),
+    );
+    ui.painter().galley(
+        Pos2::new(rect.left(), rect.center().y - g.size().y * 0.5),
+        g,
+        P::text(),
+    );
+    if resp.clicked() {
+        *on = !*on;
+        return true;
+    }
+    false
+}
+
+/// The switch: a pill with a knob, filled when on. Same vocabulary as the model list's switch
+/// (`model_ui::paint_switch`) — two kinds of switch in one dialog would be a bug of its own.
+fn switch_mark(p: &egui::Painter, r: Rect, on: bool, hover: bool) {
+    let fill = if on {
+        if hover {
+            P::ink()
+        } else {
+            P::text()
+        }
+    } else if hover {
+        P::edge_raised()
+    } else {
+        P::surface_hi()
+    };
+    p.rect_filled(r, CornerRadius::same(theme::pill(22.0)), fill);
+    if !on {
+        p.rect_stroke(
+            r,
+            CornerRadius::same(theme::pill(22.0)),
+            Stroke::new(1.0, P::edge()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let knob_x = if on { r.right() - 11.0 } else { r.left() + 11.0 };
+    let knob = if on { P::surface() } else { P::text_dim() };
+    p.circle_filled(Pos2::new(knob_x, r.center().y), 7.5, knob);
+}
+
+/// The presets offered behind the colour swatch.
+///
+/// Eight is what fits two rows of four at a comfortable size. They are a shortcut, not the limit:
+/// the hex field next to the swatch takes anything.
+const PRESETS: [&str; 8] = [
+    "#000000", "#FFFFFF", "#F5F1E8", "#1C1C18", "#8A8A80", "#3E7B4F", "#B4543C", "#2F4B7C",
+];
+
+/// One colour: `name | swatch | #RRGGBB | Default`.
+///
+/// Returns whether the colour changed (so the caller knows to restart the line and save).
+fn color_row(
+    ui: &mut Ui,
+    key_w: f32,
+    key: &str,
+    mode: theme::Mode,
+    st: &mut crate::welcome::Stage,
+) -> bool {
+    let mut changed = false;
+    let color = st.prefs.color(mode);
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 30.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let (lr, _) = ui.allocate_exact_size(Vec2::new(key_w, 18.0), Sense::hover());
+            let g = ui.painter().layout_no_wrap(key.to_string(), kv_key_font(), P::text_dim());
+            ui.painter().galley(Pos2::new(lr.left(), lr.top()), g, P::text_dim());
+            ui.add_space(KV_KEY_GAP);
+
+            let (sw, sw_resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+            crate::welcome::swatch(ui, sw, color);
+            if sw_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let _open = egui::Popup::menu(&sw_resp)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                .frame(theme::floating(theme::card_radius()).inner_margin(Margin::symmetric(8, 8)))
+                .show(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+                    for row in 0..2 {
+                        ui.horizontal(|ui| {
+                            for cell in 0..4 {
+                                let Some(c) = crate::welcome::parse_hex(PRESETS[row * 4 + cell])
+                                else {
+                                    continue;
+                                };
+                                let (r, resp) =
+                                    ui.allocate_exact_size(Vec2::new(34.0, 22.0), Sense::click());
+                                crate::welcome::swatch(ui, r, c);
+                                if resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if resp.on_hover_text(PRESETS[row * 4 + cell]).clicked() {
+                                    st.set_color(mode, c);
+                                    changed = true;
+                                }
+                            }
+                        });
+                    }
+                });
+
+            ui.add_space(8.0);
+            let field_w = (ui.available_width() - 60.0).clamp(72.0, 96.0);
+            let r = ui.add(
+                egui::TextEdit::singleline(st.draft_mut(mode))
+                    .desired_width(field_w)
+                    .margin(Margin { left: 8, right: 8, top: 4, bottom: 4 })
+                    .font(egui::FontId::proportional(12.5)),
+            );
+            // Committed on leaving the field, not per keystroke: `#E0` is not a colour, and treating
+            // it as one would fight the person typing it.
+            if r.lost_focus() && st.commit_draft(mode) {
+                changed = true;
+            }
+            ui.add_space(10.0);
+            let d = ui.add(
+                Label::new(
+                    RichText::new(aox::i18n::t("Default"))
+                        .color(P::text_dim())
+                        .size(12.0)
+                        .underline(),
+                )
+                .sense(Sense::click()),
+            );
+            if d.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if d.clicked() {
+                st.set_color(mode, crate::welcome::Prefs::default_color(mode));
+                changed = true;
+            }
+        },
+    );
+    changed
+}
+
+/// An underlined link that opens in the browser.
+fn link_label(ui: &mut Ui, text: &str, url: &str) {
+    let r = ui.add(
+        Label::new(RichText::new(text).color(P::text_dim()).size(12.0).underline())
+            .sense(Sense::click()),
+    );
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let r = r.on_hover_text(url);
+    if r.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
+}
+
+/// What happened to the last request, under the model source.
+///
+/// A failure is stated here and **only** here: the first screen shows a local sentence instead of an
+/// apology, but a user who cannot get a model-written line needs to know why, and this is the one
+/// place with room for the reason.
+fn status_line(ui: &mut Ui, st: &crate::welcome::Stage) {
+    if let Some(e) = st.note() {
+        ui.label(RichText::new(e).color(P::warn()).size(11.5));
+        return;
+    }
+    if let Some(p) = st.pending_line() {
+        ui.label(
+            RichText::new(aox::tf!("Next up: {}", p)).color(P::text_faint()).size(11.5),
+        );
+    } else if let Some(l) = st.last_line() {
+        // What the first screen is showing right now — this is what makes "another one" verifiable
+        // without closing the dialog.
+        ui.label(
+            RichText::new(aox::tf!("Last line: {}", l)).color(P::text_faint()).size(11.5),
+        );
+    }
+}
+
 impl App {
     /// Settings: one large centred card, pick on the left, read on the right.
     ///
@@ -486,18 +735,225 @@ impl App {
         self.send_requests(req);
     }
 
-    /// The "Appearance" column: three light/dark options (including follow system).
+    /// The "Appearance" column: the light/dark choice, then everything about the first screen.
     ///
-    /// Picking one only changes `theme::Pref`; what "follow system" actually resolves to is
+    /// Picking a theme only changes `theme::Pref`; what "follow system" actually resolves to is
     /// computed from the system theme by `theme::effective` and **rechecked every frame** (see
     /// `theme::follow_system`) -- without the recheck, "follow system" would amount to "decide
     /// once at startup by copying the system".
+    ///
+    /// The welcome line lives here rather than in its own column because it *is* an appearance
+    /// decision: a sentence, two colours, two switches. Its state is [`crate::welcome::Stage`];
+    /// this function only moves values around and says "something changed".
     pub(super) fn tab_appearance(&mut self, ui: &mut Ui) {
         let cur = theme::pref();
         for p in theme::Pref::ALL {
             if choice_row(ui, p.label(), cur == p).clicked() {
                 theme::apply_pref(ui.ctx(), p);
             }
+        }
+
+        ui.add_space(14.0);
+        rule(ui);
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new(aox::i18n::t("Welcome line"))
+                .color(P::text_faint())
+                .size(12.0),
+        );
+        ui.add_space(8.0);
+
+        // "Restart the line" vs "write the file": a colour or a switch changes what is on the first
+        // screen right now, while a **text** edit is still being typed — writing each keystroke is
+        // fine, restarting the typewriter on each one is not. So text edits save on every change and
+        // restart only when the field is left.
+        let mut restart = false;
+        let mut save = false;
+
+        // ── the source ──
+        let items: Vec<(&str, bool)> =
+            crate::welcome::Source::ALL.iter().map(|s| (s.label(), self.welcome.prefs.source == *s)).collect();
+        if let Some(hit) = segmented(ui, "aox-welcome-source", &items) {
+            let picked = crate::welcome::Source::ALL[hit];
+            if picked != self.welcome.prefs.source {
+                self.welcome.prefs.source = picked;
+                restart = true;
+                save = true;
+            }
+        }
+        ui.add_space(8.0);
+
+        match self.welcome.prefs.source {
+            crate::welcome::Source::Custom => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let field_w = ui.available_width() - 46.0;
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.welcome.prefs.custom)
+                            .desired_width(field_w)
+                            .margin(Margin { left: 10, right: 10, top: 7, bottom: 7 })
+                            .font(egui::FontId::proportional(14.0))
+                            .hint_text(
+                                RichText::new(aox::i18n::t("One short sentence"))
+                                    .color(P::quiet())
+                                    .size(13.0),
+                            ),
+                    );
+                    // 40 characters is what still reads as **one line** at 26pt on a 1280 window;
+                    // cutting here is honest (the field refuses more) rather than silently eliding
+                    // the user's sentence on the first screen.
+                    if self.welcome.prefs.custom.chars().count() > 40 {
+                        self.welcome.prefs.custom =
+                            self.welcome.prefs.custom.chars().take(40).collect();
+                    }
+                    if r.changed() {
+                        save = true;
+                    }
+                    if r.lost_focus() {
+                        restart = true;
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{}/40",
+                            self.welcome.prefs.custom.chars().count()
+                        ))
+                        .color(P::text_faint())
+                        .size(11.5),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(aox::i18n::t("Leave it empty for a quiet first screen."))
+                        .color(P::text_faint())
+                        .size(11.5),
+                );
+            }
+            crate::welcome::Source::Hitokoto => {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.welcome.prefs.hitokoto_url)
+                        .desired_width(ui.available_width())
+                        .margin(Margin { left: 10, right: 10, top: 7, bottom: 7 })
+                        .font(egui::FontId::proportional(13.5))
+                        .hint_text(
+                            RichText::new(aox::hello::HITOKOTO_DEFAULT)
+                                .color(P::quiet())
+                                .size(13.0),
+                        ),
+                );
+                if r.changed() {
+                    save = true;
+                }
+                // An emptied field goes back to the documented default rather than becoming a
+                // request to nowhere.
+                if r.lost_focus() {
+                    if self.welcome.prefs.hitokoto_url.trim().is_empty() {
+                        self.welcome.prefs.hitokoto_url = aox::hello::HITOKOTO_DEFAULT.to_string();
+                        save = true;
+                    }
+                    restart = true;
+                }
+                ui.add_space(6.0);
+                link_label(ui, aox::i18n::t("Hitokoto API documentation"), aox::hello::HITOKOTO_DOCS);
+                ui.add_space(6.0);
+                status_line(ui, &self.welcome);
+            }
+            crate::welcome::Source::Model => {
+                ui.label(
+                    RichText::new(aox::i18n::t(
+                        "One short line, written by the model in use. Each one gets a different \
+                         style, and now and then the exact time — so it can wish you a Saturday \
+                         afternoon. Nothing from your conversations is sent.",
+                    ))
+                    .color(P::text_dim())
+                    .size(12.5),
+                );
+                ui.add_space(8.0);
+                if flat_button(ui, aox::i18n::t("Another one")).clicked() {
+                    if let Some(ask) = self.welcome.refresh() {
+                        self.request_hello(ask);
+                    }
+                }
+                ui.add_space(6.0);
+                status_line(ui, &self.welcome);
+            }
+        }
+
+        ui.add_space(12.0);
+
+        // ── the two colours ──
+        let keys = [aox::i18n::t("Text colour · light"), aox::i18n::t("Text colour · dark")];
+        let key_w = kv_key_w(ui, &keys);
+        for (i, mode) in [theme::Mode::Light, theme::Mode::Dark].into_iter().enumerate() {
+            if color_row(ui, key_w, keys[i], mode, &mut self.welcome) {
+                restart = true;
+                save = true;
+            }
+            ui.add_space(6.0);
+        }
+
+        ui.add_space(6.0);
+        // ── the two switches ──
+        if toggle_row(ui, &mut self.welcome.prefs.typing, aox::i18n::t("Typewriter effect")) {
+            restart = true;
+            save = true;
+        }
+        ui.add_space(2.0);
+        if toggle_row(ui, &mut self.welcome.prefs.background, aox::i18n::t("Background image")) {
+            restart = true;
+            save = true;
+            // Takes effect this frame: the texture is released, or the pool is re-scanned.
+            self.brand.set_enabled(self.welcome.prefs.background);
+        }
+
+        ui.add_space(10.0);
+        // ── where the pictures go ──
+        let dir = aox::paths::app_root().join("assets");
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(
+                RichText::new(aox::i18n::t("Background folder"))
+                    .color(P::text_dim())
+                    .size(13.0),
+            );
+            let hit = ui
+                .add(
+                    Label::new(
+                        RichText::new(dir.display().to_string())
+                            .color(P::text())
+                            .size(12.5)
+                            .underline(),
+                    )
+                    .sense(Sense::click())
+                    .wrap_mode(egui::TextWrapMode::Truncate),
+                )
+                .on_hover_text(aox::i18n::t("Open this folder"));
+            if hit.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if hit.clicked() {
+                // Create both pools first: a link that opens onto "this folder is empty" is a link
+                // that taught the user nothing.
+                let _ = std::fs::create_dir_all(dir.join("light"));
+                let _ = std::fs::create_dir_all(dir.join("dark"));
+                let _ = crate::open::reveal(&dir);
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(aox::i18n::t(
+                "light/ for the light theme, dark/ for the dark one. PNG only; one is picked at \
+                 random on every start and every new conversation.",
+            ))
+            .color(P::text_faint())
+            .size(11.5),
+        );
+
+        if save {
+            let _ = self.welcome.prefs.save(&aox::paths::app_root());
+        }
+        if restart {
+            self.welcome.restart();
         }
     }
 

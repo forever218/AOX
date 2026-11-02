@@ -93,6 +93,17 @@ pub enum ToAgent {
     /// A different question from a scan, which is why it is a different message: a key can list models
     /// and still fail to chat, and a model name can be wrong in a way no list reveals.
     TestModel { base_url: String, api_key: Option<String>, model: String },
+    /// One line for the empty first screen, fetched from the user's quoting API (`aox::hello`).
+    ///
+    /// Answered with [`FromAgent::HelloLine`]. It is a *message* rather than a direct call because
+    /// the request sits on the startup path: this thread must never block on it, and the answer has
+    /// to be able to arrive while a turn is running.
+    HelloFromApi(String),
+    /// One line for the empty first screen, written by the model in use.
+    ///
+    /// It carries **nothing**: the greeting prompt gets the clock and a style, never anything from
+    /// the conversation (see `aox::hello::generate`).
+    HelloFromModel,
     /// Exit: close the plugin child processes and end the driver thread
     Shutdown,
 }
@@ -284,6 +295,12 @@ pub enum FromAgent {
     /// Separate from [`AgentEvent`] on purpose: an apply failure is not a conversation event, and
     /// putting it in the activity stream would file it under "things the model did".
     ModelNotice { ok: bool, text: String },
+    /// The first screen's line (the answer to [`ToAgent::HelloFromApi`] / [`ToAgent::HelloFromModel`]).
+    ///
+    /// `ok = false` carries the reason in `why`; the first screen never shows it (it falls back to a
+    /// local sentence instead) — it is the settings panel's status line that names the failure, so a
+    /// broken endpoint is diagnosable without being shouted at every launch.
+    HelloLine { ok: bool, text: String, why: String },
     /// An unrecoverable error occurred this turn
     Fatal(String),
 }
@@ -570,7 +587,11 @@ impl Ui for GuiUi {
                 // message arriving in this inert stub is simply left to them.
                 | Some(ToAgent::ApplyProvider(_))
                 | Some(ToAgent::ScanModels { .. })
-                | Some(ToAgent::TestModel { .. }) => continue,
+                | Some(ToAgent::TestModel { .. })
+                // The first screen's line is answered from `next_command` / `idle_until_shutdown`
+                // like the rest of the panel traffic; this stub never owns it.
+                | Some(ToAgent::HelloFromApi(_))
+                | Some(ToAgent::HelloFromModel) => continue,
             }
         }
     }
@@ -908,6 +929,35 @@ async fn test_model(
     let _ = tx.send(FromAgent::TestResult { base_url, model, ok, text });
 }
 
+/// Ask the quoting API for the first screen's line.
+///
+/// **Detached on purpose**: this request is fired while the user is looking at an empty window, and
+/// the driver loop is the thing that starts turns — making it wait 4 seconds for a nice-to-have would
+/// freeze the whole application behind a greeting.
+fn spawn_hello_api(tx: &mpsc::UnboundedSender<FromAgent>, url: String) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let (ok, text, why) = match aox::hello::hitokoto(&url).await {
+            Ok(t) => (true, t, String::new()),
+            Err(e) => (false, String::new(), format!("{e:#}")),
+        };
+        let _ = tx.send(FromAgent::HelloLine { ok, text, why });
+    });
+}
+
+/// Ask the model for the first screen's line — detached for the same reason as [`spawn_hello_api`],
+/// and even more so: a model call is seconds, not milliseconds.
+fn spawn_hello_model(tx: &mpsc::UnboundedSender<FromAgent>, llm: Arc<dyn aox::llm::LlmProvider>) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let (ok, text, why) = match aox::hello::generate(llm.as_ref()).await {
+            Ok(t) => (true, t, String::new()),
+            Err(e) => (false, String::new(), format!("{e:#}")),
+        };
+        let _ = tx.send(FromAgent::HelloLine { ok, text, why });
+    });
+}
+
 async fn scan_models(
     tx: &mpsc::UnboundedSender<FromAgent>,
     base_url: String,
@@ -1087,6 +1137,18 @@ async fn idle_until_shutdown(
             ToAgent::TestModel { base_url, api_key, model } => {
                 test_model(tx, base_url, api_key, model).await
             }
+            // The quoting API needs no model, so it works in this state too — and this is exactly
+            // when a user might be configuring everything else.
+            ToAgent::HelloFromApi(url) => spawn_hello_api(tx, url),
+            // A model line cannot be written without a model. Say so rather than leave the settings
+            // panel's status line blank forever.
+            ToAgent::HelloFromModel => {
+                let _ = tx.send(FromAgent::HelloLine {
+                    ok: false,
+                    text: String::new(),
+                    why: aox::i18n::t("model not ready").into(),
+                });
+            }
             ToAgent::Resume(_) | ToAgent::NewConversation => {
                 let _ = tx.send(FromAgent::Switched {
                     opened: None,
@@ -1238,6 +1300,11 @@ async fn next_command(
             Some(ToAgent::TestModel { base_url, api_key, model }) => {
                 test_model(tx, base_url, api_key, model).await
             }
+            // The first screen's line. Both sources are fire-and-forget: the panel is drawn by the
+            // other thread, and an answer that arrives late is simply used next time (see
+            // `gui::welcome`, rule 1).
+            Some(ToAgent::HelloFromApi(url)) => spawn_hello_api(tx, url),
+            Some(ToAgent::HelloFromModel) => spawn_hello_model(tx, agent.rt().provider.llm()),
             // Workplace button: switch tier / query state. Done in place — `Workplace` lives inside
             // `Runtime`, and this thread is the only place that can reach the Agent (and through it its
             // `rt`). It does not enter the next turn: a tier switch is a pure host action, unrelated to

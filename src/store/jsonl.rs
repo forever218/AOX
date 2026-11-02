@@ -146,6 +146,7 @@ fn local_from_system(t: SystemTime) -> Option<Local> {
         year: st.wYear,
         month: st.wMonth,
         day: st.wDay,
+        weekday: st.wDayOfWeek,
         hour: st.wHour,
         minute: st.wMinute,
         second: st.wSecond,
@@ -156,7 +157,8 @@ fn local_from_system(t: SystemTime) -> Option<Local> {
 fn local_from_system(t: SystemTime) -> Option<Local> {
     let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
     let (year, month, day, hour, minute, second) = crate::history::civil_from_unix(secs);
-    Some(Local { year, month, day, hour, minute, second })
+    let weekday = crate::history::weekday_of(year, month, day);
+    Some(Local { year, month, day, weekday, hour, minute, second })
 }
 
 /// File mtime → the "last conversation time" display string.

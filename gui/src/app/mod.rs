@@ -165,6 +165,14 @@ pub struct App {
     /// plumbed through `transcript` as a parameter.
     brand_err: Option<String>,
 
+    /// The welcome line on the first screen (see [`crate::welcome`]): which sentence, in which
+    /// colour, typed or not.
+    ///
+    /// It owns its own preferences (`welcome.prefs`), loaded from `.aox/welcome.json` before the
+    /// first frame -- the background switch has to be known that early, or the artwork would start
+    /// decoding for a user who turned it off.
+    welcome: crate::welcome::Stage,
+
     input: String,
     /// Attachments in the pending-upload bar (dragged in by the user / attached via
     /// `attach_file`).
@@ -459,6 +467,12 @@ impl App {
         // All appearance comes from `[theme]`; light/dark prefers the record of the last
         // manual switch (see theme::apply).
         theme::apply(&cc.egui_ctx, &theme_cfg);
+        // The first screen's preferences are read before the window exists: the background switch
+        // decides whether the artwork is decoded at all, and that decision is made by the first
+        // `brand::Art::poll` -- which happens on the first frame.
+        let welcome_prefs = crate::welcome::Prefs::load(&aox::paths::app_root());
+        let mut brand = brand::Art::new();
+        brand.set_enabled(welcome_prefs.background);
         let mut app = Self {
             tx,
             rx,
@@ -478,8 +492,9 @@ impl App {
             choice_text: String::new(),
             choice_reply: None,
             tex: HashMap::new(),
-            brand: brand::Art::new(),
+            brand,
             brand_err: None,
+            welcome: crate::welcome::Stage::new(welcome_prefs),
             input: String::new(),
             pending: Vec::new(),
             dragging_files: false,
@@ -573,6 +588,16 @@ impl App {
     /// wait, when it appears, has one obvious home.
     fn running(&self) -> bool {
         self.busy && !self.waiting_auth && self.choice_reply.is_none()
+    }
+
+    /// Turn a [`crate::welcome::Ask`] into a message for the agent thread, which owns every network
+    /// call in this program (the UI thread draws; it does not wait on sockets).
+    fn request_hello(&self, ask: crate::welcome::Ask) {
+        let msg = match ask {
+            crate::welcome::Ask::Api(url) => ToAgent::HelloFromApi(url),
+            crate::welcome::Ask::Model => ToAgent::HelloFromModel,
+        };
+        let _ = self.tx.send(msg);
     }
 
     /// On the first frame, converge the window into the screen and place it explicitly.
@@ -730,6 +755,15 @@ impl eframe::App for App {
         // "follow system" would degrade into "decide once at startup by copying the system".
         theme::follow_system(ctx);
 
+        // The first screen's welcome line: enter/leave edges, the grace clock, and the request when
+        // one is due. Drawing happens inside the central panel (after the transcript, so the scroll
+        // area cannot clip a line that is deliberately centred in the whole column).
+        let on_first_screen = self.on_empty_state();
+        if let Some(ask) = self.welcome.sync(on_first_screen) {
+            self.request_hello(ask);
+        }
+        self.welcome.step(ctx);
+
         // The native title bar keeps only the window title itself: no icon is set, and the model
         // name is no longer appended, so a line like "AOX · xxx" isn't crowding the top-left. For
         // the colour sync see sync_native_theme below.
@@ -873,6 +907,18 @@ impl eframe::App for App {
                 (column_rect.bottom() - COMPOSER_BOTTOM_GAP - composer_h).max(column_rect.top());
 
             self.transcript(ui, composer_top);
+
+            // The welcome line, on top of everything the transcript drew.
+            //
+            // The stage is "the column above the composer": centred in the **window's** chat area
+            // rather than in the scroll viewport, whose content is offset by however far the user
+            // has scrolled. Hidden while the "model not ready" card is up -- there the card is the
+            // message, and a greeting behind it would compete with it.
+            if self.on_empty_state() && self.log_error.is_none() {
+                let stage =
+                    Rect::from_min_max(column_rect.min, Pos2::new(column_rect.right(), composer_top));
+                self.welcome.draw(ui, stage);
+            }
 
             // The input box became a floating card (a Foreground layer) ending exactly at the
             // boundary the transcript stopped at. Why not put it in a `TopBottomPanel::bottom`:

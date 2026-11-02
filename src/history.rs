@@ -50,6 +50,9 @@ pub(crate) struct Local {
     pub(crate) year: u16,
     pub(crate) month: u16,
     pub(crate) day: u16,
+    /// `0 = Sunday .. 6 = Saturday`. Read straight from the OS on Windows (`wDayOfWeek`), computed
+    /// from the date elsewhere — the greeting needs "is it the weekend" without a calendar crate.
+    pub(crate) weekday: u16,
     pub(crate) hour: u16,
     pub(crate) minute: u16,
     pub(crate) second: u16,
@@ -68,6 +71,7 @@ pub(crate) fn local_now() -> Local {
         year: st.wYear,
         month: st.wMonth,
         day: st.wDay,
+        weekday: st.wDayOfWeek,
         hour: st.wHour,
         minute: st.wMinute,
         second: st.wSecond,
@@ -80,7 +84,25 @@ pub(crate) fn local_now() -> Local {
     // "approximate UTC+8".
     let secs = unix_now();
     let (y, m, d, hh, mm, ss) = civil_from_unix(secs);
-    Local { year: y, month: m, day: d, hour: hh, minute: mm, second: ss }
+    Local { year: y, month: m, day: d, weekday: weekday_of(y, m, d), hour: hh, minute: mm, second: ss }
+}
+
+/// Day of week for a civil date, `0 = Sunday`.
+///
+/// Lives beside [`civil_from_unix`] rather than in the greeting code: whenever a `Local` is built
+/// from a date (never from a `SYSTEMTIME`, which carries the weekday itself), the two must come from
+/// the same reading, or a line written on Sunday can claim it is the weekend on Monday.
+// Only the non-Windows clock (and the tests) need to compute this: on Windows the field is read
+// straight off `SYSTEMTIME`.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn weekday_of(y: u16, m: u16, d: u16) -> u16 {
+    // Month offsets that turn a 12-month year into a 28-day one; Jan/Feb count as months 13/14 of
+    // the previous year, which is what puts the leap day in the right place.
+    const OFFSET: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let m = m.clamp(1, 12);
+    let y = if m < 3 { y as i32 - 1 } else { y as i32 };
+    let idx = (y + y / 4 - y / 100 + y / 400 + OFFSET[(m - 1) as usize] + d as i32).rem_euclid(7);
+    idx as u16
 }
 
 /// Unix seconds → year/month/day/hour/minute/second (Howard Hinnant's civil_from_days).

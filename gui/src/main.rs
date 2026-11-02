@@ -32,6 +32,7 @@ mod svg;
 mod tex;
 mod theme;
 mod uistate;
+mod welcome;
 mod workplace_ui;
 mod wsview;
 

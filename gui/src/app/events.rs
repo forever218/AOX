@@ -138,6 +138,9 @@ impl App {
                     self.mdl.set_test(base_url, model, ok, text)
                 }
                 FromAgent::ModelNotice { ok, text } => self.mdl.set_notice(ok, text),
+                // The first screen's line arrived (or failed). Whether it is shown now or kept for
+                // the next first screen is the stage's decision -- see `welcome`'s module docs.
+                FromAgent::HelloLine { ok, text, why } => self.welcome.on_line(ok, text, why),
                 FromAgent::HistoryCurrent(id) => {
                     // Keep counts/titles fresh while the sidebar is open; while it is closed
                     // only "the conversation file changed" is worth a directory scan

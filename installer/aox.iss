@@ -64,6 +64,18 @@
   #define OutputSuffix ""
 #endif
 
+; ── optional: the language tag in the file name ─────────────────────────────────────────────────────
+; The interface language is baked into the exe at build time (`AOX_LANG`), not chosen at install
+; time, so two language builds of the same version would otherwise write the exact same file name
+; and the second one would silently overwrite the first.
+;     ISCC --define=LangTag=-zh installer\aox.iss      ->  AOX-Setup-<version>-zh.exe
+; Only the file name carries the tag: display names, AppId and the install folder stay shared, so
+; the English and Chinese editions are "the same app in another language" (installing one replaces
+; the other) rather than two programs that could both sit in the Start menu.
+#ifndef LangTag
+  #define LangTag ""
+#endif
+
 [Setup]
 AppId={{9F2C4A17-6B3E-4D5A-8C71-2E9B0D4F1A63}
 AppName={#AppName}
@@ -91,7 +103,7 @@ PrivilegesRequired=lowest
 ChangesEnvironment=yes
 
 OutputDir={#ProjectRoot}\dist
-OutputBaseFilename={#AppName}-Setup-{#AppVersion}{#OutputSuffix}
+OutputBaseFilename={#AppName}-Setup-{#AppVersion}{#OutputSuffix}{#LangTag}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern

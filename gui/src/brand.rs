@@ -274,6 +274,12 @@ enum Slot {
 
 /// The first-screen background (`[light, dark]`, one pool each).
 pub struct Art {
+    /// Whether the first screen may show a background at all (Appearance → "Background image").
+    ///
+    /// Off means **off**: the folders are not scanned, nothing is decoded, and any texture already
+    /// uploaded is dropped. Keeping the artwork resident while "disabled" would be a 4–8 MB
+    /// per-theme texture held for a picture nobody asked for.
+    enabled: bool,
     /// The sources found on disk, so a re-roll can shuffle them again without touching the disk.
     pools: [Vec<PathBuf>; 2],
     slots: [Slot; 2],
@@ -281,9 +287,27 @@ pub struct Art {
 
 impl Art {
     pub fn new() -> Self {
-        let mut me = Self { pools: [Vec::new(), Vec::new()], slots: [Slot::Idle, Slot::Idle] };
+        let mut me =
+            Self { enabled: true, pools: [Vec::new(), Vec::new()], slots: [Slot::Idle, Slot::Idle] };
         me.reroll();
         me
+    }
+
+    /// Turn the feature on or off. Cheap and idempotent: the settings page calls it whenever the
+    /// switch is drawn, which is every frame.
+    pub fn set_enabled(&mut self, on: bool) {
+        if self.enabled == on {
+            return;
+        }
+        self.enabled = on;
+        if on {
+            // Start from a clean pool: the folders may have gained a PNG while the feature was off.
+            self.reroll();
+        } else {
+            self.pools = [Vec::new(), Vec::new()];
+            // Dropping `Ready` releases the textures; `Idle` is what "nothing to show" means.
+            self.slots = [Slot::Idle, Slot::Idle];
+        }
     }
 
     /// Pick fresh images for both themes -- at startup, and every time a new conversation starts.
@@ -310,6 +334,11 @@ impl Art {
     /// is millisecond-scale, whereas "start loading only the moment the theme switches" leaves the
     /// first few frames blank after the switch -- far worse than a few extra milliseconds.
     pub fn poll(&mut self, ctx: &Context) {
+        if !self.enabled {
+            // Nothing to decode and nothing to collect: staying out of the frame entirely is also
+            // what keeps a disabled feature from asking for repaints.
+            return;
+        }
         let mut waiting = false;
         for i in 0..2 {
             // Take the slot out first and write it back: `match &mut self.slots[i]` followed by
@@ -364,6 +393,9 @@ impl Art {
     /// own rect, not one from inside the transcript's scroll area, whose content is offset by the
     /// scroll (see the call site).
     pub fn show_background(&self, ui: &Ui, rect: Rect) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
         let dark = theme::mode() == theme::Mode::Dark;
         match &self.slots[if dark { 1 } else { 0 }] {
             Slot::Ready { tex, w, h } => {

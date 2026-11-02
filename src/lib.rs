@@ -18,6 +18,7 @@ pub mod auth;
 pub mod checks;
 pub mod compact;
 pub mod config;
+pub mod hello;
 pub mod history;
 pub mod hook;
 pub mod i18n;

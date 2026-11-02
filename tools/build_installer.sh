@@ -15,6 +15,11 @@
 #   bash tools/build_installer.sh all with-python      # 只要两个捆绑变体
 #   bash tools/build_installer.sh pack                 # 只产出运行时组件包（不打安装包）
 #
+# 关于语言（AOX_LANG）：
+#   界面语言是**编译期**定的（build.rs 只把 locales/<code>.toml> 那一个嵌进来），安装时没有语言可选。
+#   默认 en；要出中文包就 AOX_LANG=zh bash tools/build_installer.sh，产物名会多一个 -zh 后缀
+#   （AOX-Setup-0.1.0-zh.exe / AOX-GUI-Setup-0.1.0-zh.exe），不会覆盖英文包。
+#
 # 关于 runtime 目录：
 #   **所有**变体都装 runtime\bash（busybox-w32，~637 KB，单文件）。理由：`bash` 工具不需要 python，
 #   而没有 Git for Windows 的机器否则只能退回 `shell`；宿主的探测顺序是「系统 bash > 侧载 bash >
@@ -48,7 +53,24 @@ esac
 # 版本号以 Cargo.toml 为唯一来源
 VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' Cargo.toml | head -1)"
 [ -n "$VERSION" ] || { echo "无法从 Cargo.toml 读取 version"; exit 1; }
-echo "==> AOX 版本: $VERSION（目标: $TARGET，变体: $BUNDLE）"
+
+# ---- 界面语言（编译期决定，不是安装时选的）
+# `AOX_LANG` 由 build.rs 读走，只把那一个 catalogue 嵌进二进制。所以同一个版本的中文包和英文包
+# 必须靠**文件名**区分：否则先后打的两个包会写同一个 AOX-GUI-Setup-<版本>.exe，后一个静默覆盖
+# 前一个。语言标记只进文件名，AppId / 安装目录 / 显示名保持共用 —— 它们是「同一个程序的另一种
+# 语言」，装中文版就等于替换英文版，而不是让两个程序并排躺在开始菜单里。
+LANG_CODE="$(printf '%s' "${AOX_LANG:-en}" | tr 'A-Z' 'a-z')"
+case "$LANG_CODE" in
+  ""|en) LANG_CODE="en"; LANG_TAG="" ;;
+  zh)    LANG_TAG="-zh" ;;
+  *)     LANG_TAG="-$LANG_CODE" ;;
+esac
+if [ "$LANG_CODE" != "en" ] && [ ! -f "locales/$LANG_CODE.toml" ]; then
+  echo "AOX_LANG=$LANG_CODE 没有对应的语言文件 locales/$LANG_CODE.toml"; exit 1
+fi
+export AOX_LANG="$LANG_CODE"
+
+echo "==> AOX 版本: $VERSION（目标: $TARGET，变体: $BUNDLE，语言: $LANG_CODE）"
 
 # ---- Python 运行时来源（可由环境变量覆盖成自建镜像）
 PYTHON_URL="${AOX_PYTHON_URL:-https://www.python.org/ftp/python/3.13.7/python-3.13.7-embed-amd64.zip}"
@@ -179,6 +201,10 @@ compile() {
   local -a args=("--define=AppVersion=$VERSION")
   if [ "$variant" = "with-python" ]; then
     args+=("--define=BUNDLE_PYTHON=1")
+  fi
+  # 语言标记只影响输出文件名；英文包不传，保持原来的文件名一个字都不变。
+  if [ -n "$LANG_TAG" ]; then
+    args+=("--define=LangTag=$LANG_TAG")
   fi
   args+=("$iss")
   while :; do
