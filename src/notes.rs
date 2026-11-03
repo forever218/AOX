@@ -110,9 +110,13 @@ fn headings_of(path: &Path) -> Vec<String> {
     heads
 }
 
-/// `4.6 KB` / `812 B` — the size is what tells the model whether opening the file is cheap.
+/// `4.6 KB` / `812 B` / `54.3 MB` — the size is what tells the model whether opening the file is
+/// cheap. The MB branch exists because a built artifact (an APK, a log) is routinely tens of
+/// megabytes, and `55216.0 KB` makes the reader do arithmetic to answer "is this big?".
 pub fn human_size(bytes: u64) -> String {
-    if bytes >= 1024 {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
@@ -194,6 +198,9 @@ mod tests {
     fn sizes_read_the_way_a_person_reads_them() {
         assert_eq!(human_size(812), "812 B");
         assert_eq!(human_size(4624), "4.5 KB");
+        // 1 MiB is where the unit flips: an artifact is usually measured in MB.
+        assert_eq!(human_size(1024 * 1024), "1.0 MB");
+        assert_eq!(human_size(56_540_979), "53.9 MB");
     }
 
     #[test]

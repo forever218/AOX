@@ -40,14 +40,15 @@ use super::Tool;
 use super::ToolKind;
 use super::ToolOutput;
 use super::HOST_FILE_TOOLS;
+use super::PUBLISH_TOOL;
 use crate::runtime::Runtime;
 use crate::workplace::PATH_ARG;
 
 /// The host file tools.
 ///
-/// `edit_file` is last because [`HOST_FILE_TOOLS`] is addressed by index (see the warning there);
-/// putting a new tool at the end leaves every existing index — and therefore the read/write split —
-/// exactly where it was.
+/// Order matters: [`HOST_FILE_TOOLS`] is addressed by index (see the warning there), so new tools
+/// go **at the end**. `edit_file` is index 5 and `publish_file` index 6 for exactly that reason —
+/// appending leaves every existing index, and therefore the read/write split, where it was.
 pub fn host_file_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadFileTool),
@@ -56,6 +57,7 @@ pub fn host_file_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(RemoveTool),
         Arc::new(AttachFileTool),
         Arc::new(EditFileTool),
+        Arc::new(PublishFileTool),
     ]
 }
 
@@ -881,6 +883,81 @@ impl Tool for AttachFileTool {
     }
 }
 
+// ---------------------------------------------------------------- publish_file
+
+/// Hand a file to the **room** rather than to the model.
+///
+/// Why this exists at all: the artifact channel is [`ToolOutput::path`], and only the two text
+/// tools (`write_file` / `edit_file`) ever filled it. So "compile an APK and send it to my phone"
+/// had no route — a build product is binary, `write_file` takes a `String`, and `attach_file`
+/// pushes bytes into the model's context (56 MB of APK would blow the request body apart). This
+/// tool is the missing third option: it declares "this existing file is an output of this turn",
+/// and the host's remote bridge uploads it to the room.
+///
+/// It is a **write** as far as the workplace boundary is concerned, even though it touches no
+/// bytes: publishing ships the file's content to everyone in the room, so "any path on this
+/// machine, no questions asked" is exactly the behaviour we must not have.
+pub(crate) struct PublishFileTool;
+
+#[async_trait]
+impl Tool for PublishFileTool {
+    fn name(&self) -> &str {
+        PUBLISH_TOOL
+    }
+    fn kind(&self) -> ToolKind {
+        ToolKind::Host
+    }
+    /// Deliberately **write** (see [`crate::tool::PUBLISH_TOOL`]) — the boundary has to apply.
+    fn access(&self) -> crate::workplace::Access {
+        host_tool_access(self.name())
+    }
+    fn description(&self) -> &str {
+        crate::i18n::t("Hand a file you produced to the room, so the phone/PC on the other side can open, install or save it (provided by the host). Unlike attach_file this does NOT put the file's bytes into your context — it publishes it as an artifact, which is what you want for an APK, a PDF, an archive, a report or a screenshot you want the user to have. The file must already exist inside the workspace.")
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                PATH_ARG: {"type": "string", "description": crate::i18n::t("Path of the file to publish (inside the workspace)")}
+            },
+            "required": [PATH_ARG]
+        })
+    }
+
+    async fn call(&self, args: Value, rt: &Arc<Runtime>) -> ToolOutput {
+        let raw = match path_arg(&args) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        // Not `guard_read`: see the struct docs. The boundary decides, exactly as for a write.
+        let path = match guard(rt, raw) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => return ToolOutput::err(crate::tf!("cannot read {}: {}", path.display(), e)),
+        };
+        if !meta.is_file() {
+            return ToolOutput::err(crate::tf!("{} is not a file", path.display()));
+        }
+        if meta.len() == 0 {
+            return ToolOutput::err(crate::i18n::t("The file is empty, so there is nothing to publish."));
+        }
+        // No size gate here on purpose: the one number that decides whether an upload is possible
+        // is the server's, and the remote bridge already checks it against the same constant. A
+        // second copy of the limit in the tool would be one more place to forget to change.
+        ToolOutput::ok(crate::tf!(
+            "Published {} ({}) to the room. It will be uploaded as an artifact of this turn.",
+            path.display(),
+            crate::notes::human_size(meta.len())
+        ))
+        // The artifact channel. `agent_loop` skips `note_modified_file` for this tool — the bytes
+        // on disk did not change, and marking them as modified would reopen a finished task.
+        .with_path(path)
+    }
+}
+
 // ---------------------------------------------------------------- remove
 
 pub(crate) struct RemoveTool;
@@ -1125,6 +1202,59 @@ mod tests {
         assert!(out.content.contains("permission boundary"), "{}", out.content);
         assert!(out.content.contains("Do not retry"), "{}", out.content);
         assert!(out.content.contains("relay this to the user"), "{}", out.content);
+    }
+
+    /// `publish_file` is the only route a **binary build product** has to the room: `write_file`
+    /// takes a `String`, and `attach_file` would stuff the bytes into the model's request (56 MB of
+    /// APK would be rejected outright). Two things have to hold — it fills `path` (that field *is*
+    /// the artifact channel) and it stays inside the workspace, because publishing ships the bytes
+    /// to everyone in the room.
+    #[tokio::test]
+    async fn publish_file_fills_the_artifact_channel_and_stays_inside_the_workspace() {
+        let d = tmp("publish");
+        let rt = rt_with_ws(&d).await;
+        let apk = d.join("app-release.apk");
+        std::fs::write(&apk, vec![0u8; 2048]).unwrap();
+
+        let out = rt.execute(HOST_FILE_TOOLS[6], json!({PATH_ARG: apk.to_string_lossy()})).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.path.as_deref(), Some(apk.as_path()), "path is the artifact channel");
+        assert!(out.attach.is_empty(), "publishing must not push the bytes into the model's context");
+        assert!(out.content.contains("2.0 KB"), "{}", out.content);
+
+        // Outside the workspace: refused with the same contract a write gets.
+        let bad = d.parent().unwrap().join("aox-hostfs-secret.apk");
+        std::fs::write(&bad, b"x").unwrap();
+        let r = rt.execute(HOST_FILE_TOOLS[6], json!({PATH_ARG: bad.to_string_lossy()})).await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("permission boundary"), "{}", r.content);
+        assert!(r.path.is_none(), "a refused publish must not leave an artifact behind");
+        let _ = std::fs::remove_file(&bad);
+    }
+
+    /// A directory, an empty file and a missing file are all "there is nothing to send" — say so
+    /// instead of publishing something the room cannot use.
+    #[tokio::test]
+    async fn publish_file_refuses_what_it_cannot_hand_over() {
+        let d = tmp("publish-bad");
+        let rt = rt_with_ws(&d).await;
+
+        let dir = d.join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = rt.execute(HOST_FILE_TOOLS[6], json!({PATH_ARG: dir.to_string_lossy()})).await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.path.is_none());
+
+        let empty = d.join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        let e = rt.execute(HOST_FILE_TOOLS[6], json!({PATH_ARG: empty.to_string_lossy()})).await;
+        assert!(e.is_error, "{}", e.content);
+        assert!(e.path.is_none());
+
+        let missing = d.join("nope.apk");
+        let m = rt.execute(HOST_FILE_TOOLS[6], json!({PATH_ARG: missing.to_string_lossy()})).await;
+        assert!(m.is_error, "{}", m.content);
+        assert!(m.path.is_none());
     }
 
     /// New semantics (2026-10-04): **reading is not restricted by the workplace**

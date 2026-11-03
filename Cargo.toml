@@ -3,7 +3,7 @@
 # the core library exposed by src/lib.rs.
 # default-members stays ["."], so `cargo build` / `cargo run` behave exactly as they did before
 # the GUI was added.
-members = [".", "gui"]
+members = [".", "gui", "crates/aoxchat-proto"]
 default-members = ["."]
 resolver = "2"
 
@@ -22,7 +22,19 @@ name = "aox"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync", "signal", "net"] }
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha2 = "0.10"
+base64 = "0.22"
+
+# The remote-control wire protocol. Vendored from the aoxchat repo so this crate stays buildable
+# offline; `tools/sync_proto.py` is the one-way copier (aoxchat/proto → here).
+aoxchat-proto = { path = "crates/aoxchat-proto" }
+# WebSocket client for `aox remote` (the host bridge). rustls so it shares the TLS stack reqwest
+# already pulls in — one fewer OpenSSL-shaped dependency on Windows.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync", "signal", "net", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }

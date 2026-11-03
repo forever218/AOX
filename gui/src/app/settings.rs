@@ -674,6 +674,7 @@ impl App {
                                     SettingsTab::Model => self.tab_model(ui),
                                     SettingsTab::Appearance => self.tab_appearance(ui),
                                     SettingsTab::System => self.tab_system(ui),
+                                    SettingsTab::Remote => self.tab_remote(ui),
                                     SettingsTab::About => self.tab_about(ui),
                                 }
                             });
@@ -1097,6 +1098,11 @@ impl App {
     /// The license text is **the repo's own `LICENSE`, embedded directly**, not copied out by
     /// hand -- a hand-copied version that drifts from the file means what "About" shows is no
     /// longer the license actually in force, and nobody ever double-checks that kind of error.
+    /// 远程页：配对 / 启停 / 日志。桥跑在独立线程，这里只负责把状态画出来。
+    pub(super) fn tab_remote(&mut self, ui: &mut Ui) {
+        self.remote.page(ui);
+    }
+
     pub(super) fn tab_about(&self, ui: &mut Ui) {
         // Masthead: AOX GUI in a serif face + the version, with a thin rule underneath (the same
         // vocabulary as the empty state)

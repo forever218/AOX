@@ -49,9 +49,29 @@ pub const PURPOSE_DESC: &str = "One short line (a few words, not a sentence) say
 /// ⚠️ **Append only.** Entries are addressed by index ([`READ_ONLY_TOOLS`], and every
 /// `HOST_FILE_TOOLS[n]` in `hostfs` / `edit` / the tests), so inserting a name in the middle
 /// silently re-points the read/write split at a different tool. `edit_file` was appended as
-/// index 5 for exactly that reason.
-pub(crate) const HOST_FILE_TOOLS: [&str; 6] =
-    ["read_file", "write_file", "list_dir", "remove", "attach_file", "edit_file"];
+/// index 5 for exactly that reason, `publish_file` as index 6.
+pub(crate) const HOST_FILE_TOOLS: [&str; 7] = [
+    "read_file",
+    "write_file",
+    "list_dir",
+    "remove",
+    "attach_file",
+    "edit_file",
+    PUBLISH_TOOL,
+];
+
+/// `publish_file`: hands an **existing** file to the room instead of to the model.
+///
+/// Its own constant because `agent_loop` has to single it out. The tool sets
+/// [`ToolOutput::path`] — that field is the whole artifact channel, the only way a file reaches
+/// the room — but it never touches the disk. Recording it as "modified" would bump the task
+/// epoch and reopen a task that was already `done`, purely because the agent published its own
+/// output; so `agent_loop` skips `note_modified_file` for exactly this name.
+///
+/// It is **not** in [`READ_ONLY_TOOLS`], and that is not an oversight: publishing ships bytes off
+/// the machine to everyone in the room, so the workspace boundary must judge it as strictly as it
+/// judges a write. "Read-only" would mean any path on the disk can be handed to a group chat.
+pub(crate) const PUBLISH_TOOL: &str = "publish_file";
 
 /// Which entries in that table are **read-only** (by index) — reads are unrestricted, only
 /// writes and deletes go through the workplace boundary (the 2026-10-04 semantics).
@@ -62,7 +82,8 @@ pub(crate) const HOST_FILE_TOOLS: [&str; 6] =
 /// and nothing else — the `if` below cannot fall out of sync.
 ///
 /// `edit_file` is deliberately **absent**: it rewrites bytes on disk, so it is a write, and the
-/// workspace boundary must judge it exactly as it judges `write_file`.
+/// workspace boundary must judge it exactly as it judges `write_file`. `publish_file` is absent
+/// for its own reason — see [`PUBLISH_TOOL`].
 const READ_ONLY_TOOLS: [usize; 3] = [0 /* read_file */, 2 /* list_dir */, 4 /* attach_file */];
 
 /// The **access intent** of a host file tool: read-only (read a file / list a directory /
@@ -314,7 +335,7 @@ mod tests {
     /// executes is a comment, not a fact. Adding a host tool now breaks this test first.
     #[test]
     fn the_quoted_host_tool_count_matches_reality() {
-        const DOCUMENTED: usize = 17;
+        const DOCUMENTED: usize = 18;
         let n = meta::meta_tools().len()
             + hostfs::host_file_tools().len()
             + ask::ask_tools().len()

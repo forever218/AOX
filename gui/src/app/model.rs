@@ -322,16 +322,19 @@ pub(super) enum SettingsTab {
     Appearance,
     /// System: paths and runtime diagnostics
     System,
+    /// Remote: 配对、启停、日志。放在 About 之前，设置类的都在前面。
+    Remote,
     /// About: version, license, links
     About,
 }
 
 impl SettingsTab {
-    pub(super) const ALL: [SettingsTab; 5] = [
+    pub(super) const ALL: [SettingsTab; 6] = [
         SettingsTab::Extra,
         SettingsTab::Model,
         SettingsTab::Appearance,
         SettingsTab::System,
+        SettingsTab::Remote,
         SettingsTab::About,
     ];
 
@@ -341,6 +344,7 @@ impl SettingsTab {
             SettingsTab::Model => aox::i18n::t("Model"),
             SettingsTab::Appearance => aox::i18n::t("Appearance"),
             SettingsTab::System => aox::i18n::t("System"),
+            SettingsTab::Remote => aox::i18n::t("Remote"),
             SettingsTab::About => aox::i18n::t("About"),
         }
     }
@@ -411,10 +415,13 @@ pub(super) const WRITE_FILE_TOOL: &str = "write_file";
 /// Tools whose row **names the file it works on**.
 ///
 /// The two file writers — `write_file` (whole-file) and `edit_file` (in-place snippets) — both take a
-/// `path` and both produce a diff, so both rows should say which file they are about. Adding a read or
-/// a delete here is a one-line change the day the same is wanted for them; nothing else keys off this
-/// list.
-pub(super) const SUBJECT_TOOLS: &[&str] = &[WRITE_FILE_TOOL, "edit_file"];
+/// `path` and both produce a diff, so both rows should say which file they are about. `publish_file`
+/// joins them for the same reason from the other end: it writes nothing, but the whole point of the
+/// call is *which* existing file it hands to the user, so a row saying only "publish_file" would
+/// hide the one fact it carries. Adding a read or a delete here is a one-line change the day the same
+/// is wanted for them; nothing else keys off this list (the diff panel and the line counter key off
+/// [`WRITE_FILE_TOOL`] directly).
+pub(super) const SUBJECT_TOOLS: &[&str] = &[WRITE_FILE_TOOL, "edit_file", "publish_file"];
 
 /// Height cap of the unfolded diff panel. A peephole into the edit, not a second editor — the point
 /// is "which lines moved", and the panel scrolls for the rest.
@@ -539,6 +546,26 @@ mod tests {
         assert_eq!(purpose_from_value("read_file", &json!({"path": "a.rs"})), None);
         // Whitespace-only purpose is not a purpose.
         assert_eq!(purpose_from_value("bash", &json!({"purpose": "   ", "command": "dir"})), Some("dir".into()));
+    }
+
+    /// Which calls name their file. `publish_file` is the odd one: it writes nothing, but "which
+    /// file went to the user" is the only fact its row can carry, so it must be here.
+    #[test]
+    fn only_the_calls_that_are_about_a_file_name_one() {
+        use serde_json::json;
+
+        assert_eq!(
+            subject_from_value("publish_file", &json!({"path": r"C:\out\aoxchat.apk"})),
+            Some(r"C:\out\aoxchat.apk".into())
+        );
+        assert_eq!(
+            subject_from_value("write_file", &json!({"path": "a.rs", "content": "x"})),
+            Some("a.rs".into())
+        );
+        // A read is not about producing the file, so its row stays bare.
+        assert_eq!(subject_from_value("read_file", &json!({"path": "a.rs"})), None);
+        // No `path` argument at all — nothing to name, nothing invented.
+        assert_eq!(subject_from_value("publish_file", &json!({})), None);
     }
 
     /// Live events carry only the tool **name**, so the path argument is what keeps two calls of

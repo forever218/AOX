@@ -27,6 +27,8 @@ mod markdown;
 mod model_ui;
 mod open;
 mod recovery_ui;
+mod remote_lock;
+mod remote_ui;
 mod syntax;
 mod svg;
 mod tex;

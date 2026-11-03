@@ -267,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn plugin_tools_are_hidden_until_one_lookup_reveals_them() {
-        // 6 host tools + find_tools + 5 plugin tools = 12 > 6 => on-demand mode.
+        // 7 host tools + find_tools + 5 plugin tools = 13 > 6 => on-demand mode.
         let (rt, dir) = rt("reveal", 6, 5).await;
         let mut scope = Scope::from_config(&rt.config.tools);
 
@@ -280,7 +280,7 @@ mod tests {
         assert!(before.contains(&"read_file".to_string()), "host tools are always visible");
 
         // The full list is still there — what is hidden is advertising, not capability.
-        assert_eq!(rt.tool_schemas().await.len(), 12);
+        assert_eq!(rt.tool_schemas().await.len(), 13);
 
         let out = search(&rt, &mut scope, "directory tree").await;
         assert!(!out.is_error, "{}", out.content);

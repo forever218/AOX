@@ -29,7 +29,7 @@
 //!
 //! # The three tiers
 //!
-//! - **core**: `ToolKind::Meta | Host`, always visible (17 tools).
+//! - **core**: `ToolKind::Meta | Host`, always visible (18 tools).
 //! - **enabled**: names pinned in `[tools] enabled`, always visible (plugin tools included).
 //! - **discovered**: added by a `find_tools` hit, or automatically after a successful
 //!   `create_plugin` / `update_plugin`. Visible for the rest of this conversation; **never
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn below_the_threshold_nothing_is_hidden() {
-        // The default threshold (24): 17 host tools plus a few plugins => full list, byte-identical
+        // The default threshold (24): 18 host tools plus a few plugins => full list, byte-identical
         // to the behaviour before this module existed.
         let s = scope(24, &[]);
         assert!(!s.hides(12));

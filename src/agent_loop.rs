@@ -557,8 +557,15 @@ impl AgentLoop for StandardLoop {
                 // cannot claim a file it did not touch. A no-op when this conversation has no
                 // checkpoint (see `crate::task`), and after `after_tool` so a blocked result — whose
                 // `path` was just dropped — is not recorded.
+                //
+                // `publish_file` is the one exception: it fills `path` (that field *is* the artifact
+                // channel) without changing a single byte on disk. Recording it would bump the epoch
+                // and reopen a task that was already `done` — an agent publishing its own output at
+                // the end of a turn must not overturn the conclusion it just reached.
                 if let Some(p) = &output.path {
-                    agent.note_modified_file(p);
+                    if name != crate::tool::PUBLISH_TOOL {
+                        agent.note_modified_file(p);
+                    }
                 }
                 // ── What this tool really said ──
                 // Kept for `verify`'s `output_contains`: the check may only cite text a tool produced,

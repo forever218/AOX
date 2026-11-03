@@ -9,6 +9,7 @@
 //! lands, and rots into a lie ("why is this allowed?").
 #![allow(dead_code)]
 
+mod bootstrap;
 mod agent;
 mod agent_loop;
 mod attach;
@@ -29,6 +30,9 @@ mod prompt;
 mod provider_live;
 mod recovery;
 mod recycle;
+// Host side of AOX Remote. Declared here as well as in `lib.rs` for the usual reason: this bin
+// compiles its own copy of every module.
+mod remote;
 mod repeat;
 mod runtime;
 mod runtimes;
@@ -60,7 +64,6 @@ use anyhow::Result;
 
 use crate::agent::Agent;
 use crate::runtime::Runtime;
-use crate::tool::{ask, hostfs, meta};
 use crate::ui::cli::CliUi;
 use crate::ui::{AgentEvent, Ui};
 
@@ -371,70 +374,13 @@ async fn main() -> Result<()> {
             return Ok(());
         }
     };
-    for t in meta::meta_tools() {
-        rt.register(t).await?;
-    }
-    // Host file tools (sandbox approach ③: take file capability back into the host).
-    // Both parameters and implementation are in the host's hands, so "the path must
-    // first pass the workplace check" cannot be bypassed — registered in the same
-    // batch as `meta_tools`; under the default tier (full) they behave no differently
-    // from ordinary read/write tools.
-    for t in hostfs::host_file_tools() {
-        rt.register(t).await?;
-    }
-    // The interactive tool (`ask_user`): lets the model hand a "multiple-choice
-    // question" to the UI instead of writing it in the body and waiting for the user
-    // to type (see `tool::ask`). It's special-cased by the Agent; registering it here
-    // is to **make it visible in the model's tools list** — nobody calls an invisible tool.
-    for t in ask::ask_tools() {
-        rt.register(t).await?;
-    }
-    // Tool discovery (`src/tool/discover.rs`). Registered for the same reason as `task_state`: the
-    // model has to **see** the entry point, while the call itself is intercepted by the Agent (it
-    // changes which tools this conversation advertises, and `Tool::call` only sees `Runtime`).
-    for t in tool::discover::find_tools() {
-        rt.register(t).await?;
-    }
-    // Task checkpoints (`src/tool/task.rs`). Registered only so the model can **see** it in the tool
-    // list — the call itself is intercepted by `Agent::authorize_and_execute`, because a checkpoint
-    // belongs to a conversation and `Tool::call` only sees `Runtime`.
-    for t in tool::task::task_tools() {
-        rt.register(t).await?;
-    }
-    // Verification (`src/tool/verify.rs`). Registered for the same reason as `task_state`: the model
-    // has to see the entry point, while the call is intercepted by the Agent (evidence belongs to a
-    // conversation's checkpoint, and `Tool::call` only sees `Runtime`).
-    for t in tool::verify::verify_tools() {
-        rt.register(t).await?;
-    }
-    // The built-in command line (`src/tool/shell.rs`). Registered like the file tools: the host owns
-    // both the schema and the execution, so "the working directory must be inside the workspace" is
-    // not a convention the model may skip. `[shell] enabled = false` leaves it unregistered, which is
-    // the difference between "not advertised" and "advertised then refused".
-    if rt.config.shell.enabled {
-        for t in tool::shell::shell_tools(&rt.config.shell) {
-            rt.register(t).await?;
-        }
-        // The POSIX shell. Registered **only when a real bash was found**: a tool that can only fail
-        // would cost the model a round trip to learn what `[shell] bash` already knows.
-        for t in tool::bash::bash_tools(&rt) {
-            rt.register(t).await?;
-        }
-        // Long-lived jobs (`shell_job`). Registered even when the limit is 0, because status/logs/
-        // stop must stay available to clean up jobs started before the limit was tightened.
-        for t in tool::job::job_tools() {
-            rt.register(t).await?;
-        }
-    }
+    bootstrap::register_tools(&rt).await?;
 
-    // The built-in web tool (`src/tool/web.rs`). Registered like the file tools: the host owns the
-    // schema and the execution, so "one charset decision, one byte cap, one envelope" is the same in
-    // the CLI and the GUI. `[web] enabled = false` leaves it unregistered — the difference between
-    // "not advertised" and "advertised then refused".
-    if rt.config.web.enabled {
-        for t in tool::web::web_tools(&rt.config.web) {
-            rt.register(t).await?;
-        }
+    // ---- `aox remote ...`: the host side of AOX Remote ----
+    // Placed **after** every tool is registered, so a remote turn has exactly the same tool set as
+    // a local one, and before the banner/REPL, which a daemon has no use for.
+    if args.get(1).map(String::as_str) == Some("remote") {
+        return crate::remote::cli(rt.clone(), app_root.clone(), &args[2..]).await;
     }
 
     let mut ui = CliUi::new();

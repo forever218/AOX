@@ -122,6 +122,9 @@ pub struct App {
 
     items: Vec<Item>,
     live: Option<Live>,
+    /// 远程页的状态（配对、启停、日志）。桥跑在自己的线程里。
+    remote: crate::remote_ui::RemoteState,
+
     /// The activity stream's shared state. It lives in its own window (`activity.rs`); the
     /// main window only writes into it.
     act: activity::Shared,
@@ -483,6 +486,7 @@ impl App {
             boot: None,
             items: Vec::new(),
             live: None,
+            remote: crate::remote_ui::RemoteState::default(),
             act: activity::new_shared(),
             cache: cache::new_shared(),
             wsview: wsview::new_shared(),
@@ -729,6 +733,24 @@ impl eframe::App for App {
         // yet (the system theme only becomes readable inside a pass). Idempotent, free after the
         // first call. See `theme::settle`.
         theme::settle(ctx);
+        self.remote.poll();
+        // 远程接管时屏蔽键盘事件（快捷键、输入、粘贴）：鼠标要留着，否则中央那个
+        // "取回控制权"按钮自己也点不到。
+        if crate::remote_lock::current().is_some() {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    !matches!(
+                        e,
+                        egui::Event::Key { .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Copy
+                            | egui::Event::Cut
+                    )
+                });
+            });
+        }
+
         self.fit_window(ctx);
         // Before `pump`: the clock's run/stop state has to be settled from the *current* flags
         // before this frame's events are timestamped, so nothing records a moment that belongs to
@@ -1029,6 +1051,12 @@ impl eframe::App for App {
             )),
             full,
         );
+        // 远程接管：画在最后，压在所有浮层之上。桥不在了会自动解除（心跳过期）。
+        if let Some(info) = crate::remote_lock::current() {
+            crate::remote_lock::takeover(ctx, &info);
+            ctx.request_repaint_after(std::time::Duration::from_millis(800));
+        }
+
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

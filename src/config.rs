@@ -595,7 +595,7 @@ pub struct ToolsConfig {
     /// Registry size at or below which the whole list is sent (old behaviour). `0` = never hide
     /// plugin tools, ever — the permanent escape hatch.
     ///
-    /// The default (24) is picked so that the 17 host tools plus a handful of plugins stay fully
+    /// The default (24) is picked so that the 18 host tools plus a handful of plugins stay fully
     /// inline: discovery costs a round trip, and paying it to save a few hundred tokens is a bad
     /// trade. It starts paying when a registry holds dozens of tools.
     pub inline_max: usize,

@@ -15,6 +15,7 @@ pub mod agent;
 pub mod agent_loop;
 pub mod attach;
 pub mod auth;
+pub mod bootstrap;
 pub mod checks;
 pub mod compact;
 pub mod config;
@@ -34,6 +35,8 @@ pub mod prompt;
 pub mod provider_live;
 pub mod recovery;
 pub mod recycle;
+/// Host side of AOX Remote (`aox remote`): pairing, the socket, and the `Ui` that speaks it.
+pub mod remote;
 pub mod repeat;
 pub mod runtime;
 pub mod runtimes;
