@@ -386,11 +386,16 @@ impl Stage {
         self.note.as_deref()
     }
 
+    /// 设置页不再显示这两行（"下一句在路上" / "首屏正在显示哪一句"）——那两行只是小字，
+    /// 对"改完有没有生效"没有帮助，看一眼首屏更快。读取口留着：`on_line` 仍然按"现在显示
+    /// 还是留给下一次"来决定 `pending`，这两个访问器是它的对外说法。
+    #[allow(dead_code)]
     pub fn last_line(&self) -> Option<&str> {
         self.last_line.as_deref()
     }
 
     /// The line held for next time, if it is still fresh.
+    #[allow(dead_code)]
     pub fn pending_line(&self) -> Option<&str> {
         match &self.pending {
             Some((t, at)) if at.elapsed().as_secs_f32() < PENDING_TTL => Some(t),

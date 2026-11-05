@@ -114,6 +114,9 @@ pub enum Body {
     HelloOk(HelloOk),
     Pong(Pong),
     MsgNew(MsgNew),
+    /// 房间待办的最新**全量**列表。增删改都发整份：一个群的待办不会多到需要 diff，
+    /// 而三种操作合并成一条帧，客户端就不必维护命令重放的顺序。
+    Todos(Todos),
     /// Transient progress — **never persisted**, safe to drop when a client is slow.
     TaskUpdate(TaskUpdate),
     /// A persisted state transition; this is what a reconnecting client rebuilds from.
@@ -163,6 +166,9 @@ pub struct DeviceInfo {
 pub enum DeviceKind {
     Phone,
     Host,
+    /// A browser tab. Speaks as its owner like a phone, but is not one: it cannot receive
+    /// background pushes, and the device list should not pretend it is a handset.
+    Web,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -380,7 +386,20 @@ pub struct ReplyView {
     pub seq: i64,
     pub sender_name: String,
     /// 已经压成一行并截断，规则和会话列表的预览是同一套（`preview_of`）。
+    ///
+    /// 加密房间的正文是 `enc:v1:<base64>`，**不能截**：base64 少一个字符就再也解不开。
+    /// 所以这种情况下这里是占位（"加密消息"），完整密文在 `sealed` 里。
     pub preview: String,
+    /// 原文是密文时的那份完整密文。客户端有房间口令就解它、自己截断；没有口令就显示
+    /// `preview` 那句占位。服务端不解密，也不需要密钥——它只负责别把密文截坏。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<String>,
+    /// 被引用那条消息里的产物。
+    ///
+    /// 引用条要能写出"引了哪几个"（`[3 个附件]` 这种摘要认不出东西），宿主也要照着
+    /// 这份清单去拉取——本机的 `artifacts_of()` 之外再给一份权威版本，省一次往返。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactView>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,11 +434,43 @@ pub struct MsgSend {
     /// 引用的是哪一条（消息 id）。只传 id：摘要由服务端按库里的原文展开，客户端伪造不了。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// 引用一条带多个文件的消息时，**只引这几个**（空 = 整条都引）。
+    ///
+    /// 服务端会校验这些 id 确实属于被引用的那条消息，并把结果落在消息的 payload 里
+    /// （`{"pick":[…]}`），这样所有人看到的引用条都是同一份清单，宿主也只拉这几个文件。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reply_artifact_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MsgNew {
     pub msg: Message,
+}
+
+/// 群里的一条待办。
+///
+/// 没有"谁能不能改"的字段：**房间里所有人都能增删改**（这是产品决定，不是漏了权限）。
+/// `created_by` 只用来在行尾写一句"谁加的"，不参与判断。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub id: String,
+    pub text: String,
+    #[serde(default)]
+    pub done: bool,
+    pub created_by: String,
+    /// 加待办那个人的显示名。改名/退群后这里留的是当时的名字——一条记录，不是引用。
+    #[serde(default)]
+    pub created_by_name: String,
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+/// 一个房间的待办全量快照。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Todos {
+    pub room: String,
+    pub items: Vec<TodoItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -440,6 +491,13 @@ pub struct TaskView {
     pub created_by: String,
     /// The instruction as the human wrote it, without the @mention.
     pub prompt: String,
+    /// 触发这一轮的那条消息。
+    ///
+    /// 手机要把"运行中"的呼吸条挂在那条 `@agent` 的消息下面——而 `prompt` 是剥掉 @ 之后的
+    /// 正文，靠它反查原文等于做一次模糊匹配。跑在房间里的任务可以有好几轮，匹配错一行的
+    /// 观感比没有这条动画更糟，所以宿主直接把消息 id 带下来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_msg_id: Option<String>,
     pub status: TaskStatus,
     #[serde(default)]
     pub steps: Vec<StepView>,
@@ -506,6 +564,9 @@ pub struct UsageView {
     pub prompt: u64,
     #[serde(default)]
     pub completion: u64,
+    /// 端点只报了总数（没拆输入/输出）时用它。0 = 没报。
+    #[serde(default)]
+    pub total: u64,
     #[serde(default)]
     pub calls: u32,
 }
@@ -513,6 +574,18 @@ pub struct UsageView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskUpdate {
     pub task_id: String,
+    /// 这一轮是哪台机器在跑。
+    ///
+    /// 手机要把任务归到具体的 agent 名下（"点开 @text 看它在干什么"），而 `task_id` 里没有
+    /// 任何归属信息。收尾快照 `TaskView` 一直有这个字段，只有瞬态帧漏了。
+    ///
+    /// 服务端转发时会用**连接自身的 agent_id** 覆盖它——一台宿主只承载一台 Agent，服务端
+    /// 比宿主更可信；顺带让还没升级的老宿主也能被正确归类。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_id: String,
+    /// 触发这一轮的那条消息（原帧里就是 `@agent` 那一句）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_msg_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TaskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -522,6 +595,10 @@ pub struct TaskUpdate {
     /// One line of interim narration ("先看目录结构").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// 这一轮从房间里取到了什么。取完就发一次，不用等整轮结束——人想马上知道"它到底看到了
+    /// 什么"，而不是在两分钟后翻历史。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -745,6 +822,7 @@ mod tests {
                 client_msg_id: "c_1".into(),
                 body: MessageBody::Text { text: "构建 release".into() },
                 reply_to: None,
+                reply_artifact_ids: vec![],
             }),
         )
         .in_room("r_1");
@@ -787,9 +865,10 @@ mod tests {
         let task = TaskView {
             id: "t_1".into(),
             agent_id: "a_1".into(),
-            agent_handle: "aox-lisiran".into(),
+            agent_handle: "aox-alice".into(),
             created_by: "u_1".into(),
             prompt: "做一个番茄钟".into(),
+            source_msg_id: Some("m_9".into()),
             status: TaskStatus::Running,
             steps: vec![StepView {
                 idx: 0,
@@ -800,7 +879,7 @@ mod tests {
                 diff: Some((184, 0)),
                 preview: None,
             }],
-            usage: UsageView { prompt: 12_400, completion: 900, calls: 3 },
+            usage: UsageView { prompt: 12_400, completion: 900, total: 0, calls: 3 },
             context_digest: Some("20 条消息 / 1 个产物".into()),
             error: None,
             artifacts: vec![],
@@ -823,6 +902,7 @@ mod tests {
             sender_id: "a_1".into(),
             sender_kind: SenderKind::Agent,
             sender_name: "aox-A".into(),
+            sender_avatar: None,
             created_at: 1,
             reply_to: None,
             body: MessageBody::System { text: "任务已排队".into() },
@@ -843,13 +923,16 @@ mod tests {
             seq: 9,
             sender_id: "u_1".into(),
             sender_kind: SenderKind::User,
-            sender_name: "lisiran".into(),
+            sender_name: "alice".into(),
+            sender_avatar: None,
             created_at: 2,
             reply_to: Some(ReplyView {
                 id: "m_1".into(),
                 seq: 7,
                 sender_name: "aox-A".into(),
                 preview: "任务已排队".into(),
+                sealed: None,
+                artifacts: vec![],
             }),
             body: MessageBody::Text { text: "好".into() },
         };
@@ -859,6 +942,28 @@ mod tests {
         // flatten 的 body 和 reply_to 并列，不互相盖掉。
         assert_eq!(v["kind"], "text");
         assert_eq!(v["text"], "好");
+    }
+
+    /// 加密房间：密文不能被截断（base64 少一个字符就解不开），所以整份走 `sealed`，
+    /// `preview` 只放一句占位。
+    #[test]
+    fn a_sealed_reply_keeps_the_ciphertext_whole() {
+        let ct = "enc:v1:AAAABBBBCCCCDDDD";
+        let sealed = ReplyView {
+            id: "m_1".into(),
+            seq: 3,
+            sender_name: "B".into(),
+            preview: "加密消息".into(),
+            sealed: Some(ct.into()),
+            artifacts: vec![],
+        };
+        let v = serde_json::to_value(&sealed).unwrap();
+        assert_eq!(v["sealed"], ct);
+        assert_eq!(v["preview"], "加密消息");
+
+        // 明文消息不带这个键：老客户端不用看见一个永远为 null 的字段。
+        let plain = ReplyView { sealed: None, ..sealed };
+        assert!(serde_json::to_value(&plain).unwrap().get("sealed").is_none());
     }
 
     #[test]

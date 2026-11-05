@@ -1149,7 +1149,7 @@ fn paint_pencil(p: &egui::Painter, r: Rect) {
 
 /// The green check: the only coloured mark in the model UI, and the one that answers "which one is in
 /// force". Drawn, not typed — the glyph may not exist in the hand-picked font.
-fn paint_check(p: &egui::Painter, r: Rect) {
+pub(crate) fn paint_check(p: &egui::Painter, r: Rect) {
     let fg = P::add_green();
     let a = Pos2::new(r.left() + 1.5, r.center().y + 0.5);
     let b = Pos2::new(r.center().x - 0.8, r.bottom() - 2.6);

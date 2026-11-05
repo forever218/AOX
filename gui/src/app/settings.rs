@@ -81,31 +81,51 @@ pub(super) fn tab_row(ui: &mut Ui, tab: SettingsTab, selected: bool) -> egui::Re
     resp
 }
 
-/// A radio row (used by the "Appearance" column): a dot on the right, filled when selected.
+/// 一张可点卡片的底座：1px 边框 + 12pt 圆角，hover / 选中时**底色和边框一起上一档**。
 ///
-/// A dot rather than a tick: the tick's shape is already taken in this UI by the "workplace tier"
-/// (meaning "the tier currently in force"), and using it again would read as the same thing.
-/// Filled / hollow is the drawing that needs the least explaining for "selected / not selected".
-pub(super) fn choice_row(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
-    let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::click());
+/// 这些行原来是"无边框、hover 时才铺一层灰"的极简写法。在 700pt 宽的对话框里，一列没有边界的
+/// 文字看着像清单、不像控件——点不点得动全靠猜；hover 也只是在字底下垫一层几乎看不出的灰。
+/// 卡片是主界面（模型列表、入口行）已经在用的语言，这里跟上它：高度 52，和模型列表的 56 一档。
+fn card_bg(p: &egui::Painter, rect: Rect, hot: bool, on: bool) {
+    let fill = if hot || on { P::surface_hi() } else { P::surface() };
+    let edge = if hot || on { P::border_strong() } else { P::border() };
+    p.rect_filled(rect, CornerRadius::same(theme::R2), fill);
+    p.rect_stroke(
+        rect,
+        CornerRadius::same(theme::R2),
+        Stroke::new(1.0, edge),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// The height of one card row on the settings page. The model list uses 56; the appearance column
+/// keeps the same family so switching tabs doesn't feel like switching programs.
+fn card_h() -> f32 {
+    52.0
+}
+
+/// 一行"选一个"的卡片（浅色 / 深色 / 跟随系统）：右边一个点，选中时实心。
+///
+/// 点而不是勾：勾这个形状在这个界面里已经是"当前生效的工作区层级"，再用一次会被当成同一件事。
+/// 实心 / 空心是"选中 / 没选中"最不需要解释的画法。
+fn choice_card(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), card_h()), Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    card_bg(ui.painter(), rect, resp.hovered(), selected);
 
-    let painter = ui.painter();
-    if resp.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
-    }
     let fg = if selected { P::text() } else { P::text_dim() };
-    let g = painter.layout_no_wrap(label.to_string(), egui::FontId::proportional(14.5), fg);
-    painter.galley(Pos2::new(rect.left() + 4.0, rect.center().y - g.size().y * 0.5), g, fg);
+    let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(15.0), fg);
+    ui.painter()
+        .galley(Pos2::new(rect.left() + 16.0, rect.center().y - g.size().y * 0.5), g, fg);
 
-    let dot = Pos2::new(rect.right() - 12.0, rect.center().y);
+    let dot = Pos2::new(rect.right() - 18.0, rect.center().y);
     if selected {
-        painter.circle_filled(dot, 5.0, P::ink());
+        ui.painter().circle_filled(dot, 5.0, P::ink());
     } else {
-        painter.circle_stroke(dot, 5.0, Stroke::new(1.5, P::border_strong()));
+        ui.painter()
+            .circle_stroke(dot, 5.0, Stroke::new(1.5, P::border_strong()));
     }
     resp
 }
@@ -346,7 +366,7 @@ fn segmented(ui: &mut Ui, salt: &str, items: &[(&str, bool)]) -> Option<usize> {
     if items.is_empty() {
         return None;
     }
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::same(theme::R2), P::surface_hi());
     let seg_w = rect.width() / items.len() as f32;
     let mut hit = None;
@@ -359,17 +379,22 @@ fn segmented(ui: &mut Ui, salt: &str, items: &[(&str, bool)]) -> Option<usize> {
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
+        let inner = seg.shrink2(Vec2::new(2.0, 2.0));
         if *on {
-            ui.painter().rect_filled(
-                seg.shrink2(Vec2::new(2.0, 2.0)),
+            ui.painter().rect_filled(inner, CornerRadius::same(theme::R2), P::surface());
+        } else if resp.hovered() {
+            // 未选中的那一格 hover 时给一圈边，而不是填色：填色会和"已选中"撞成同一个样子。
+            ui.painter().rect_stroke(
+                inner,
                 CornerRadius::same(theme::R2),
-                P::surface(),
+                Stroke::new(1.0, P::border_strong()),
+                egui::StrokeKind::Inside,
             );
         }
         let color = if *on { P::ink() } else { P::text_dim() };
         let g = ui.painter().layout_no_wrap(
             (*label).to_string(),
-            egui::FontId::proportional(13.0),
+            egui::FontId::proportional(14.0),
             color,
         );
         ui.painter().galley(seg.center() - g.size() * 0.5, g, color);
@@ -380,24 +405,87 @@ fn segmented(ui: &mut Ui, salt: &str, items: &[(&str, bool)]) -> Option<usize> {
     hit
 }
 
-/// A full-width row: label on the left, switch on the right. **The whole row** is the hit target.
-fn toggle_row(ui: &mut Ui, on: &mut bool, label: &str) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+/// 一个"做一件事"的卡片行（换一句 / 打开文件夹）：左边文字，右边一个 `›`。
+///
+/// 不用 `flat_button`：那个是对话框底部 34pt 的文本按钮，单独摆在 52pt 的卡片堆里像一个漏排的
+/// 控件。这里和别的卡片同高、同边框、同样的 hover。
+fn action_card(ui: &mut Ui, label: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), card_h()), Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    card_bg(ui.painter(), rect, resp.hovered(), false);
+
+    let fg = P::text();
+    let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(15.0), fg);
+    ui.painter()
+        .galley(Pos2::new(rect.left() + 16.0, rect.center().y - g.size().y * 0.5), g, fg);
+    chevron(ui.painter(), Pos2::new(rect.right() - 18.0, rect.center().y), resp.hovered());
+    resp
+}
+
+/// 两行字的卡片："背景文件夹" + 路径，右边一个 `›`。整张卡都能点。
+fn folder_card(ui: &mut Ui, label: &str, path: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 66.0), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    card_bg(ui.painter(), rect, resp.hovered(), false);
+
+    let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(15.0), P::text());
+    ui.painter().galley(Pos2::new(rect.left() + 16.0, rect.top() + 13.0), g, P::text());
+
+    // 路径用等宽字：它是一串要对照的字符，不是一句话。超长时截断——完整路径在悬停提示里，
+    // 而且点一下就是那个目录本身。
+    let avail = rect.width() - 48.0;
+    let mut job = egui::text::LayoutJob::single_section(
+        path.to_owned(),
+        egui::TextFormat {
+            font_id: theme::mono_font(12.5),
+            color: P::text_dim(),
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = avail;
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = ui.painter().layout_job(job);
+    ui.painter()
+        .galley(Pos2::new(rect.left() + 16.0, rect.top() + 37.0), galley, P::text_dim());
+
+    chevron(ui.painter(), Pos2::new(rect.right() - 18.0, rect.center().y), resp.hovered());
+    resp
+}
+
+/// 右边那个 `›`。三处卡片共用，粗细和 `entry_row` 的一致。
+fn chevron(p: &egui::Painter, c: Pos2, hot: bool) {
+    let s = 3.4;
+    let st = Stroke::new(1.4, if hot { P::text() } else { P::text_faint() });
+    p.line_segment([c + Vec2::new(-s * 0.45, -s), c + Vec2::new(s * 0.65, 0.0)], st);
+    p.line_segment([c + Vec2::new(s * 0.65, 0.0), c + Vec2::new(-s * 0.45, s)], st);
+}
+
+/// 一行开关卡片：左边标签，右边开关，**整行**都是热区。
+fn toggle_card(ui: &mut Ui, on: &mut bool, label: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), card_h()), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    card_bg(ui.painter(), rect, resp.hovered(), false);
+
     let sw = Rect::from_center_size(
-        Pos2::new(rect.right() - 20.0, rect.center().y),
+        Pos2::new(rect.right() - 34.0, rect.center().y),
         Vec2::new(40.0, 22.0),
     );
     switch_mark(ui.painter(), sw, *on, resp.hovered());
+
     let g = ui.painter().layout_no_wrap(
         label.to_string(),
-        egui::FontId::proportional(13.5),
+        egui::FontId::proportional(15.0),
         P::text(),
     );
     ui.painter().galley(
-        Pos2::new(rect.left(), rect.center().y - g.size().y * 0.5),
+        Pos2::new(rect.left() + 16.0, rect.center().y - g.size().y * 0.5),
         g,
         P::text(),
     );
@@ -447,6 +535,10 @@ const PRESETS: [&str; 8] = [
 /// One colour: `name | swatch | #RRGGBB | Default`.
 ///
 /// Returns whether the colour changed (so the caller knows to restart the line and save).
+///
+/// The row is a card now (46pt) with the controls laid out inside it. When these two rows were bare
+/// 30pt lines they read as a legend under the switches rather than something you could interact
+/// with — the swatch was the only hint, and it is 20pt.
 fn color_row(
     ui: &mut Ui,
     key_w: f32,
@@ -455,81 +547,83 @@ fn color_row(
     st: &mut crate::welcome::Stage,
 ) -> bool {
     let mut changed = false;
-    let color = st.prefs.color(mode);
-    ui.allocate_ui_with_layout(
-        Vec2::new(ui.available_width(), 30.0),
-        Layout::left_to_right(Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            let (lr, _) = ui.allocate_exact_size(Vec2::new(key_w, 18.0), Sense::hover());
-            let g = ui.painter().layout_no_wrap(key.to_string(), kv_key_font(), P::text_dim());
-            ui.painter().galley(Pos2::new(lr.left(), lr.top()), g, P::text_dim());
-            ui.add_space(KV_KEY_GAP);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::hover());
+    card_bg(ui.painter(), rect, false, false);
 
-            let (sw, sw_resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
-            crate::welcome::swatch(ui, sw, color);
-            if sw_resp.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            let _open = egui::Popup::menu(&sw_resp)
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
-                .frame(theme::floating(theme::card_radius()).inner_margin(Margin::symmetric(8, 8)))
-                .show(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::splat(4.0);
-                    for row in 0..2 {
-                        ui.horizontal(|ui| {
-                            for cell in 0..4 {
-                                let Some(c) = crate::welcome::parse_hex(PRESETS[row * 4 + cell])
-                                else {
-                                    continue;
-                                };
-                                let (r, resp) =
-                                    ui.allocate_exact_size(Vec2::new(34.0, 22.0), Sense::click());
-                                crate::welcome::swatch(ui, r, c);
-                                if resp.hovered() {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                }
-                                if resp.on_hover_text(PRESETS[row * 4 + cell]).clicked() {
-                                    st.set_color(mode, c);
-                                    changed = true;
-                                }
-                            }
-                        });
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(Vec2::new(16.0, 0.0)))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    let ui = &mut child;
+    ui.spacing_mut().item_spacing.x = 0.0;
+
+    let color = st.prefs.color(mode);
+    let (lr, _) = ui.allocate_exact_size(Vec2::new(key_w, 18.0), Sense::hover());
+    let g = ui.painter().layout_no_wrap(key.to_string(), kv_key_font(), P::text_dim());
+    ui.painter().galley(Pos2::new(lr.left(), lr.top()), g, P::text_dim());
+    ui.add_space(KV_KEY_GAP);
+
+    let (sw, sw_resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+    crate::welcome::swatch(ui, sw, color);
+    if sw_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let _open = egui::Popup::menu(&sw_resp)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+        .frame(theme::floating(theme::card_radius()).inner_margin(Margin::symmetric(8, 8)))
+        .show(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+            for row in 0..2 {
+                ui.horizontal(|ui| {
+                    for cell in 0..4 {
+                        let Some(c) = crate::welcome::parse_hex(PRESETS[row * 4 + cell]) else {
+                            continue;
+                        };
+                        let (r, resp) = ui.allocate_exact_size(Vec2::new(34.0, 22.0), Sense::click());
+                        crate::welcome::swatch(ui, r, c);
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.on_hover_text(PRESETS[row * 4 + cell]).clicked() {
+                            st.set_color(mode, c);
+                            changed = true;
+                        }
                     }
                 });
+            }
+        });
 
-            ui.add_space(8.0);
-            let field_w = (ui.available_width() - 60.0).clamp(72.0, 96.0);
-            let r = ui.add(
-                egui::TextEdit::singleline(st.draft_mut(mode))
-                    .desired_width(field_w)
-                    .margin(Margin { left: 8, right: 8, top: 4, bottom: 4 })
-                    .font(egui::FontId::proportional(12.5)),
-            );
-            // Committed on leaving the field, not per keystroke: `#E0` is not a colour, and treating
-            // it as one would fight the person typing it.
-            if r.lost_focus() && st.commit_draft(mode) {
-                changed = true;
-            }
-            ui.add_space(10.0);
-            let d = ui.add(
-                Label::new(
-                    RichText::new(aox::i18n::t("Default"))
-                        .color(P::text_dim())
-                        .size(12.0)
-                        .underline(),
-                )
-                .sense(Sense::click()),
-            );
-            if d.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if d.clicked() {
-                st.set_color(mode, crate::welcome::Prefs::default_color(mode));
-                changed = true;
-            }
-        },
+    ui.add_space(10.0);
+    let field_w = (ui.available_width() - 66.0).clamp(76.0, 100.0);
+    let r = ui.add(
+        egui::TextEdit::singleline(st.draft_mut(mode))
+            .desired_width(field_w)
+            .margin(Margin { left: 8, right: 8, top: 5, bottom: 5 })
+            .font(egui::FontId::proportional(13.0)),
     );
+    // Committed on leaving the field, not per keystroke: `#E0` is not a colour, and treating
+    // it as one would fight the person typing it.
+    if r.lost_focus() && st.commit_draft(mode) {
+        changed = true;
+    }
+    ui.add_space(12.0);
+    let d = ui.add(
+        Label::new(
+            RichText::new(aox::i18n::t("Default"))
+                .color(P::text_dim())
+                .size(13.0)
+                .underline(),
+        )
+        .sense(Sense::click()),
+    );
+    if d.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if d.clicked() {
+        st.set_color(mode, crate::welcome::Prefs::default_color(mode));
+        changed = true;
+    }
     changed
 }
 
@@ -548,26 +642,13 @@ fn link_label(ui: &mut Ui, text: &str, url: &str) {
     }
 }
 
-/// What happened to the last request, under the model source.
+/// 上一次请求**失败**时的原因，只此一条。
 ///
-/// A failure is stated here and **only** here: the first screen shows a local sentence instead of an
-/// apology, but a user who cannot get a model-written line needs to know why, and this is the one
-/// place with room for the reason.
-fn status_line(ui: &mut Ui, st: &crate::welcome::Stage) {
+/// 失败必须说出来：首屏会退回一句本地句子，不解释的话人只会觉得"模型不灵"。成功时不画任何
+/// 东西——"下一句正在路上"这种话对结果没有影响，只是又一行要读的小字。
+fn error_line(ui: &mut Ui, st: &crate::welcome::Stage) {
     if let Some(e) = st.note() {
-        ui.label(RichText::new(e).color(P::warn()).size(11.5));
-        return;
-    }
-    if let Some(p) = st.pending_line() {
-        ui.label(
-            RichText::new(aox::tf!("Next up: {}", p)).color(P::text_faint()).size(11.5),
-        );
-    } else if let Some(l) = st.last_line() {
-        // What the first screen is showing right now — this is what makes "another one" verifiable
-        // without closing the dialog.
-        ui.label(
-            RichText::new(aox::tf!("Last line: {}", l)).color(P::text_faint()).size(11.5),
-        );
+        ui.label(RichText::new(e).color(P::warn()).size(12.5));
     }
 }
 
@@ -749,20 +830,23 @@ impl App {
     pub(super) fn tab_appearance(&mut self, ui: &mut Ui) {
         let cur = theme::pref();
         for p in theme::Pref::ALL {
-            if choice_row(ui, p.label(), cur == p).clicked() {
+            if choice_card(ui, p.label(), cur == p).clicked() {
                 theme::apply_pref(ui.ctx(), p);
             }
+            ui.add_space(8.0);
         }
 
         ui.add_space(14.0);
         rule(ui);
-        ui.add_space(12.0);
+        ui.add_space(15.0);
+        // 一个小标题，不是说明文字：下面那三个选项（自定义 / 一言 / 模型）得有个名字，否则
+        // "自定义" 是在自定义什么没人知道。字号和卡片标签同档，它读起来是"这一段叫什么"。
         ui.label(
             RichText::new(aox::i18n::t("Welcome line"))
-                .color(P::text_faint())
-                .size(12.0),
+                .color(P::text())
+                .size(15.0),
         );
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
         // "Restart the line" vs "write the file": a colour or a switch changes what is on the first
         // screen right now, while a **text** edit is still being typed — writing each keystroke is
@@ -782,7 +866,7 @@ impl App {
                 save = true;
             }
         }
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
         match self.welcome.prefs.source {
             crate::welcome::Source::Custom => {
@@ -792,18 +876,19 @@ impl App {
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut self.welcome.prefs.custom)
                             .desired_width(field_w)
-                            .margin(Margin { left: 10, right: 10, top: 7, bottom: 7 })
-                            .font(egui::FontId::proportional(14.0))
+                            .margin(Margin { left: 12, right: 12, top: 9, bottom: 9 })
+                            .font(egui::FontId::proportional(14.5))
                             .hint_text(
                                 RichText::new(aox::i18n::t("One short sentence"))
                                     .color(P::quiet())
-                                    .size(13.0),
+                                    .size(13.5),
                             ),
                     );
                     // 40 characters is what still reads as **one line** at 26pt on a 1280 window;
                     // cutting here is honest (the field refuses more) rather than silently eliding
                     // the user's sentence on the first screen.
-                    if self.welcome.prefs.custom.chars().count() > 40 {
+                    let n = self.welcome.prefs.custom.chars().count();
+                    if n > 40 {
                         self.welcome.prefs.custom =
                             self.welcome.prefs.custom.chars().take(40).collect();
                     }
@@ -813,22 +898,17 @@ impl App {
                     if r.lost_focus() {
                         restart = true;
                     }
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "{}/40",
-                            self.welcome.prefs.custom.chars().count()
-                        ))
-                        .color(P::text_faint())
-                        .size(11.5),
-                    );
+                    // 计数只在快写满时出现：写到 34 个字以前，这个数字没有任何用处，只是多一行
+                    // 要读的小字。写到那儿了，它才变成"还剩几个字"这个真问题。
+                    if n >= 34 {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!("{n}/40"))
+                                .color(if n >= 40 { P::warn() } else { P::text_faint() })
+                                .size(12.0),
+                        );
+                    }
                 });
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(aox::i18n::t("Leave it empty for a quiet first screen."))
-                        .color(P::text_faint())
-                        .size(11.5),
-                );
             }
             crate::welcome::Source::Hitokoto => {
                 let r = ui.add(
@@ -854,33 +934,23 @@ impl App {
                     }
                     restart = true;
                 }
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 link_label(ui, aox::i18n::t("Hitokoto API documentation"), aox::hello::HITOKOTO_DOCS);
-                ui.add_space(6.0);
-                status_line(ui, &self.welcome);
+                error_line(ui, &self.welcome);
             }
             crate::welcome::Source::Model => {
-                ui.label(
-                    RichText::new(aox::i18n::t(
-                        "One short line, written by the model in use. Each one gets a different \
-                         style, and now and then the exact time — so it can wish you a Saturday \
-                         afternoon. Nothing from your conversations is sent.",
-                    ))
-                    .color(P::text_dim())
-                    .size(12.5),
-                );
-                ui.add_space(8.0);
-                if flat_button(ui, aox::i18n::t("Another one")).clicked() {
+                // 没有说明段落：三个选项的名字已经把这件事说全了，模型写的句子好不好，看一眼
+                // 首屏就知道，不需要一段小字先解释它好在哪。
+                if action_card(ui, aox::i18n::t("Another one")).clicked() {
                     if let Some(ask) = self.welcome.refresh() {
                         self.request_hello(ask);
                     }
                 }
-                ui.add_space(6.0);
-                status_line(ui, &self.welcome);
+                error_line(ui, &self.welcome);
             }
         }
 
-        ui.add_space(12.0);
+        ui.add_space(16.0);
 
         // ── the two colours ──
         let keys = [aox::i18n::t("Text colour · light"), aox::i18n::t("Text colour · dark")];
@@ -890,57 +960,43 @@ impl App {
                 restart = true;
                 save = true;
             }
-            ui.add_space(6.0);
+            ui.add_space(8.0);
         }
 
-        ui.add_space(6.0);
+        ui.add_space(8.0);
         // ── the two switches ──
-        if toggle_row(ui, &mut self.welcome.prefs.typing, aox::i18n::t("Typewriter effect")) {
+        if toggle_card(ui, &mut self.welcome.prefs.typing, aox::i18n::t("Typewriter effect")) {
             restart = true;
             save = true;
         }
-        ui.add_space(2.0);
-        if toggle_row(ui, &mut self.welcome.prefs.background, aox::i18n::t("Background image")) {
+        ui.add_space(8.0);
+        if toggle_card(ui, &mut self.welcome.prefs.background, aox::i18n::t("Background image")) {
             restart = true;
             save = true;
             // Takes effect this frame: the texture is released, or the pool is re-scanned.
             self.brand.set_enabled(self.welcome.prefs.background);
         }
 
-        ui.add_space(10.0);
+        ui.add_space(14.0);
         // ── where the pictures go ──
         let dir = aox::paths::app_root().join("assets");
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(
-                RichText::new(aox::i18n::t("Background folder"))
-                    .color(P::text_dim())
-                    .size(13.0),
-            );
-            let hit = ui
-                .add(
-                    Label::new(
-                        RichText::new(dir.display().to_string())
-                            .color(P::text())
-                            .size(12.5)
-                            .underline(),
-                    )
-                    .sense(Sense::click())
-                    .wrap_mode(egui::TextWrapMode::Truncate),
-                )
-                .on_hover_text(aox::i18n::t("Open this folder"));
-            if hit.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if hit.clicked() {
-                // Create both pools first: a link that opens onto "this folder is empty" is a link
-                // that taught the user nothing.
-                let _ = std::fs::create_dir_all(dir.join("light"));
-                let _ = std::fs::create_dir_all(dir.join("dark"));
-                let _ = crate::open::reveal(&dir);
-            }
-        });
-        ui.add_space(4.0);
+        let hit = folder_card(
+            ui,
+            aox::i18n::t("Background folder"),
+            &dir.display().to_string(),
+        );
+        if hit.clicked() {
+            // Create both pools first: a link that opens onto "this folder is empty" is a link
+            // that taught the user nothing.
+            let _ = std::fs::create_dir_all(dir.join("light"));
+            let _ = std::fs::create_dir_all(dir.join("dark"));
+            let _ = crate::open::reveal(&dir);
+        }
+        hit.on_hover_text(aox::i18n::t("Open this folder"));
+
+        ui.add_space(8.0);
+        // 这一段小字是**唯一**留下的一段：它说的是怎么摆放文件（light/、dark/、只收 PNG、
+        // 每次随机），这些从界面上看不出来，也不是点一下就能明白的事。
         ui.label(
             RichText::new(aox::i18n::t(
                 "light/ for the light theme, dark/ for the dark one. PNG only; one is picked at \

@@ -38,9 +38,11 @@ use crate::runtime::Runtime;
 pub mod approvals;
 pub mod calls;
 pub mod cancels;
+pub mod context;
 pub mod crypto;
 pub mod roomkeys;
 pub mod store;
+pub mod tool;
 pub mod ui;
 
 use approvals::Approvals;
@@ -56,9 +58,12 @@ pub(crate) fn frame_id(prefix: &str) -> String {
     format!("{prefix}{}-{}", now_ms(), SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
-pub async fn cli(rt: Arc<Runtime>, root: PathBuf, args: &[String]) -> Result<()> {
+/// `interactive` 决定配对时**能不能追问**。`aox remote pair` 传 true（终端里一行行问）；
+/// REPL 里的 `/remote pair` 传 false——它跑在已经持有 stdin 的行编辑里，再开一个
+/// `read_line` 会把用户敲的内容抢走。
+pub async fn cli(rt: Arc<Runtime>, root: PathBuf, args: &[String], interactive: bool) -> Result<()> {
     match args.first().map(String::as_str) {
-        Some("pair") => pair(&root, args).await,
+        Some("pair") => pair(&root, args, interactive).await,
         Some("serve") => serve(rt, root).await,
         Some("status") => status(&root),
         Some("list") => status(&root),
@@ -287,16 +292,21 @@ pub async fn pair_with(
     Ok(profile)
 }
 
-async fn pair(root: &Path, args: &[String]) -> Result<()> {
+async fn pair(root: &Path, args: &[String], interactive: bool) -> Result<()> {
     println!("\nAOX 远程 · 配对");
     println!("服务端地址请填写你自己那台服务器的地址，本程序不内置任何服务器。\n");
 
+    // 不能追问的场合（REPL）就要求参数给全：少一个就报用法，别去碰 stdin。
+    let ask = interactive && is_tty();
+
     let server = match args.get(1) {
         Some(s) => normalize_server(s)?,
+        None if !ask => bail!("缺少服务端地址：aox remote pair <服务端地址> <配对码> [Agent 名称]"),
         None => normalize_server(&prompt("服务端地址（例如 https://chat.example.com）：")?)?,
     };
     let code = match args.get(2) {
         Some(c) => c.trim().to_ascii_uppercase(),
+        None if !ask => bail!("缺少配对码：aox remote pair <服务端地址> <配对码> [Agent 名称]"),
         None => prompt("配对码（手机 App → 添加电脑）：")?.to_ascii_uppercase(),
     };
     if code.is_empty() {
@@ -306,14 +316,10 @@ async fn pair(root: &Path, args: &[String]) -> Result<()> {
     let host = hostname();
     let handle = match args.get(3) {
         Some(h) => h.trim().to_ascii_lowercase(),
-        None if !is_tty() => default_handle(&host),
+        None if !ask => default_handle(&host),
         None => prompt_or("Agent 名称", &default_handle(&host))?.to_ascii_lowercase(),
     };
-    let device_name = if is_tty() {
-        prompt_or("设备名称", &host)?
-    } else {
-        host.clone()
-    };
+    let device_name = if ask { prompt_or("设备名称", &host)? } else { host.clone() };
 
     println!("\n正在向 {server} 配对…");
     let profile = pair_with(&server, &code, &handle, &device_name, root).await?;
@@ -418,18 +424,56 @@ async fn owner_name(profile: &RemoteProfile) -> String {
 }
 
 async fn serve(rt: Arc<Runtime>, root: PathBuf) -> Result<()> {
-    serve_with(rt, root, None, Arc::new(std::sync::atomic::AtomicBool::new(false))).await
+    serve_with(rt, root, None, Arc::new(std::sync::atomic::AtomicBool::new(false)), true).await
+}
+
+/// REPL 里的 `/remote start`：后台常驻，**不接管终端输入**。
+///
+/// `serve_with` 原本会起一个 stdin 读线程处理 `allow / deny`。在 REPL 里那是灾难：
+/// 它和 `read_user_input` 抢同一行，用户打的普通消息会被它吞掉。
+/// 授权的主路径本来就在手机上点，这里不需要终端控制。
+pub async fn serve_headless(
+    rt: Arc<Runtime>,
+    root: PathBuf,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    serve_with(rt, root, None, stop, false).await
+}
+
+/// REPL 的 `/remote`：一屏状态。用户想知道的是"配了没、在跑没"，
+/// 不是一整页子命令手册（那仍然可以 `/remote list` 看到）。
+pub fn brief(root: &Path, running: bool) -> String {
+    let mut out = String::new();
+    out.push_str(if running {
+        "远程服务：运行中\n"
+    } else {
+        "远程服务：未运行（/remote start 启动）\n"
+    });
+    match Book::load(root) {
+        Ok(book) if !book.pairings.is_empty() => {
+            out.push_str(&format!("共 {} 条配对（* 为当前）：\n", book.pairings.len()));
+            for (i, p) in book.pairings.iter().enumerate() {
+                let mark = if Some(&p.id) == book.active.as_ref() { "*" } else { " " };
+                out.push_str(&format!("{mark} {}. {} @{}\n", i + 1, p.title(), p.agent_handle));
+            }
+        }
+        _ => out.push_str("还没有配对（/remote pair <服务端地址> <配对码>）\n"),
+    }
+    out.push_str("其余子命令同 aox remote：list / use / pair / policy / remove / rename");
+    out
 }
 
 /// 常驻主体。`events` 给了就发事件（GUI），`stop` 置位后在一个心跳周期内退出。
 ///
 /// 授权只在**手机**上决定：桌面端不弹框（用户 2026-11-03 要求），CLI 只在交互终端里打一行
-/// 提示，不打断任何东西。
+/// 提示，不打断任何东西。`control_stdin` 只给 `aox remote serve` 那种"整个终端交给远程"的
+/// 用法；REPL 后台启动时传 false，否则会和行编辑抢 stdin。
 pub async fn serve_with(
     rt: Arc<Runtime>,
     root: PathBuf,
     events: Option<mpsc::UnboundedSender<RemoteEvent>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    control_stdin: bool,
 ) -> Result<()> {
     use std::sync::atomic::Ordering;
 
@@ -490,7 +534,20 @@ pub async fn serve_with(
     let cancels = Arc::new(Cancels::default());
     let keys = Arc::new(RoomKeys::load(&root));
     let calls = Arc::new(CallGate::default());
-    spawn_stdin_control(calls.clone());
+    if control_stdin {
+        spawn_stdin_control(calls.clone());
+    }
+
+    // `room_history` / `room_pull` 只在接了 aoxchat 的时候存在：本地 CLI / GUI 的对话里看不到。
+    // 先 unregister 再 register 是"替换"——服务被停掉再启一次时不会撞名字。
+    let room_now: tool::Slot = Arc::new(tokio::sync::RwLock::new(None));
+    for t in tool::tools(room_now.clone(), profile.clone(), keys.clone()) {
+        rt.unregister(t.name()).await;
+        if let Err(e) = rt.register(t).await {
+            // 注册不上不是致命的：这一轮照跑，只是模型没有"往回翻"的入口。
+            println!("  ↑ 房间工具没注册上：{e:#}");
+        }
+    }
 
     tokio::spawn(worker(
         job_rx,
@@ -502,6 +559,7 @@ pub async fn serve_with(
         profile.clone(),
         root.clone(),
         rt.plugins_dir.clone(),
+        room_now,
     ));
 
     let mut backoff = 3u64;
@@ -546,14 +604,20 @@ pub async fn serve_with(
 
 struct Job {
     room: String,
+    /// 触发这一轮的那条消息 id。手机靠它把"运行中"的呼吸条挂在原文下面。
+    msg_id: String,
     prompt: String,
     /// 只有设备主人能改配置（模型、工作空间）。群里的协作者可以下指令，但不能改你的机器。
     from_owner: bool,
     /// 这条消息带的图。**不在 WS 循环里下载**：几百 KB 的图也能把心跳卡住，交给 worker。
     media: Vec<aoxchat_proto::ArtifactView>,
+    /// 这条消息引用的是哪一条。取原文、解密、下载都在 worker 里做（见 `context.rs`）。
+    quote: Option<aoxchat_proto::ReplyView>,
     /// 这个房间的存储上限（MB），0 = 不限。由房主在房间设置里定，服务端在 `Room` 里带下来。
     /// 宿主的 inbox 只是服务端那份的副本，两边用同一个数字，否则"房间上限"管不住本机磁盘。
     cap_mb: u32,
+    /// 触发这一轮的那条消息的 seq。`room_history` 从它往前翻（不含它自己）。
+    last_seq: i64,
 }
 
 /// 没见过这个房间时按服务端的默认值（200 MB）兜底。这不是宿主自己的策略，
@@ -710,25 +774,26 @@ async fn run_once(
                                     .get(&msg.room)
                                     .map(String::as_str)
                                     .unwrap_or(&profile.agent_handle);
-                                let Some(prompt) = mention_prompt(&msg, handle) else {
+                                let Some(mention) = mention_of(&msg, handle) else {
                                     continue;
                                 };
 
-                                println!("收到指令（{}）：{prompt}", msg.room);
+                                println!("收到指令（{}）：{}", msg.room, mention.prompt);
                                 let from_owner = msg.sender_id == profile.owner_id;
-                                let media = match &msg.body {
-                                    MessageBody::Media { artifacts, .. } => artifacts.clone(),
-                                    _ => Vec::new(),
-                                };
                                 let job = Job {
                                     room: msg.room.clone(),
-                                    prompt,
+                                    msg_id: msg.id.clone(),
+                                    prompt: mention.prompt,
                                     from_owner,
-                                    media,
+                                    media: mention.media,
+                                    // 引用只记下"引的是哪一条"，取原文与文件交给 worker：那一步要发
+                                    // HTTP，在这条读循环里 await 会把心跳、取消、审批一起卡住。
+                                    quote: msg.reply_to.clone(),
                                     cap_mb: room_caps
                                         .get(&msg.room)
                                         .copied()
                                         .unwrap_or(DEFAULT_ROOM_STORAGE_MB),
+                                    last_seq: msg.seq,
                                 };
 
                                 // 斜杠命令先拦：这是配置操作，批了也会被 worker 拒，白问一次。
@@ -822,23 +887,38 @@ fn split_mentions(text: &str) -> (Vec<String>, String) {
     (mentions, rest.trim().to_string())
 }
 
+/// 一条消息要不要这台机器干活，要的话做什么。
+struct Mention {
+    /// 剔掉所有 `@handle` 之后剩下的那句——这才是"这台机器该做什么"。
+    prompt: String,
+    /// 这条消息自己带的图（`media` 消息）。引用里的那些是另一条消息的，不在这里。
+    media: Vec<aoxchat_proto::ArtifactView>,
+}
+
 /// Only human messages addressed to this agent count. Two exclusions matter:
 /// agents never obey agents (that is how a loop starts), and this host never obeys itself.
-fn mention_prompt(msg: &aoxchat_proto::Message, handle: &str) -> Option<String> {
+///
+/// 带图的消息同样能点名：`media` 是"一句话 + 最多 9 张图"，而 `@` 就写在那句话里。早先这里
+/// 只认 `MessageBody::Text`，于是"@aox 看看这张图"什么都不发生——`Job.media` 也因此一直
+/// 是个只有一处赋值、而那处永远走不到的死字段。
+fn mention_of(msg: &aoxchat_proto::Message, handle: &str) -> Option<Mention> {
     if msg.sender_kind != aoxchat_proto::SenderKind::User {
         return None;
     }
-    let MessageBody::Text { text } = &msg.body else {
-        return None;
+    let (text, media) = match &msg.body {
+        MessageBody::Text { text } => (text.as_str(), Vec::new()),
+        MessageBody::Media { text, artifacts } => (text.as_str(), artifacts.clone()),
+        _ => return None,
     };
     let (mentions, rest) = split_mentions(text);
     if !mentions.iter().any(|m| m == handle) {
         return None;
     }
+    // 只点名不写字 = 没有指令。光有图也一样：图是宾语，动词还是得人说。
     if rest.is_empty() {
         None
     } else {
-        Some(rest)
+        Some(Mention { prompt: rest, media })
     }
 }
 
@@ -995,10 +1075,14 @@ impl Drop for BusyGuard {
     }
 }
 
-/// 把一条消息里的图拉到本地，返回可以直接喂给模型的附件。
+/// 把一条消息里的附件拉到本地，分成两组：能直接喂给模型的，和只落盘的。
 ///
 /// 落在 `.aox/remote/inbox/<room>/`：一次会话一个目录，整目录清理即可，也不会和产物目录混。
 /// 下载走能力链接、不带 Authorization——链接本身就是凭证，和服务端 `download` 的约定一致。
+///
+/// **只有图片进附件通道**。非图片走 `to_content` 会被 base64 成 `{"type":"file"}` 塞进请求体，
+/// 而多数端点根本不认这个块，整轮直接 400——"发个 zip 让它跑一下"本来也不需要它看见字节，
+/// 给它路径就够了。顺带解决了大小：附件上限 36 MiB（48 MiB 请求体倒推），落盘没有这个限制。
 async fn download_media(
     http: &reqwest::Client,
     profile: &RemoteProfile,
@@ -1006,14 +1090,15 @@ async fn download_media(
     room: &str,
     items: &[aoxchat_proto::ArtifactView],
     cap_mb: u32,
-) -> Vec<std::path::PathBuf> {
+) -> (Vec<std::path::PathBuf>, Vec<Loose>) {
     let dir = root.join(".aox").join("remote").join("inbox").join(room);
     if tokio::fs::create_dir_all(&dir).await.is_err() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let mut out = Vec::new();
-    // 服务端已经限过 9 张，这里再兜一次：真收到 100 条也不会把机器拖死。
+    let mut loose = Vec::new();
+    // 服务端已经限过 9 个，这里再兜一次：真收到 100 条也不会把机器拖死。
     for a in items.iter().take(9) {
         let url = format!("{}{}", profile.server.trim_end_matches('/'), a.url);
         let resp = match http.get(&url).send().await {
@@ -1039,16 +1124,49 @@ async fn download_media(
             eprintln!("写入「{}」失败：{e}", a.name);
             continue;
         }
+        if !a.mime.starts_with("image/") {
+            loose.push(Loose { name: a.name.clone(), path, size: bytes.len() as u64 });
+            continue;
+        }
         match Attachment::probe(&path) {
             // probe 只是校验（大小上限、是不是目录），真正的解析由 run_turn 自己做；
             // 这里提前拦一次，日志能落到具体文件名上，而不是一行"附件加载失败"。
             Ok(_) => out.push(path),
-            Err(reason) => eprintln!("「{}」不能作为附件：{reason}", a.name),
+            // 图片但太大：降级成只落盘，比悄悄丢掉强——模型至少知道有这张图、在哪。
+            Err(reason) => {
+                eprintln!("「{}」不能作为附件，改为只落盘：{reason}", a.name);
+                loose.push(Loose { name: a.name.clone(), path, size: bytes.len() as u64 });
+            }
         }
     }
 
     prune_inbox(&dir, cap_mb).await;
-    out
+    (out, loose)
+}
+
+/// 一个只落了盘、没进附件通道的文件。路径要写进 prompt 交给模型。
+struct Loose {
+    name: String,
+    path: std::path::PathBuf,
+    size: u64,
+}
+
+/// 只落盘的那些文件，写进 prompt 的一段。
+///
+/// 措辞和 `context::prompt_block` 的文件清单对齐：先说清"这是别人发来的"，再给路径。
+/// 不写"请阅读"——读不读是模型自己的判断，我们只负责让它知道东西在哪、多大。
+fn media_block(files: &[Loose]) -> String {
+    let mut s = String::from("\n\n[随消息发来的文件]\n");
+    s.push_str("已拉到本机，路径可以直接用：\n");
+    for f in files {
+        s.push_str(&format!(
+            "  {}（{}，{}）\n",
+            f.path.display(),
+            context::size_text(f.size),
+            f.name
+        ));
+    }
+    s
 }
 
 fn short_id(id: &str) -> String {
@@ -1133,6 +1251,7 @@ async fn worker(
     profile: RemoteProfile,
     root: PathBuf,
     plugins_dir: PathBuf,
+    room_now: tool::Slot,
 ) {
     // One Agent per room: separate conversations, separate checkpoints, separate usage books.
     let mut rooms: HashMap<String, RoomCtx> = HashMap::new();
@@ -1163,31 +1282,87 @@ async fn worker(
 
         // 图先落到本地：模型只能读路径，读不了 url。放在 worker 里做而不是 WS 循环，
         // 是为了不让下载把心跳和取消卡住。
-        let attachments = if job.media.is_empty() {
-            Vec::new()
-        } else {
-            download_media(&http, &profile, &root, &job.room, &job.media, job.cap_mb).await
-        };
-        if !attachments.is_empty() {
-            println!("附件 {} 个", attachments.len());
-        }
-
         let meta = TaskMeta {
             agent_id: profile.agent_id.clone(),
             agent_handle: profile.agent_handle.clone(),
             owner_id: profile.owner_id.clone(),
             prompt: job.prompt.clone(),
+            msg_id: job.msg_id.clone(),
         };
+        // 先建 ui 再取物：取的过程要能推到手机上（"正在取引用的内容…"），否则一个大文件要等
+        // 下载完，手机才知道这一轮已经开始了。
         let mut ui = RemoteUi::new(out.clone(), job.room.clone(), approvals.clone(), meta);
+
+        let (mut attachments, loose) = if job.media.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            download_media(&http, &profile, &root, &job.room, &job.media, job.cap_mb).await
+        };
+
+        // 引用取物：一次 HTTP 取原文，再按类型把文件搬下来（见 `context.rs`）。
+        let mut prompt = job.prompt.clone();
+        // 只落盘的文件挂在 prompt 末尾：指令在前、清单在后，模型读完要干什么再看到有什么可用。
+        if !loose.is_empty() {
+            prompt.push_str(&media_block(&loose));
+        }
+        if let Some(reply) = &job.quote {
+            ui.note("正在取引用的内容…");
+            // 要跑的东西必须落在**工作区**里：边界只放行区内的写与执行。`/cwd` 之后工作区
+            // 可能不在 app root 下，所以两个目录要分开算。
+            let ws = ctx
+                .rt
+                .config
+                .workplace
+                .root
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| ctx.rt.root.clone());
+            let quote = context::resolve(
+                &http,
+                &profile,
+                &keys,
+                &job.room,
+                reply,
+                &root.join(".aox").join("remote").join("inbox"),
+                &ws.join(".aox").join("remote").join("files"),
+            )
+            .await;
+            for n in &quote.notes {
+                ui.note(n.clone());
+            }
+            // 一样都没取到就在房间里说一声：否则"发了没反应"和"它根本没看到"分不出来。
+            if quote.is_empty() {
+                let why = quote
+                    .notes
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "引用里没有可取的内容".to_string());
+                let text = format!("引用的内容没取到：{why}");
+                send_text(&out, &job.room, &outbound(&keys, &job.room, &text));
+            }
+            ui.set_digest(context::digest(&quote));
+            attachments.extend(quote.attachments());
+            // 引用块拼在指令**前面**：模型先知道"这是什么"，再知道"要干什么"。
+            prompt.insert_str(0, &context::prompt_block(&quote));
+        }
+
+        if !attachments.is_empty() {
+            println!("附件 {} 个", attachments.len());
+        }
 
         let started = std::time::Instant::now();
         println!("开始执行…");
         // 取消 = drop 掉这个 future + 关掉恢复轮次（和 GUI 的停止按钮同一条路径）。
         let mut cancel_rx = cancels.register(ui.task_id());
+        // `room_history` 只在这一轮里有效：设进去、跑完清掉。**清掉是必要的**——本地 GUI 的
+        // 对话和远程 worker 共用同一个 Runtime，不清的话那边也能翻到这个房间。
+        *room_now.write().await =
+            Some(tool::Current::new(job.room.clone(), job.last_seq));
         let outcome = tokio::select! {
-            r = ctx.agent.run_turn(&mut ui, &job.prompt, &attachments) => Some(r),
+            r = ctx.agent.run_turn(&mut ui, &prompt, &attachments) => Some(r),
             _ = &mut cancel_rx => None,
         };
+        *room_now.write().await = None;
         match outcome {
             None => {
                 let _ = ctx.rt.recovery.abort_turn();
@@ -1204,15 +1379,23 @@ async fn worker(
                 if !text.trim().is_empty() {
                     send_text(&out, &job.room, &outbound(&keys, &job.room, &text));
                 }
-                let task = ui.snapshot(aoxchat_proto::TaskStatus::Done, None);
-                if let Err(e) = upload_task(&profile, &job.room, &task).await {
-                    println!("  ↑ 任务记录写入失败：{e:#}");
-                }
                 // 产物在回复之后上传：先让人看到结论，再传文件。文件此刻是**暂存副本**，
                 // 原件可能已经被这一轮删掉了。
-                for file in ui.take_artifacts() {
-                    match upload_artifact(&profile, &job.room, &file.name, &file.path).await {
-                        Ok(name) => println!("  ↑ 已上传产物 {name}"),
+                //
+                // **一轮只发一条消息**（最多 9 个附件，超出分条）。以前是一个文件一条消息，
+                // 产出 5 个文件就是 5 张卡竖着排满一屏，而且"引用这一轮的全部产物"无从谈起
+                // ——`reply_to` 是单值。归组之后，折叠、引用、取物三件事同时成立。
+                //
+                // 顺序是"先传文件、再写任务快照"：快照里要带这一轮的产物清单，引用任务卡
+                // 才能取回整轮文件。快照本身是一条 HTTP 请求，落库顺序仍在文件之前。
+                let files = ui.take_artifacts();
+                let mut views = Vec::new();
+                for file in files {
+                    match defer_artifact(&profile, &job.room, &file.name, &file.path).await {
+                        Ok(view) => {
+                            println!("  ↑ 已上传产物 {}", view.name);
+                            views.push(view);
+                        }
                         Err(e) => {
                             println!("  ↑ 产物上传失败 {}：{e:#}", file.path.display());
                             // 手机上看不到宿主的标准输出。文件没送到就得说出来，
@@ -1221,6 +1404,14 @@ async fn worker(
                             send_text(&out, &job.room, &outbound(&keys, &job.room, &msg));
                         }
                     }
+                }
+                ui.set_artifacts(views.clone());
+                let task = ui.snapshot(aoxchat_proto::TaskStatus::Done, None);
+                if let Err(e) = upload_task(&profile, &job.room, &task).await {
+                    println!("  ↑ 任务记录写入失败：{e:#}");
+                }
+                for chunk in views.chunks(9) {
+                    send_media(&out, &job.room, "", chunk.to_vec());
                 }
             }
             Some(Err(e)) => {
@@ -1375,26 +1566,36 @@ fn outbound(keys: &RoomKeys, room: &str, text: &str) -> String {
 
 /// inbound：密文必须能解开才处理。解不开就跳过并说明原因——
 /// 把密文当普通文本喂给模型，等于让它对着一串 base64 编故事。
+///
+/// `media` 消息里的那句话同样会被加密（加密只作用于 `text` 字段，图片是字节）。早先这里只
+/// 看 `Text`，加密房间里的图片消息带着一句密文进上下文。
 fn decrypt_incoming(
     keys: &RoomKeys,
     mut msg: aoxchat_proto::Message,
 ) -> std::result::Result<aoxchat_proto::Message, String> {
-    let MessageBody::Text { text } = &msg.body else {
-        return Ok(msg);
-    };
-    if !crypto::is_encrypted(text) {
-        return Ok(msg);
+    match &msg.body {
+        MessageBody::Text { text } => {
+            let plain = open_text(keys, &msg.room, text)?;
+            msg.body = MessageBody::Text { text: plain };
+        }
+        MessageBody::Media { text, artifacts } => {
+            let plain = open_text(keys, &msg.room, text)?;
+            msg.body = MessageBody::Media { text: plain, artifacts: artifacts.clone() };
+        }
+        _ => {}
     }
-    let Some(key) = keys.get(&msg.room) else {
+    Ok(msg)
+}
+
+/// 一段正文的解密。明文原样返回——房间里可能只有一半人设了口令。
+fn open_text(keys: &RoomKeys, room: &str, text: &str) -> std::result::Result<String, String> {
+    if !crypto::is_encrypted(text) {
+        return Ok(text.to_string());
+    }
+    let Some(key) = keys.get(room) else {
         return Err("收到密文，但本机未设置口令（先发 /key <口令>）".to_string());
     };
-    match crypto::decrypt(&key, text) {
-        Some(plain) => {
-            msg.body = MessageBody::Text { text: plain };
-            Ok(msg)
-        }
-        None => Err("口令不对，解不开这条消息".to_string()),
-    }
+    crypto::decrypt(&key, text).ok_or_else(|| "口令不对，解不开这条消息".to_string())
 }
 
 fn send_text(out: &mpsc::UnboundedSender<Frame>, room: &str, text: &str) {
@@ -1408,6 +1609,7 @@ fn send_text(out: &mpsc::UnboundedSender<Frame>, room: &str, text: &str) {
                 // 宿主发的是机器人的话，不引用任何人的消息。字段在协议里是
                 // `Option` + `skip_serializing_if`，这里显式写 None 只是为了跟着 crate 走。
                 reply_to: None,
+                reply_artifact_ids: Vec::new(),
             }),
         ),
         room,
@@ -1457,13 +1659,16 @@ async fn upload_task(
     Ok(())
 }
 
-/// 上传一个文件并让它出现在房间里。服务端一次请求完成"存文件 + 落库 + 发消息"。
-async fn upload_artifact(
+/// 上传一个文件，但**不发消息**（`?defer=1`），只把产物视图拿回来。
+///
+/// 一轮的产物要归到同一条 `media` 消息里：以前一次请求完成"存 + 发消息"，于是一个文件一条
+/// 消息，五张卡竖着排满一屏；引用也没法覆盖"这一轮的全部产物"。
+async fn defer_artifact(
     profile: &RemoteProfile,
     room: &str,
     name: &str,
     path: &std::path::Path,
-) -> Result<String> {
+) -> Result<aoxchat_proto::ArtifactView> {
     let meta = tokio::fs::metadata(path).await?;
     if meta.len() > MAX_UPLOAD {
         anyhow::bail!("超过 {} MB", MAX_UPLOAD / 1024 / 1024);
@@ -1475,7 +1680,9 @@ async fn upload_artifact(
     // 用 Url 的 query_pairs_mut 而不是手拼字符串：中文文件名必须被正确编码。
     url.query_pairs_mut()
         .append_pair("name", name)
-        .append_pair("mime", mime_of(name));
+        .append_pair("mime", mime_of(name))
+        // 服务端按字符串收（`?defer=1` 也行）；这里写 `true` 是它最直白的形态。
+        .append_pair("defer", "true");
 
     let bytes = tokio::fs::read(path).await?;
     let res = reqwest::Client::new()
@@ -1490,6 +1697,145 @@ async fn upload_artifact(
     if !status.is_success() {
         anyhow::bail!("HTTP {status} {text}");
     }
-    let v: serde_json::Value = serde_json::from_str(&text)?;
-    Ok(v["name"].as_str().unwrap_or(name).to_string())
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// 发一条附件消息。服务端只认 id，其余字段按库里的数据补全。
+fn send_media(
+    out: &mpsc::UnboundedSender<Frame>,
+    room: &str,
+    text: &str,
+    artifacts: Vec<aoxchat_proto::ArtifactView>,
+) {
+    let frame = Frame::in_room(
+        Frame::new(
+            frame_id("h"),
+            now_ms(),
+            Body::MsgSend(MsgSend {
+                client_msg_id: frame_id("c"),
+                body: MessageBody::Media {
+                    text: text.to_string(),
+                    artifacts,
+                },
+                reply_to: None,
+                reply_artifact_ids: Vec::new(),
+            }),
+        ),
+        room,
+    );
+    let _ = out.send(frame);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aoxchat_proto::{ArtifactView, Message, SenderKind};
+
+    fn msg(kind: SenderKind, body: MessageBody) -> Message {
+        Message {
+            id: "m_1".into(),
+            room: "r_1".into(),
+            seq: 1,
+            sender_id: "u_1".into(),
+            sender_kind: kind,
+            sender_name: "B".into(),
+            sender_avatar: None,
+            created_at: 1,
+            reply_to: None,
+            body,
+        }
+    }
+
+    fn art() -> ArtifactView {
+        ArtifactView {
+            id: "a1".into(),
+            name: "shot.png".into(),
+            size: 10,
+            mime: "image/png".into(),
+            sha256: String::new(),
+            url: "/api/artifacts/a1?k=t".into(),
+            origin: "user".into(),
+            width: 0,
+            height: 0,
+        }
+    }
+
+    /// 带图的消息同样能点名。早先这里只认 `Text`，"@aox 看看这张图"什么都不发生，
+    /// `Job.media` 也因此一直是个走不到的死字段。
+    #[test]
+    fn a_photo_with_a_mention_still_reaches_the_agent() {
+        let m = msg(
+            SenderKind::User,
+            MessageBody::Media { text: "@aox 看看这张图".into(), artifacts: vec![art()] },
+        );
+        let got = mention_of(&m, "aox").expect("带图的消息也该能点名");
+        assert_eq!(got.prompt, "看看这张图");
+        assert_eq!(got.media.len(), 1);
+    }
+
+    /// 只点名不写字 = 没有指令。光有图也一样：图是宾语，动词还得人说。
+    #[test]
+    fn a_bare_mention_is_not_an_instruction() {
+        assert!(mention_of(&msg(SenderKind::User, MessageBody::Text { text: "@aox".into() }), "aox")
+            .is_none());
+        assert!(mention_of(
+            &msg(SenderKind::User, MessageBody::Media { text: "@aox ".into(), artifacts: vec![art()] }),
+            "aox"
+        )
+        .is_none());
+    }
+
+    /// 只落盘的文件必须出现在 prompt 里。
+    ///
+    /// 原来 `probe` 失败只打一行日志，于是"发了个 100 MB 的包让它跑一下"在模型那边等于
+    /// 没发过——用户看到的是"发了没反应"。
+    #[test]
+    fn files_that_are_only_saved_on_disk_still_reach_the_prompt() {
+        let block = media_block(&[Loose {
+            name: "build.zip".into(),
+            path: std::path::PathBuf::from("/tmp/inbox/build.zip"),
+            size: 2048,
+        }]);
+        assert!(block.contains("/tmp/inbox/build.zip"), "{block}");
+        assert!(block.contains("build.zip"), "{block}");
+        // 大小要跟着走：模型得知道该不该整个读进来。
+        assert!(block.contains("2 KB"), "{block}");
+    }
+
+    /// Agent 不听 Agent 的——这是死循环的起点。自己的消息也不算。
+    #[test]
+    fn agents_never_obey_agents() {
+        let m = msg(SenderKind::Agent, MessageBody::Text { text: "@aox 去改一下".into() });
+        assert!(mention_of(&m, "aox").is_none());
+    }
+
+    /// 一条消息点名多个 Agent 时，所有 `@` 都要剔掉，只剩"这台机器该做什么"。
+    #[test]
+    fn every_mention_is_stripped_from_the_prompt() {
+        let m = msg(SenderKind::User, MessageBody::Text { text: "@aox @other 一起看下".into() });
+        assert_eq!(mention_of(&m, "aox").unwrap().prompt, "一起看下");
+        // 没点到我就不归我管
+        assert!(mention_of(&m, "aox-b").is_none());
+    }
+
+    /// `/remote` 不带参数时看到的那一屏：**先说在不在跑，再说配了没**。
+    ///
+    /// 值得钉住的是"没有 remote.json 时不能说成出错"——新用户第一次打 `/remote`
+    /// 就是这个路径，一个 `Book::load` 的错误弹出来会让人以为程序坏了。
+    #[test]
+    fn brief_survives_a_missing_booking_file() {
+        let dir = std::env::temp_dir().join(format!("aox-remote-brief-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let idle = brief(&dir, false);
+        assert!(idle.contains("未运行"), "{idle}");
+        assert!(idle.contains("还没有配对"), "{idle}");
+        assert!(idle.contains("/remote pair"), "要告诉用户怎么开始：{idle}");
+
+        let running = brief(&dir, true);
+        assert!(running.contains("运行中"), "{running}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

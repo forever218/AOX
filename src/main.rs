@@ -77,6 +77,98 @@ fn pause_before_exit() {
     let _ = std::io::stdin().read_line(&mut buf);
 }
 
+/// 当前进程的 stdin 是不是真终端。引导只对"人坐在前面"的情况开放——
+/// 在管道里问问题等于让脚本挂住。
+fn stdin_is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+}
+
+/// 问一行，空输入取默认值。EOF 返回空串，调用方按"跳过"处理。
+fn ask(label: &str, default: &str) -> String {
+    use std::io::Write as _;
+    if default.is_empty() {
+        print!("{label}: ");
+    } else {
+        print!("{label} [{default}]: ");
+    }
+    let _ = std::io::stdout().flush();
+    let mut buf = String::new();
+    if std::io::stdin().read_line(&mut buf).unwrap_or(0) == 0 {
+        return String::new();
+    }
+    let v = buf.trim();
+    if v.is_empty() {
+        default.to_string()
+    } else {
+        v.to_string()
+    }
+}
+
+/// 首次运行的引导：端点 / Key / 模型名 → `.aox/models.json`。
+///
+/// 写的是和 GUI「设置 → 模型」同一份文件，所以两边看到的是同一个模型；之后随时
+/// `/model` 可以换或加。Key 空 = 跳过，不拦着启动：本地命令和 `/remote` 都不需要模型。
+fn first_run_setup(app_root: &Path) -> Result<()> {
+    println!();
+    println!(
+        "{}",
+        crate::i18n::t(
+            "AOX needs a model before it can answer. Three questions (all editable later with /model)."
+        )
+    );
+    println!();
+
+    let base_url = ask(crate::i18n::t("API endpoint").as_ref(), "https://api.deepseek.com");
+    if base_url.trim().is_empty() {
+        println!(
+            "{}",
+            crate::i18n::t("No endpoint given; skipping. You can add one later with /model.")
+        );
+        return Ok(());
+    }
+    let key = ask(crate::i18n::t("API key (visible as you type)").as_ref(), "");
+    if key.trim().is_empty() {
+        println!(
+            "{}",
+            crate::i18n::t("No key given; skipping model setup. Add one later with /model.")
+        );
+        return Ok(());
+    }
+    let model = ask(crate::i18n::t("Model name").as_ref(), "deepseek-chat");
+    if model.trim().is_empty() {
+        println!("{}", crate::i18n::t("No model name given; skipping."));
+        return Ok(());
+    }
+
+    let id = format!(
+        "m{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let mut rec = crate::modelbook::ModelRecord::blank(id.clone());
+    rec.name = model.trim().to_string();
+    rec.base_url = base_url.trim().to_string();
+    rec.api_key = key.trim().to_string();
+    rec.model = model.trim().to_string();
+
+    let mut book = crate::modelbook::Book::load(app_root);
+    book.upsert(rec);
+    book.set_active(&id);
+    book.save(app_root)?;
+
+    println!();
+    println!("{}", crate::tf!("Saved: {} @ {}", model.trim(), base_url.trim()));
+    println!(
+        "{}",
+        crate::tf!("Stored in {}", app_root.join(".aox").join("models.json").display())
+    );
+    println!();
+    Ok(())
+}
+
 /// Resolve the "application root".
 ///
 /// Rule: from the exe's directory, walk upward to the nearest Cargo.toml; if found,
@@ -259,6 +351,13 @@ fn history_command(agent: &mut Agent, line: &str, store: &dyn store::Store) -> R
     })
 }
 
+/// REPL 后台跑的远程服务。只有"怎么停"和"等它停"两件事——
+/// 具体协议、重连、心跳都在 `remote::serve_headless` 里，这里不重复。
+struct RemoteJob {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // ---- hidden shell-helper entry: **must be first** ----
@@ -329,6 +428,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `--setup` 强制走一遍模型引导：换机器、换 key 时不必手改 JSON，也让自动化
+    // （管道喂三个值）能测到引导本身。放在最前面是因为首次运行的模板分支要用它：
+    // 非 TTY 时那个分支默认"说完就退"，但带了 --setup 就不该退。
+    let force_setup = args.iter().any(|a| a == "--setup");
+
     let resolved = match config::layer::resolve(
         &app_root,
         &config_path,
@@ -343,24 +447,65 @@ async fn main() -> Result<()> {
                 match std::fs::write(&config_path, config::TEMPLATE) {
                     Ok(()) => {
                         println!("{}", crate::tf!("No config file found; created a template for you: {}", config_path.display()));
-                        println!("{}", crate::i18n::t("Open it in an editor, fill in base_url and api_key (or api_key_env), then restart this program."));
+                        if !stdin_is_tty() && !force_setup {
+                            // 脚本/管道：保持"不碰你的输入、说清楚下一步"的老行为。
+                            println!("{}", crate::i18n::t("Open it in an editor, fill in base_url and api_key (or api_key_env), then restart this program."));
+                            pause_before_exit();
+                            return Ok(());
+                        }
+                        // 交互终端：不要让人去编辑器里改文件——模型本来就不在 config.toml 里，
+                        // 下面直接问端点 / Key / 模型名，写进 .aox/models.json。
+                        println!("{}", crate::i18n::t("The template has no model section any more; let's fill one in here."));
                     }
                     Err(werr) => {
                         println!("{}", crate::tf!("Could not create config file {}: {}", config_path.display(), werr));
                         println!("{}", crate::i18n::t("Make sure the directory is writable, or use --config <path> to point at a writable location."));
+                        pause_before_exit();
+                        return Ok(());
                     }
                 }
             } else {
                 println!("{}", crate::tf!("[config error] {}", format!("{e:#}")));
+                pause_before_exit();
+                return Ok(());
             }
-            pause_before_exit();
-            return Ok(());
+            // 模板刚写下去，重新解析一次（它一定是合法的；真坏了就按配置错误处理）。
+            match config::layer::resolve(
+                &app_root,
+                &config_path,
+                manifest_arg.as_deref(),
+                profile_arg.as_deref(),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("{}", crate::tf!("[config error] {}", format!("{e:#}")));
+                    pause_before_exit();
+                    return Ok(());
+                }
+            }
         }
     };
     // `/config` must show people "which layers composed this config", so keep the short
     // summary around first — the config itself is taken by Runtime right after.
     let layer_summary = resolved.composed.layer_summary();
     let config = resolved.config;
+
+    // ---- First-run setup: ask for endpoint / key / model, write `.aox/models.json`
+    //
+    // The GUI pops an "add a model" dialog on first launch; the CLI used to answer "edit
+    // config.toml and restart", which post-2026-10-28 is wrong twice over: the template has no
+    // `[provider]` any more, and a double-clicked exe closes before anyone can edit anything.
+    //
+    // Triggers: no active record **and** no usable `[provider]` (old configs are left alone), or
+    // an explicit `--setup` (re-run it without hand-editing JSON). Non-interactive runs skip the
+    // questions — a piped script should be able to start the REPL without waiting on stdin.
+    if force_setup
+        || (stdin_is_tty()
+            && crate::modelbook::Book::load(&app_root).active_record().is_none()
+            && !config.provider.is_configured())
+    {
+        first_run_setup(&app_root)?;
+    }
 
     // ---- Assemble the runtime: meta tools + restore persisted plugins
     // A wrong `[store] backend` fails here. Treated as a "config error": friendly
@@ -380,7 +525,7 @@ async fn main() -> Result<()> {
     // Placed **after** every tool is registered, so a remote turn has exactly the same tool set as
     // a local one, and before the banner/REPL, which a daemon has no use for.
     if args.get(1).map(String::as_str) == Some("remote") {
-        return crate::remote::cli(rt.clone(), app_root.clone(), &args[2..]).await;
+        return crate::remote::cli(rt.clone(), app_root.clone(), &args[2..], true).await;
     }
 
     let mut ui = CliUi::new();
@@ -463,6 +608,9 @@ async fn main() -> Result<()> {
     // be attached, what gets blocked" — which is also why the decision was gathered
     // into one implementation in `src/attach.rs` in the first place.
     let mut pending: Vec<PathBuf> = Vec::new();
+    // `/remote start` 起的后台服务。放在循环外：退出时要先请它自己断开，
+    // 直接 drop 掉任务等于掐线，服务端得等心跳超时才发现这台机器没了。
+    let mut remote: Option<RemoteJob> = None;
     loop {
         let Some(line) = ui.read_user_input().await? else { break };
         let line = line.trim();
@@ -473,6 +621,69 @@ async fn main() -> Result<()> {
         if line == "/attach" || line.starts_with("/attach ") {
             let rest = line["/attach".len()..].trim();
             attach_command(&mut pending, rest, &mut ui);
+            continue;
+        }
+        // 远程服务。子命令和 `aox remote` 完全一致，区别只有 start：在 REPL 里它是**后台**的
+        // （阻塞住就等于把终端交给守护进程，那是外部的 `aox remote serve`）。
+        if line == "/remote" || line.starts_with("/remote ") {
+            let rest = line["/remote".len()..].trim();
+            let args: Vec<String> = rest.split_whitespace().map(String::from).collect();
+            match args.first().map(String::as_str) {
+                None | Some("status") => {
+                    // "在跑"要看任务本身：`remote` 是 Some 只说明起过，可能已经因为
+                    // 断网/被 GUI 取回控制权退出了。
+                    let running = remote.as_ref().is_some_and(|j| !j.handle.is_finished());
+                    ui.emit(AgentEvent::Info(crate::remote::brief(&app_root, running).into()));
+                }
+                Some("start") | Some("serve") => {
+                    if remote.as_ref().is_some_and(|j| !j.handle.is_finished()) {
+                        ui.emit(AgentEvent::Info(
+                            "远程服务已经在跑了（先 /remote stop）".into(),
+                        ));
+                    } else {
+                        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let handle = tokio::spawn({
+                            let rt = rt.clone();
+                            let root = app_root.clone();
+                            let stop = stop.clone();
+                            async move {
+                                if let Err(e) = crate::remote::serve_headless(rt, root, stop).await {
+                                    eprintln!("{}", crate::tf!("远程服务退出：{}", format!("{e:#}")));
+                                }
+                            }
+                        });
+                        remote = Some(RemoteJob { stop, handle });
+                        ui.emit(AgentEvent::Info(
+                            "远程服务已启动（后台）。/remote stop 停止。".into(),
+                        ));
+                    }
+                }
+                Some("stop") => {
+                    let live = remote.as_ref().is_some_and(|j| !j.handle.is_finished());
+                    if !live {
+                        remote = None;
+                        ui.emit(AgentEvent::Info("远程服务没在跑。".into()));
+                    } else if let Some(job) = remote.take() {
+                        job.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        ui.emit(AgentEvent::Info(
+                            "已请求停止（最多 5 秒内断开）".into(),
+                        ));
+                    }
+                }
+                // 配对的交互式追问要读 stdin，会和行编辑抢：在 REPL 里必须一次把参数给全。
+                Some("pair") if args.len() < 3 => {
+                    ui.emit(AgentEvent::Info(
+                        "在 REPL 里请一次给全：/remote pair <服务端地址> <配对码> [Agent 名称]"
+                            .into(),
+                    ));
+                }
+                // 其余子命令直接复用 `aox remote`：两处各写一遍只会慢慢走偏。
+                Some(_) => {
+                    if let Err(e) = crate::remote::cli(rt.clone(), app_root.clone(), &args, false).await {
+                        ui.emit(AgentEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
             continue;
         }
         match line {
@@ -735,6 +946,10 @@ async fn main() -> Result<()> {
                         "/model",
                         crate::i18n::t("List the saved models; /model <number|name> switches to one (the same list the GUI edits; effective on the next request)"),
                     ),
+                    (
+                        "/remote",
+                        crate::i18n::t("Phone bridge in this session: /remote start|stop; list / use / pair / policy / remove work like `aox remote`"),
+                    ),
                     ("/quit", crate::i18n::t("Quit the program (/exit is equivalent)")),
                 ] {
                     println!(
@@ -801,6 +1016,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+
+    // 后台远程服务：先请它自己断开（心跳 5 秒一轮），最多等 6 秒。
+    // 超时就直接放弃——用户已经按了退出，不该被一条连接拖住。
+    if let Some(job) = remote.take() {
+        job.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(6), job.handle).await;
     }
 
     // ---- Shut down all plugin processes before exiting

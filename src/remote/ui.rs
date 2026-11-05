@@ -20,9 +20,10 @@ use tokio::sync::mpsc;
 
 use aoxchat_proto::{
     now_ms, ApprovalReq, ApprovalStatus, ApprovalView, Body, Frame, StepState, StepView,
-    TaskStatus, TaskUpdate, TaskView,
+    TaskStatus, TaskUpdate, TaskView, UsageView,
 };
 
+use crate::llm::Usage;
 use crate::ui::{AgentEvent, AuthDecision, Ui};
 
 use super::approvals::Approvals;
@@ -33,6 +34,8 @@ pub struct TaskMeta {
     pub agent_handle: String,
     pub owner_id: String,
     pub prompt: String,
+    /// 触发这一轮的那条消息（`@agent` 那一句）。手机靠它把"运行中"的呼吸条挂在对的地方。
+    pub msg_id: String,
 }
 
 /// How long a phone has to answer before the tool is refused. Long enough to read a command,
@@ -71,6 +74,12 @@ pub struct RemoteUi {
     meta: TaskMeta,
     steps: Vec<StepView>,
     started_at: i64,
+    /// 这一轮从房间里取到了什么（见 `context::digest`）。写进快照，手机上可核对。
+    digest: Option<String>,
+    /// 这一轮累计的 token。以前一直是 0：宿主根本没填，手机那边自然什么都看不到。
+    usage: UsageView,
+    /// 这一轮产出的文件（上传之后才拿得到视图）。写进收尾快照，引用任务卡就能取回整轮产物。
+    made: Vec<aoxchat_proto::ArtifactView>,
 }
 
 impl RemoteUi {
@@ -93,7 +102,16 @@ impl RemoteUi {
             meta,
             steps: Vec::new(),
             started_at: now_ms(),
+            digest: None,
+            usage: UsageView::default(),
+            made: Vec::new(),
         }
+    }
+
+    /// 把这一轮的产物记进快照。上传发生在收尾之前，所以拿得到视图；
+    /// 快照里带上它，"引用任务卡 → 取回整轮文件"才成立。
+    pub fn set_artifacts(&mut self, views: Vec<aoxchat_proto::ArtifactView>) {
+        self.made = views;
     }
 
     /// 这轮执行的最终快照，写到房间历史里。
@@ -104,12 +122,13 @@ impl RemoteUi {
             agent_handle: self.meta.agent_handle.clone(),
             created_by: self.meta.owner_id.clone(),
             prompt: self.meta.prompt.clone(),
+            source_msg_id: Some(self.meta.msg_id.clone()),
             status,
             steps: self.steps.clone(),
-            usage: Default::default(),
-            context_digest: None,
+            usage: self.usage,
+            context_digest: self.digest.clone(),
             error,
-            artifacts: Vec::new(),
+            artifacts: self.made.clone(),
             started_at: Some(self.started_at),
             ended_at: Some(now_ms()),
         }
@@ -160,23 +179,49 @@ impl RemoteUi {
         let _ = self.out.send(frame);
     }
 
-    fn note(&self, text: impl Into<String>) {
+    /// 一行进度/说明，推到手机上那张任务卡。**不落库**：`TaskUpdate` 本来就是瞬时的。
+    pub fn note(&self, text: impl Into<String>) {
         self.send(Body::TaskUpdate(TaskUpdate {
             task_id: self.task_id.clone(),
+            agent_id: self.meta.agent_id.clone(),
+            source_msg_id: Some(self.meta.msg_id.clone()),
             status: None,
             step: None,
             usage: None,
             note: Some(text.into()),
+            context_digest: None,
+        }));
+    }
+
+    /// "这次它看到了什么"，写进 `context_digest`：先推一帧（手机上立刻能看到），再留一份给
+    /// 收尾时的快照（历史里的任务卡也要有）。
+    ///
+    /// 这个字段从协议 v1 就存在、一直是 `None`。填上它是为了让人能核对：模型说"我看过了"的时候，
+    /// 手机上有据可查它到底看到了几条、几个文件。
+    pub fn set_digest(&mut self, digest: String) {
+        self.digest = Some(digest.clone());
+        self.send(Body::TaskUpdate(TaskUpdate {
+            task_id: self.task_id.clone(),
+            agent_id: self.meta.agent_id.clone(),
+            source_msg_id: Some(self.meta.msg_id.clone()),
+            status: None,
+            step: None,
+            usage: None,
+            note: None,
+            context_digest: Some(digest),
         }));
     }
 
     fn update(&self, step: StepView, status: Option<TaskStatus>) {
         self.send(Body::TaskUpdate(TaskUpdate {
             task_id: self.task_id.clone(),
+            agent_id: self.meta.agent_id.clone(),
+            source_msg_id: Some(self.meta.msg_id.clone()),
             status,
             step: Some(step),
             usage: None,
             note: None,
+            context_digest: None,
         }));
     }
 }
@@ -323,10 +368,41 @@ impl Ui for RemoteUi {
     async fn turn_end(&mut self) {
         self.send(Body::TaskUpdate(TaskUpdate {
             task_id: self.task_id.clone(),
+            agent_id: self.meta.agent_id.clone(),
+            source_msg_id: Some(self.meta.msg_id.clone()),
             status: Some(TaskStatus::Done),
             step: None,
-            usage: None,
+            // 收尾再报一次总量：手机上的实时累加可能因为漏帧少一两个数。
+            usage: Some(self.usage),
             note: None,
+            context_digest: None,
+        }));
+    }
+
+    /// 每次模型调用后更新这轮的 token 账，并立刻推给手机。
+    ///
+    /// 不这么做的话，手机上要等整轮结束才能看到数字——一个跑十轮工具的任务中间全是空白。
+    /// `usage` 是**单次调用**的量，累加在这里做；`TaskUpdate` 带的是累计值。
+    async fn call_usage(&mut self, usage: &Usage, _last_prompt: Option<u64>) {
+        self.usage.calls = self.usage.calls.saturating_add(1);
+        self.usage.prompt = self.usage.prompt.saturating_add(usage.prompt.unwrap_or(0));
+        self.usage.completion = self
+            .usage
+            .completion
+            .saturating_add(usage.completion.unwrap_or(0));
+        // 有些端点只给 total（不拆输入/输出）。什么都不记会让"用了多少"永远是 0。
+        if usage.prompt.is_none() && usage.completion.is_none() {
+            self.usage.total = self.usage.total.saturating_add(usage.total.unwrap_or(0));
+        }
+        self.send(Body::TaskUpdate(TaskUpdate {
+            task_id: self.task_id.clone(),
+            agent_id: self.meta.agent_id.clone(),
+            source_msg_id: Some(self.meta.msg_id.clone()),
+            status: Some(TaskStatus::Running),
+            step: None,
+            usage: Some(self.usage),
+            note: None,
+            context_digest: None,
         }));
     }
 }
@@ -381,6 +457,7 @@ mod tests {
                 agent_handle: "text".into(),
                 owner_id: "u1".into(),
                 prompt: "go".into(),
+                msg_id: "m1".into(),
             },
         )
     }
