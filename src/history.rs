@@ -152,10 +152,68 @@ pub struct Meta {
     pub created: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The app root this conversation was created under. **Informational only** — since the single
+    /// conversation store (2026-11-05) the file's own location is the only place that matters, and
+    /// this field exists so "which install was this written by" stays answerable after the file is
+    /// copied somewhere else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Who opened this conversation: `local` (this desktop / the CLI) or `remote` (one turn from a
+    /// phone in an AOXChat room). Written at creation, never changed.
+    ///
+    /// Absent = `local`: a file written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// The space this conversation was **born in** (`builtin:remote` for remote turns; absent for
+    /// local ones, whose group is derived from the workplace records as before).
+    ///
+    /// A hint, not the authority: `spaces.json` still decides where a conversation is shown, and
+    /// "move to another space" only touches that file. This one exists so the list can group a
+    /// conversation correctly even when the registry has never heard of it (a fresh clone, a lost
+    /// `spaces.json`, a file copied in from another machine).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<String>,
+    /// The AOXChat room this conversation belongs to, when `origin == "remote"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<MetaRoom>,
+}
+
+/// The room half of a remote conversation's header. Both fields are copied out of the frame that
+/// started the turn — the host never guesses a name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaRoom {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+/// Who opened a conversation. Two values, and the list only ever needs to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Origin {
+    #[default]
+    Local,
+    Remote,
+}
+
+impl Origin {
+    /// The wire/disk spelling (`local` / `remote`), which is also what goes into the header.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Local => "local",
+            Origin::Remote => "remote",
+        }
+    }
+
+    /// Anything unrecognised reads as `local`: this is a display hint, and refusing to show a
+    /// conversation because of an unknown origin would be worse than showing it in the wrong group.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "remote" => Origin::Remote,
+            _ => Origin::Local,
+        }
+    }
 }
 
 /// One turn's token account (corresponding to a `kind:"usage"` line in the jsonl).
@@ -268,6 +326,13 @@ pub struct Summary {
     /// questions and both are needed: an unrestricted record has no root, and "no root because
     /// unrestricted" has to be told apart from "no record at all" (an older file) when grouping.
     pub ws_full: bool,
+    /// Who opened it (`local` / `remote`), read from the header.
+    pub origin: Origin,
+    /// The space named in the header, if any. A **hint** for grouping — `spaces.json` still wins
+    /// when the user has placed the conversation somewhere.
+    pub space: Option<String>,
+    /// The AOXChat room's display name, when this came from a phone.
+    pub room_name: Option<String>,
 }
 
 /// One message read back out.

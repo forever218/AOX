@@ -443,6 +443,7 @@ mod tests {
             call_policy: Default::default(),
             created_at: 0,
             last_connected_at: 0,
+            rooms: Default::default(),
         };
         Arc::new(Shared {
             now: slot,

@@ -1418,11 +1418,9 @@ async fn boot_and_run(
             // disabled. The history-reading backend uses the default one (the config is not read yet),
             // so the sidebar doesn't go empty along with it.
             let store = aox::store::default_store(&root, 0);
-            // Feed the workspaces even here: the registry only needs `.aox/spaces.json`, not the
-            // config, so a broken config must not also cost the user the conversations made in other
-            // workspaces. Exactly the call `Runtime::new` makes.
-            let spaces = aox::space::Registry::load(&root);
-            store.set_workspaces(&spaces.workspace_roots(&root));
+            // The store is one directory since 2026-11-05, so a broken config can no longer cost the
+            // user their conversations: there is nothing to "feed" it any more.
+            let _ = &store;
             // Config could not be read: the row uses the defaults (`[shell] bash = "auto"`), which is
             // the honest thing to show — the reason the config failed is shown right above it.
             let paths = boot_paths(

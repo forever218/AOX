@@ -43,6 +43,11 @@ pub struct Agent {
     /// Which file it lands in and what it is named is none of this type's business — that is an
     /// implementation detail of `self.rt.store` (see `src/store.rs`). This type only talks to it by **id**.
     log: Option<Box<dyn crate::store::Session>>,
+    /// 这条会话的出生信息：谁开的（本机 / 手机）、算哪个空间、哪个房间。
+    ///
+    /// 只影响首行 meta 和列表分组，不参与任何路径计算。桌面与 CLI 用默认值（本机、无空间）；
+    /// 远端 worker 给每个房间的 Agent 设成 `Birth::remote(房间)`。
+    birth: crate::store::Birth,
     /// Persist errors are reported only once, so we don't repeat the same warning every turn.
     log_error_reported: bool,
     /// Cumulative usage for this conversation so far (reloaded from file or reset on switch/new conversation).
@@ -155,6 +160,7 @@ impl Agent {
             rt,
             messages: vec![Message::system(sys)],
             log: None,
+            birth: crate::store::Birth::default(),
             log_error_reported: false,
             session_usage: Usage::default(),
             session_calls: 0,
@@ -175,6 +181,14 @@ impl Agent {
     /// The id is fixed by the storage backend when created (for the jsonl backend it's the filename stem); this just relays it.
     pub fn history_id(&self) -> Option<&str> {
         self.log.as_ref().map(|l| l.id())
+    }
+
+    /// 给这个 Agent 之后的会话打上出生标记（远端房间用）。
+    ///
+    /// 必须在**第一条消息之前**调用：meta 是在创建文件那一刻写的，之后改不了。远端 worker 在
+    /// 建立房间上下文时设一次。
+    pub fn set_birth(&mut self, birth: crate::store::Birth) {
+        self.birth = birth;
     }
 
     /// Persist the current workplace state into **this conversation's archive** (only writing when it actually changed).
@@ -233,17 +247,20 @@ impl Agent {
         if !cfg.enabled {
             return;
         }
-        let at = self.rt.workplace.active_root();
         // The model **in force**, which after a `/model` switch is no longer the one in `config.toml`:
         // the file name (and the history header) should say which model the conversation ran on.
         let model = self.rt.provider.cfg().model;
-        match self.rt.store.create(Some(&model), at.as_deref()) {
+        // No directory argument: since 2026-11-05 every conversation lives in the one store, and
+        // "which workspace / which room" is written into the header instead. The workplace is not
+        // consulted here on purpose — it used to decide where the file landed, which is what scattered
+        // history into `workplace/<project>/.aox/history`.
+        match self.rt.store.create(Some(&model), &self.birth) {
             Ok(log) => self.log = Some(log),
             Err(e) if !self.log_error_reported => {
                 self.log_error_reported = true;
                 ui.emit(AgentEvent::Warn(crate::tf!(
                     "conversation history cannot be written to {} ({}): this conversation will not be saved",
-                    self.rt.store.history_dir_for(at.as_deref()).display(),
+                    self.rt.store.location().display(),
                     format!("{e:#}")
                 )));
             }
@@ -1627,7 +1644,7 @@ mod tests {
 
         // A conversation must exist before a checkpoint has anywhere to live.
         let id = {
-            let log = a.rt.store.create(None, None).unwrap();
+            let log = a.rt.store.create(None, &Default::default()).unwrap();
             log.id().to_string()
         };
         a.resume(&id).unwrap();
@@ -1658,7 +1675,7 @@ mod tests {
         // Rewriting the same state again must not add a second row.
         let rows = |ws: &std::path::Path| {
             let mut n = 0;
-            if let Ok(rd) = std::fs::read_dir(ws.join("history")) {
+            if let Ok(rd) = std::fs::read_dir(ws.join(".aox").join("conversations")) {
                 for e in rd.flatten() {
                     if let Ok(s) = std::fs::read_to_string(e.path()) {
                         n += s.lines().filter(|l| l.contains("\"kind\":\"task\"")).count();

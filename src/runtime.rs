@@ -179,12 +179,11 @@ impl Runtime {
         let prompt_segments = crate::prompt::registry_from_config(&config.prompt);
         // Fix the storage backend before `config` is moved into Self (it needs config.store / config.history).
         let store = crate::store::backend(&config.store.backend, &root, config.history.keep)?;
-        // The space registry, read before `root` is moved into Self. Its only job at startup is to
-        // tell the store **which workspaces to visit**: history is per workspace
-        // (`<workspace>/.aox/history`), so listing every conversation needs the list of workspaces —
-        // this call is the entire coupling between the registry and the storage seam.
+        // The space registry, read before `root` is moved into Self. It used to be handed to the
+        // store ("which workspaces to scan"), which is gone since the single conversation store
+        // (2026-11-05): the registry is now **only** the UI's grouping, and reading it here just
+        // keeps one copy that both the agent thread and the overlay see.
         let spaces = crate::space::Registry::load(&root);
-        store.set_workspaces(&spaces.workspace_roots(&root));
         // The loop hook chain is likewise fixed before `config` is moved.
         // `?` is used here: something unintelligible in `[hook]` (not an object, a value
         // that won't convert to JSON) errors **at startup** rather than quietly not taking

@@ -69,6 +69,9 @@ pub struct RemoteProfile {
     pub created_at: i64,
     #[serde(default)]
     pub last_connected_at: i64,
+    /// 群 → 会话。每个群一条，跨重启接上；`/new` 清掉一条。
+    #[serde(default)]
+    pub rooms: std::collections::HashMap<String, RoomConv>,
 }
 
 impl RemoteProfile {
@@ -101,6 +104,21 @@ impl RemoteProfile {
     pub fn api(&self, path: &str) -> String {
         format!("{}{}", self.server.trim_end_matches('/'), path)
     }
+}
+
+/// 一个群对应哪条会话。
+///
+/// 存下来的唯一目的是**跨重启接上上下文**：`conversation` 是会话 id（也就是文件名），
+/// 下一轮先 `resume` 它；文件没了就当新的一段。手机上发 `/new` 会把这条删掉。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomConv {
+    pub conversation: String,
+    /// 房间名（可能为空：老配对或服务端没给）。只用来显示。
+    #[serde(default)]
+    pub name: String,
+    /// 最后说上话的时间（毫秒）。现在只用于排查，不参与任何清理。
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +180,7 @@ impl Book {
             device_name: old.device_name,
             owner_id: old.owner_id,
             label: String::new(),
+            rooms: Default::default(),
             call_policy: CallPolicy::default(),
             created_at: aoxchat_proto::now_ms(),
             last_connected_at: 0,

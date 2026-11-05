@@ -677,7 +677,7 @@ mod tests {
         let llm = Arc::new(CountingLlm { calls: AtomicUsize::new(0) });
         let mut agent = Agent::new_with(llm.clone(), rt);
         let id = {
-            let log = agent.rt().store.create(None, None).unwrap();
+            let log = agent.rt().store.create(None, &Default::default()).unwrap();
             log.id().to_string()
         };
         agent.resume(&id).unwrap();
@@ -694,7 +694,7 @@ mod tests {
         let (mut agent, llm, _id, dir) = agent_with_history("shrink", 20, 3_000, 9_000).await;
         let before_msgs = agent.messages().len();
         let raw_before = std::fs::read_to_string(
-            std::fs::read_dir(dir.join(".aox").join("history")).unwrap().next().unwrap().unwrap().path(),
+            std::fs::read_dir(dir.join(".aox").join("conversations")).unwrap().next().unwrap().unwrap().path(),
         )
         .unwrap();
 
@@ -705,7 +705,7 @@ mod tests {
 
         // The file did not move. One byte of difference would mean the projection leaked into disk.
         let raw_after = std::fs::read_to_string(
-            std::fs::read_dir(dir.join(".aox").join("history")).unwrap().next().unwrap().unwrap().path(),
+            std::fs::read_dir(dir.join(".aox").join("conversations")).unwrap().next().unwrap().unwrap().path(),
         )
         .unwrap();
         assert_eq!(raw_before, raw_after, "compaction must never touch the conversation file");
@@ -720,7 +720,7 @@ mod tests {
         let cut = before_msgs - 4;
         agent.truncate_messages(cut);
         let raw = std::fs::read_to_string(
-            std::fs::read_dir(dir.join(".aox").join("history")).unwrap().next().unwrap().unwrap().path(),
+            std::fs::read_dir(dir.join(".aox").join("conversations")).unwrap().next().unwrap().unwrap().path(),
         )
         .unwrap();
         assert!(raw.contains("user turn 0"), "the earliest turn must still be on disk after a rollback");

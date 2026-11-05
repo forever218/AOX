@@ -1,9 +1,15 @@
-//! The JSONL backend: one file per conversation, living under `<app_root>/history/`, with the
-//! filename itself being the conversation's timestamp:
+//! The JSONL backend: one file per conversation, all of them under
+//! `<app_root>/.aox/conversations/`, with the filename being the conversation's timestamp:
 //!
 //! ```text
 //! 20261002-153912-a1b2.jsonl
 //! ```
+//!
+//! **One store, one directory** (since 2026-11-05). Conversations used to be scattered across
+//! `<workspace>/.aox/history` for every registered workspace, which meant the file's location
+//! doubled as the sandbox boundary: pick a project as the working directory and its history landed
+//! inside the project. Now the folder is fixed and "which workspace / which room" lives in the
+//! header, where it belongs (see `crate::history::Meta`).
 //!
 //! The content is JSONL with one record per line, and the **first line is the meta**:
 //!
@@ -55,7 +61,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -68,8 +73,11 @@ use crate::history::{
 use crate::message::Message;
 use crate::store::{Session, Store, TITLE_MAX_CHARS};
 
-/// The history directory name (relative to the app root).
-const DIR_NAME: &str = "history";
+/// The conversation store's directory name (relative to the app root).
+///
+/// Named `conversations` rather than `history`: it holds every conversation of this install, and the
+/// old name is what made "history" sound like it belonged to a workspace.
+const DIR_NAME: &str = "conversations";
 const EXT: &str = "jsonl";
 
 /// The title is only searched for in the first few lines: the first user message is always on line 2,
@@ -333,20 +341,14 @@ fn dir_of(root: &Path) -> PathBuf {
 
 // ─────────────────────────── Backend ───────────────────────────
 
-/// The JSONL backend: one file per conversation, under `<workspace>/.aox/history/`.
+/// The JSONL backend: one file per conversation, all under `<app root>/.aox/conversations/`.
 pub struct JsonlStore {
     /// The app root. The meta row's `root` field records it.
     root: PathBuf,
-    /// The **default workspace's** history directory (`<app root>/.aox/history`). Always scanned, and
-    /// what [`Store::location`] reports.
+    /// The conversation directory (`<app root>/.aox/conversations`). The only one.
     home: PathBuf,
-    /// Every other workspace to scan, already converted to history directories. Behind a lock because
-    /// workspaces come and go at runtime — the registry can gain one between two refreshes, and the
-    /// store is shared with the agent thread.
-    extra: RwLock<Vec<PathBuf>>,
-    /// How many conversations to keep **in total** (0 = no limit). Global by design: "keep the newest
-    /// 200" is a different promise from "each workspace keeps its own 200", and the config comment has
-    /// always described the former.
+    /// How many conversations to keep (0 = no limit). Global by design: "keep the newest 200" is a
+    /// different promise from "each workspace keeps its own 200".
     keep: usize,
 }
 
@@ -354,39 +356,17 @@ impl JsonlStore {
     pub fn new(root: &Path, keep: usize) -> Self {
         let root = root.to_path_buf();
         let home = dir_of(&root);
-        Self { root, home, extra: RwLock::new(Vec::new()), keep }
+        Self { root, home, keep }
     }
 
-    /// Every directory to scan: home first, then the other workspaces.
+    /// Locate `id` in the store.
     ///
-    /// Home leads so an mtime tie breaks towards the default workspace — the sort is stable, and "the
-    /// conversation I was just in" is usually there.
-    fn dirs(&self) -> Vec<PathBuf> {
-        let mut out = vec![self.home.clone()];
-        let extra = self.extra.read().unwrap_or_else(|e| e.into_inner());
-        for d in extra.iter() {
-            if !out.contains(d) {
-                out.push(d.clone());
-            }
-        }
-        out
-    }
-
-    /// Where a conversation created for workspace `at` lands (`None` = the default workspace).
-    fn target_dir(&self, at: Option<&Path>) -> PathBuf {
-        match at {
-            Some(root) => dir_of(root),
-            None => self.home.clone(),
-        }
-    }
-
-    /// Locate `id` across every scanned directory.
-    ///
-    /// Ids are globally unique (a timestamp plus a random salt), so the first hit is the only hit.
-    /// `exists()` rather than trying to open: opening a session takes an exclusive-ish handle, and
-    /// this is also called on read paths that must not leave a file open.
+    /// Ids are globally unique (a timestamp plus a random salt). `exists()` rather than trying to
+    /// open: opening a session takes an exclusive-ish handle, and this is also called on read paths
+    /// that must not leave a file open.
     fn find(&self, id: &str) -> Option<PathBuf> {
-        self.dirs().into_iter().map(|d| file_of(&d, id)).find(|p| p.exists())
+        let p = file_of(&self.home, id);
+        p.exists().then_some(p)
     }
 }
 
@@ -401,32 +381,13 @@ impl Store for JsonlStore {
 
     /// `keep` is fixed at construction time (from `config.toml [history] keep`).
     ///
-    /// Pruning happens **before** the new file is written and spans **every** workspace: the limit is
-    /// global, and trimming after creation would make the newcomer a candidate for its own trim.
-    fn create(&self, model: Option<&str>, at: Option<&Path>) -> Result<Box<dyn Session>> {
-        let dirs = self.dirs();
+    /// Pruning happens **before** the new file is written: trimming after creation would make the
+    /// newcomer a candidate for its own trim.
+    fn create(&self, model: Option<&str>, birth: &crate::store::Birth) -> Result<Box<dyn Session>> {
         if self.keep > 0 {
-            prune_all(&dirs, self.keep);
+            prune_all(&self.home, self.keep);
         }
-        JsonlSession::create(&self.target_dir(at), model, &self.root).map(|s| Box::new(s) as _)
-    }
-
-    fn set_workspaces(&self, roots: &[PathBuf]) {
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        for r in roots {
-            let d = dir_of(r);
-            // The app root is already `home`; listing it twice would show its conversations twice in
-            // the merged list.
-            if d == self.home || dirs.contains(&d) {
-                continue;
-            }
-            dirs.push(d);
-        }
-        *self.extra.write().unwrap_or_else(|e| e.into_inner()) = dirs;
-    }
-
-    fn history_dir_for(&self, root: Option<&Path>) -> PathBuf {
-        self.target_dir(root)
+        JsonlSession::create(&self.home, model, &self.root, birth).map(|s| Box::new(s) as _)
     }
 
     fn open(&self, id: &str) -> Result<Box<dyn Session>> {
@@ -437,11 +398,11 @@ impl Store for JsonlStore {
     }
 
     fn list(&self, limit: usize) -> Vec<Summary> {
-        list_all(&self.dirs(), limit)
+        list_all(&self.home, limit)
     }
 
     fn resolve(&self, key: &str) -> Result<Summary> {
-        resolve_any(&self.dirs(), key)
+        resolve_any(&self.home, key)
     }
 
     fn load(&self, id: &str) -> Result<Vec<Loaded>> {
@@ -479,14 +440,14 @@ impl Store for JsonlStore {
         // conversation to the system recycle bin is `crate::recycle`'s job, and that has to happen on
         // a thread that is allowed to block. Kept as-is because the CLI's `/history rm` has always
         // meant "gone".
-        let s = resolve_any(&self.dirs(), key)?;
+        let s = resolve_any(&self.home, key)?;
         std::fs::remove_file(&s.path)
             .with_context(|| crate::tf!("Cannot delete {}", s.path.display()))?;
         Ok(s)
     }
 
     fn prune(&self, keep: usize) -> usize {
-        prune_all(&self.dirs(), keep)
+        prune_all(&self.home, keep)
     }
 }
 
@@ -502,18 +463,29 @@ pub struct JsonlSession {
 impl JsonlSession {
     /// Create a new conversation file and write the meta row.
     ///
-    /// No pruning here: the limit is **global across workspaces** (see [`prune_all`]), so trimming is
-    /// the backend's call, not one session's — a session only knows the directory it was told to land
-    /// in. The caller prunes before creating, which also keeps the new file out of the reckoning.
-    fn create(dir: &Path, model: Option<&str>, root: &Path) -> Result<Self> {
+    /// No pruning here: the limit is the backend's call (it is the one that can see the whole
+    /// directory), and the caller prunes before creating, which also keeps the new file out of the
+    /// reckoning.
+    fn create(
+        dir: &Path,
+        model: Option<&str>,
+        root: &Path,
+        birth: &crate::store::Birth,
+    ) -> Result<Self> {
         std::fs::create_dir_all(dir)
-            .with_context(|| crate::tf!("Cannot create history directory {}", dir.display()))?;
+            .with_context(|| crate::tf!("Cannot create the conversation directory {}", dir.display()))?;
         let meta = Meta {
             id: new_id(dir),
             created: unix_now(),
             model: model.map(str::to_string),
             root: Some(root.display().to_string()),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            origin: Some(birth.origin.as_str().to_string()),
+            space: birth.space.clone(),
+            room: birth.room.as_ref().map(|(id, name)| crate::history::MetaRoom {
+                id: id.clone(),
+                name: name.clone(),
+            }),
         };
         let path = file_of(dir, &meta.id);
         let file = OpenOptions::new().create(true).write(true).append(true).open(&path)?;
@@ -542,6 +514,9 @@ impl JsonlSession {
                 model: None,
                 root: None,
                 version: None,
+                origin: None,
+                space: None,
+                room: None,
             });
         let file = OpenOptions::new().write(true).append(true).open(path)?;
         Ok(Self { path: path.to_path_buf(), file, meta })
@@ -732,12 +707,9 @@ fn collect(dir: &Path) -> Vec<Entry> {
 ///
 /// `limit` is applied **after** the merge, not per directory: it caps the list the user sees, not how
 /// many conversations each workspace may contribute.
-fn list_all(dirs: &[PathBuf], limit: usize) -> Vec<Summary> {
+fn list_all(dir: &Path, limit: usize) -> Vec<Summary> {
     let this_year = local_now().year;
-    let mut all: Vec<Entry> = Vec::new();
-    for d in dirs {
-        all.extend(collect(d));
-    }
+    let mut all: Vec<Entry> = collect(dir);
     all.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| b.id.cmp(&a.id)));
     all.into_iter().take(limit).filter_map(|e| read_summary(e, this_year)).collect()
 }
@@ -748,14 +720,21 @@ fn read_summary(e: Entry, this_year: u16) -> Option<Summary> {
     let mut reader = BufReader::new(file);
     let mut line = String::new();
 
-    // Line 1 is the meta (with id / model / version): consume it, and incidentally confirm this
-    // really is our format
+    // Line 1 is the meta (id / model / version / origin / space / room): consumed here, and it
+    // doubles as "this really is our format". `origin`/`space`/`room` are read from the same line
+    // so grouping needs no second source — a `spaces.json` that lost the entry still gets it right.
     if reader.read_line(&mut line).ok()? == 0 {
         return None;
     }
-    if !parse_row(line.trim()).is_some_and(|v| is_kind(&v, "meta")) {
-        return None;
-    }
+    let meta: crate::history::Meta = match parse_row(line.trim())
+        .and_then(|v| serde_json::from_value::<crate::history::Meta>(v).ok())
+    {
+        Some(m) => m,
+        None => return None,
+    };
+    let origin = crate::history::Origin::parse(meta.origin.as_deref().unwrap_or(""));
+    let born_in = meta.space.clone();
+    let room_name = meta.room.as_ref().map(|r| r.name.clone()).filter(|n| !n.is_empty());
 
     let mut messages = 0usize;
     let mut title: Option<String> = None;
@@ -834,6 +813,9 @@ fn read_summary(e: Entry, this_year: u16) -> Option<Summary> {
         messages,
         ws_root: ws.as_ref().and_then(|r| r.root.clone()),
         ws_full: ws.as_ref().is_some_and(|r| r.mode == "full"),
+        origin,
+        space: born_in,
+        room_name,
     })
 }
 
@@ -992,14 +974,11 @@ fn load_titles(path: &Path) -> Vec<Option<String>> {
 /// The limit is global on purpose: the user configured one number, and letting each workspace keep
 /// that many would quietly multiply it by the number of workspaces.
 /// Returns the number of deleted files.
-fn prune_all(dirs: &[PathBuf], keep: usize) -> usize {
+fn prune_all(dir: &Path, keep: usize) -> usize {
     if keep == 0 {
         return 0;
     }
-    let mut all: Vec<Entry> = Vec::new();
-    for d in dirs {
-        all.extend(collect(d));
-    }
+    let mut all: Vec<Entry> = collect(dir);
     all.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| b.id.cmp(&a.id)));
     let mut n = 0;
     for e in all.into_iter().skip(keep) {
@@ -1025,7 +1004,7 @@ fn prune_all(dirs: &[PathBuf], keep: usize) -> usize {
 /// digits (the list cap is 60, and even lifted it wouldn't reach 8), so **pure digits of 8 or more are
 /// always treated as an id prefix**. Without this split, `/history rm 20261003` would become "there is
 /// no conversation number 20261003".
-fn resolve_any(dirs: &[PathBuf], key: &str) -> Result<Summary> {
+fn resolve_any(dir: &Path, key: &str) -> Result<Summary> {
     let key = key.trim().trim_end_matches(&format!(".{EXT}"));
     // An empty key must be blocked here: `id.starts_with("")` is always true, so letting it through
     // would "successfully resolve" to the list's first entry — which is arbitrary. Better to error
@@ -1034,7 +1013,7 @@ fn resolve_any(dirs: &[PathBuf], key: &str) -> Result<Summary> {
         bail!(crate::i18n::t("Give a conversation number or file name (see /history for the list)"));
     }
     let is_index = key.len() < 8 && key.bytes().all(|c| c.is_ascii_digit());
-    let items = list_all(dirs, DEFAULT_LIST_LIMIT);
+    let items = list_all(dir, DEFAULT_LIST_LIMIT);
     if is_index {
         let n: usize = key
             .parse()
@@ -1107,7 +1086,7 @@ mod tests {
     fn attachment_payloads_are_not_persisted() {
         let d = Tmp::new("attach-slim");
         let s = d.store();
-        let mut log = s.create(Some("deepseek-flash"), None).unwrap();
+        let mut log = s.create(Some("deepseek-flash"), &Default::default()).unwrap();
         let id = log.id().to_string();
 
         let png = d.0.join("shot.png");
@@ -1149,7 +1128,7 @@ mod tests {
     fn round_trip_messages() {
         let d = Tmp::new("rt");
         let s = d.store();
-        let mut log = s.create(Some("deepseek-chat"), None).unwrap();
+        let mut log = s.create(Some("deepseek-chat"), &Default::default()).unwrap();
         let id = log.id().to_string();
 
         log.append(&Message::user("第一行\n第二行 \"引号\" 与中文"), None);
@@ -1192,7 +1171,7 @@ mod tests {
     fn system_prompt_is_skipped() {
         let d = Tmp::new("sys");
         let s = d.store();
-        let mut log = s.create(None, None).unwrap();
+        let mut log = s.create(None, &Default::default()).unwrap();
         log.append(&Message::system("You are AOX…"), None);
         log.append(&Message::user("hi"), None);
         drop(log);
@@ -1208,7 +1187,7 @@ mod tests {
     fn rewrite_drops_rolled_back_turn() {
         let d = Tmp::new("rw");
         let s = d.store();
-        let mut log = s.create(None, None).unwrap();
+        let mut log = s.create(None, &Default::default()).unwrap();
         let id = log.id().to_string();
         let path = log.path().to_path_buf();
         let mut msgs = vec![Message::system("sys")];
@@ -1241,7 +1220,7 @@ mod tests {
     fn host_prompt_is_not_a_title() {
         let d = Tmp::new("host");
         let s = d.store();
-        let mut log = s.create(None, None).unwrap();
+        let mut log = s.create(None, &Default::default()).unwrap();
         log.append(&Message::user("(host hint) your previous reply was empty."), None);
         log.append(&Message::assistant(Some("ok".into()), None, vec![]), None);
         log.append(&Message::user("fix the login bug"), None);
@@ -1256,7 +1235,7 @@ mod tests {
         let d = Tmp::new("prune");
         let s = d.store();
         for _ in 0..5 {
-            let mut log = s.create(None, None).unwrap();
+            let mut log = s.create(None, &Default::default()).unwrap();
             log.append(&Message::user("x"), None);
             drop(log);
             // Filename precision is to the second, so sleep to guarantee different timestamps
@@ -1276,7 +1255,7 @@ mod tests {
     fn corrupt_line_is_skipped() {
         let d = Tmp::new("bad");
         let s = d.store();
-        let mut log = s.create(None, None).unwrap();
+        let mut log = s.create(None, &Default::default()).unwrap();
         let id = log.id().to_string();
         let path = log.path().to_path_buf();
         log.append(&Message::user("fine"), None);
@@ -1298,7 +1277,7 @@ mod tests {
     fn acts_live_alongside_messages() {
         let d = Tmp::new("act");
         let s = d.store();
-        let mut log = s.create(None, None).unwrap();
+        let mut log = s.create(None, &Default::default()).unwrap();
         let id = log.id().to_string();
         log.append(&Message::user("first line"), None);
         log.append_act(&json!({"at": 0.0, "kind": "input", "title": "user instruction", "seq": 1}));
@@ -1335,7 +1314,7 @@ mod tests {
     fn resolve_by_index_and_id() {
         let d = Tmp::new("resolve");
         let s = d.store();
-        let mut log = s.create(None, None).unwrap();
+        let mut log = s.create(None, &Default::default()).unwrap();
         log.append(&Message::user("the only one"), None);
         let id = log.id().to_string();
         drop(log);
@@ -1361,7 +1340,7 @@ mod tests {
     fn open_continues_the_same_file() {
         let d = Tmp::new("reopen");
         let s = d.store();
-        let mut log = s.create(Some("m"), None).unwrap();
+        let mut log = s.create(Some("m"), &Default::default()).unwrap();
         let id = log.id().to_string();
         log.append(&Message::user("first line"), None);
         drop(log); // Close the handle, simulating "this session ended"
@@ -1420,6 +1399,9 @@ mod tests {
                 model: None,
                 root: None,
                 version: None,
+                origin: None,
+                space: None,
+                room: None,
             };
             let body =
                 format!("{}\n{}\n", meta_line(&meta), message_line(&Message::user(text), None));
@@ -1452,7 +1434,7 @@ mod tests {
     fn usage_round_trip() {
         let d = Tmp::new("usage");
         let s = d.store();
-        let mut log = s.create(Some("mock-model"), None).unwrap();
+        let mut log = s.create(Some("mock-model"), &Default::default()).unwrap();
         let id = log.id().to_string();
         let rec = UsageRecord {
             round: 1,
@@ -1494,7 +1476,7 @@ mod tests {
 
         let d = Tmp::new("workplace");
         let s = d.store();
-        let mut log = s.create(None, None).unwrap();
+        let mut log = s.create(None, &Default::default()).unwrap();
         let id = log.id().to_string();
 
         assert_eq!(s.load_workplace(&id), None, "None when nothing was written yet (old conversation files all take this branch)");
@@ -1537,7 +1519,7 @@ mod tests {
 
         let d = Tmp::new("task");
         let s = d.store();
-        let mut log = s.create(None, None).unwrap();
+        let mut log = s.create(None, &Default::default()).unwrap();
         let id = log.id().to_string();
 
         assert!(s.load_task(&id).is_none(), "no checkpoint yet must read as None, not as an error");
@@ -1578,7 +1560,7 @@ mod tests {
     fn usage_keeps_missing_fields_absent() {
         let d = Tmp::new("usage-sparse");
         let s = d.store();
-        let mut log = s.create(None, None).unwrap();
+        let mut log = s.create(None, &Default::default()).unwrap();
         let id = log.id().to_string();
         log.append_usage(&UsageRecord {
             round: 1,
@@ -1606,7 +1588,7 @@ mod tests {
         let s = d.store();
         let id;
         {
-            let mut log = s.create(None, None).unwrap();
+            let mut log = s.create(None, &Default::default()).unwrap();
             id = log.id().to_string();
             log.append(&Message::user("first line"), None);
             log.append(&Message::assistant(Some("cut off".into()), None, vec![]), None);
@@ -1640,7 +1622,7 @@ mod tests {
         let d = Tmp::new("usage-count");
         let s = d.store();
         {
-            let mut log = s.create(Some("mock-model"), None).unwrap();
+            let mut log = s.create(Some("mock-model"), &Default::default()).unwrap();
             log.append(&Message::user("see what capabilities exist now"), None);
             log.append_usage(&UsageRecord {
                 round: 1,
@@ -1668,7 +1650,7 @@ mod tests {
         let s = d.store();
         let mut ids = Vec::new();
         for _ in 0..2 {
-            let mut log = s.create(None, None).unwrap();
+            let mut log = s.create(None, &Default::default()).unwrap();
             log.append(&Message::user("x"), None);
             ids.push(log.id().to_string());
             drop(log);
@@ -1688,187 +1670,12 @@ mod tests {
         assert!(s.list(10).is_empty());
     }
 
-    // ─────────────── Per-workspace layout (layout decision of 2026-10-14) ───────────────
+    // ─────────────── 单一会话库（2026-11-05） ───────────────
     //
-    // History used to pile up in the install directory's single `history/`; it now travels with the
-    // workspace (`<workspace>/.aox/history/`). The tests below pin the three things that change:
-    // where a new file **lands**, how the list **merges** several directories, and that
-    // resolve / open / remove / prune **reach across** them. `ws` is nested inside the temp app root
-    // so the `Tmp` drop guard cleans it up; `collect` is non-recursive, so nesting is harmless.
-
-    /// A conversation created for a workspace lands **inside that workspace**, under
-    /// `<workspace>/.aox/history/` — not in the install directory's one `history/`. This is the whole
-    /// point of "history travels with the workspace": copy or archive the folder and its
-    /// conversations come along, with no migration step in between.
-    #[test]
-    fn create_lands_in_the_workspace_dir() {
-        let d = Tmp::new("ws-land");
-        let s = d.store();
-        let ws = d.0.join("project1");
-
-        // No workspace → the app root's own directory (`home`).
-        let mut home = s.create(None, None).unwrap();
-        let home_id = home.id().to_string();
-        home.append(&Message::user("in the default workspace"), None);
-        drop(home);
-        assert!(file_of(&s.home, &home_id).exists(), "None lands in <app root>/.aox/history");
-
-        // A workspace → `<workspace>/.aox/history`, and **only** there.
-        let mut log = s.create(None, Some(&ws)).unwrap();
-        let id = log.id().to_string();
-        log.append(&Message::user("in ws1"), None);
-        drop(log);
-
-        let dir = dir_of(&ws);
-        assert_eq!(dir, ws.join(".aox").join(DIR_NAME), "the layout is <ws>/.aox/history");
-        assert!(file_of(&dir, &id).exists(), "the file sits inside the workspace");
-        assert!(!file_of(&s.home, &id).exists(), "not in the default workspace");
-
-        // `history_dir_for` must agree with where `create` actually put it: the caller uses it to tell
-        // the user the path, and a mismatch would show a wrong location for every new conversation in
-        // a non-default workspace.
-        assert_eq!(s.history_dir_for(Some(&ws)), dir, "the reported path is where it really went");
-        assert_eq!(s.history_dir_for(None), s.home);
-        assert_eq!(s.location(), s.home.as_path(), "location() reports the default workspace");
-
-        // Until the workspace is registered, only `home` is scanned.
-        assert_eq!(s.list(10).len(), 1, "an unregistered workspace is not listed yet");
-    }
-
-    /// The list spans **every registered workspace**: merged, then re-sorted by last activity. A
-    /// conversation just used in one workspace must outrank an older one in another — the
-    /// per-directory order must not leak through, or the list would look randomly re-ordered whenever
-    /// more than one workspace is in play.
-    #[test]
-    fn list_merges_workspaces_and_sorts_by_last_activity() {
-        let d = Tmp::new("ws-merge");
-        let s = d.store();
-        let ws = d.0.join("project1");
-
-        let mut home = s.create(None, None).unwrap();
-        let home_id = home.id().to_string();
-        home.append(&Message::user("older, in default"), None);
-        drop(home);
-        // NTFS mtime is 100ns-accurate, so 30ms cleanly separates the two writes.
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        let mut other = s.create(None, Some(&ws)).unwrap();
-        let other_id = other.id().to_string();
-        other.append(&Message::user("newer, in ws1"), None);
-        drop(other);
-
-        s.set_workspaces(&[ws.clone()]);
-        let items = s.list(10);
-        assert_eq!(items.len(), 2, "both workspaces contribute to the one list");
-        assert_eq!(items[0].id, other_id, "the newer conversation comes first");
-        assert_eq!(items[1].id, home_id);
-
-        // Chat once more in the default workspace → it floats to the top of the **merged** list.
-        let mut again = s.open(&home_id).unwrap();
-        again.append(&Message::user("said one more thing"), None);
-        drop(again);
-        assert_eq!(s.list(10)[0].id, home_id, "the merge re-sorts by mtime, not per directory");
-    }
-
-    /// Registering the app root (or the same root twice) must not make its conversations show up
-    /// twice: `set_workspaces` drops the directory equal to `home`. The default workspace *is* the app
-    /// root, and a caller that simply passes "every root I know about" will naturally include it.
-    #[test]
-    fn set_workspaces_dedupes_the_app_root() {
-        let d = Tmp::new("ws-dedup");
-        let s = d.store();
-        let mut log = s.create(None, None).unwrap();
-        log.append(&Message::user("only one"), None);
-        drop(log);
-
-        s.set_workspaces(&[d.0.clone(), d.0.clone()]);
-        assert_eq!(s.dirs().len(), 1, "home only — the app root and its duplicate were dropped");
-        assert_eq!(s.list(10).len(), 1, "and it must not be listed twice");
-    }
-
-    /// `resolve` / `open` / `load` reach a conversation **wherever it lives**. The CLI's
-    /// `/history rm 2` and the GUI's "resume" both key off the merged list, so the index must count in
-    /// that merged order and the id/stem lookups must search every directory — otherwise a
-    /// conversation in a non-default workspace would resolve to something the user never saw.
-    #[test]
-    fn resolve_and_open_reach_other_workspaces() {
-        let d = Tmp::new("ws-resolve");
-        let s = d.store();
-        let ws = d.0.join("project1");
-
-        let mut home = s.create(None, None).unwrap();
-        let home_id = home.id().to_string();
-        home.append(&Message::user("in the default workspace"), None);
-        drop(home);
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        let mut other = s.create(None, Some(&ws)).unwrap();
-        let other_id = other.id().to_string();
-        other.append(&Message::user("in ws1"), None);
-        drop(other);
-        s.set_workspaces(&[ws.clone()]);
-
-        // The merged order puts the newer (workspace) one first.
-        assert_eq!(s.resolve("1").unwrap().id, other_id, "the index counts the merged list");
-        assert_eq!(s.resolve("2").unwrap().id, home_id);
-        assert_eq!(s.resolve(&other_id).unwrap().id, other_id, "by full id");
-        assert_eq!(s.resolve(&other_id[..13]).unwrap().id, other_id, "by timestamp prefix");
-        assert_eq!(s.resolve(&format!("{other_id}.jsonl")).unwrap().id, other_id, "by filename stem");
-
-        // `open` appends to the workspace's own file, not to a new one in the install directory.
-        let mut again = s.open(&other_id).unwrap();
-        again.append(&Message::user("more"), None);
-        drop(again);
-        assert_eq!(s.load(&other_id).unwrap().len(), 2, "reopened and appended in place");
-        assert!(file_of(&dir_of(&ws), &other_id).exists(), "writes stay in the workspace");
-        assert!(!file_of(&s.home, &other_id).exists(), "and never leak into the install directory");
-    }
-
-    /// The retention limit is **global across workspaces**, as the config comment has always promised
-    /// ("keep the newest 200", not "200 each"). Pruning must therefore trim the merged list, and it
-    /// must be able to delete files that live in a non-default workspace.
-    #[test]
-    fn prune_is_global_across_workspaces() {
-        let d = Tmp::new("ws-prune");
-        let s = d.store();
-        let ws = d.0.join("project1");
-
-        // Two in the default workspace, one in the other; 30ms apart so mtime order is stable.
-        let mut newest = String::new();
-        for (i, at) in [None, None, Some(ws.as_path())].into_iter().enumerate() {
-            let mut log = s.create(None, at).unwrap();
-            log.append(&Message::user(&format!("conversation {i}")), None);
-            newest = log.id().to_string();
-            drop(log);
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }
-        s.set_workspaces(&[ws.clone()]);
-        assert_eq!(s.list(10).len(), 3, "all three are visible before pruning");
-
-        assert_eq!(s.prune(1), 2, "keep the single newest across every workspace");
-        let items = s.list(10);
-        assert_eq!(items.len(), 1, "the merged list shrank to the limit");
-        assert_eq!(items[0].id, newest, "the newest survived — and it lived in the other workspace");
-    }
-
-    /// `remove` finds the file across workspaces too, and it really is gone afterwards.
-    #[test]
-    fn remove_reaches_other_workspaces() {
-        let d = Tmp::new("ws-remove");
-        let s = d.store();
-        let ws = d.0.join("project1");
-
-        let mut log = s.create(None, Some(&ws)).unwrap();
-        let id = log.id().to_string();
-        log.append(&Message::user("in ws1"), None);
-        drop(log);
-        s.set_workspaces(&[ws.clone()]);
-
-        let removed = s.remove(&id).unwrap();
-        assert_eq!(removed.id, id);
-        assert!(!file_of(&dir_of(&ws), &id).exists(), "the workspace file was deleted");
-        assert!(!file_of(&s.home, &id).exists(), "no stray copy in the install directory");
-        assert!(s.list(10).is_empty());
-        assert!(s.remove(&id).is_err(), "a second removal of the same id fails cleanly");
-    }
+    // 这里原本有六条“按工作区分散存储”的测试：会话落在 `<workspace>/.aox/history`、列表合并多个
+    // 目录、resolve/open/remove/prune 跨目录可达。那套设计已经取消——所有会话都在
+    // `<app root>/.aox/conversations`，文件位置不再跟着工作目录走（“哪个工作区”写进首行 meta）。
+    // 对应的行为没有了，测试跟着删掉，而不是改成断言“还是只有一个目录”。
 
     /// A rename beats the title derived from the first user message — and clearing it hands the row
     /// back to that first message instead of leaving it blank or stuck on the old name.
@@ -1880,7 +1687,7 @@ mod tests {
     fn rename_overrides_the_derived_title_and_clearing_restores_it() {
         let d = Tmp::new("rename");
         let s = d.store();
-        let mut log = s.create(None, None).unwrap();
+        let mut log = s.create(None, &Default::default()).unwrap();
         let id = log.id().to_string();
         log.append(&Message::user("the first thing I asked"), None);
         drop(log);
@@ -1915,7 +1722,7 @@ mod tests {
     fn a_rollback_keeps_the_rename() {
         let d = Tmp::new("rename-rollback");
         let s = d.store();
-        let mut log = s.create(None, None).unwrap();
+        let mut log = s.create(None, &Default::default()).unwrap();
         let id = log.id().to_string();
         let keep = Message::user("kept");
         log.append(&keep, None);

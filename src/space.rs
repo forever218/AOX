@@ -49,14 +49,20 @@ const VERSION: u32 = 1;
 /// Ids of the built-ins. Prefixed `builtin:` so "is this ours" is a test on the id itself and cannot
 /// drift out of sync with a separate flag.
 const ID_DEFAULT: &str = "builtin:default";
+/// The group every remote (phone) conversation is born into. Public because the remote worker and
+/// the storage layer both write it into a conversation's header — see `store::Birth`.
+pub const ID_REMOTE: &str = "builtin:remote";
 const ID_FULL: &str = "builtin:full";
 
-/// The two spaces that are not the user's to create or delete.
+/// The spaces that are not the user's to create or delete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Builtin {
     /// The app root — where a conversation lands when nobody picked anything.
     Default,
+    /// Conversations opened from the phone (AOXChat). No root: a group is all it is, and a remote
+    /// turn's workspace stays "the whole app root" (see `docs/会话与工作区重构设计.md`).
+    Remote,
     /// The unrestricted tier, which has no root: it cannot charitably be folded into any workspace,
     /// so it gets a group of its own (an explicit decision on 2026-10-14).
     Full,
@@ -69,7 +75,11 @@ impl Builtin {
     /// translated group name; a **user-named** space is shown verbatim and never translated.
     pub fn label(self) -> &'static str {
         match self {
-            Builtin::Default => crate::i18n::t("Default"),
+            // "Local" rather than "Default": after 2026-11-05 this group is not "the fallback",
+            // it is specifically *this machine's* conversations, and "Default" read like a setting
+            // value. A separate key so the old "Default" translations (used elsewhere) stay put.
+            Builtin::Default => crate::i18n::t("Local"),
+            Builtin::Remote => crate::i18n::t("Remote"),
             Builtin::Full => crate::i18n::t("Full access"),
         }
     }
@@ -144,6 +154,7 @@ impl Default for Registry {
         Self {
             spaces: vec![
                 Space { id: ID_DEFAULT.into(), builtin: Some(Builtin::Default), ..Default::default() },
+                Space { id: ID_REMOTE.into(), builtin: Some(Builtin::Remote), ..Default::default() },
                 Space { id: ID_FULL.into(), builtin: Some(Builtin::Full), ..Default::default() },
             ],
             hidden: Vec::new(),
@@ -198,12 +209,11 @@ impl Registry {
         &self.hidden
     }
 
-    /// The workspace roots that should be **listed and scanned**: the app root plus every named
-    /// space with a root, minus the removed ones.
+    /// 这个注册表认识的所有**目录**（app root + 每个绑了目录的空间，去掉已移除的）。
     ///
-    /// This is what the history layer is handed (see `Store::set_workspaces`) — that is the whole
-    /// coupling between the two, so the store never has to learn about spaces.
-    pub fn workspace_roots(&self, app_root: &Path) -> Vec<PathBuf> {
+    /// 2026-11-05 之前这是交给存储层的"要扫描哪些目录"；单一会话库之后它不再参与读写，
+    /// 只用来回答"这台机器上一共有哪些工作目录"（面板的目录树用它决定展开哪些行）。
+    pub fn roots(&self, app_root: &Path) -> Vec<PathBuf> {
         let mut out = vec![app_root.to_path_buf()];
         for s in &self.spaces {
             let Some(root) = s.root.as_ref() else { continue };
@@ -293,7 +303,7 @@ impl Registry {
     ///
     /// Two folders are deliberately left out:
     ///
-    /// * **The app root.** [`Registry::workspace_roots`] always contains it, so it needs no row --
+    /// * **The app root.** [`Registry::roots`] always contains it, so it needs no row --
     ///   and giving it one would be actively wrong: `group()` asks `find_root_space` *before* it
     ///   asks `same_path(app_root)`, so a registered app root would pull every conversation that
     ///   lands there "when nobody chose anything" out of `Default` and into a workspace of its own.
@@ -405,16 +415,21 @@ impl Registry {
     /// Guarantee the two built-ins exist and sit first — the file may be missing them (hand-edited,
     /// or written by a future build that dropped one), and every grouping path assumes they are there.
     fn ensure_builtins(&mut self) {
-        for (id, b) in [(ID_DEFAULT, Builtin::Default), (ID_FULL, Builtin::Full)] {
+        for (id, b) in [
+            (ID_DEFAULT, Builtin::Default),
+            (ID_REMOTE, Builtin::Remote),
+            (ID_FULL, Builtin::Full),
+        ] {
             if !self.spaces.iter().any(|s| s.id == id) {
                 self.spaces.insert(0, Space { id: id.into(), builtin: Some(b), ..Default::default() });
             }
         }
-        // Fixed order: the two built-ins always lead, so the list's top never shuffles.
+        // Fixed order: the built-ins always lead, so the list's top never shuffles.
         self.spaces.sort_by_key(|s| match s.builtin {
             Some(Builtin::Default) => 0,
-            Some(Builtin::Full) => 1,
-            None => 2,
+            Some(Builtin::Remote) => 1,
+            Some(Builtin::Full) => 2,
+            None => 3,
         });
     }
 }
@@ -505,6 +520,13 @@ pub fn group(app_root: &Path, reg: &Registry, items: Vec<Summary>) -> Vec<Group>
     for (pos, s) in items.into_iter().enumerate() {
         let target: Option<Key> = if let Some(&si) = placed.get(s.id.as_str()) {
             Some(key_of(&reg.spaces[si]))
+        } else if let Some(id) = s.space.as_deref().and_then(|id| reg.index_of(id)) {
+            // The header's own claim ("this was born in `builtin:remote`"). Sits **above** the
+            // workspace rules because it is the only thing a remote conversation has: those turns
+            // run with the app root as their workspace, which would otherwise drop every one of them
+            // into the local group. An id the registry no longer knows falls through instead of
+            // disappearing — a lost `builtin:remote` must not hide the conversations.
+            Some(key_of(&reg.spaces[id]))
         } else if s.ws_full {
             Some(key_of(&reg.spaces[full_idx.unwrap_or(default_idx)]))
         } else {
@@ -589,8 +611,9 @@ pub fn group(app_root: &Path, reg: &Registry, items: Vec<Summary>) -> Vec<Group>
     groups.sort_by_key(|g| {
         let builtin_rank = match g.builtin {
             Some(Builtin::Default) => 0,
-            Some(Builtin::Full) => 1,
-            None => 2,
+            Some(Builtin::Remote) => 1,
+            Some(Builtin::Full) => 2,
+            None => 3,
         };
         (builtin_rank, g.newest.unwrap_or(usize::MAX))
     });
@@ -643,6 +666,9 @@ mod tests {
             time: "10-14 10:00".into(),
             ws_root: ws_root.map(PathBuf::from),
             ws_full,
+            origin: crate::history::Origin::Local,
+            space: None,
+            room_name: None,
         }
     }
 
@@ -728,8 +754,9 @@ mod tests {
     }
 
     /// Picking a folder in the directory list is what **makes** it a workspace: the registry is
-    /// where `workspace_roots` is read from, so a root nobody wrote down is not scanned on the next
-    /// launch and both the group and its conversations vanish. `adopt_workspace` is that write.
+    /// where the group comes from, so a root nobody wrote down is drawn as an `auto:` fallback with
+    /// no name and no way to open a new conversation there. `adopt_workspace` is that write.
+    /// (Conversations are unaffected either way since 2026-11-05 — they all live in one store.)
     ///
     /// The two exclusions are the interesting part, and both are asserted here:
     ///
@@ -747,7 +774,7 @@ mod tests {
 
         let picked = PathBuf::from("E:/rust22");
         let id = reg.adopt_workspace(&picked, &app).expect("a picked folder is registered");
-        assert!(reg.workspace_roots(&app).iter().any(|r| same_path(r, &picked)));
+        assert!(reg.roots(&app).iter().any(|r| same_path(r, &picked)));
         // The group the new space will be drawn as, and the reason the caller can unfold it.
         assert_eq!(reg.index_of(&id).map(|i| &reg.spaces[i]).and_then(|s| s.root.as_deref()),
             Some(picked.as_path()));
@@ -782,73 +809,58 @@ mod tests {
     fn path_comparison_ignores_case_on_windows() {
         assert!(same_path(Path::new("E:/RustApp"), Path::new("e:\\rustapp")));
     }
-
-    /// The boot wiring, end to end and against a **real file**: save a registry naming a second
-    /// workspace, read it back, hand its roots to the *default* store (the same trait object the
-    /// bridge and the GUI use), and the store must then list the conversations living in that
-    /// workspace.
-    ///
-    /// This covers the one seam no other test touches — `Registry::load` → `Store::set_workspaces`
-    /// → `Store::list` — and it is deliberately written through the trait object rather than through
-    /// `JsonlStore` directly, because "the call went to the wrong impl" is exactly the kind of bug a
-    /// concrete-type test would hide.
+    /// 首行 meta 里的 `space` 决定分组：远端会话的工作区是 app root，但必须落在「远端」，
+    /// 不能混进「本机」。这条规则就是"远端对话不污染 Default"的全部实现。
     #[test]
-    fn registry_on_disk_widens_what_the_default_store_lists() {
-        let app = std::env::temp_dir().join(format!("aox-space-e2e-{}", std::process::id()));
+    fn a_conversation_born_remote_groups_under_remote() {
+        let app = std::env::temp_dir().join(format!("aox-space-remote-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&app);
-        let ws = app.join("project1");
         let store = crate::store::default_store(&app, 0);
 
-        // One conversation in the default workspace, one in the second.
-        //
-        // Each gets a `kind:"workplace"` record, because that line is what `Summary::ws_root` is read
-        // from — a conversation without one always groups under Default (see the "no record at all"
-        // branch in [`group`]). Writing only the message would make this test assert nothing about
-        // the workspace path at all.
+        // 本机的一条：默认出生信息。
         {
-            let mut log = store.create(None, None).unwrap();
-            log.append(&crate::message::Message::user("in the default workspace"), None);
+            let mut log = store.create(None, &Default::default()).unwrap();
+            log.append(&crate::message::Message::user("本机的一段"), None);
             log.append_workplace(&crate::workplace::Record {
                 mode: "default".into(),
                 root: Some(app.clone()),
                 own: None,
             });
         }
+        // 手机那一轮的一条：工作区同样是 app root，但出生在 builtin:remote。
         {
-            let mut log = store.create(None, Some(&ws)).unwrap();
-            log.append(&crate::message::Message::user("in project1"), None);
+            let mut log = store
+                .create(None, &crate::store::Birth::remote("r_1", "前端组"))
+                .unwrap();
+            log.append(&crate::message::Message::user("群里的一段"), None);
             log.append_workplace(&crate::workplace::Record {
-                mode: "fixed".into(),
-                root: Some(ws.clone()),
+                mode: "default".into(),
+                root: Some(app.clone()),
                 own: None,
             });
         }
-        assert_eq!(store.list(10).len(), 1, "before registering, only the default workspace is scanned");
-
-        let mut reg = Registry::default();
-        reg.push_space(Space {
-            id: "s-1".into(),
-            name: Some("Playground".into()),
-            root: Some(ws.clone()),
-            ..Default::default()
-        });
-        reg.save(&app).unwrap();
-        let reg = Registry::load(&app);
-        store.set_workspaces(&reg.workspace_roots(&app));
 
         let items = store.list(10);
+        assert_eq!(items.len(), 2, "两条都在同一个会话库里");
         assert_eq!(
-            items.len(),
-            2,
-            "the second workspace's conversation must be listed: {:?}",
-            items.iter().map(|s| s.id.clone()).collect::<Vec<_>>()
+            items.iter().filter(|s| s.origin == crate::history::Origin::Remote).count(),
+            1,
+            "origin 从首行读出来"
         );
+
+        let reg = Registry::default();
         let groups = group(&app, &reg, items);
-        assert!(
-            groups.iter().any(|g| g.name == "Playground"),
-            "and it must land in its named group: {:?}",
-            groups.iter().map(|g| g.name.clone()).collect::<Vec<_>>()
-        );
+        let remote = groups
+            .iter()
+            .find(|g| g.builtin == Some(Builtin::Remote))
+            .expect("远端组必须存在");
+        assert_eq!(remote.items.len(), 1, "只有那条远端的");
+        assert_eq!(remote.items[0].room_name.as_deref(), Some("前端组"));
+        let local = groups
+            .iter()
+            .find(|g| g.builtin == Some(Builtin::Default))
+            .expect("本机组必须存在");
+        assert_eq!(local.items.len(), 1, "本机组里只剩本机的");
 
         let _ = std::fs::remove_dir_all(&app);
     }
@@ -870,7 +882,7 @@ mod tests {
         let back: Wire = serde_json::from_str(&text).unwrap();
         let mut back = Registry { spaces: back.spaces, hidden: back.hidden };
         back.ensure_builtins();
-        assert_eq!(back.workspace_roots(Path::new("E:/app")), vec![
+        assert_eq!(back.roots(Path::new("E:/app")), vec![
             PathBuf::from("E:/app"),
             PathBuf::from("E:/rust22")
         ]);

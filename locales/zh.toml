@@ -153,6 +153,7 @@
 "Full ISC license text" = "ISC 协议全文"
 "Full access" = "完全访问"
 "Full access tier (writes unrestricted)" = "完全访问档（写入不受限）"
+"Local" = "本机"
 "GDI+ failed to initialize (status {})" = "GDI+ 初始化失败（status {}）"
 "Give a conversation number or file name (see /history for the list)" = "请给出对话序号或文件名（可用 /history 查看列表）"
 "Go" = "定位"

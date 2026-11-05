@@ -53,10 +53,10 @@ impl App {
                 self.hist_fold_loaded = true;
             }
         }
+        // No workspace list to hand the store any more — every conversation lives in the one
+        // directory, and "which workspace" is read from each file's header (see `space::group`).
+        // The registry is still needed, but only for grouping.
         let reg = root.as_deref().map(aox::space::Registry::load);
-        if let (Some(root), Some(reg)) = (root.as_deref(), reg.as_ref()) {
-            store.set_workspaces(&reg.workspace_roots(root));
-        }
         let mut items = store.list(HISTORY_LIST_LIMIT);
         // The conversation being chatted in is always pinned to the top.
         //
@@ -449,12 +449,11 @@ impl App {
     /// Write a folder the user has just chosen into the registry, so it **survives a restart**.
     ///
     /// This is the missing half of the directory picker. `ToAgent::Workplace` only tells the agent
-    /// thread where the next conversation may write; it says nothing to the registry, and the
-    /// registry is what `workspace_roots` — and therefore the store's scan — is built from. So a
-    /// folder picked from the list switched the writes correctly and then **vanished on the next
-    /// launch**: the group was drawn from an `auto:` fallback for as long as a conversation lived
-    /// there, and the conversations themselves were never listed again because their directory was
-    /// never scanned.
+    /// thread where the next conversation may write; it says nothing to the registry, so a folder
+    /// picked from the list switched the writes correctly and then **vanished on the next launch**:
+    /// the group fell back to an `auto:` row with no name and no "new conversation here".
+    /// (Before 2026-11-05 it was worse — the store only scanned registered roots, so the
+    /// conversations made there disappeared from the list entirely.)
     ///
     /// Called from [`App::send_ws`] rather than from the picker so that every door onto "switch to
     /// this folder" — the tier menu, the full-access confirmation, the picker — passes through it.

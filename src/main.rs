@@ -43,9 +43,9 @@ mod selftest;
 // own copy of every module (see the trap note in TRAPS.md).
 mod shell;
 // The space registry's tree-building half (`group`, `Group`, the writers) exists for the GUI's
-// history panel; this CLI links the module only to call `Registry::load` / `workspace_roots` when it
-// sets up storage. Covered by the crate-root `allow(dead_code)` above — the library build keeps the
-// signal (see the note at the top of `src/space.rs`).
+// history panel; the CLI links the module for `Registry::load` alone (nothing here groups). Covered
+// by the crate-root `allow(dead_code)` above — the library build keeps the signal (see the note at
+// the top of `src/space.rs`).
 mod space;
 mod store;
 // Task checkpoints (`src/task.rs`): the CLI has no surface that shows one, but the agent writes and
@@ -315,11 +315,10 @@ fn history_command(agent: &mut Agent, line: &str, store: &dyn store::Store) -> R
         // line tells the user whether their config change took effect, instead of
         // having to guess.
         //
-        // The path named is the **default workspace's** directory. Conversations live per workspace
-        // since 2026-10-14, so printing one path without saying so would read as "this is all there
-        // is" — and send the user looking in the wrong folder for a conversation made elsewhere.
+        // One directory holds every conversation of this install (2026-11-05): the path printed is
+        // the whole answer, with no "and also look over there".
         history::Cmd::Dir => crate::tf!(
-            "{} (backend {}; each workspace keeps its own conversations under <workspace>/.aox/history)",
+            "{} (backend {}; every conversation of this install lives here)",
             store.location().display(),
             store.backend()
         ),

@@ -285,6 +285,7 @@ pub async fn pair_with(
         call_policy: store::CallPolicy::default(),
         created_at: now_ms(),
         last_connected_at: 0,
+        rooms: Default::default(),
     };
     let mut book = Book::load(root)?;
     book.upsert(profile.clone());
@@ -604,6 +605,9 @@ pub async fn serve_with(
 
 struct Job {
     room: String,
+    /// 房间名（`hello_ok` 的 rooms 里带下来的）。只用来给会话起名：`远端 · 前端组`。
+    /// 拿不到就是空串——宁可用 `远端`，也不编一个房间 id 上去。
+    room_name: String,
     /// 触发这一轮的那条消息 id。手机靠它把"运行中"的呼吸条挂在原文下面。
     msg_id: String,
     prompt: String,
@@ -647,6 +651,8 @@ async fn run_once(
     let mut room_handles: HashMap<String, String> = HashMap::new();
     // 房间 → 存储上限（MB）。和 room_handles 一起维护：都来自同一个 `Room` 快照。
     let mut room_caps: HashMap<String, u32> = HashMap::new();
+    // 房间名，只给会话标题用。运行期新建的房间靠 `RoomUpdated` 补（见下），和 handle 同一条路。
+    let mut room_names: HashMap<String, String> = HashMap::new();
     let (ws, _) = tokio_tungstenite::connect_async(&url)
         .await
         .with_context(|| format!("无法连接 {url}"))?;
@@ -690,6 +696,7 @@ async fn run_once(
                         .map(|a| (r.id.clone(), a.handle.clone()))
                 }));
                 room_caps.extend(ok.rooms.iter().map(|r| (r.id.clone(), r.max_storage_mb)));
+                room_names.extend(ok.rooms.iter().map(|r| (r.id.clone(), r.name.clone())));
                 println!(
                     "已连接，{} 个房间。等待 @{} 的指令…",
                     ok.rooms.len(),
@@ -782,6 +789,7 @@ async fn run_once(
                                 let from_owner = msg.sender_id == profile.owner_id;
                                 let job = Job {
                                     room: msg.room.clone(),
+                                    room_name: room_names.get(&msg.room).cloned().unwrap_or_default(),
                                     msg_id: msg.id.clone(),
                                     prompt: mention.prompt,
                                     from_owner,
@@ -820,6 +828,8 @@ async fn run_once(
                             Body::RoomUpdated(u) => {
                                 // 房主刚把上限调了，下一条消息就该按新数清 inbox。
                                 room_caps.insert(u.room.id.clone(), u.room.max_storage_mb);
+                                // 房间名可能刚改过，也可能这是个新建的房间。
+                                room_names.insert(u.room.id.clone(), u.room.name.clone());
                                 // 房间里我的别名可能被改了，也可能刚被拉进一个新房间。
                                 match u.room.agents.iter().find(|a| {
                                     a.owner_id == profile.owner_id && a.id == profile.agent_id
@@ -1248,7 +1258,7 @@ async fn worker(
     approvals: Arc<Approvals>,
     cancels: Arc<Cancels>,
     keys: Arc<RoomKeys>,
-    profile: RemoteProfile,
+    mut profile: RemoteProfile,
     root: PathBuf,
     plugins_dir: PathBuf,
     room_now: tool::Slot,
@@ -1264,7 +1274,9 @@ async fn worker(
         }
 
         if !rooms.contains_key(&job.room) {
-            let agent = Agent::new(base.clone());
+            // 一个群一条会话：登记表里有、文件还在就接上（消息、token 账本、workplace 全恢复）；
+            // 没有就开新的一段。以前每次重启都从零开始，列表里还多一排看不出是谁的文件。
+            let agent = room_agent(&base, &profile, &job.room, &job.room_name);
             rooms.insert(job.room.clone(), RoomCtx { rt: base.clone(), agent });
         }
 
@@ -1426,8 +1438,83 @@ async fn worker(
         }
 
         cancels.finish(ui.task_id());
+
+        // 这一轮之后把"这个群对应哪条会话"记下来，下次启动才接得上。
+        // 只在 id 变了时写盘：一条会话聊一百轮也只落一次，`remote.json` 不会被每轮刷一遍。
+        let conv_id = ctx.agent.history_id().map(str::to_string);
+        if let Some(id) = conv_id {
+            let known = profile.rooms.get(&job.room).map(|r| r.conversation.as_str());
+            if known != Some(id.as_str()) {
+                // 标题只在第一次（或换了一段之后）写一次：`远端 · 前端组`。
+                let name = room_title(&job.room_name);
+                let _ = ctx.agent.rename_conversation(&id, Some(&name));
+                profile.rooms.insert(
+                    job.room.clone(),
+                    crate::remote::store::RoomConv {
+                        conversation: id.clone(),
+                        name: job.room_name.clone(),
+                        updated_at: now_ms(),
+                    },
+                );
+                if let Err(e) = remember_room(&root, &profile.id, &job.room, &profile.rooms[&job.room])
+                {
+                    println!("  ↑ 房间会话登记失败：{e:#}");
+                }
+            }
+        }
         rooms.insert(job.room.clone(), ctx);
     }
+}
+
+
+
+/// 给一个房间建 Agent：带上出生标记（远端 · 房间名），并尽量接上这个群上一段会话。
+///
+/// 两处调用（worker 首次遇到某个群、`/cwd` 换了工作空间重建运行时）。**必须都走这里**：
+/// 漏掉 `set_birth` 的那条路会以 `local` 出生，会话就落进「本机」组，列表里再也认不出它是谁。
+fn room_agent(
+    base: &Arc<Runtime>,
+    profile: &RemoteProfile,
+    room: &str,
+    room_name: &str,
+) -> Agent {
+    let mut agent = Agent::new(base.clone());
+    agent.set_birth(crate::store::Birth::remote(room, room_name));
+    if let Some(rc) = profile.rooms.get(room) {
+        if agent.resume(&rc.conversation).is_err() {
+            // 文件被删了（手机上清过、或换了台机器）：当新的一段，别让这一轮卡住。
+            agent.new_conversation();
+        }
+    }
+    agent
+}
+
+/// 一个群在会话列表里叫什么：`远端 · 前端组`。没有房间名就只写 `远端`。
+fn room_title(room_name: &str) -> String {
+    let tag = crate::i18n::t("Remote");
+    if room_name.trim().is_empty() {
+        tag.to_string()
+    } else {
+        format!("{tag} · {room_name}")
+    }
+}
+
+/// 把"这个群 → 这条会话"写回 `remote.json`。
+///
+/// 整表 load-modify-save：`Book` 是这份文件唯一的结构化视图，直接改内存里那份 `profile` 不落盘，
+/// 重启就白记。配对/改名是人在设置页偶尔做的事，和这里撞车的概率远低于维护两套写法的成本。
+fn remember_room(
+    root: &Path,
+    profile_id: &str,
+    room: &str,
+    rc: &crate::remote::store::RoomConv,
+) -> Result<()> {
+    let mut book = Book::load(root)?;
+    if let Some(p) = book.pairings.iter_mut().find(|p| p.id == profile_id) {
+        p.rooms.insert(room.to_string(), rc.clone());
+        book.save(root)?;
+    }
+    Ok(())
 }
 
 /// 斜杠命令：改模型、换工作空间。只有设备主人能执行——群里的协作者可以下指令，
@@ -1533,7 +1620,8 @@ async fn handle_command(
             cfg.workplace.root = Some(path.to_string_lossy().to_string());
             match crate::bootstrap::build(cfg, root.to_path_buf(), plugins_dir.to_path_buf()).await {
                 Ok(new_rt) => {
-                    let agent = Agent::new(new_rt.clone());
+                    // 换了工作目录不等于换了话题：接着这个群上一段会话聊。
+                    let agent = room_agent(&new_rt, profile, &job.room, &job.room_name);
                     rooms.insert(job.room.clone(), RoomCtx { rt: new_rt, agent });
                     send_text(
                         out,
@@ -1547,10 +1635,39 @@ async fn handle_command(
                 Err(e) => send_text(out, &job.room, &format!("切换失败：{e:#}")),
             }
         }
+        "/new" => {
+            // 一段对话聊满了、或者换了话题：手机上说一声，下一句从新的一段开始。
+            // 同时把登记表里这条删掉——否则下一次重启会又 resume 回刚才那段。
+            rooms.remove(&job.room);
+            let mut book = match Book::load(root) {
+                Ok(b) => b,
+                Err(e) => {
+                    send_text(out, &job.room, &format!("会话登记读取失败：{e:#}"));
+                    return;
+                }
+            };
+            let mut cleared = false;
+            if let Some(p) = book.pairings.iter_mut().find(|p| p.id == profile.id) {
+                cleared = p.rooms.remove(&job.room).is_some();
+                if let Err(e) = book.save(root) {
+                    send_text(out, &job.room, &format!("保存失败：{e:#}"));
+                    return;
+                }
+            }
+            send_text(
+                out,
+                &job.room,
+                if cleared {
+                    "好，下一句开新的一段（上一段还在本地历史里）"
+                } else {
+                    "好，下一句开新的一段"
+                },
+            );
+        }
         _ => send_text(
             out,
             &job.room,
-            "可用命令：\n/model [id]  查看或切换模型\n/cwd [路径]   查看或切换工作空间",
+            "可用命令：\n/model [id]  查看或切换模型\n/cwd [路径]   查看或切换工作空间\n/new          下一句开新的一段",
         ),
     }
     let _ = profile; // 目前命令只用得到 owner 判定，保留参数便于后续加 /status

@@ -173,17 +173,13 @@ pub fn sweep_scratch(ws: &Path, min_age: std::time::Duration) -> Swept {
 
 /// Subdirectory of [`AOX_DIR`] holding conversations (`<workspace>/.aox/history/`).
 ///
-/// ⚠️ **This name must match the storage backend's.** The backend owns the directory it writes into
-/// and keeps its own copy of the name (`store::jsonl::DIR_NAME`) rather than reaching for this
-/// constant, because the layering runs `store -> workplace` (the backend asks for [`AOX_DIR`], not the
-/// other way round). This constant exists for the places that create the folder *ahead of* any write —
-/// see [`Workplace::ensure_started`] — so the two copies have to be kept in step by hand.
-pub const HISTORY_DIR: &str = "history";
-
 /// Hidden marker directory created at a workspace root on first use (`<root>/.aox/`). It holds the
-/// AI's own dated notes under [`MEMORY_DIR`], this workspace's conversations under [`HISTORY_DIR`],
-/// and its scratch files under [`TMP_DIR`] — the per-workspace state that should travel with the
-/// project.
+/// AI's own dated notes under [`MEMORY_DIR`] and its scratch files under [`TMP_DIR`] — the
+/// per-workspace state that should travel with the project.
+///
+/// **Conversations are not here any more** (2026-11-05): one store, `<app root>/.aox/conversations`,
+/// whatever the working directory is. A workspace used to grow its own `.aox/history` the moment a
+/// conversation picked it, which is what scattered history into `workplace/<project>/`.
 pub const AOX_DIR: &str = ".aox";
 
 /// Subdirectory of [`AOX_DIR`] holding the AI's own dated markdown notes
@@ -602,10 +598,9 @@ impl Workplace {
             // up front so the model (and its plugins, which call `open()` directly) can drop files
             // straight in without a separate mkdir step:
             //   .aox/tmp/      scratch —— screenshots, caches, one-off output
-            //   .aox/history/  this workspace's conversations (see `HISTORY_DIR` for why this
-            //                  constant lives beside `AOX_DIR` rather than in the storage backend)
             //   .aox/memory/   the AI's own dated notes (see the prompt's "# Memory" segment)
             //   workplace/     durable deliverables, one folder per project
+            // Conversations are **not** created here: they all live in the app root's store.
             // The prompt's "Run environment" segment teaches the model this same layout.
             let dir = normalize(app_root);
             std::fs::create_dir_all(&dir)
@@ -613,10 +608,7 @@ impl Workplace {
             // Best-effort: if this fails the model can still create the directory itself
             // (`write_file` creates missing parents), so it must not fail the turn.
             let _ = std::fs::create_dir_all(dir.join(WORKPLACE_DIR));
-            // The history folder is created here even though the backend would make it on the first
-            // message anyway: a workspace whose layout is only complete after you have spoken is a
-            // strange thing to show someone.
-            for sub in [TMP_DIR, HISTORY_DIR, MEMORY_DIR] {
+            for sub in [TMP_DIR, MEMORY_DIR] {
                 let _ = std::fs::create_dir_all(dir.join(AOX_DIR).join(sub));
             }
             st.active = Active::At(dir.clone());
@@ -667,7 +659,7 @@ impl Workplace {
             // tier sets up (best-effort), so a picked workspace is immediately as usable as the app
             // root. A relative pick resolves under the app root (above), so all of it stays inside the
             // workspace.
-            for sub in [TMP_DIR, HISTORY_DIR, MEMORY_DIR] {
+            for sub in [TMP_DIR, MEMORY_DIR] {
                 let _ = std::fs::create_dir_all(d.join(AOX_DIR).join(sub));
             }
         }
@@ -1369,8 +1361,9 @@ mod tests {
         // …and so is AOX's own per-workspace state, under one hidden folder (2026-10-14):
         // scratch files, conversations, and the AI's notes.
         assert!(app.join(AOX_DIR).join(TMP_DIR).is_dir(), ".aox/tmp/ should be created");
-        assert!(app.join(AOX_DIR).join(HISTORY_DIR).is_dir(), ".aox/history/ should be created");
         assert!(app.join(AOX_DIR).join(MEMORY_DIR).is_dir(), ".aox/memory/ should be created");
+        // Conversations are store-wide, so a workspace must **not** grow one of its own.
+        assert!(!app.join(AOX_DIR).join("history").exists(), "no per-workspace history any more");
         assert!(w.check(&dir.join("x.txt").to_string_lossy()).is_ok());
         // A conversation establishes its root only once
         assert!(w.ensure_started(&app).unwrap().is_none(), "the same conversation must not re-establish the root");
@@ -1831,11 +1824,11 @@ mod tests {
         let aox = root.join(AOX_DIR);
         let tmp = aox.join(TMP_DIR);
         std::fs::create_dir_all(tmp.join("__pycache__")).unwrap();
-        std::fs::create_dir_all(aox.join(HISTORY_DIR)).unwrap();
+        std::fs::create_dir_all(aox.join("other")).unwrap();
         std::fs::create_dir_all(aox.join(MEMORY_DIR)).unwrap();
         std::fs::write(tmp.join("fix1.py"), "print(1)").unwrap();
         std::fs::write(tmp.join("__pycache__").join("x.pyc"), "junk").unwrap();
-        std::fs::write(aox.join(HISTORY_DIR).join("conv.jsonl"), "{}").unwrap();
+        std::fs::write(aox.join("other").join("kept.txt"), "{}").unwrap();
         std::fs::write(aox.join(MEMORY_DIR).join("2026-10-23.md"), "# note").unwrap();
         std::fs::write(root.join("deliverable.txt"), "keep me").unwrap();
 
@@ -1855,7 +1848,7 @@ mod tests {
         assert!(tmp.is_dir());
         // The rest of `.aox` (conversations, notes) and the workspace's own files are untouched —
         // the sweep must never be a reason to lose history.
-        assert!(aox.join(HISTORY_DIR).join("conv.jsonl").is_file());
+        assert!(aox.join("other").join("kept.txt").is_file());
         assert!(aox.join(MEMORY_DIR).join("2026-10-23.md").is_file());
         assert!(root.join("deliverable.txt").is_file());
 

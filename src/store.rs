@@ -19,7 +19,7 @@
 
 pub mod jsonl;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -90,47 +90,47 @@ pub trait Session: Send {
     fn rewrite(&mut self, msgs: &[Message]);
 }
 
+/// 一段新会话的"出生信息"。
+///
+/// 只写进首行 meta，**不参与定位**：从 2026-11-05 起所有会话都落在同一个目录
+/// （`<app root>/.aox/conversations`），"这个会话是谁开的、算哪个空间"只是拿来分组的元数据。
+/// 默认值 = 本机、无空间、无房间，也就是桌面和 CLI 的常态。
+#[derive(Debug, Clone, Default)]
+pub struct Birth {
+    pub origin: crate::history::Origin,
+    /// 出厂归属的空间 id。远端固定 `builtin:remote`；本机留空——它的分组仍由
+    /// `workplace` 记录推出来（见 `space::group`）。
+    pub space: Option<String>,
+    /// 远端房间 `(id, name)`。
+    pub room: Option<(String, String)>,
+}
+
+impl Birth {
+    /// 手机那一轮发起的新会话：固定落在「远端」空间，并带上房间名。
+    pub fn remote(room_id: &str, room_name: &str) -> Self {
+        Self {
+            origin: crate::history::Origin::Remote,
+            space: Some(crate::space::ID_REMOTE.to_string()),
+            room: Some((room_id.to_string(), room_name.to_string())),
+        }
+    }
+}
+
 /// The storage backend (directory-level).
 pub trait Store: Send + Sync {
     /// The backend name, i.e. the value of `config.toml [store] backend`.
     fn backend(&self) -> &'static str;
-    /// Where the **default workspace's** history is kept — what the UI shows under "history lives
-    /// here", and what the CLI's `/history dir` prints.
+    /// Where conversations are kept — what the UI shows under "history lives here", and what the
+    /// CLI's `/history dir` prints.
     ///
-    /// Since 2026-10-14 this is no longer the only location: every workspace keeps its own history
-    /// under `<workspace>/.aox/history`, and this is the app root's one. It stays a single path
-    /// because that is all every caller wants ("one place to point at"); the full set is what
-    /// [`Store::set_workspaces`] is for.
+    /// Since 2026-11-05 this is **the only** location: one store, one directory, no per-workspace
+    /// scanning. A conversation's workspace is recorded *inside* the file, not by where it sits.
     fn location(&self) -> &Path;
     /// Create a new conversation and write the header record.
     ///
-    /// `at` is the **workspace root this conversation belongs to** (`None` = the default or
-    /// unrestricted one, i.e. the backend's home directory). The backend turns that into its own
-    /// layout; the caller must not spell out `.aox/history` itself, or the layout would leak out of
-    /// the storage seam (see the module docs on why paths stay off this interface).
-    ///
-    /// It is a parameter rather than a field on the backend because it varies **per conversation** and
-    /// can change mid-conversation (`/workplace`, the GUI's workspace button), while the backend is
-    /// built once at startup.
-    fn create(&self, model: Option<&str>, at: Option<&Path>) -> Result<Box<dyn Session>>;
-
-    /// Tell the backend which **workspaces** to read history from, in addition to its own home.
-    ///
-    /// History is per workspace (`<workspace>/.aox/history`), so "list every conversation" has to know
-    /// which workspaces exist. This method is the entire coupling with the space registry
-    /// (`crate::space`): the registry computes the list of roots, the backend only ever sees paths.
-    /// Swapping the storage backend therefore does not drag the registry along, and the registry does
-    /// not have to know how history is stored.
-    ///
-    /// Takes **workspace roots**, not history directories — the same rule as `create`.
-    fn set_workspaces(&self, roots: &[PathBuf]);
-
-    /// Where a conversation belonging to workspace `root` lands (`None` = the default workspace).
-    ///
-    /// Exposed **only** so a failure can name the directory it failed in. The alternative — letting
-    /// the caller join `.aox/history` itself — is exactly the layout leak this seam exists to prevent
-    /// (see the module docs on why paths stay off this interface).
-    fn history_dir_for(&self, root: Option<&Path>) -> PathBuf;
+    /// No path parameter: where a conversation lives is the backend's business (see the module docs
+    /// on why paths stay off this interface). `birth` only says what to write into the header.
+    fn create(&self, model: Option<&str>, birth: &Birth) -> Result<Box<dyn Session>>;
     /// Continue an existing conversation (keep writing by id).
     fn open(&self, id: &str) -> Result<Box<dyn Session>>;
     /// List conversations, **most recently used first**.
@@ -247,7 +247,7 @@ mod tests {
     }
 
     /// Both leaving it empty (unconfigured) and explicitly writing the default
-    /// name should resolve to the jsonl backend, located at `<root>/history`.
+    /// name should resolve to the jsonl backend, located at `<root>/.aox/conversations`.
     #[test]
     fn default_backend_resolves_to_jsonl() {
         let root: PathBuf = std::env::temp_dir().join("aox-store-default-test");
@@ -255,7 +255,11 @@ mod tests {
         for name in ["", "jsonl", "  jsonl  "] {
             let s = backend(name, &root, 0).unwrap_or_else(|e| panic!("{name:?} should be usable: {e:#}"));
             assert_eq!(s.backend(), "jsonl");
-            assert!(s.location().ends_with("history"), "location: {}", s.location().display());
+            assert_eq!(
+                s.location(),
+                root.join(".aox").join("conversations"),
+                "the single conversation store"
+            );
         }
         assert_eq!(default_store(&root, 0).backend(), "jsonl");
     }

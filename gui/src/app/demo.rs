@@ -17,11 +17,8 @@ pub(super) fn seed_demo(app: &mut App) {
     // ornamental.
     let root = aox::paths::resolve_workplace().0;
     let store = aox::store::default_store(&root, 0);
-    // The same wiring a real boot does: `--demo` should show the conversations that are actually on
-    // this machine, including the ones made in other workspaces. Without this the preview would look
-    // poorer than the real thing for no reason.
-    let spaces = aox::space::Registry::load(&root);
-    store.set_workspaces(&spaces.workspace_roots(&root));
+    // One store, one directory (2026-11-05): `--demo` reads the same conversations the real window
+    // does, with no extra wiring.
     app.boot = Some(BootInfo {
         config_path: app.config_path.clone(),
         // The demo data gets a realistic layer chain too, so that row in the "About" window is
