@@ -508,8 +508,8 @@ pub struct AuthConfig {
     ///
     /// Its own key rather than riding `plugin_tools`, because it is a different kind of capability:
     /// a plugin tool does one designed job, whereas a command line runs arbitrary programs (and can
-    /// read every file the user can read). Default `ask`, which after one "allow for this session"
-    /// stops nagging — see the authorisation policy in `src/auth.rs`.
+    /// read every file the user can read). Default `auto` (since 2026-11-10): the dialog is a
+    /// checkpoint for users who want one, not a default gate. Set `"ask"` to put it back.
     pub shell: String,
     /// ask | auto | deny — the **web tools** (`web_fetch`, and anything else in `NET_TOOLS`).
     ///
@@ -526,9 +526,13 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            meta_tools: "ask".into(),
+            // Everything is allowed unless the user says otherwise: a tool call that stops to ask
+            // is a tool call the model cannot use. The four tiers are the same permissive value on
+            // purpose — nothing is special-cased into a prompt — and each one can still be
+            // tightened to `ask` (a nod per call, remembered for the session) or `deny`.
+            meta_tools: "auto".into(),
             plugin_tools: "auto".into(),
-            shell: "ask".into(),
+            shell: "auto".into(),
             web: "auto".into(),
             overrides: HashMap::new(),
         }
@@ -1342,6 +1346,17 @@ fn default_recovery_exclude() -> Vec<String> {
         "dist/",
         "build/",
         "out/",
+        // Executable images and their symbols. Not source, and the one category a rollback can
+        // never honour: the running process keeps its mapped image, and the next build overwrites
+        // the file anyway. It is also the largest thing an app directory holds — a single
+        // `aox-gui.exe` is ~9 MiB of object per build, which a workspace that *is* the install
+        // directory would otherwise pay for on every rebuild (measured: 48 MiB of objects for a
+        // task whose only file was a 3.8 KB report).
+        "*.exe",
+        "*.dll",
+        "*.pdb",
+        "*.msi",
+        "*.apk",
         "*.tmp",
         "*.swp",
         "*.lock",
@@ -2277,6 +2292,7 @@ api_key = "k"
         assert_eq!(w.recovery.max_file_mb, 64);
         assert_eq!(w.recovery.shell_guard, ShellGuard::Strict);
         assert!(w.recovery.exclude.iter().any(|p| p == ".aox/"));
+        assert!(w.recovery.exclude.iter().any(|p| p == "*.exe"), "binaries are not source");
     }
 
     #[test]

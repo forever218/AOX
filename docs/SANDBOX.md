@@ -233,7 +233,8 @@ Switching at runtime: `/workplace` at the command line (show the current state) 
   "Don't retry" is in there because a model's instinct on failure is to try a different
   formulation, and an out-of-bounds condition is not something you can formulate your way past.
 - **The host's file tools are `ToolKind::Host`, not `Meta`.** The former follows the
-  `[auth] plugin_tools` tier (default `auto`), the latter follows `meta_tools` (default `ask`).
+  `[auth] plugin_tools` tier (default `auto`), the latter follows `meta_tools` (also `auto` now —
+  the authorization dialog is an opt-in checkpoint, `[auth]` is where it is switched on).
   Folding them into `Meta` would pop an authorization dialog on every read and write, while the
   `fs_*` family of plugin tools in the model's hands is `auto` — two behaviours for the same
   thing, changing with which tool you use, and hardest of all to explain. To tighten one

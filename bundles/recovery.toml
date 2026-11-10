@@ -46,6 +46,12 @@ exclude = [
     "dist/",
     "build/",
     "out/",
+    # Executable images and symbols: ~9 MiB per build, never restorable into a running process.
+    "*.exe",
+    "*.dll",
+    "*.pdb",
+    "*.msi",
+    "*.apk",
     "*.tmp",
     "*.swp",
     "*.lock",

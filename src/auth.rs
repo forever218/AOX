@@ -245,6 +245,33 @@ mod tests {
         );
     }
 
+    /// The factory stance: nothing is special-cased into a prompt. If this ever changes, the
+    /// default policy has quietly become a gate again — which is the thing the 2026-11-10 change
+    /// was about, so it deserves a test rather than a comment.
+    #[test]
+    fn the_factory_policy_asks_for_nothing() {
+        let p = ConfigPolicy::from_config(&AuthConfig::default());
+        let shell = crate::tool::shell::SHELL_TOOL;
+        let cases: [(ToolKind, &str); 6] = [
+            (ToolKind::Meta, "create_plugin"),
+            (ToolKind::Meta, "remove_plugin"),
+            (ToolKind::Host, shell),
+            (ToolKind::Host, "write_file"),
+            (ToolKind::Host, crate::tool::web::WEB_TOOL),
+            (ToolKind::Plugin("mine".into()), "mine_do"),
+        ];
+        for (kind, name) in cases {
+            assert_eq!(p.level_for(&kind, name, &[]), AuthLevel::Auto, "{name} must not ask");
+        }
+        // A component's capability request is still an ask: that is the component asking the user
+        // for a capability, not an ordinary tool call, and `[auth.overrides]` can lift it.
+        let caps = ["fs_write".to_string()];
+        assert_eq!(
+            p.level_for(&ToolKind::Plugin("comp".into()), "comp_do", &caps),
+            AuthLevel::Ask
+        );
+    }
+
     /// The aliases and casing of the three tier strings: changing them would
     /// silently turn a value the user wrote in config into ask.
     #[test]

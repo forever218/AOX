@@ -163,9 +163,11 @@ reads (one order line plus the bullet order in the prompt's command-line section
 report and the "Command line" row in Settings → System. `cmd` needs no tool name of its own: it is
 already `shell`'s default dialect, so both settings expose the same two tools.
 
-`[auth] shell = "ask" | "auto" | "deny"` — its own key, default `ask`: a command line is a different
-kind of capability from "a tool that does one designed job", and one "allow for this session" is
-enough after the first prompt.
+`[auth] shell = "ask" | "auto" | "deny"` — its own key, default `auto`: a command line is a
+different kind of capability from "a tool that does one designed job", so it gets a tier of its own
+rather than riding `plugin_tools`. Note what `auto` means precisely: the boundary check for a command
+is its `cwd`, not the command's own reach, so `auto` is "the model may run anything this user can
+run". Set `"ask"` for a nod per call (remembered for the session), `"deny"` to remove the tools.
 
 ## 6. Deliberately not done
 

@@ -666,6 +666,7 @@ let scan = guard.finish();                       // 所有退出分支都要执�
 ### 9.2 扫描范围
 
 - `.aox`、`.git`、`target`、`node_modules`、`.venv`、`dist`、`build`、`out` 默认排除。
+- 可执行影像与符号（`*.exe`/`*.dll`/`*.pdb`/`*.msi`/`*.apk`）默认排除；当前进程自身的 exe 无条件排除，不受配置影响。
 - 排除表来自配置，默认值不能写死在两处。
 - 对不存在的根跳过；遇到 reparse point 不进入，记 partial。
 - 最大深度、条目、字节、时间由配置和内存预算控制；strict 超限 ⇒ 命令不启动。
@@ -740,6 +741,7 @@ pub enum ShellGuard { Strict, BestEffort, Off }
 .aox/  .git/  .hg/  .svn/
 target/  node_modules/  .venv/  venv/  __pycache__/
 .pytest_cache/  dist/  build/  out/
+*.exe  *.dll  *.pdb  *.msi  *.apk
 *.tmp  *.swp  *.lock
 ```
 

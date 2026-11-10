@@ -436,6 +436,7 @@ parse args -> guard/workplace -> capture_before() -> mutate -> capture_after() -
 target/ node_modules/ .venv/ venv/ __pycache__/ .pytest_cache/
 runtime/ .workbuddy/  # 下载下来的工具链 / 伙伴工具自己的状态，都不是用户源码
 dist/ build/ out/     # 需要按项目调整；默认视为生成物
+*.exe *.dll *.pdb *.msi *.apk   # 可执行影像与符号：一次构建约 9 MiB，且无法"恢复"进运行中的进程
 *.tmp *.swp *.lock    # 编辑器/进程临时文件
 ```
 

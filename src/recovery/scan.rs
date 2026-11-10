@@ -364,6 +364,8 @@ mod tests {
         write(&d, "src/b.txt", "b");
         write(&d, "target/c.txt", "should be invisible");
         write(&d, "node_modules/x/y.js", "invisible");
+        // The app's own image: a workspace that *is* the install directory must not pay for it.
+        write(&d, "aox-gui.exe", "not really an exe, but the name decides");
         let store = store_for(&d);
 
         let s = scan(&store, &d, &BTreeMap::new(), StoreScope::All, &Limits::unlimited(), 4 << 20);

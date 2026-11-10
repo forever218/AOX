@@ -16,9 +16,14 @@
 [auth]
 # Meta tools (create_plugin / remove_plugin and other operations that **change the system
 # itself**): ask | auto | deny
-meta_tools = "ask"
+meta_tools = "auto"
 # Tools from plugins the model built for itself: ask | auto | deny
 plugin_tools = "auto"
+# The built-in command line (shell / bash / job): ask | auto | deny
+# Its own tier because it runs arbitrary programs rather than one designed job. Default auto: the
+# dialog is an opt-in checkpoint, not a gate — and note that auto here is "anything this user can
+# run", since the boundary check for a command is only its `cwd`.
+shell = "auto"
 # The built-in web tool (web_fetch): ask | auto | deny
 # It has its own tier because it is the only capability that leaves the machine; `[web] egress`
 # already keeps it narrower than the shell, so the default is auto rather than ask.

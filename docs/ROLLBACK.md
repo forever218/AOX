@@ -815,7 +815,8 @@ exercise this against the real `history/`.
 Short limitations for `/help`:
 
 - only AOX-recorded paths are undone, not the entire workspace;
-- `.git`, `target`, `node_modules`, `.aox` are excluded by default;
+- `.git`, `target`, `node_modules`, `.aox` are excluded by default, and so are executable images
+  (`*.exe`/`*.dll`/`*.pdb`) — including the running one, unconditionally;
 - writes by a running `shell_job` are not guaranteed;
 - external editors can make restore abort; that is protection, not a bug;
 - chat history is not rolled back, and old verification evidence expires;

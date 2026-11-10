@@ -23,6 +23,10 @@ meta_tools = "deny"
 # Tools from plugins the model built for itself are no longer allowed automatically; every one
 # of them needs your nod.
 plugin_tools = "ask"
+# The command line asks too. The factory default is `auto` (a command line is guarded by the
+# workplace boundary and the per-turn backup, not by a click); being stricter is the whole point
+# of this bundle, so it is spelled out here rather than inherited.
+shell = "ask"
 # Reaching the network is not automatic either: every fetch asks once, then the session remembers.
 web = "ask"
 

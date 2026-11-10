@@ -197,8 +197,11 @@ eviction — not this directory back again.
 **D6 · Web content is framed as untrusted, everywhere.** The envelope says it, the system prompt says
 it, and the extractor drops `script`/`style`/`iframe` entirely. Control characters and bidi overrides
 are stripped so a page cannot rewrite the terminal or visually reorder text. This is mitigation, not
-a solution: a page can still *ask* the model to do something. The backstop is `[auth]` — `shell` is
-`ask` by default, and a user who sets `shell = "auto"` while browsing the web has removed it.
+a solution: a page can still *ask* the model to do something. The backstop used to be `[auth]` —
+`shell` was `ask` by default, one click as a human gate. Since 2026-11-10 `shell` defaults to `auto`,
+so that gate is open by default: injected page content can land as a command, and what is left is the
+"untrusted" framing plus rollback inside the workspace. Set `shell = "ask"` to put the gate back —
+that is why the key exists.
 
 **D7 · Redirects are followed by hand.** `reqwest`'s own policy cannot re-check egress per hop, cannot
 drop custom headers when the host changes, and hides the chain. A 30-line loop gives all three, and
@@ -345,7 +348,7 @@ entry).
 | Risk | Position |
 |---|---|
 | DNS rebinding between the check and the connect | accepted for v1; a real fix pins the resolved address per client, which rules out connection pooling. The check is a guard rail, not an SSRF boundary — the shell already reaches the same hosts |
-| prompt injection | mitigated, not solved (D6). Stated in the prompt; the actual backstop is `[auth]` |
+| prompt injection | mitigated, not solved (D6). Stated in the prompt; with `shell` defaulting to `auto`, `[auth] shell = "ask"` is the only real gate (D6) |
 | `[web]` itself is model-writable | `config.toml` sits in the writable root today (the known control-plane gap from the 2026-10-29 audit). Until that is fixed, `egress` is a guard rail: an injected page could talk the model into widening it. Making config / model book / rules read-only is a separate, higher-priority change — this tool does not create that hole, but it does make it worth more |
 | extraction quality | a hand-written extractor will lose on some pages; `mode="text"` and `mode="raw"` exist so the model has a way out, and the fixture corpus grows from real failures |
 | binary size | about +106 KB (GUI) / +147 KB (CLI) for the whole tool; removing the renderer gave back 12.8 KB (8,153,088 → 8,140,288) and 16.4 KB (4,706,816 → 4,690,432), measured 2026-10-29. `opt-level = "s"` + LTO keep it honest |

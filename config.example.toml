@@ -21,11 +21,17 @@
 # `.aox/models.json`; after that it is inert, so delete it.
 
 [auth]
+# Everything is allowed unless you say otherwise. The dialogs still exist — set any tier to
+# "ask" (a nod per call, remembered for the rest of the session) or "deny".
 # Meta tools (create_plugin / remove_plugin and other operations that change the system
 # itself): ask | auto | deny
-meta_tools = "ask"
+meta_tools = "auto"
 # Tools from plugins the model built for itself: ask | auto | deny
 plugin_tools = "auto"
+# The built-in command line (shell / bash / job): ask | auto | deny
+shell = "auto"
+# The built-in web tool (web_fetch): ask | auto | deny
+web = "auto"
 # Overriding by individual tool name or plugin name:
 #   * a complete name = an exact match, e.g. shell_exec
 #   * a trailing `*` = a prefix wildcard, to block "a class of tools" in one go
@@ -408,6 +414,8 @@ exclude = [
     ".aox/", ".git/", ".hg/", ".svn/",
     "target/", "node_modules/", ".venv/", "venv/", "__pycache__/",
     ".pytest_cache/", "runtime/", ".workbuddy/", "dist/", "build/", "out/",
+    # Executable images and symbols: ~9 MiB per build, never restorable into a running process.
+    "*.exe", "*.dll", "*.pdb", "*.msi", "*.apk",
     "*.tmp", "*.swp", "*.lock",
 ]
 

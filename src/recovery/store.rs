@@ -50,6 +50,14 @@ pub struct RecoveryStore {
     workspace_id: String,
     cfg: RecoveryConfig,
     used: Mutex<u64>,
+    /// The running executable, workspace-relative and case-folded, when it lives inside `root`.
+    ///
+    /// `None` whenever the workspace is anywhere but the app directory, which is the normal case.
+    /// It exists for the case that is not normal but does happen — the app run from, and therefore
+    /// working in, its own install directory — where the first strict scan would copy
+    /// `aox-gui.exe` into `objects/` and the baseline would keep it there: ~9 MiB of executable
+    /// image per build, for a file no rollback can put back into a running process.
+    self_rel: Option<String>,
 }
 
 pub struct FileLock {
@@ -112,11 +120,20 @@ impl RecoveryStore {
             workspace_id: format.workspace_id,
             cfg: cfg.clone(),
             used: Mutex::new(used),
+            self_rel: self_executable_rel(root),
         })
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Test hook: pretend the process runs from `rel`, so the "never back up yourself" rule can be
+    /// exercised without moving the test binary into the temporary workspace.
+    #[cfg(test)]
+    fn with_self_exe(mut self, rel: &str) -> Self {
+        self.self_rel = Some(rel.to_ascii_lowercase());
+        self
     }
 
     pub fn lock(&self) -> RecoveryResult<FileLock> {
@@ -211,6 +228,12 @@ impl RecoveryStore {
     pub fn is_excluded(&self, rel: &str) -> bool {
         let r = rel.replace('\\', "/");
         let lower = r.to_ascii_lowercase();
+        // Not configurable on purpose: the file this process is running from is never rollback
+        // material, whatever `[recovery] exclude` says. Restoring it could not affect the live
+        // process, and the next build replaces it.
+        if self.self_rel.as_deref() == Some(lower.as_str()) {
+            return true;
+        }
         for pat in &self.cfg.exclude {
             let p = pat.replace('\\', "/");
             let p_low = p.to_ascii_lowercase();
@@ -832,6 +855,28 @@ fn new_workspace_id(root: &Path) -> String {
         .to_string()
 }
 
+/// The running executable's path relative to `root`, `/`-separated and case-folded, or `None` when
+/// it is outside the workspace.
+///
+/// Both sides are canonicalised as a fallback before stripping, so a workspace spelled differently
+/// from what the loader reports (`E:\app` vs `\\?\E:\app`, a relative `root`, a linked parent)
+/// still matches. Returning `None` is the common answer and costs one `strip_prefix`.
+fn self_executable_rel(root: &Path) -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let rel = match exe.strip_prefix(root) {
+        Ok(p) => p.to_path_buf(),
+        Err(_) => {
+            let canon_root = std::fs::canonicalize(root).ok()?;
+            let canon_exe = std::fs::canonicalize(&exe).ok()?;
+            canon_exe.strip_prefix(&canon_root).ok()?.to_path_buf()
+        }
+    };
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    Some(rel.to_string_lossy().replace('\\', "/").to_ascii_lowercase())
+}
+
 fn dir_size(path: &Path) -> io::Result<u64> {
     let mut total = 0u64;
     if !path.exists() {
@@ -928,5 +973,27 @@ mod tests {
         assert_eq!(s.relative(&d.join("target").join("x")).unwrap(), None);
         assert_eq!(s.relative(&d.join(".aox").join("backup").join("x")).unwrap(), None);
         assert_eq!(s.relative(&d.join("src").join("a.rs")).unwrap().as_deref(), Some("src/a.rs"));
+    }
+
+    #[test]
+    fn executable_images_are_never_stored() {
+        let d = tmp("binaries");
+        let s = RecoveryStore::open(&d, &cnt(), true).unwrap();
+        for rel in ["aox-gui.exe", "bin/tool.dll", "debug/app.pdb", "setup.msi", "app.apk"] {
+            assert_eq!(s.relative(&d.join(rel)).unwrap(), None, "{rel} must be excluded");
+        }
+        // A name that merely contains "exe" is ordinary source.
+        assert!(s.relative(&d.join("notes.exe.txt")).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_running_executable_is_excluded_even_without_a_matching_pattern() {
+        let d = tmp("self-exe");
+        let s = RecoveryStore::open(&d, &cnt(), true).unwrap().with_self_exe("sub/aox-helper.dat");
+        assert_eq!(s.relative(&d.join("sub").join("aox-helper.dat")).unwrap(), None);
+        assert!(
+            s.relative(&d.join("sub").join("other.dat")).unwrap().is_some(),
+            "only the running image is refused, not its neighbours"
+        );
     }
 }
