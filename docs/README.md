@@ -1,10 +1,12 @@
 # AOX documentation index
 
+[← README](../README.md) · [中文](README.zh-CN.md)
+
 Two kinds of writing live in this repo:
 
 - **`docs/`** — the design record: how the architecture got to where it is, what each seam is, what
-  is decided and what is still open. **English is the source language**; every document has a
-  `*.zh-CN.md` copy alongside it.
+  is decided and what is still open. **English is the source language**; most documents have a
+  `*.zh-CN.md` copy alongside them.
 - **`.workbuddy/memory/`** — the working notebooks: the operational detail you read *before*
   touching a given area (pitfalls, current shapes, historical traps). Chinese only.
 
@@ -12,6 +14,13 @@ Start with the **roadmap** if you want the whole picture; start with the **noteb
 about to change code.
 
 ---
+
+## Start here
+
+| Document | What it covers |
+|---|---|
+| [`USAGE.md`](USAGE.md) | **The manual** — install, model setup, GUI layout, history on disk, runtime resolution, release artifacts, troubleshooting |
+| [`ARCH-ROADMAP.md`](ARCH-ROADMAP.md) | **The why** — the seven design principles and the stage-by-stage plan they produced |
 
 ## 1. Design record (`docs/`)
 
