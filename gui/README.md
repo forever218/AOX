@@ -240,10 +240,10 @@ A few efficiency notes when changing the interface:
 - To verify that a light/dark switch really took effect, confirm the window has focus and then
   do a real `SetCursorPos` + `mouse_event` click, and check whether `.aox-gui-theme` flipped.
 
-## Not done yet
+## Status
 
-- The installer `installer/aox.iss` currently collects only `aox.exe`. To ship the GUI too, add
-  a line `Source: "..\target\release\aox-gui.exe"` (and make sure the build order produces it
-  first).
-- Session history is not written to disk; closing the window loses it (the agent's `messages`
-  live in-process).
+The threading model, palette and egui traps above still hold. The **interface** has moved on since
+this file was written: the top strip now carries only the drawer button, the status pill and the
+window buttons, Settings lives in the drawer header, and the activity stream / cache hit map /
+workspace view are three separate windows. For the current behaviour see
+[`../docs/USAGE.md`](../docs/USAGE.md#graphical-interface).

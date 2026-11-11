@@ -17,7 +17,7 @@
 
 | 文档 | 内容 |
 |---|---|
-| [`USAGE.zh-CN.md`](USAGE.zh-CN.md) | **使用手册** —— 安装、模型配置、GUI 布局、历史落盘、运行时解析、发行产物、故障排查 |
+| [`USAGE.zh-CN.md`](USAGE.zh-CN.md) | **使用手册** —— 安装、模型、全部命令、GUI 各窗口、会话与空间、配置分层、工具、边界、回滚、远程、打包 |
 | [`ARCH-ROADMAP.zh-CN.md`](ARCH-ROADMAP.zh-CN.md) | **为什么这样设计** —— 七条设计原则，以及它们推出来的分阶段计划 |
 
 ## 1. 设计记录（`docs/`）
@@ -28,6 +28,9 @@
 | [`SANDBOX.md`](SANDBOX.md) | **围栏线** —— 插件子进程现在实际被挡住了什么、多挡一点要付什么代价（①/②a/②b/③/④ 选项对比） | ① JobObject + ③ 工作区边界已实现、待验收；②a / ②b / ④ 未做 | [✓](SANDBOX.zh-CN.md) |
 | [`COMPONENT-CONTRIBUTIONS.md`](COMPONENT-CONTRIBUTIONS.md) | **阶段 6b** —— 插件不再只是「加一个工具」：组件如何贡献 hook、主题、提示词与工具 | 已交付 | [✓](COMPONENT-CONTRIBUTIONS.zh-CN.md) |
 | [`I18N.md`](I18N.md) | **国际化** —— 一种语言一个发行版：`t()` / `tf!` 管线、`AOX_LANG`、目录规则 | 已交付（文案阶段完成） | [✓](I18N.zh-CN.md) |
+| [`WEB.md`](WEB.md) | **联网工具** —— `web_fetch`：触达范围（`[web] egress`）、正文提取、游标，以及它**不是**网络边界 | M2 已交付；缓存、JS 渲染、`web_search` 均立项后砍掉（D5/D10/D11） | [✓](WEB.zh-CN.md) |
+| [`SHELL.md`](SHELL.md) | **命令行工具** —— `shell` / `bash`：方言、写入护栏、上限，以及实测得出「它不是内核边界」的经过 | 2026-10-20 已交付 | — |
+| [`ROLLBACK.md`](ROLLBACK.md) | **任务检查点** —— 恢复点、回滚 / 重做契约、保留策略与磁盘结构 | 设计记录；实现见 [`ROLLBACK-IMPLEMENTATION.zh-CN.md`](ROLLBACK-IMPLEMENTATION.zh-CN.md) 与 [`ROLLBACK-GUI.zh-CN.md`](ROLLBACK-GUI.zh-CN.md) | [✓](ROLLBACK.zh-CN.md) |
 | [`UI-CUSTOMIZATION.md`](UI-CUSTOMIZATION.md) | **立项册**：UI 缝 —— 元素 id、属性覆盖、具名插槽、沙箱化补丁 | **已立项、延后**（2026-10-03） | [✓](UI-CUSTOMIZATION.zh-CN.md) |
 | [`SUBAGENT.md`](SUBAGENT.md) | **立项册**：子代理 —— 自孵化无界面实例、协议、三条隔离轴、授权策略 | **已立项、延后**（2026-10-09） | [✓](SUBAGENT.zh-CN.md) |
 

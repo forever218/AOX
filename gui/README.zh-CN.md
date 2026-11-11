@@ -197,8 +197,8 @@ python tools/check_no_console_window.py --app target/release/aox-gui.exe --cwd .
 - 想验证明暗切换是否真的生效，可以在确认窗口获得焦点后 `SetCursorPos` + `mouse_event` 真点一下，
   再看 `.aox-gui-theme` 有没有翻转。
 
-## 还没有做的
+## 现状
 
-- 安装包 `installer/aox.iss` 目前只收 `aox.exe`。要一起分发 GUI，加一行
-  `Source: "..\target\release\aox-gui.exe"`（并确保构建顺序先生成它）即可。
-- 会话历史没有落盘，关掉窗口即散失（Agent 的 `messages` 在进程内）。
+上面那些线程模型、配色与 egui 陷阱仍然成立。但**界面**在本文件写成之后已经改过：顶栏现在只留抽屉
+按钮、状态药丸与窗口按钮，设置入口在抽屉头部，活动流 / 缓存命中图 / 工作区视图是三个独立窗口。
+当前行为以 [`../docs/USAGE.zh-CN.md`](../docs/USAGE.zh-CN.md#图形界面) 为准。

@@ -2,379 +2,394 @@
 
 [← README](../README.md) · [Docs index](README.md) · [中文](USAGE.zh-CN.md)
 
-Everything that doesn't belong on the front page: the GUI in detail, how conversations are stored on
-disk, where interpreters come from, what the build produces, and what to do when something is wrong.
+Everything that doesn't belong on the front page: the packages, every command the two front ends
+accept, where conversations actually live, how the config is composed, what the boundaries do and do
+not cover, and how to build the thing.
 
-**Contents** — [Models](#models) · [Command line](#command-line) · [Waiting animation](#waiting-animation-and-folding) ·
-[GUI](#graphical-interface) · [History](#conversation-history) · [Requirements](#system-requirements) ·
-[Building](#building-from-source) · [Troubleshooting](#troubleshooting) · [Layout](#directory-layout) · [Uninstall](#uninstall)
+**Contents** — [Install](#install-and-first-run) · [Models](#models) · [Commands](#command-line) ·
+[GUI](#graphical-interface) · [Conversations](#conversations-and-spaces) · [Config](#configuration-layers) ·
+[Tools](#tools) · [Boundaries](#boundaries) · [Rollback](#checkpoints-and-rollback) · [Runtimes](#runtimes) ·
+[Remote](#remote) · [Building](#building-from-source) · [Troubleshooting](#troubleshooting) ·
+[Layout](#directory-layout) · [Uninstall](#uninstall)
+
+## Install and first run
+
+Windows 10 1809+ on x64. Four packages per front end, eight in total (see
+[Building from source](#release-artifacts)); any one of them is self-contained.
+
+| Package | Contents |
+|---|---|
+| `AOX-GUI-Setup-<version>.exe` | the graphical build, host only (~7.1 MB) |
+| `AOX-Setup-<version>.exe` | the command-line build, host only (~4.4 MB) |
+| `…-with-python.exe` | the same build plus `runtime/python` (~16 / ~13 MB) |
+| `…-<version>-zh.exe` | a Chinese build — the UI language is **compile-time**, hence a separate file |
+
+Every variant ships `runtime/bash` (busybox-w32, 637 KB) as a fallback POSIX shell, and nothing is
+written to `PATH` or to user environment variables. Uninstalling removes `runtime` only; `plugins/`
+and `.aox/` are user data and survive.
+
+Both front ends resolve "the app root" as the directory the exe sits in, and that is also the
+default workspace — so a portable copy is just a copied folder.
+
+- **GUI**: first launch opens **Settings → Model** by itself with the caret in the key field.
+- **CLI**: on a TTY it asks three questions (endpoint, key, model name) and writes
+  `.aox/models.json`; an empty answer skips. `aox --setup` forces the wizard, and a non-TTY run
+  never blocks on input.
 
 ## Models
 
-Endpoint, key, model name, and its parameters (context window / output cap / temperature / thinking)
-all live in `<app root>/.aox/models.json`. That is the **only** copy of the model configuration — the
-CLI and the GUI read the same file, and the GUI's Settings → Model edits it in place (it never writes
-`config.toml`). No restart is needed after a change.
+Endpoint, key, model name and its parameters all live in `<app root>/.aox/models.json`
+(version 2). That is the **only** place a key lives; the CLI and the GUI read the same file, and the
+GUI never writes `config.toml`.
 
-The list holds several models; one is `active`. `/model 2` in the terminal, or the toggle in
-Settings, switches it — effective on the next request.
+| Field | Meaning | Default |
+|---|---|---|
+| `name` | label shown in the pickers | the model name |
+| `base_url` / `api_key` / `api_key_env` | endpoint, inline key, or an environment variable | — |
+| `model` | the model id sent to the API | — |
+| `enabled` | whether it appears in the input box's list | true |
+| `context_window` | tokens of context, used for the budget ring and compaction | 600000 |
+| `max_tokens` | output cap per request | 32000 |
+| `temperature` | sampling temperature | 0.3 |
+| `thinking` | `default` · `off` · `low` · `high` · `max` | default |
+| `thinking_wire` | `auto` · `deepseek` · `openai` · `qwen` · `none` — how the level is put on the wire | auto |
+| `stream` | stream the response; turn off for endpoints that reject `stream` | true |
 
-"Test connection" (in the edit dialog) sends a single-token probe; "Scan models" only lists what the
-endpoint advertises — a service can list models and still refuse to chat.
+Several models can be saved; one is active. Switch with `/model <n|name>` in the terminal, the
+model chip under the input box, or **Settings → Model** — effective on the next request. "Test"
+sends a one-token probe; "Scan models" only lists what the endpoint advertises (a service can list
+models and still refuse to chat).
+
+A `[provider]` section left in `config.toml` by an older version is read **once**, migrated into
+`models.json`, and inert afterwards.
 
 ## Command line
 
 | Command | What it does |
 | --- | --- |
 | `/help` | Show help (lists every command) |
-| `/tools` | View all currently available tools |
-| `/plugins` | View the loaded plugins |
-| `/history` | View the conversation list (`/history show <n>` for the full text, `/history open <n>` to continue it, `/history dir` for the directory, `/history rm <n>` to delete) |
-| `/model` | List the saved models (the same list the GUI's Settings → Model edits); `/model <n\|name>` switches to one, effective on the next request |
+| `/tools` | List all currently available tools |
+| `/plugins` | List loaded plugins and what each contributes (hooks / prompt segments / capabilities) |
+| `/runtime` | Plugin runtime status; `/runtime install python` assembles a bundled runtime |
+| `/history` | Conversations: `list` · `dir` · `show <n\|id>` · `open <n\|id>` · `rm <n\|id>` |
 | `/new` | Start a new conversation (the current one is already on disk) |
-| `/runtime` | View how the interpreters resolved; `/runtime install python` assembles the bundled runtime |
-| `/demo` | Preview terminal layout and folding |
-| `/expand` | Expand the most recently folded tool-call sequence |
-| `/quit` | Exit (`/exit` is equivalent) |
+| `/attach` | Stage local files in the pending-upload tray; `/attach clear` empties it |
+| `/demo` | Preview the terminal layout and the collapsed-trace effect |
+| `/expand` | Expand the most recent collapsed tool-call trace |
+| `/usage` | Token breakdown of this conversation (per round, cache hit/miss, current context) |
+| `/prompt` | How the system prompt is assembled from segments (`[prompt]` reorders / disables / adds) |
+| `/hook` | The active loop hooks, from `[hook]` and plugins' `[contributes]` |
+| `/loop` | The main-loop implementation, context trimming and the per-turn request ceiling (`[loop]`) |
+| `/task` | This conversation's checkpoint: goal, plan with ticks, acceptance criteria |
+| `/checkpoints` | Task-level file recovery points in this workspace (`--all` for the full list) |
+| `/rollback` | Preview the previous task's changes; `--yes` restores (`--force`, `--allow-partial`) |
+| `/redo` | Undo the most recent rollback, using its safety snapshot |
+| `/backup` | Recovery status: `status` · `verify` · `prune` (apply retention, free space) |
+| `/sandbox` | The fence around plugin subprocesses (`[sandbox]`), including what it does not cover |
+| `/shell` | The built-in command line: dialects, boundary, limits (`[shell]`) |
+| `/web` | The built-in fetch tool: reach, budget, timeout (`[web]`) |
+| `/workplace` | Show / switch the write boundary: `full` · `default` · `<dir>` (`[workplace]`) |
+| `/config` | Which layers this config is composed of (`aox.toml` customizes the stack) |
+| `/model` | List saved models; `/model <n\|name>` switches, effective on the next request |
+| `/remote` | Phone bridge in this session: `start` · `stop`; `list` / `use` / `pair` / `policy` / `remove` |
+| `/quit` | Quit (`/exit` is equivalent) |
 
-Press `Ctrl+C` to interrupt a running task.
+Anything else is sent to the model. `Ctrl+C` interrupts the turn that is running: only the step in
+flight is dropped, everything already completed stays in context.
 
-The project URL in the startup banner is a clickable hyperlink (OSC 8). Windows Terminal, the VS
-Code terminal and the like enable it automatically; legacy conhost (for example, double-clicking the
-exe) doesn't recognise the sequence and falls back to a plain-text URL. When auto-detection gets it
-wrong, force it on with `AOX_HYPERLINK=1` or off with `AOX_HYPERLINK=0`.
+Command-line flags:
 
-## Waiting animation and folding
+| Flag | Effect |
+|---|---|
+| `--config <path>` | use another file as the last config layer |
+| `--plugins <dir>` | use another plugin directory |
+| `--manifest <path>` | explicit composition manifest (default `<app root>/aox.toml`) |
+| `--profile <name>` | pick a `[profiles.<name>]` from the manifest |
+| `--dump-config` | print the layer stack and the composed tree, then exit |
+| `--setup` | force the first-run wizard |
+| `selftest` | exercise the plugin pipeline end to end without a model |
+| `remote …` | the host side of AOX Remote (see [Remote](#remote)) |
 
-While a task runs, the terminal keeps **a single line** of status (the text switches automatically
-when a tool runs):
-
-```
-⠹ Thinking 3.2s
-⠼ Running fs_read 8.7s
-```
-
-If the model is a **thinking model** (`deepseek-flash` / `deepseek-reasoner` and the like), during
-the wait it also scrolls its reasoning live below the status line — seeing *what it's thinking*
-tells you which step the task is at:
-
-```
-⠹ Thinking 3.2s
-  I first need to see which files are in this directory,
-  then decide whether to build a new plugin to read the config.
-```
-
-This reasoning is a **momentary echo that appears immediately and vanishes when the response
-ends** (the scrolling window keeps the last 4 lines); it doesn't pollute the output and doesn't
-enter the folded region. To turn streaming off (for example, an endpoint that doesn't support the
-`stream` parameter), set `"stream": false` on that model in `.aox/models.json` — or turn
-Streaming off in the model's edit dialog in the GUI.
-
-Once a task finishes, the intermediate model thinking and tool calls are folded automatically into
-a one-line summary, showing only the final output:
-
-```
-▸ Folded 8 tool calls · 12.4s · /expand to expand
-
-(the model's final output)
-```
-
-Type `/expand` at any time to expand the details of the most recent run (each step's call arguments
-and result).
-
-The animation goes silent automatically when output is redirected to a file/pipe; force it on with
-the environment variable `AOX_ANIM=1` or off with `AOX_ANIM=0`.
+The project URL in the banner is a clickable OSC 8 hyperlink. Windows Terminal and the VS Code
+terminal enable it automatically; legacy conhost does not. Force it with `AOX_HYPERLINK=1`, or off
+with `AOX_HYPERLINK=0`. The spinner goes quiet when output is redirected; `AOX_ANIM=1` / `0`
+overrides.
 
 ## Graphical interface
 
-Besides the command-line version, the repo also carries a **standalone graphical interface**: `gui/`
-(crate name `aox-gui`).
+One borderless window (1280×800 initially, 1000×640 minimum) plus three optional tool windows. The
+top strip carries only the drawer button, a status pill (`Thinking`, `Running bash`, `Retrying in
+3 s`, `Waiting for your choice`…) and minimise / maximise / close; double-clicking it maximises. The
+settings gear lives in the drawer header.
 
-It **shares a single core** with the CLI — `src/lib.rs` exposes the Agent main loop, the LLM
-Provider, the plugin host and the `Ui` abstraction as a library, and the GUI is just another
-implementation of `aox::ui::Ui`, with no logic forking off anywhere. The CLI's behaviour is
-unaffected (`cargo build` still builds only the CLI, see `default-members`).
+### Drawer (left)
 
-```bash
-cargo run -p aox-gui                      # run directly (shares config.toml with the CLI)
-cargo run -p aox-gui -- --demo            # demo mode: no model, previews the interface and event stream
-cargo run -p aox-gui -- --prompt "what plugins are there right now"   # send the first instruction automatically on launch
-cargo build -p aox-gui --release          # produces target/release/aox-gui.exe
+300 px, pushes the transcript instead of floating, 0.18 s slide, open/closed state remembered in
+`.aox/ui.json`.
+
+- Search box filters by **workspace name** or conversation title; `Esc` clears it.
+- The tree is grouped by workspace (from `.aox/spaces.json`): folder icon + name + conversation
+  count, collapsible; hover a group for `+` (new conversation in that directory).
+- A conversation row shows its title, then `time · N msgs` on hover; `⋯` offers `Rename`,
+  `Move to ▸` and `Delete` (the conversation you are in cannot be deleted).
+- Group header context menu: `New conversation` · `Rename` · `Open in file manager` ·
+  `Remove from AOX`.
+- Footer: `New workspace`, `Open workspace folder` (`<root>/workplace/`).
+
+### Composer (bottom)
+
+A floating card: plan strip → input → second row.
+
+- **Plan strip** shows `{done}/{total}` and the current step, collapsed by default; expanding lists
+  every step. Steps are read-only and travel with the checkpoint.
+- **Attachments**: drag files anywhere onto the window; image files are decoded and shown inline in
+  the transcript. A chip per file, `×` to remove. Images over 32 MiB are refused with a reason.
+- **Second row**: model chip (`deepseek-chat · 1M`), workspace chip (`Default · <dir>` /
+  `Full access`), recovery chip (undo icon + count), context ring (`Context: … used, … left`; turns
+  amber at 75 %, red at 92 %, spins while compacting) and a `Σ N tok` chip that opens the usage
+  panel.
+- The send button becomes **Stop** while a turn runs; `Enter` sends, `Shift+Enter` breaks the line.
+- Placeholders report state: `Model not configured; chat unavailable`, `Waiting for
+  authorization…`, `Running; click Stop on the right`.
+
+### Tool windows
+
+Opened from **Settings → Extra** (and all three at once under `--demo`). Each is a separate
+borderless window with pin / minimise / maximise / close.
+
+| Window | Contents |
+|---|---|
+| **Activity Stream** | A horizontal timeline: lanes for Input / Model / Tool / System, block width = real elapsed time, same plugin = same colour family. Toolbar: `Start` · `Center` · `Latest`, `Round` + `Go`, row height, zoom, `Fit`, `Link lines`. Click a block for its full content. |
+| **Cache Hit Map** | 16×16 grid of recent calls (hit / partial / miss), hit rate, tokens saved, lifetime hit rate. |
+| **Workspace** | Read-only file tree plus this turn's changes, with `File` / `Diff` views. |
+
+### Settings
+
+| Tab | Contents |
+|---|---|
+| `Extra` | Entrances to the three tool windows |
+| `Model` | Add / edit / batch-manage models; `Use` switches, the switch decides whether it is listed in the composer |
+| `Appearance` | `Follow system` / `Dark · ink` / `Light · paper`; welcome line (`My own` / `Hitokoto` / `Model`); text colour per theme; typewriter effect; background image folder |
+| `System` | Read-only facts: command line, runtime environment, model, config file and layers, app root, workspace, history, plugins and runtime directories; `Install Python runtime` when missing |
+| `Remote` | Start / stop the bridge, pairings, recent log |
+| `About` | Version, ISC licence, project home |
+
+### Shortcuts
+
+`Enter` send · `Shift+Enter` newline · `Ctrl+↑` / `Ctrl+↓` previous / next question ·
+`Esc` close overlay (or clear the search; in the authorization modal it denies) ·
+`y` allow once · `a` allow for the session · `n` deny.
+
+### Theme
+
+Two palettes, lightness only: light is warm paper (`#F2EFE8`), dark is warm black (`#141412`); the
+one hue is the brick-red danger colour. `[theme.light]` / `[theme.dark]` / `[theme.metrics]` /
+`[theme.fonts]` override field by field; `themes/paper.toml`, `ink.toml` and `high-contrast.toml`
+are ready-made; `--theme <file>` replaces the whole `[theme]` table. The choice lands in
+`.aox-gui-theme`, and the native caption follows via DWM.
+
+Fonts resolve as `[theme.fonts]` → `AOX_GUI_FONT` / `…_BOLD` / `…_SERIF` / `…_BRAND` / `…_MONO` →
+a system candidate list (DengXian, YaHei, SimHei…; Cascadia Mono, Consolas…).
+
+The welcome line appears with a typewriter effect over a random background from
+`assets/light|dark/*.png`.
+
+## Conversations and spaces
+
+Every conversation is one JSONL file:
+
+```
+<app root>/.aox/conversations/20261105-164145-c314.jsonl
 ```
 
-Interface layout:
+The stem is the conversation id (`YYYYMMDD-HHMMSS-4 hex`); `/history` accepts an index, the full
+id, an id prefix, or `<id>.jsonl`.
 
-| Area | Contents |
-| --- | --- |
-| Top bar | The two leftmost icons: **history sidebar toggle**, **new conversation**; the top-right three (left to right): About, activity-stream toggle, **light/dark toggle**. The left side shows a running elapsed time only while a task is executing |
-| Left history sidebar | Collapsed by default; click the top bar's leftmost icon to expand it (see [Conversation history](#conversation-history)). Clicking an entry **switches to that conversation** to continue it |
-| Main area | The conversation flow: user bubbles, the assistant's Markdown (headings with a hairline rule, **inline code as a tinted chip**, **tables with a full frame + a header band + row separators**, **fenced code blocks with syntax highlighting**), and **automatically folded process blocks** (click to expand the tool-call details) |
-| Activity stream | **Not in the main window**: clicking that top-bar icon opens a separate window, initially the same size as the main one (with the system title bar — draggable, resizable, minimisable, Win11's own rounded corners). Its body is a **horizontal timeline**: the x axis is time, the task advances left to right, and a block's width is its real elapsed time; tool calls / thinking / authorisation / messages each get a row and a colour, and blocks for the same plugin use one colour family at different shades. **Click a block (or a row in the list below) to see the details**. Wheel to pan, Ctrl+wheel to zoom |
-| Bottom | Multi-line input (`Enter` sends, `Shift+Enter` inserts a newline), send / stop buttons |
-
-Other details:
-
-- The palette is a **"paper and ink" monochrome scheme** — lightness only, no hue: light mode is a
-  sheet of warm paper (`#F2EFE8`), dark mode is a warm black (`#141412`). Click the top bar's
-  rightmost button to switch (light shows a crescent moon, dark shows a sun), and the native title
-  bar's background and text colour follow along (DWM attributes); the preference is remembered in
-  `.aox-gui-theme`. Success/warning/failure are not distinguished by colour but by lightness levels
-  and inverted blocks. **The one exception is code blocks**: syntax highlighting is a low-saturation
-  warm family (ochre-red keywords, pine-green types, steel-blue functions, olive strings, plum
-  numbers, warm-grey comments, amber metadata), only two sets of light and dark, switching with the
-  theme.
-- Syntax highlighting covers rust / python / js·ts / the c family / shell / sql / json·toml·yaml /
-  html·xml; an unrecognised language falls back to "highlight only strings and numbers" rather than
-  mislabelling. Recognition rests on two general heuristics: **an identifier immediately followed by
-  `(` is a function, and PascalCase is a type**, so no per-language type table has to be maintained.
-  The info string of a fenced block accepts suffixes like `rust,ignore`; only the first segment is
-  used.
-- The native title bar carries no model name (the title is always `AOX`), and no window icon is set
-  separately either: the top-left shows only the title itself, branding is left to the initial
-  screen, and the model name and runtime distribution state live in the About window. Note that on
-  Windows the title-bar icon and the taskbar icon are the same one, so without setting it the icon
-  is invisible on the taskbar too.
-- The initial screen is a greeting plus three example instructions; clicking one fills it into the
-  input box (it does not send immediately).
-- Meta-tools that need authorisation pop up a modal, with shortcuts identical to the CLI: `y` allow
-  once, `a` always allow this session, `n` / `Esc` deny.
-- While a task is running you can click the stop button in the bottom-right to interrupt it, and the
-  conversation history rolls back to its pre-task state (equivalent to the CLI's `Ctrl+C`); the
-  in-memory messages and the already-written `history/*.jsonl` roll back together, leaving no
-  half-written record.
-- The interface language follows the system: it automatically picks a Chinese font from
-  `C:\Windows\Fonts` (DengXian / Microsoft YaHei / SimHei…), with no manual configuration. The
-  greeting on the initial screen picks a different **flourished display face** (Gabriola → Ink
-  Free → …), falling back step by step to serif, bold and body fonts so it never becomes tofu.
-  Use `AOX_GUI_FONT`, `AOX_GUI_FONT_BOLD`, `AOX_GUI_FONT_SERIF`, `AOX_GUI_FONT_BRAND`,
-  `AOX_GUI_FONT_MONO` to point at font files.
-- Scrolling up through history doesn't get yanked back to the bottom automatically; scrolling back
-  near the bottom resumes following.
-
-The repository root's behaviour is **exactly the same** as before the GUI was added; the GUI is a
-separate crate, and you can remove it by deleting `gui/` and the `[workspace] members` entry in
-`Cargo.toml`.
-
-## Conversation history
-
-Conversations are **written to disk automatically**, and the command line and the GUI use the same
-implementation (the single write point inside `Agent`), so closing the window/terminal doesn't lose
-them.
-
-They live in `<app root>/history/`, **one file per conversation**:
-
-```
-history/
-  20261002-155959-d81c.jsonl
-  20261002-160001-e98c.jsonl
-```
-
-> The two installers default to different directories by design (`%LOCALAPPDATA%\Programs\AOX` and
-> `…\AOX-GUI`), so each has its own `history/`. To share them, just install one into the other's
-> directory.
-
-The filename stem is the conversation's id (`yyyymmdd-hhmmss-4 random chars`) and is also the key
-the command line's `show` / `rm` recognise.
+A **space** is a logical grouping that may point at a directory — not a storage partition.
+`spaces.json` registers the built-ins (`Local` = the app root, `Remote` = phone conversations,
+`Full access`), user spaces (`s:<canonical path>`) and automatic ones for roots that were never
+registered (`auto:<path>`); folders under `<app root>/workplace/**` fold into `Local`.
 
 ### File format
 
-JSONL — one JSON object per line, with the first line holding metadata and each line after that a
-message:
+One JSON object per line. The first line is `meta` (`id`, `created`, `model`, `root`, `version`,
+`origin`, `space`, `room`); every following line is one of `message`, `act`, `usage`, `workplace`,
+`title`, `task`. Attachments store a path and a name, never base64.
 
-```json
-{"created":1790927628,"id":"20261002-155348-c5d8","kind":"meta","model":"deepseek-chat","root":"D:\\AOX","version":"0.1.0"}
-{"content":"Hi, take a look at the directory first","kind":"message","role":"user"}
-{"content":"Let me list the directory first.","kind":"message","role":"assistant","tool_calls":[...]}
-{"content":"[FILE] ...","is_error":false,"kind":"message","name":"fs_ls","role":"tool","tool_call_id":"call_1"}
-```
+A `message` line is the **raw message object of the OpenAI request body** plus `is_error`, so the
+file is both a log and a replayable request. Trade-offs, unchanged: append-only; one unparsable
+line does not break the file; an interrupted turn is rolled back out of the file so no half-written
+`tool_calls` survives.
 
-A message line is the **raw message object from the OpenAI request body**, with only one extra field
-added, `is_error`; so the file is both a human-readable log and directly replayable as a request
-body. The system prompt is not written to disk (it is reassembled from code on every launch, and
-saving it would only store a copy that goes stale). `kind` distinguishes line types and is stripped
-when reading back.
-
-A few deliberate trade-offs:
-
-- **Append-only**, never rewritten wholesale. A power cut or a killed process loses at most the last
-  line; everything before it survives.
-- **One bad line doesn't break the whole file**: unparsable lines are skipped on read, rather than
-  making the entire conversation unopenable.
-- **An interruption rolls back**: when `Ctrl+C` / the stop button rolls back a half-finished task,
-  that half is deleted from the file as well — otherwise it would leave a broken record with
-  `tool_calls` but no result, which the server rejects outright on replay.
-
-### Command line
+### `/history`
 
 ```bash
 /history                  # list: index, time, count, first user input as the title
-/history show 1           # view the full text of entry 1 (you / assistant / tool calls and results)
-/history open 1           # switch to entry 1 and continue it (the old conversation is already on disk, no "save" needed)
-/history dir              # print the directory path
-/history rm 2             # delete entry 2
+/history show 1            # full text of entry 1
+/history open 1            # switch to entry 1 and keep talking
+/history dir               # print the directory
+/history rm 2              # delete entry 2
 ```
 
-In the list, the entry for the current session is marked `← current`. `show` / `open` / `rm` also
-accept an id or id prefix, so you don't have to count indices.
-
-### GUI
-
-The top-left two icons: **list** toggles the left sidebar, **plus** starts a new conversation.
-
-- The sidebar lists every conversation, ordered **by the time it was last spoken to**, newest first;
-  a small dot on the right marks **the one you're in right now** (it is always pinned to the top —
-  an old conversation you just switched into also lands at the very top).
-- Clicking any entry **switches to that conversation**: the main body swaps in immediately, and
-  continuing the chat continues its context; to start a fresh one, click the plus — the previous one
-  is already sitting complete in `history/`.
-- Both side panels are collapsed by default, so the window opens to a clean conversation area.
-- After the current conversation is written to disk the sidebar refreshes automatically, so the
-  manual "refresh" button is rarely needed; that button is a fallback for "another window was
-  opened / `history/` was changed elsewhere".
-
-### Retention policy
+### Retention
 
 `[history]` in `config.toml`:
 
 ```toml
 [history]
-enabled = true   # once off, no new files are written; existing history is still viewable
-keep = 200       # keep only the most recent N conversations, 0 = unlimited
+enabled = true   # off = no new files; existing ones stay readable
+keep = 200       # counted across all spaces, 0 = unlimited
 ```
 
-Cleanup is **incidental**: it only counts the directory and deletes the excess old files when a new
-conversation file is created — no background thread, no timer, and no full scan at startup.
+Cleanup is incidental: it runs only when a new conversation file is created — no timer, no scan at
+startup. `[store] backend = "jsonl"` is the only backend today; an unknown name fails loudly at
+startup instead of silently falling back.
 
-## System requirements
+## Configuration layers
 
-Platform: Windows 10 / 11 (x64).
+The config is **composed**, lowest to highest: `bundle → patch → config.toml`. What you write in
+`config.toml` always wins, so an existing file needs no migration.
 
-The host itself (`aox.exe` / `aox-gui.exe`) **needs no external runtime**: releases are statically
-linked against the MSVC runtime, so they neither require the VC++ Redistributable (there is no
-`VCRUNTIME140.dll` in the import table) nor Python / Node / Rust.
+- `aox.toml` (optional, `<app root>`) is the manifest: which bundles to load, which patch files to
+  stack, and named profiles. `--manifest` / `--profile` override it for one run.
+- Bundles live in `<app root>/bundles/<name>.toml` and replace the built-in layer of the same name.
+  Built-ins: `core`, `llm-openai`, `tools`, `web`, `store-jsonl`, `recovery`, `loop-standard`,
+  `prompt-core`, `strict`.
+- Unknown bundle, missing patch, bundle cycle or unknown profile is a startup error, never a quiet
+  fallback.
+- `/config` prints the layer stack; `aox --dump-config` prints the stack **and** every composed
+  value with the layer that last wrote it.
 
-External runtimes affect only **plugins**, and the three languages have different requirements:
+Sections in `config.toml`: `[auth]` `[agent]` `[prompt]` `[sandbox]` `[plugins]` `[tools]`
+`[workplace]` `[history]` `[store]` `[recovery]` `[shell]` `[web]` `[runtimes]` `[theme]`.
 
-| Plugin language | Running an existing plugin | Creating a new plugin (`create_plugin`) |
-| --- | --- | --- |
-| python | needs a working `python` (3.8+) | same as the left |
-| node | needs a working `node` | same as the left |
-| rust | **needs no environment at all** | needs `rustc` (no longer needed once compiled) |
+## Tools
 
-In other words, only the python / node plugins already in `plugins/` require their interpreter to be
-present; a rust plugin is a compiled native exe that the host runs directly, so it works without the
-Rust toolchain installed.
+| Group | Tools |
+|---|---|
+| Plugins | `create_plugin`, `update_plugin`, `list_plugins`, `remove_plugin` |
+| Files | `read_file`, `write_file`, `edit_file`, `list_dir`, `remove` (recycle bin), `attach_file`, `publish_file` |
+| Host | `ask_user`, `find_tools`, `task_state`, `verify` |
+| Command line | `shell` (cmd / PowerShell / pwsh / git dialects), `bash` (registered when a POSIX shell is found), `shell_job` (long-running background jobs) |
+| Web | `web_fetch` (`readable` / `links` / `text` / `json` / `raw`, `save=true` to land it on disk) |
 
-### Where interpreters come from: three-tier resolution
+Files deleted with `remove` go to the **system recycle bin**. Above `[tools] inline_max` (default 24)
+plugin tools are hidden from the request until the model calls `find_tools`; hiding is advertising
+only, so a hidden tool still runs when called by name.
 
-At startup the host resolves each language (python / node / rustc) once, in this order, **taking the
-first hit**:
+### Authorization
 
-1. A **full path** written under `[runtimes]` in `config.toml` → used directly, with no substitution;
-2. The field is a **bare command** (the default is `python` / `node` / `rustc`) and a bundled runtime
-   exists at `<app root>/runtime/<language>/<executable>` → the bundled one is used;
-3. Still nothing → the bare command is handed to `PATH`.
+Four gates — `meta_tools`, `plugin_tools`, `shell`, `web` — each `ask` · `auto` · `deny`, **all
+default to `auto`**. `[auth.overrides]` matches by exact tool or plugin name, or by a trailing `*`
+prefix; a key containing `*` must be quoted in TOML. Order: exact → longest prefix → `*` →
+category default. Components that declare non-empty `caps` still force a prompt.
 
-Tier 2 is the important one: **drop a runtime into the app directory and it takes effect
-automatically** — no config change, and nothing written to the system `PATH` or user environment
-variables (it disappears on uninstall).
+## Boundaries
 
-### Assembling the Python runtime
+Two independent things, often confused:
 
-With no interpreter present the program still starts, can hold a conversation, and can use local
-commands like `/tools` and `/plugins` — but python plugins fail to load, and the startup banner says
-so explicitly. To supply it:
+| | `[workplace]` | `[sandbox]` |
+|---|---|---|
+| Governs | where this session may **write and delete** | how plugin **subprocesses** run |
+| Tiers | `default` (app root) · `full` · `fixed` + `root` | `enabled`, `max_processes`, `max_memory_mb`, `ui_limits` |
+| Enforced by | the host, on file tools and declared plugin path arguments | a Windows Job Object (`CREATE_SUSPENDED` → assign → resume, `KILL_ON_JOB_CLOSE`) |
 
-```
-/runtime                      # view the three runtimes' status and origin (with version numbers)
-/runtime install python       # assemble the Python runtime into <app root>/runtime/python
-/runtime dir                  # print the runtime directory
-```
+- **Reading is never restricted** by the workplace — `read_file` / `list_dir` can look anywhere.
+  The boundary covers writes and deletes, and it judges a plugin's declared path arguments as
+  writes (a coarse net). It **cannot** stop a misbehaving plugin from `open()`-ing a file itself;
+  that would need OS-level isolation.
+- `full` must be chosen explicitly and is confirmed with a red dialog; `/workplace` and the
+  `Workspace` chip switch tiers mid-session.
+- The sandbox is a **guard rail, not a security boundary**, and it does not cover files or network.
+  Windows only. The shell has its own job (`[shell] max_processes`, default 16) and can optionally
+  run through a low-integrity helper.
 
-`install`'s order is: **already present → local offline package → download**.
+## Checkpoints and rollback
 
-- **Offline package**: the filename is fixed at `aox-python-runtime.zip`, and it is auto-discovered
-  when placed **next to the exe**, in the app root, in `<app root>/runtime`, or under
-  `%LOCALAPPDATA%\AOX`. `bash tools/build_installer.sh pack` produces this package (about 10 MB),
-  suited to intranets / offline distribution.
-- **Download**: by default it fetches CPython's official embeddable distribution (about 10 MB) and
-  verifies it against a built-in official SHA-256. A self-hosted mirror can be substituted:
-
-  ```toml
-  [runtimes]
-  python_url    = "https://your-mirror.example.com/python-3.13.7-embed-amd64.zip"
-  python_sha256 = "<the official or self-built package's SHA-256>"
-  ```
-
-- **It takes effect immediately** after assembly (an internal re-resolution happens): python plugins
-  created afterwards use it directly, and a plugin that previously failed to load for want of python
-  recovers after a restart.
-- The whole process uses only the system's existing capabilities: the download goes through
-  `reqwest`, extraction through the system `tar.exe` (Win10 1803+), and verification through
-  `certutil`. The host **added no third-party dependency for this**.
-- A single Node binary is over 80 MB, so it isn't suited to automatic assembly.
-  `/runtime install node` says so outright; install it yourself and make sure `node` is on `PATH`.
-- A plugin's **third-party pip dependencies** must be installed by you. Note that the official
-  "embeddable distribution" **does not include `pip`**: if you really need `pip`, install the full
-  Python and point `[runtimes] python` at it.
-
-### Release artifacts (one build produces them all)
-
-There is only one script per installer in `installer/*.iss`, using conditional compilation to
-produce two variants (no second script is maintained). `bash tools/build_installer.sh` **with no
-arguments produces all five files below in one go**:
-
-| Artifact | Contents | Size |
-| --- | --- | --- |
-| `AOX-Setup-<version>.exe` | command-line build, host only | about 3 MB |
-| `AOX-GUI-Setup-<version>.exe` | graphical build, host only | about 4 MB |
-| `AOX-Setup-<version>-with-python.exe` | command-line build + Python runtime (works offline) | about 11.4 MB |
-| `AOX-GUI-Setup-<version>-with-python.exe` | graphical build + Python runtime (works offline) | about 12.5 MB |
-| `aox-python-runtime.zip` | runtime component package, for offline assembly by main-package users | about 10.4 MB |
+Each task leaves a recovery point under `<workspace>/.aox/backup/`: a content-addressed object
+store (BLAKE3) plus immutable nodes, an atomic `cursor.json`, journals and a redo snapshot.
 
 ```bash
-bash tools/build_installer.sh                    # default: everything above
-bash tools/build_installer.sh all none           # only the two main packages (fastest)
-bash tools/build_installer.sh all with-python    # only the two bundled variants
-bash tools/build_installer.sh cli                # the command-line build only (both variants)
-bash tools/build_installer.sh pack               # only produce the runtime component package
+/checkpoints                # list recovery points (20 by default, --all for everything)
+/rollback                   # preview the previous task's changes
+/rollback --yes             # restore them (--force = --yes, --allow-partial accepts an incomplete point)
+/redo                       # undo that rollback from its safety snapshot
+/backup status              # object count, size, retention
+/backup verify              # re-hash the store
+/backup prune               # apply retention and free unused space
 ```
 
-The script passes the version to ISCC as `--define=AppVersion=…`; **do not change it to the old-style
-`/DAppVersion=…`**: ISCC treats arguments beginning with `/` as options, and Git Bash (MSYS) rewrites
-such arguments as Unix paths before launching a native program (`/DAppVersion=0.1.0` →
-`<Git install dir>/DAppVersion=0.1.0`), so ISCC doesn't recognise it as an option and reports
-`You may not specify more than one script filename.` `--define=` doesn't begin with `/` and is
-immune to this rule; the same applies when compiling by hand, see the header comment of
-`installer/*.iss`.
+Retention defaults in `[recovery]`: `keep = 30` tasks, `max_total_mb = 512`, `max_file_mb = 64`,
+`max_turn_mb = 256`, `shell_guard = "strict"`, `protect_plugins = true`, plus exclusion globs. In
+the GUI the undo chip opens the same thing with a preview, a risk confirmation and the four
+maintenance actions.
 
-The two `-with-python` variants differ from the main package **only in whether `runtime/python` is
-installed into the app directory along with it**; the host discovers it automatically (tier 2 of the
-three-tier resolution).
+## Runtimes
+
+The host itself needs nothing. Plugins do — three languages, resolved once at startup, first hit
+wins:
+
+1. a **full path** in `[runtimes]` → used as-is (a missing path is reported, never substituted);
+2. `prefer = "system"` (default) → `PATH` first, then the bundled `runtime/<lang>/`;
+3. `prefer = "builtin"` → the bundled one first, skipping `PATH`.
+
+| Language | Running a plugin | Creating one |
+|---|---|---|
+| python | needs `python` 3.8+ | same |
+| node | needs `node` | same |
+| rust | needs nothing (compiled exe) | needs `rustc` |
+
+`/runtime install python` assembles CPython 3.13.7 embeddable (~10 MB, SHA-256 verified) into
+`runtime/python`; an offline `aox-python-runtime.zip` next to the exe, in the app root, in
+`runtime/` or under `%LOCALAPPDATA%\AOX` is picked up first. Node is over 80 MB and is not
+auto-installed; rustc is not bundled. The embeddable distribution has no `pip` — point
+`[runtimes] python` at a full install if you need it.
+
+The `bash` **tool** is separate from plugin runtimes: Git for Windows → a `git.exe`-derived bash →
+`bash.exe` on `PATH` → `runtime/bash/bash.exe` → `runtime/bash/busybox.exe` (WSL's stub is
+rejected). busybox is a POSIX `sh`: no arrays, no `[[ ]]`, no process substitution.
+
+## Remote
+
+`aox remote` registers this machine as an agent on an AOXChat server and keeps a WebSocket open. A
+room member @-mentions the agent and a real turn runs **here**; process, result and artefacts go
+back to the room. The server address is not baked in; credentials live in `.aox/remote.json`.
+
+```bash
+aox remote pair [server] [code] [agent name]   # code comes from the phone: Settings → Add computer
+aox remote list | use <n|id> | rename | remove | status
+aox remote policy [ask|owner|open]             # who may trigger this machine
+aox remote serve                               # long-running bridge (blocking)
+```
+
+Inside a session, `/remote start` / `/remote stop` run the same bridge in the background, and
+`/remote list|use|pair|policy|remove` behave as above. `call_policy` defaults to `ask`: someone
+else's mention requires your nod. While the phone is in control, a modal covers the window
+(`Remote control is active`, with `Take back control`), keyboard input is swallowed, and
+`.aox/remote.lock` records the takeover.
 
 ## Building from source
 
 Requires Rust 1.90+ and the MSVC toolchain.
 
 ```bash
-cargo build                      # build the CLI only (the workspace default member)
-cargo run                        # run the CLI
-cargo build -p aox-gui --release # build the GUI
-cargo run -p aox-gui             # run the GUI
+cargo build                      # CLI only (the workspace default member)
+cargo build -p aox-gui --release  # GUI  → target/release/aox-gui.exe
+AOX_LANG=zh cargo build -p aox-gui --release   # Chinese catalogue, compiled in
 ```
 
-**Windows + Git Bash users, take note**: Git Bash's bundled coreutils `link` shadows MSVC's
-`link.exe` on `PATH`, reporting `link: extra operand '...rcgu.o'`. The fix is to specify the linker
-and `LIB` / `INCLUDE` explicitly in `.cargo/config.toml`:
+`AOX_LANG` only picks which `locales/<code>.toml` is embedded — there is no runtime language switch,
+which is why the Chinese installer is a separate file.
+
+**Windows + Git Bash**: Git Bash's coreutils `link` shadows MSVC's `link.exe` (`link: extra operand
+'...rcgu.o'`). Pin the linker and the MSVC runtime in `.cargo/config.toml`:
 
 ```toml
 [target.x86_64-pc-windows-msvc]
 linker = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\<version>\\bin\\Hostx64\\x64\\link.exe"
 
-# Statically link the MSVC runtime (the equivalent of /MT), **mandatory for releases**:
-# otherwise the exe depends on VCRUNTIME140.dll, which is not a Windows built-in component
-# (it comes from the VC++ 2015-2022 Redistributable), and a clean install dies immediately
-# with "VCRUNTIME140.dll not found".
+# Static MSVC runtime (the /MT equivalent). **Mandatory for releases**: without it the exe
+# depends on VCRUNTIME140.dll, which no clean Windows install has.
 rustflags = ["-C", "target-feature=+crt-static"]
 
 [env]
@@ -382,74 +397,94 @@ LIB     = { value = "<MSVC>\\lib\\x64;<WinSDK>\\Lib\\<version>\\um\\x64;<WinSDK>
 INCLUDE = { value = "<MSVC>\\include;<WinSDK>\\Include\\<version>\\um;<WinSDK>\\Include\\<version>\\ucrt;<WinSDK>\\Include\\<version>\\shared;<WinSDK>\\Include\\<version>\\winrt", force = true }
 ```
 
-This file holds machine-specific absolute paths (useless to anyone else) and is excluded by
-`.gitignore`, so **you must create it yourself**. Building from PowerShell / cmd, or from a terminal
-that has already run `vcvars64`, does not need the `linker` / `LIB` / `INCLUDE` entries — but **the
-`rustflags` line must stay no matter which terminal you use**.
+The file holds machine-specific paths and is git-ignored, so create it yourself. From PowerShell,
+cmd or a `vcvars64` terminal the `linker` / `LIB` / `INCLUDE` entries are unnecessary — but
+`rustflags` must stay in every case, or `build.rs` prints a loud `cargo:warning` about the artefact
+not starting on a clean machine.
 
-If you leave out `rustflags` the build does not fail, but both `build.rs` scripts print a prominent
-`cargo:warning` telling you the artifact won't start on a clean machine.
+### Release artifacts
+
+```bash
+bash tools/build_installer.sh                    # eight installers + the runtime zip
+bash tools/build_installer.sh all none           # hosts only (both front ends, both languages)
+bash tools/build_installer.sh gui with-python    # GUI, bundled python only
+bash tools/build_installer.sh pack               # only aox-python-runtime.zip
+```
+
+`installer/aox.iss` and `installer/aox-gui.iss` are compiled twice each (with and without
+`BUNDLE_PYTHON`), and `AOX_LANG=zh` adds the `-zh` file names.
+
+| Artifact | Contents | Size |
+|---|---|---|
+| `AOX-Setup-<v>.exe` / `AOX-GUI-Setup-<v>.exe` | host only | ≈4.4 MB / ≈7.1 MB |
+| `AOX-Setup-<v>-with-python.exe` / `AOX-GUI-Setup-<v>-with-python.exe` | plus `runtime/python` | ≈13 MB / ≈16 MB |
+| `AOX-Setup-<v>-zh.exe` and the three siblings | Chinese UI | same |
+| `aox-python-runtime.zip` | runtime component package | ≈11 MB |
+
+Pass the version to ISCC as `--define=AppVersion=…`, **not** the old `/DAppVersion=…`: ISCC treats
+`/`-prefixed arguments as options, and Git Bash rewrites them as Unix paths before launching a
+native program, so ISCC reports `You may not specify more than one script filename.`
 
 ## Troubleshooting
 
-**The task stops halfway through and the model outputs nothing?**
+**A turn stops halfway and the model says nothing.** Look for a `⚠` / `✗` line first; AOX no longer
+ends silently.
 
-First check the terminal for a `⚠` / `✗` line — AOX no longer "ends silently". If something really
-is wrong, work through this order:
+1. **Thinking models** return `reasoning_content`, which must be replayed verbatim or the second
+   request of a multi-step task is rejected with a 400. AOX handles this; nothing to do.
+2. **`max_tokens` too small** — reasoning tokens are billed against the output budget, and an
+   exhausted budget yields an empty reply. 8192+ is a sane floor.
+3. **Raw traffic**: `AOX_DEBUG_LLM=1 aox` appends every request and response to `logs/llm.jsonl`
+   under the **current working directory** (`finish_reason`, `usage`, empty replies).
 
-1. **Thinking-mode models**: models like `deepseek-flash` and `deepseek-reasoner` return
-   `reasoning_content`, which **must be passed back verbatim** when replaying history, otherwise the
-   API rejects the second request of every multi-step task with a 400
-   (`reasoning_content ... must be passed back to the API`). AOX handles this automatically, so you
-   don't need to intervene.
-2. **`max_tokens` too small**: reasoning tokens count against the output budget too, and exhausting
-   it yields an **empty reply**. Set it to `8192` or more in the model's parameters.
-3. **Capture the raw traffic**: launch with `AOX_DEBUG_LLM=1 aox` and every request and response is
-   appended to `logs/llm.jsonl`, so you can see `finish_reason`, `usage`, empty replies and other
-   details directly.
-
-AOX's handling of an "empty reply" is: retry twice with a prompt, then, if it's still empty, report
-an explicit error explaining why — it will **not** treat a preamble like "Let me take a look…" as the
-final answer.
-
-**In the GUI, "a black python window pops up whenever a plugin is used / initialised"?**
-
-The GUI build uses the `windows` subsystem and **has no console of its own**. If a plugin
-subprocess is spawned without `CREATE_NO_WINDOW`, Windows allocates a **windowed** console for
-`python.exe` — and the symptom is a handful of black windows flashing up at random. The host has
-been fixed (`src/plugin/mod.rs::hide_console`, covering all three paths: restoring plugins at first
-launch, self-healing restart after a plugin crash, and `rustc` compilation), so installing the
-latest `AOX-GUI-Setup` is enough. A regression check is included:
+**A black console flashes in the GUI.** `aox-gui.exe` is a `windows`-subsystem program with no
+console; spawning `python.exe` without `CREATE_NO_WINDOW` makes Windows allocate one. The host sets
+it on every spawn path, so a current build is clean. `cargo run` builds a **console** binary — a
+black window there is normal.
 
 ```bash
-python tools/check_no_console_window.py --ab                                  # mechanism self-test, takes seconds
+python tools/check_no_console_window.py --ab     # mechanism self-check
 python tools/check_no_console_window.py --app target/release/aox-gui.exe --cwd .
 ```
 
-Note that a `cargo run` **debug build is itself a console program**, so seeing a black window is
-normal and not this bug.
+**`Model not ready`.** `models.json` has no active model, or the key is a placeholder. Open
+Settings → Model; the GUI says which file it read.
+
+**Python plugins will not load.** No interpreter was found. `/runtime` reports which tier resolved
+(or not), and `/runtime install python` fixes it in place.
 
 ## Directory layout
 
-The program directory (the install directory) auto-generates:
+```
+<app root>/
+  config.toml                your configuration (generated on first run)
+  aox.toml                   optional composition manifest (bundles / patches / profiles)
+  bundles/<name>.toml        optional bundle overrides
+  RULES.md                   optional project rules, injected into the system prompt
+  aox.exe / aox-gui.exe
+  .aox/
+    models.json              the model list and the active model
+    spaces.json              the space registry
+    conversations/*.jsonl     one file per conversation
+    backup/                  content-addressed recovery store
+    memory/*.md              the agent's own dated notes
+    remote.json              AOX Remote pairings
+    ui.json / welcome.json / remote.lock
+    tmp/  web/  files/  run/  toolcache/
+  plugins/<name>/            plugins the model wrote, plus sdk/
+  runtime/bash/              busybox-w32 fallback shell
+  runtime/python/            only with -with-python or /runtime install python
+  workplace/<project>/       durable deliverables
+  temp/                      scratch files
+  logs/llm.jsonl             only with AOX_DEBUG_LLM=1, under the current working directory
+```
 
-| Path | Description |
-| --- | --- |
-| `config.toml` | Your configuration (auto-generated on first run) |
-| `.aox/models.json` | The model list and the active model (see [Models](#models)) |
-| `plugins/<name>/` | Plugins the model wrote itself, including source and `plugin.toml` |
-| `plugins/sdk/` | The plugin SDK and protocol docs the host provides, refreshed on every launch |
-| `history/*.jsonl` | Conversation history, one file per conversation (see [Conversation history](#conversation-history)) |
-| `RULES.md` | Optional. Project rules written here are injected into the system prompt |
-| `logs/llm.jsonl` | Optional. Records raw requests/responses only when launched with `AOX_DEBUG_LLM=1`, for diagnosing model-side problems |
-
-Plugin subprocesses are started with **the install directory as their working directory**, and
-Python plugins are forced to UTF-8 output by the host.
+Plugin subprocesses start with the **app root** as their working directory; Python plugins are
+forced to UTF-8 output.
 
 ## Uninstall
 
-Use "Settings → Apps" or the uninstall entry in the Start menu. Uninstalling deletes
-`<install dir>/runtime` (the runtime assembled on demand or bundled in — machine-specific and
-rebuildable at any time), but **does not delete `plugins/` or `history/`** — the former is the
-plugins the model accumulated, the latter your conversation records, and both are user data. If you
-really no longer need them, delete the install directory by hand.
+Settings → Apps, or the Start-menu entry. Uninstalling removes `runtime/` (machine-specific and
+re-provisionable) and the installed binaries. It **keeps** `plugins/` (capability the model built)
+and `.aox/` (conversations, models, snapshots, pairings) — both are user data. Delete the install
+folder by hand if you really want them gone.

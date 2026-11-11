@@ -19,7 +19,7 @@ about to change code.
 
 | Document | What it covers |
 |---|---|
-| [`USAGE.md`](USAGE.md) | **The manual** — install, model setup, GUI layout, history on disk, runtime resolution, release artifacts, troubleshooting |
+| [`USAGE.md`](USAGE.md) | **The manual** — install, models, every command, GUI windows, conversations and spaces, config layers, tools, boundaries, rollback, remote, packaging |
 | [`ARCH-ROADMAP.md`](ARCH-ROADMAP.md) | **The why** — the seven design principles and the stage-by-stage plan they produced |
 
 ## 1. Design record (`docs/`)
@@ -31,6 +31,8 @@ about to change code.
 | [`COMPONENT-CONTRIBUTIONS.md`](COMPONENT-CONTRIBUTIONS.md) | **Stage 6b** — plugins are no longer just "add a tool": how components contribute hooks, themes, prompts and tools | shipped | [✓](COMPONENT-CONTRIBUTIONS.zh-CN.md) |
 | [`I18N.md`](I18N.md) | **Internationalisation** — one language, one distribution: the `t()` / `tf!` pipeline, `AOX_LANG`, the catalogue rules | shipped (copy phase complete) | [✓](I18N.zh-CN.md) |
 | [`WEB.md`](WEB.md) | **The web tool** — `web_fetch`: reach (`[web] egress`), readable extraction, cursors, and what it is *not* (a network boundary) | M2 + prompt shipped; finished — the cache, the JS renderer and `web_search` were each scoped and dropped (D5, D10, D11) | [✓](WEB.zh-CN.md) |
+| [`SHELL.md`](SHELL.md) | **The shell tool** — `shell` / `bash`: dialects, the write guard rail, limits, and the measured reason it is not a kernel boundary | shipped 2026-10-20 | — |
+| [`ROLLBACK.md`](ROLLBACK.md) | **Task checkpoints** — recovery points, the rollback / redo contract, retention and the on-disk store | design record; implementation notes in [`ROLLBACK-IMPLEMENTATION.zh-CN.md`](ROLLBACK-IMPLEMENTATION.zh-CN.md) and [`ROLLBACK-GUI.zh-CN.md`](ROLLBACK-GUI.zh-CN.md) | [✓](ROLLBACK.zh-CN.md) |
 | [`UI-CUSTOMIZATION.md`](UI-CUSTOMIZATION.md) | **Charter**: the UI seam — element ids, property overrides, named slots, sandboxed patches | **chartered, deferred** (2026-10-03) | [✓](UI-CUSTOMIZATION.zh-CN.md) |
 | [`SUBAGENT.md`](SUBAGENT.md) | **Charter**: subagents — self-spawning a headless instance, the protocol, the three isolation axes, the auth policy | **chartered, deferred** (2026-10-09) | [✓](SUBAGENT.zh-CN.md) |
 

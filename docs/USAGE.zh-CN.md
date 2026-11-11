@@ -2,195 +2,209 @@
 
 [← README](../README.zh-CN.md) · [文档索引](README.zh-CN.md) · [English](USAGE.md)
 
-README 上放不下的都在这里：GUI 细节、对话怎么落盘、解释器从哪来、构建产出什么、出问题怎么查。
+README 上放不下的都在这里：安装包、两个前端接受的全部命令、会话到底存在哪、配置怎么分层、
+边界管什么又不管什么，以及怎么自己构建。
 
-**目录** — [模型](#模型) · [命令行](#命令行) · [等待动画](#等待动画与过程折叠) ·
-[图形界面](#图形界面) · [对话历史](#对话历史) · [系统要求](#系统要求) ·
-[从源码构建](#从源码构建) · [故障排查](#故障排查) · [目录说明](#目录说明) · [卸载](#卸载)
+**目录** — [安装](#安装与首次启动) · [模型](#模型) · [命令行](#命令行) · [图形界面](#图形界面) ·
+[会话](#会话与空间) · [配置](#配置分层) · [工具](#工具) · [边界](#边界) · [回滚](#检查点与回滚) ·
+[运行时](#插件运行时) · [远程](#远程接管) · [构建](#从源码构建) · [故障](#故障排查) ·
+[目录](#目录说明) · [卸载](#卸载)
+
+## 安装与首次启动
+
+Windows 10 1809+ / x64。每个前端四种包，共八种（见[发行产物](#发行产物)），任选其一即可，
+装完就是完整可用的。
+
+| 包 | 内容 |
+|---|---|
+| `AOX-GUI-Setup-<版本>.exe` | 图形界面版，只有宿主（约 7.1 MB） |
+| `AOX-Setup-<版本>.exe` | 命令行版，只有宿主（约 4.4 MB） |
+| `…-with-python.exe` | 同上 + `runtime/python`（约 16 / 13 MB） |
+| `…-<版本>-zh.exe` | 中文包——界面语言是**编译期**定死的，所以单独一个文件 |
+
+所有变体都带 `runtime/bash`（busybox-w32，637 KB）作为 POSIX shell 的兜底；不往 `PATH` 或用户
+环境变量里写任何东西。卸载只删 `runtime`，`plugins/` 与 `.aox/` 属于用户数据，会保留。
+
+两个前端都把「exe 所在目录」当应用根，它同时也是默认工作区——所以绿色版就是拷一个文件夹。
+
+- **GUI**：首次启动自动跳到 **设置 → 模型**，光标落在 key 输入框。
+- **CLI**：在 TTY 里问三个问题（端点、key、模型名）写进 `.aox/models.json`，直接回车即跳过；
+  `aox --setup` 强制走一遍向导；非 TTY 下不会卡在输入上。
 
 ## 模型
 
-端点、key、模型名，以及上下文窗口 / 输出上限 / 温度 / 思考强度，全部存在
-`<程序目录>/.aox/models.json` 里——那是**唯一**一份模型配置，命令行版 `aox.exe` 和 GUI 读的
-都是它。GUI 的「设置 → 模型」直接改这个文件，**不写** `config.toml`；改完不用重启。
+端点、key、模型名与它的参数全部存在 `<程序目录>/.aox/models.json`（version 2）。这是**唯一**
+存放 key 的地方；CLI 与 GUI 读同一份，GUI 从不写 `config.toml`。
 
-列表里可以存多个模型，其中一个是 `active`。命令行用 `/model <序号|名字>` 切换，GUI 用启用开关，
-都在下一个请求生效。
+| 字段 | 含义 | 默认 |
+|---|---|---|
+| `name` | 选择器里显示的名字 | 同模型名 |
+| `base_url` / `api_key` / `api_key_env` | 端点、内联 key，或一个环境变量 | — |
+| `model` | 发给 API 的模型 id | — |
+| `enabled` | 是否出现在输入框的模型列表里 | true |
+| `context_window` | 上下文 token 数，用于上下文环与压缩 | 600000 |
+| `max_tokens` | 单次请求的输出上限 | 32000 |
+| `temperature` | 采样温度 | 0.3 |
+| `thinking` | `default` · `off` · `low` · `high` · `max` | default |
+| `thinking_wire` | `auto` · `deepseek` · `openai` · `qwen` · `none`，决定思考强度怎么上线 | auto |
+| `stream` | 流式输出；端点不认 `stream` 时关掉 | true |
 
-「测试连接」只发一个 token 的探活；「扫描」只列出端点自报的模型——能列出模型不代表能聊天。
+可以存多个模型，其中一个是 active。切换方式：命令行 `/model <序号|名字>`、输入框的模型 chip、
+或 **设置 → 模型**——下一个请求生效。「测试」只发一个 token 的探活；「扫描模型」只列出端点自报的
+列表（能列出来不代表能聊天）。
+
+旧版本留在 `config.toml` 里的 `[provider]` 只在启动时读**一次**，迁进 `models.json` 之后即失效。
 
 ## 命令行
 
 | 命令 | 作用 |
 | --- | --- |
 | `/help` | 显示帮助（列出全部命令） |
-| `/tools` | 查看当前所有可用工具 |
-| `/plugins` | 查看已加载的插件 |
-| `/history` | 查看历史对话列表（`/history show <序号>` 看全文、`/history open <序号>` 接着聊、`/history dir` 看目录、`/history rm <序号>` 删除） |
-| `/model` | 列出已保存的模型（和 GUI 的「设置 → 模型」是同一份）；`/model <序号\|名字>` 切换，下一个请求生效 |
+| `/tools` | 列出当前所有可用工具 |
+| `/plugins` | 列出已加载的插件，以及每个插件贡献了什么（hook / 提示词分段 / 能力） |
+| `/runtime` | 插件运行时状态；`/runtime install python` 装配内置运行时 |
+| `/history` | 历史对话：`list` · `dir` · `show <序号\|id>` · `open <序号\|id>` · `rm <序号\|id>` |
 | `/new` | 开一段新对话（当前这段已经落盘） |
-| `/runtime` | 查看解释器解析结果；`/runtime install python` 自动装配内置运行时 |
+| `/attach` | 把本地文件放进待发托盘，随下一条消息发出；`/attach clear` 清空 |
 | `/demo` | 预览终端排版与折叠效果 |
-| `/expand` | 展开上一次被折叠的工具调用过程 |
+| `/expand` | 展开上一次被折叠的工具调用 |
+| `/usage` | 本轮对话的 token 明细（逐轮、缓存命中/未命中、当前上下文占用） |
+| `/prompt` | 系统提示由哪些分段组成（`[prompt]` 可重排 / 关闭 / 新增） |
+| `/hook` | 当前生效的循环 hook，来源为 `[hook]` 与插件的 `[contributes]` |
+| `/loop` | 主循环实现、上下文裁剪、单轮请求上限（`[loop]`） |
+| `/task` | 当前会话的检查点：目标、打勾的计划、验收标准 |
+| `/checkpoints` | 本工作区的任务级文件恢复点（`--all` 看全部） |
+| `/rollback` | 预览上一个任务的改动；`--yes` 执行（另有 `--force` / `--allow-partial`） |
+| `/redo` | 用安全快照撤销最近一次回滚 |
+| `/backup` | 恢复系统状态：`status` · `verify` · `prune`（按保留策略回收空间） |
+| `/sandbox` | 插件子进程的围栏（`[sandbox]`），并写明它**不**覆盖什么 |
+| `/shell` | 内建命令行：方言、边界、上限（`[shell]`） |
+| `/web` | 内建抓取工具：触达范围、预算、超时（`[web]`） |
+| `/workplace` | 查看 / 切换写入边界：`full` · `default` · `<目录>`（`[workplace]`） |
+| `/config` | 这份配置由哪些层组成（`aox.toml` 可自定义层栈） |
+| `/model` | 列出已保存的模型；`/model <序号\|名字>` 切换，下一个请求生效 |
+| `/remote` | 本会话的手机接管：`start` · `stop`；`list` / `use` / `pair` / `policy` / `remove` |
 | `/quit` | 退出（`/exit` 等价） |
 
-按 `Ctrl+C` 可中断正在进行的任务。
+其它任何输入都直接发给模型。`Ctrl+C` 中断正在跑的一轮：只丢掉正在执行的那一步，已完成的都留在上下文里。
 
-启动横幅里的项目地址是可点击超链接（OSC 8）。Windows Terminal、VS Code 终端等会自动启用；
-传统 conhost（例如直接双击 exe）不认这个序列，会自动退回纯文本 URL。
-自动探测不灵时可用 `AOX_HYPERLINK=1` 强制开启、`AOX_HYPERLINK=0` 关闭。
+命令行参数：
 
-## 等待动画与过程折叠
+| 参数 | 作用 |
+|---|---|
+| `--config <路径>` | 换一个文件作为最后一层配置 |
+| `--plugins <目录>` | 换一个插件目录 |
+| `--manifest <路径>` | 显式指定组合清单（默认 `<程序目录>/aox.toml`） |
+| `--profile <名字>` | 选清单里的 `[profiles.<名字>]` |
+| `--dump-config` | 打印层栈与合成后的完整配置，然后退出 |
+| `--setup` | 强制走首次配置向导 |
+| `selftest` | 不依赖模型，端到端跑一遍插件流水线 |
+| `remote …` | 远程接管的主机侧（见[远程接管](#远程接管)） |
 
-任务进行中，终端只保留**一行**状态（执行工具时会自动切换提示文字）：
-
-```
-⠹ 思考中 3.2s
-⠼ 执行 fs_read 8.7s
-```
-
-如果模型是**思考模式**（`deepseek-flash` / `deepseek-reasoner` 等），等待期间它还会把推理过程
-实时滚动显示在状态行下方——看到它「在想什么」，就知道任务跑到哪一步了：
-
-```
-⠹ 思考中 3.2s
-  我需要先确认这个目录下有哪些文件，
-  然后判断是否要新建一个插件来读取配置。
-```
-
-这段推理过程是**即时出现、响应结束即消失**的临时回显（滚动窗口保留末尾 4 行），
-不会污染输出，也不会进入折叠区。想关掉流式（例如端点不支持 `stream` 参数），
-在 `.aox/models.json` 里给那条模型记录加 `"stream": false`，或在 GUI 的模型编辑弹窗里关掉「流式输出」。
-
-任务完成后，中间的模型思考与工具调用会自动折叠成一行摘要，只显示最终输出：
-
-```
-▸ 已折叠 8 步工具调用 · 12.4s · /expand 展开
-
-（这里是模型的最终输出）
-```
-
-输入 `/expand` 可随时展开最近一次的过程明细（每一步的调用参数与结果）。
-
-动画在输出被重定向到文件/管道时自动静默；可用环境变量 `AOX_ANIM=1` 强制开启、`AOX_ANIM=0` 强制关闭。
+横幅里的项目地址是可点击的 OSC 8 超链接，Windows Terminal / VS Code 终端自动支持，传统 conhost
+不支持；用 `AOX_HYPERLINK=1` / `0` 强制开关。输出被重定向时动画自动静默，可用 `AOX_ANIM=1` / `0` 覆盖。
 
 ## 图形界面
 
-除了命令行版本，仓库里还有一套**独立的图形界面**：`gui/`（crate 名 `aox-gui`）。
+一个无边框主窗口（初始 1280×800，最小 1000×640）加三个可选工具窗口。顶部条只有抽屉按钮、状态药丸
+（`思考中` / `执行 bash` / `3 秒后重试` / `等待你的选择`…）和最小化 / 最大化 / 关闭；双击最大化。
+设置齿轮在抽屉头部。
 
-它和 CLI **共用同一套核心**——`src/lib.rs` 把 Agent 主循环、LLM Provider、插件宿主、`Ui`
-抽象层暴露成库，GUI 只是 `aox::ui::Ui` 的另一个实现，没有任何逻辑分叉。CLI 的行为不受影响
-（`cargo build` 仍然只构建 CLI，见 `default-members`）。
+### 左侧抽屉
 
-```bash
-cargo run -p aox-gui                      # 直接运行（与 CLI 共用 config.toml）
-cargo run -p aox-gui -- --demo            # 演示模式：不连模型，预览界面与事件流
-cargo run -p aox-gui -- --prompt "看看现在有哪些插件"   # 启动后自动发第一条指令
-cargo build -p aox-gui --release          # 产出 target/release/aox-gui.exe
+300 px，**挤压**正文而非浮层，0.18 s 滑出，开合状态记在 `.aox/ui.json`。
+
+- 搜索框按**工作区名**或会话标题过滤，`Esc` 清空。
+- 树按工作区分组（来自 `.aox/spaces.json`）：文件夹图标 + 名称 + 会话数，可折叠；悬停组头出现 `+`
+  （在该目录新建对话）。
+- 会话行显示标题，悬停淡入 `时间 · N 条`；`⋯` 提供 `重命名`、`移动到 ▸`、`删除`（正在聊的那条不能删）。
+- 组头右键：`新建对话` · `重命名` · `在文件管理器中打开` · `从 AOX 移除`。
+- 底部：`新建工作区`、`打开工作区文件夹`（`<根>/workplace/`）。
+
+### 输入卡
+
+浮动卡片：计划条 → 输入行 → 第二行。
+
+- **计划条**显示 `{已完成}/{总数}` 与当前步骤，默认折叠；展开是逐步骤一行。步骤只读，随检查点保存。
+- **附件**：文件拖到窗口任意位置即可；图片会后台解码、在转录里就地显示。每个附件一个 chip，`×` 移除；
+  超过 32 MiB 的图片会被拒绝并说明原因。
+- **第二行**：模型 chip（`deepseek-chat · 1M`）、工作区 chip（`Default · <目录>` / `完全访问`）、
+  恢复 chip（撤销图标 + 数量）、上下文环（`Context: … used, … left`，75% 转警告色、92% 转危险色，
+  压缩时旋转）和 `Σ N tok` chip（点开用量明细）。
+- 任务执行中发送按钮变**停止**；`Enter` 发送，`Shift+Enter` 换行。
+- 占位文字会报告状态：`模型未配置，暂不可对话`、`等待授权…`、`运行中；点右侧停止`。
+
+### 工具窗口
+
+从 **设置 → 额外** 打开（`--demo` 会同时开三个）。每个都是独立的无边框窗口，带置顶 / 最小化 /
+最大化 / 关闭。
+
+| 窗口 | 内容 |
+|---|---|
+| **活动流** | 横向时间轴：输入 / 模型 / 工具 / 系统四条道，色块宽度 = 真实耗时，同一插件同一族色。工具栏：`开头` · `居中` · `最新`、`轮次` + `跳转`、行高、缩放、`适配`、`连线`。点色块看完整内容。 |
+| **缓存命中图** | 16×16 格记录最近调用（命中 / 部分 / 未命中）、命中率、省下的 token、历史命中率。 |
+| **工作区视图** | 只读文件树 + 本轮的改动列表，`文件` / `差异` 两种视图。 |
+
+### 设置
+
+| 页签 | 内容 |
+|---|---|
+| `额外` | 三个工具窗口的入口 |
+| `模型` | 添加 / 编辑 / 批量管理；`使用` 切模型，右侧开关只决定它是否出现在输入框的列表里 |
+| `外观` | `跟随系统` / `暗色 · 墨` / `亮色 · 纸`；欢迎语（`自定` / `一言` / `模型`）；明暗两套文字色；打字机效果；背景图文件夹 |
+| `系统` | 只读信息：命令行、运行环境、当前模型、配置文件与层、应用根、工作区、历史、插件与运行时目录；缺 Python 时给出安装入口 |
+| `远程` | 启停桥接、配对列表、近期日志 |
+| `关于` | 版本、ISC 许可、项目主页 |
+
+### 快捷键
+
+`Enter` 发送 · `Shift+Enter` 换行 · `Ctrl+↑` / `Ctrl+↓` 上/下一个提问 · `Esc` 关闭浮层（或清空搜索；
+授权框里等于拒绝）· `y` 允许一次 · `a` 本会话始终允许 · `n` 拒绝。
+
+### 主题
+
+两套配色只差明度：亮色是暖纸（`#F2EFE8`），暗色是暖黑（`#141412`），唯一色相是砖红危险色。
+`[theme.light]` / `[theme.dark]` / `[theme.metrics]` / `[theme.fonts]` 逐字段覆盖；
+`themes/paper.toml`、`ink.toml`、`high-contrast.toml` 是现成的整包；`--theme <文件>` 整段替换
+`[theme]`。选择记在 `.aox-gui-theme`，原生标题栏经 DWM 跟着变。
+
+字体解析顺序：`[theme.fonts]` → `AOX_GUI_FONT` / `…_BOLD` / `…_SERIF` / `…_BRAND` / `…_MONO` →
+系统候选（等线、雅黑、黑体…；Cascadia Mono、Consolas…）。
+
+欢迎语以打字机效果出现，背景图从 `assets/light|dark/*.png` 随机取。
+
+## 会话与空间
+
+每个会话就是一个 JSONL 文件：
+
+```
+<程序目录>/.aox/conversations/20261105-164145-c314.jsonl
 ```
 
-界面结构：
+文件名主干即会话 id（`年月日-时分秒-4位十六进制`）；`/history` 接受序号、完整 id、id 前缀或 `<id>.jsonl`。
 
-| 区域 | 内容 |
-| --- | --- |
-| 顶栏 | 最左两枚图标：**历史侧边栏开关**、**新建对话**；右上角三枚（自左向右）关于、活动流开关、**明暗切换**。只有任务执行中才在左侧显示一行耗时 |
-| 左侧历史栏 | 默认折叠，点顶栏最左那枚图标展开（见 [对话历史](#对话历史)）。点某一条就**切换到那段对话**接着聊 |
-| 主区 | 对话流：用户气泡、助手 Markdown（标题带细线、**行内代码是带底色的芯片**、**表格有完整外框 + 表头色带 + 行分隔线**、**围栏代码块带语法高亮**）、**自动折叠的过程块**（点击展开工具调用明细） |
-| 活动流 | **不在主窗口里**：点顶栏那枚图标会打开一个独立窗口，初始尺寸与主窗口一致（用系统标题栏，可拖动、缩放、最小化，Win11 自带圆角）。主体是一条**横向时间轴**：横轴是时间，任务自左向右推进，色块宽度 = 真实耗时；工具调用 / 思考 / 授权 / 消息分三行各用一种颜色，同一插件的色块用同一族色分深浅。**点色块（或下方列表里的一行）看详情**。滚轮平移、Ctrl+滚轮缩放 |
-| 底部 | 多行输入（`Enter` 发送、`Shift+Enter` 换行）、发送 / 停止按钮 |
-
-其它细节：
-
-- 配色是**「纸与墨」的单色方案**，只有明度、没有色相：亮色是一张发暖的纸（`#F2EFE8`），
-  暗色是暖调的黑（`#141412`）。点顶栏最右的按钮即可切换（亮色显示月牙、暗色显示太阳），
-  原生标题栏的底色与文字色也跟着一起变（DWM 属性）；偏好记在 `.aox-gui-theme`。
-  成功/警告/失败不靠颜色区分，而用明度层次与反白块表达。
-  **唯一的例外是代码块**：语法高亮是低饱和的暖色系（赭红关键字、松绿类型、钢蓝函数、
-  橄榄字符串、梅紫数字、暖灰注释、琥珀元信息），只跟明暗两套、随主题一起切换。
-- 语法高亮覆盖 rust / python / js·ts / c 系 / shell / sql / json·toml·yaml / html·xml，
-  认不出来的语言按「只高亮字符串与数字」处理，不会乱标。识别靠两条通用启发式：
-  **紧跟 `(` 的标识符当函数、PascalCase 当类型**，因此不必为每种语言维护类型表。
-  围栏代码块的信息串支持 `rust,ignore` 这类后缀，只取第一段。
-- 原生标题栏上不缀模型名（标题固定是 `AOX`），也不再单独设窗口图标：左上角只剩标题本身，
-  品牌交给初始界面承担，模型名与运行时分发状态都在「关于」窗口里。注意 Windows 的标题栏图标
-  与任务栏图标共用同一枚，不设它之后任务栏上也看不到这个图标。
-- 初始界面是一句问候加三条示例指令，点一下会填进输入框（不会直接发送）。
-- 需要授权的元工具会弹出 Modal，快捷键与 CLI 完全一致：`y` 允许一次、`a` 本会话始终允许、`n` / `Esc` 拒绝。
-- 任务执行中可点右下角的停止按钮中断，对话历史会回滚到任务前状态（与 CLI 的 `Ctrl+C` 等价）；
-  内存里的消息和已落盘的 `history/*.jsonl` 一起回滚，不会留下半截记录。
-- 界面语言跟随系统：自动从 `C:\Windows\Fonts` 挑一个中文字体（等线 / 微软雅黑 / 黑体…），
-  无需手动配置。初始界面那句问候另挑一个**带笔势的展示体**（Gabriola → Ink Free → …），
-  找不到就逐级退回衬线、粗体、正文字体，永远不会变成方块。
-  可用 `AOX_GUI_FONT`、`AOX_GUI_FONT_BOLD`、`AOX_GUI_FONT_SERIF`、`AOX_GUI_FONT_BRAND`、
-  `AOX_GUI_FONT_MONO` 指定字体文件。
-- 鼠标往上翻历史时不会自动被拽回底部；滚回底部附近会自动恢复跟随。
-
-仓库根目录的行为与加 GUI 之前**完全一致**；GUI 是独立 crate，删掉 `gui/` 与
-`Cargo.toml` 里的 `[workspace] members` 即可移除。
-
-## 对话历史
-
-对话**自动落盘**，命令行和 GUI 走的是同一套实现（`Agent` 里的唯一写入点），
-关掉窗口/终端也不会丢。
-
-存在 `<应用根>/history/`，**每个对话一个文件**：
-
-```
-history/
-  20261002-155959-d81c.jsonl
-  20261002-160001-e98c.jsonl
-```
-
-> 两个安装包默认装到不同目录（`%LOCALAPPDATA%\Programs\AOX` 与 `…\AOX-GUI`），
-> 因此各自有一份 `history/`。想让它们共用，把其中一个装到另一个的目录即可。
-
-文件名主干就是这次对话的 id（`年月日-时分秒-4位随机`），也是命令行 `show` / `rm` 认的键。
+**空间（space）**是逻辑分组，可以指向一个目录，不是存储分区。`spaces.json` 里登记了内置空间
+（`本机` = 程序目录、`远程` = 手机来的会话、`完全访问`）、用户空间（`s:<规范化路径>`），以及从未登记过
+的目录自动生成的空间（`auto:<路径>`）；`<程序目录>/workplace/**` 下的文件夹归入「本机」。
 
 ### 文件格式
 
-JSONL——一行一个 JSON 对象，第一行是元信息，之后每行是一条消息：
+一行一个 JSON 对象。首行是 `meta`（`id`、`created`、`model`、`root`、`version`、`origin`、`space`、`room`）；
+之后每行是 `message`、`act`、`usage`、`workplace`、`title`、`task` 之一。附件只存路径与文件名，不存 base64。
 
-```json
-{"created":1790927628,"id":"20261002-155348-c5d8","kind":"meta","model":"deepseek-chat","root":"D:\\AOX","version":"0.1.0"}
-{"content":"你好，先看看目录","kind":"message","role":"user"}
-{"content":"我先列一下目录。","kind":"message","role":"assistant","tool_calls":[...]}
-{"content":"[FILE] ...","is_error":false,"kind":"message","name":"fs_ls","role":"tool","tool_call_id":"call_1"}
-```
+`message` 行就是 **OpenAI 请求体里的原始消息对象**加一个 `is_error`，所以这个文件既是日志也能直接重放。
+几个刻意的取舍没变：追加写；一行坏了不影响整份文件；被中断的半截任务会从文件里回滚掉，不留「有
+`tool_calls` 没结果」的残缺记录。
 
-消息行就是 **OpenAI 请求体里的原始消息对象**，额外只多一个 `is_error` 字段；
-所以这个文件既是给人看的日志，也能直接当请求体重放。系统提示不落盘（每次启动都由代码重组，
-存下来只会是一份随时会过期的副本）。`kind` 用来区分行类型，读回时会被剥掉。
-
-几个刻意的取舍：
-
-- **追加写**，不整体重写。中途断电/杀进程最多丢最后一行，前面都还在。
-- **一行坏了不影响整个文件**：读取时跳过解析失败的行，而不是让整个对话打不开。
-- **中断会回滚**：`Ctrl+C` / 停止按钮回滚半截任务时，文件里那半截也一并删掉——
-  否则会留下「有 `tool_calls` 但没有结果」的残缺记录，重放时会被服务端直接拒绝。
-
-### 命令行
+### `/history`
 
 ```bash
 /history                  # 列表：序号、时间、条数、首条用户输入当标题
-/history show 1           # 看第 1 条的全文（你 / 助手 / 工具调用与结果）
-/history open 1           # 切到第 1 条接着聊（旧对话已落盘，不需要「保存」）
+/history show 1           # 看第 1 条的全文
+/history open 1           # 切到第 1 条接着聊
 /history dir              # 打印目录路径
 /history rm 2             # 删掉第 2 条
 ```
-
-列表里本次会话那一条会标 `← 当前`。`show` / `open` / `rm` 也接受 id 或 id 前缀，不必去数序号。
-
-### GUI
-
-左上角两枚图标：**列表**开关左侧边栏，**加号**新开一段对话。
-
-- 侧边栏列出全部历史，按**最后一次说话的时间**从新到旧排；右侧一个小圆点标出
-  **眼下正在聊的**那条（它永远置顶——刚切进去的老对话也排得到最上面）。
-- 点任意一条即**切换到那段对话**：界面上那段的正文立刻换上，接着往下聊是接着它的上下文；
-  想另起一段就点加号，原来那段已经完整躺在 `history/` 里了。
-- 两侧面板默认都是收起的，窗口打开就是干净的对话区。
-- 当前对话落盘后侧边栏会自动刷新，一般用不着手动点「刷新」；那个按钮是给
-  「另开了窗口 / 在别处改动了 `history/`」这类情况兜底的。
 
 ### 保留策略
 
@@ -199,105 +213,119 @@ JSONL——一行一个 JSON 对象，第一行是元信息，之后每行是一
 ```toml
 [history]
 enabled = true   # 关掉后不再写新文件；已有历史仍可查看
-keep = 200       # 只保留最近 N 个对话，0 = 不限制
+keep = 200       # 所有空间合起来计数，0 = 不限制
 ```
 
-清理是**顺带的**：只在新建对话文件时数一下目录、删掉超出的旧文件，没有后台线程、
-没有定时器、也不会在启动时全盘扫描。
+清理是顺带的：只在新建会话文件时执行一次，没有后台线程、没有定时器、启动时也不扫描。
+`[store] backend = "jsonl"` 是目前唯一的后端；写了不认识的名字会在启动时报错，而不是悄悄回落。
 
-## 系统要求
+## 配置分层
 
-平台：Windows 10 / 11（x64）。
+配置是**合成**出来的，从低到高：`bundle → patch → config.toml`。写在 `config.toml` 里的永远最强，
+所以老配置不用为「分层」做任何迁移。
 
-宿主本体（`aox.exe` / `aox-gui.exe`）**不需要任何外部运行时**：发行版已静态链接 MSVC 运行库，
-既不要求 VC++ Redistributable（导入表里没有 `VCRUNTIME140.dll`），也不需要 Python / Node / Rust。
+- `aox.toml`（可选，放在程序目录）是清单：加载哪些 bundle、叠哪些 patch、以及具名 profile。
+  `--manifest` / `--profile` 可以临时覆盖。
+- bundle 放在 `<程序目录>/bundles/<名字>.toml`，整体替换同名内置层。内置层：
+  `core`、`llm-openai`、`tools`、`web`、`store-jsonl`、`recovery`、`loop-standard`、`prompt-core`、`strict`。
+- 未知 bundle、缺失 patch、bundle 成环、未知 profile 都是启动错误，不会静默回落。
+- `/config` 打印层栈；`aox --dump-config` 打印层栈**和**每个值最终由哪一层写入。
 
-外部运行时只影响**插件**，而且三种语言的要求不一样：
+`config.toml` 的分节：`[auth]` `[agent]` `[prompt]` `[sandbox]` `[plugins]` `[tools]` `[workplace]`
+`[history]` `[store]` `[recovery]` `[shell]` `[web]` `[runtimes]` `[theme]`。
 
-| 插件语言 | 运行已有插件 | 新建插件（`create_plugin`） |
-| --- | --- | --- |
-| python | 需要能用的 `python`（3.8+） | 同左 |
-| node | 需要能用的 `node` | 同左 |
-| rust | **不需要任何环境** | 需要 `rustc`（编译完就不再需要） |
+## 工具
 
-也就是说，`plugins/` 里已有的插件只有 python / node 两类要求解释器在场；rust 插件是编译好的原生 exe，
-宿主直接运行它，没装 Rust 工具链也能用。
+| 分组 | 工具 |
+|---|---|
+| 插件 | `create_plugin`、`update_plugin`、`list_plugins`、`remove_plugin` |
+| 文件 | `read_file`、`write_file`、`edit_file`、`list_dir`、`remove`（进回收站）、`attach_file`、`publish_file` |
+| 宿主 | `ask_user`、`find_tools`、`task_state`、`verify` |
+| 命令行 | `shell`（cmd / PowerShell / pwsh / git 方言）、`bash`（找到 POSIX shell 才注册）、`shell_job`（长期后台作业） |
+| 网络 | `web_fetch`（`readable` / `links` / `text` / `json` / `raw`，`save=true` 落盘） |
 
-### 解释器从哪来：三档解析
+`remove` 走**系统回收站**。超过 `[tools] inline_max`（默认 24）时，插件工具会从请求里隐藏，模型调用
+`find_tools` 后重新出现；隐藏只是「不投放广告」，按名字调用照样能跑。
 
-宿主启动时对每个语言（python / node / rustc）按下面的顺序解析一次，**取第一个命中的**：
+### 授权
 
-1. `config.toml` 的 `[runtimes]` 里写了**完整路径** → 直接用它，不做任何替换；
-2. 该字段是**裸命令**（默认值就是 `python` / `node` / `rustc`）且应用目录下存在内置运行时
-   `<应用根>/runtime/<语言>/<可执行文件>` → 用内置的那份；
-3. 仍然没有 → 用裸命令交给 `PATH`。
+四道闸门 `meta_tools`、`plugin_tools`、`shell`、`web`，取值 `ask` · `auto` · `deny`，**默认全是 `auto`**。
+`[auth.overrides]` 支持精确工具名或插件名，以及尾部 `*` 的前缀通配；含 `*` 的键在 TOML 里必须加引号。
+命中顺序：精确 → 最长前缀 → `*` → 分类默认。声明了非空 `caps` 的组件仍然强制询问。
 
-第 2 档是重点：**把运行时放进应用目录就自动生效**，不用改配置，也不会往系统 `PATH`
-或用户环境变量里写任何东西（卸载即消失）。
+## 边界
 
-### 装配 Python 运行时
+两件经常被混为一谈的事：
 
-没有任何解释器时程序照常启动、能对话、能用 `/tools` `/plugins` 等本地命令，
-但 python 插件会加载失败——此时启动横幅会明确提示一行。补上它的方式：
+| | `[workplace]` | `[sandbox]` |
+|---|---|---|
+| 管什么 | 本会话能**写和删**哪里 | 插件**子进程**怎么跑 |
+| 档位 | `default`（程序目录）· `full` · `fixed` + `root` | `enabled`、`max_processes`、`max_memory_mb`、`ui_limits` |
+| 谁来执行 | 宿主，作用于文件工具与插件声明的路径参数 | Windows Job Object（`CREATE_SUSPENDED` → 入 Job → 放行，`KILL_ON_JOB_CLOSE`） |
 
-```
-/runtime                      # 查看三种运行时的状态与来源（含版本号）
-/runtime install python       # 装配 Python 运行时到 <应用根>/runtime/python
-/runtime dir                  # 打印运行时目录
-```
+- **读取从不限制**：`read_file` / `list_dir` 可以看任何地方。边界只管写入与删除，并且把插件声明的路径
+  参数一律按「写」判定（粗网）。它**挡不住**插件自己 `open()` 一个文件——那需要系统级隔离。
+- `full` 必须显式选择，并且要过一道红色确认；`/workplace` 与输入框的工作区 chip 可以中途换档。
+- 沙箱是**护栏，不是安全边界**，也不覆盖文件与网络，只在 Windows 上生效。shell 另有自己的 Job
+  （`[shell] max_processes`，默认 16），可选走低完整性 helper。
 
-`install` 的顺序是：**已存在 → 本地离线包 → 下载**。
+## 检查点与回滚
 
-- **离线包**：文件名固定为 `aox-python-runtime.zip`，放在 **exe 同目录**、应用根、
-  `<应用根>/runtime` 或 `%LOCALAPPDATA%\AOX` 下都会被自动发现。用
-  `bash tools/build_installer.sh pack` 可以产出这个包（约 10 MB），适合内网 / 离线分发。
-- **下载**：默认取 CPython 官方嵌入式发行版（约 10 MB），并用内置的官方 SHA-256 校验。
-  可换成自建镜像：
-
-  ```toml
-  [runtimes]
-  python_url    = "https://your-mirror.example.com/python-3.13.7-embed-amd64.zip"
-  python_sha256 = "<官方或自建包的 SHA-256>"
-  ```
-
-- 装配完成后**立即生效**（内部会重新解析一次）：之后新建的 python 插件直接用它；
-  此前因缺少 python 而加载失败的插件，重启程序即可恢复。
-- 整个过程只用系统已有能力：下载走 `reqwest`，解压走系统 `tar.exe`（Win10 1803+），
-  校验走 `certutil`。宿主**没有为此增加任何第三方依赖**。
-- Node 单文件就超过 80 MB，不适合自动装配。`/runtime install node` 会直接说明这一点，
-  请自行安装并保证 `node` 在 `PATH` 中。
-- 个别插件的**第三方 pip 依赖**要自己装。注意官方「嵌入式发行版」**不含 `pip`**：
-  确实需要 `pip` 时请装完整 Python，并在 `[runtimes] python` 指向它。
-
-### 发行产物（一次构建全部产出）
-
-`installer/*.iss` 只有一份脚本，靠条件编译产出两种变体（不维护第二份脚本）。
-`bash tools/build_installer.sh` **不带参数时一次产出下面全部五种文件**：
-
-| 产物 | 内容 | 体积 |
-| --- | --- | --- |
-| `AOX-Setup-<版本>.exe` | 命令行版，只有宿主 | 约 3 MB |
-| `AOX-GUI-Setup-<版本>.exe` | 图形界面版，只有宿主 | 约 4 MB |
-| `AOX-Setup-<版本>-with-python.exe` | 命令行版 + Python 运行时（离线可用） | 约 11.4 MB |
-| `AOX-GUI-Setup-<版本>-with-python.exe` | 图形界面版 + Python 运行时（离线可用） | 约 12.5 MB |
-| `aox-python-runtime.zip` | 运行时组件包，给主包用户离线装配用 | 约 10.4 MB |
+每个任务都在 `<工作区>/.aox/backup/` 留下一个恢复点：内容寻址（BLAKE3）的对象库 + 不可变节点 +
+原子 `cursor.json` + 日志与重做快照。
 
 ```bash
-bash tools/build_installer.sh                    # 默认：上面全部
-bash tools/build_installer.sh all none           # 只要两个主包（最快）
-bash tools/build_installer.sh all with-python    # 只要两个捆绑变体
-bash tools/build_installer.sh cli                # 只做命令行版（两种变体）
-bash tools/build_installer.sh pack               # 只产出运行时组件包
+/checkpoints                # 列出恢复点（默认 20 个，--all 看全部）
+/rollback                   # 预览上一个任务改了哪些文件
+/rollback --yes             # 执行恢复（--force 等于 --yes，--allow-partial 接受不完整的点）
+/redo                       # 用安全快照撤销这次回滚
+/backup status              # 对象数、体积、保留策略
+/backup verify              # 重新校验对象
+/backup prune               # 按保留策略裁剪并回收
 ```
 
-脚本把版本号以 `--define=AppVersion=…` 传给 ISCC，**不要改成旧式的 `/DAppVersion=…`**：
-ISCC 把 `/` 开头的参数当选项，而 Git Bash（MSYS）在启动原生程序前会把这类参数当 Unix
-路径改写一遍（`/DAppVersion=0.1.0` → `<Git 安装目录>/DAppVersion=0.1.0`），ISCC 认不出它是
-选项，就报 `You may not specify more than one script filename.`。`--define=` 不以 `/` 开头，
-不受这条规则影响；手动编译时同理，见 `installer/*.iss` 头部注释。
+`[recovery]` 的默认值：`keep = 30` 个任务、`max_total_mb = 512`、`max_file_mb = 64`、
+`max_turn_mb = 256`、`shell_guard = "strict"`、`protect_plugins = true`，外加排除清单。GUI 里
+撤销 chip 打开的是同一套东西：预览、风险确认，以及四个维护动作。
 
-两个 `-with-python` 变体与主包的**差别只在于是否把 `runtime/python` 一并装进应用目录**，
-宿主会自动发现它（三档解析的第 2 档）。
+## 插件运行时
+
+宿主本身什么都不需要，插件才需要。三种语言，启动时各解析一次，取第一个命中的：
+
+1. `[runtimes]` 里写了**完整路径** → 原样使用（路径不存在只报告，不做替换）；
+2. `prefer = "system"`（默认）→ 先 `PATH`，再内置 `runtime/<语言>/`；
+3. `prefer = "builtin"` → 先内置，跳过 `PATH`。
+
+| 语言 | 运行已有插件 | 新建插件 |
+|---|---|---|
+| python | 需要 `python` 3.8+ | 同左 |
+| node | 需要 `node` | 同左 |
+| rust | 什么都不需要（编译好的 exe） | 需要 `rustc` |
+
+`/runtime install python` 会把 CPython 3.13.7 embeddable（约 10 MB，校验 SHA-256）装进
+`runtime/python`；放在 exe 同目录、程序目录、`runtime/` 或 `%LOCALAPPDATA%\AOX` 下的离线包
+`aox-python-runtime.zip` 会被优先发现。Node 单文件超过 80 MB，不自动装配；rustc 不内置。嵌入式发行版
+**不含 `pip`**，需要时装完整 Python 并把 `[runtimes] python` 指向它。
+
+`bash` **工具**与插件运行时是两回事：Git for Windows → 由 `git.exe` 推导的 bash → `PATH` 上的
+`bash.exe` → `runtime/bash/bash.exe` → `runtime/bash/busybox.exe`（WSL 的 stub 会被拒绝）。
+busybox 是 POSIX `sh`：没有数组、没有 `[[ ]]`、没有进程替换。
+
+## 远程接管
+
+`aox remote` 把本机注册成 AOXChat 服务器上的一个 agent，并保持一条 WebSocket。群里有人 @ 这个 agent，
+就在**本机**跑一轮真实任务，过程、结果与产物回传到房间里。服务器地址不内置；凭证在 `.aox/remote.json`。
+
+```bash
+aox remote pair [服务器] [配对码] [agent 名]    # 配对码在手机端：设置 → 添加电脑
+aox remote list | use <序号|id> | rename | remove | status
+aox remote policy [ask|owner|open]             # 谁可以触发这台机器
+aox remote serve                               # 常驻桥接（阻塞）
+```
+
+会话里 `/remote start` / `/remote stop` 在后台跑同一条桥，`/remote list|use|pair|policy|remove`
+与上面一致。`call_policy` 默认 `ask`：别人 @ 你时需要你点头。手机接管期间会盖一层模态
+（`已被远程接管`，只留「取回控制权」），键盘输入被吞掉，`.aox/remote.lock` 记录这次接管。
 
 ## 从源码构建
 
@@ -305,22 +333,22 @@ ISCC 把 `/` 开头的参数当选项，而 Git Bash（MSYS）在启动原生程
 
 ```bash
 cargo build                      # 只构建 CLI（workspace 默认成员）
-cargo run                        # 运行 CLI
-cargo build -p aox-gui --release # 构建 GUI
-cargo run -p aox-gui             # 运行 GUI
+cargo build -p aox-gui --release  # GUI → target/release/aox-gui.exe
+AOX_LANG=zh cargo build -p aox-gui --release   # 中文界面，编译期嵌入
 ```
 
-**Windows + Git Bash 用户注意**：Git Bash 自带的 coreutils `link` 会抢占 PATH 里 MSVC 的
-`link.exe`，报 `link: extra operand '...rcgu.o'`。解决办法是在 `.cargo/config.toml` 里
-显式指定链接器与 `LIB` / `INCLUDE`：
+`AOX_LANG` 只决定把哪个 `locales/<code>.toml` 嵌进二进制——没有运行时语言切换，这也是中文安装包
+必须是单独文件的原因。
+
+**Windows + Git Bash**：Git Bash 自带的 coreutils `link` 会抢占 MSVC 的 `link.exe`
+（`link: extra operand '...rcgu.o'`）。在 `.cargo/config.toml` 里钉住链接器与运行库：
 
 ```toml
 [target.x86_64-pc-windows-msvc]
 linker = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\<版本>\\bin\\Hostx64\\x64\\link.exe"
 
 # 静态链接 MSVC 运行库（/MT 等价），**发行必加**：
-# 否则 exe 会依赖 VCRUNTIME140.dll，而它不属于 Windows 自带组件
-# （来自 VC++ 2015-2022 Redistributable），干净装机上直接报「找不到 VCRUNTIME140.dll」。
+# 否则 exe 依赖 VCRUNTIME140.dll，而干净装机上没有这个文件。
 rustflags = ["-C", "target-feature=+crt-static"]
 
 [env]
@@ -328,66 +356,87 @@ LIB     = { value = "<MSVC>\\lib\\x64;<WinSDK>\\Lib\\<版本>\\um\\x64;<WinSDK>\
 INCLUDE = { value = "<MSVC>\\include;<WinSDK>\\Include\\<版本>\\um;<WinSDK>\\Include\\<版本>\\ucrt;<WinSDK>\\Include\\<版本>\\shared;<WinSDK>\\Include\\<版本>\\winrt", force = true }
 ```
 
-这个文件含本机绝对路径（对别人无效），已被 `.gitignore` 排除，**需要自建**。
-用 PowerShell / cmd 或已 `vcvars64` 的终端构建则不需要其中的 `linker` / `LIB` / `INCLUDE`，
-但 **`rustflags` 那行无论用哪个终端都要保留**。
+这个文件含本机绝对路径、已被 `.gitignore` 排除，需要自建。用 PowerShell / cmd / 已 `vcvars64` 的终端
+构建时 `linker` / `LIB` / `INCLUDE` 可以不要，但 **`rustflags` 必须留着**，否则 `build.rs` 会打一条
+显眼的 `cargo:warning`，提醒产物在干净机器上起不来。
 
-漏加 `rustflags` 时构建不会失败，但两个 `build.rs` 会打出显眼的 `cargo:warning` 提醒你产物
-在干净机器上起不来。
+### 发行产物
+
+```bash
+bash tools/build_installer.sh                    # 八个安装包 + 运行时组件包
+bash tools/build_installer.sh all none           # 只要两个前端 × 两种语言的主包
+bash tools/build_installer.sh gui with-python    # 只打 GUI 的捆绑变体
+bash tools/build_installer.sh pack               # 只产出 aox-python-runtime.zip
+```
+
+`installer/aox.iss` 与 `installer/aox-gui.iss` 各编译两遍（带不带 `BUNDLE_PYTHON`），`AOX_LANG=zh`
+让产物多一个 `-zh` 后缀。
+
+| 产物 | 内容 | 体积 |
+|---|---|---|
+| `AOX-Setup-<v>.exe` / `AOX-GUI-Setup-<v>.exe` | 只有宿主 | 约 4.4 MB / 约 7.1 MB |
+| `AOX-Setup-<v>-with-python.exe` / `AOX-GUI-Setup-<v>-with-python.exe` | 加 `runtime/python` | 约 13 MB / 约 16 MB |
+| `AOX-Setup-<v>-zh.exe` 及同族三个 | 中文界面 | 同上 |
+| `aox-python-runtime.zip` | 运行时组件包 | 约 11 MB |
+
+版本号以 `--define=AppVersion=…` 传给 ISCC，**不要用旧式的 `/DAppVersion=…`**：ISCC 把 `/` 开头当选项，
+而 Git Bash 在启动原生程序前会把它改写成 Unix 路径，于是报
+`You may not specify more than one script filename.`
 
 ## 故障排查
 
-**任务跑到一半停下、模型什么也没输出？**
+**任务跑到一半停下、模型什么也不说。** 先看有没有 `⚠` / `✗` 行——AOX 不会再静默结束。
 
-先看终端里有没有 `⚠` / `✗` 行——AOX 现在不会再「静默结束」了。若确有异常，按以下顺序排查：
+1. **思考模型**返回 `reasoning_content`，回传历史时必须原样带回，否则多步任务的第二次请求会被 400 拒绝。
+   AOX 已自动处理。
+2. **`max_tokens` 太小**：推理 token 也占输出额度，额度耗尽就是一条空回复。8192 起步比较稳。
+3. **抓原始报文**：`AOX_DEBUG_LLM=1 aox`，每条请求与响应追加到**当前工作目录**下的
+   `logs/llm.jsonl`（含 `finish_reason`、`usage`、空回复）。
 
-1. **思考模式（thinking）模型**：`deepseek-flash`、`deepseek-reasoner` 这类模型会返回
-   `reasoning_content`，回传历史时**必须原样带回**，否则每次多步任务的第二次请求都会被
-   API 以 400 拒绝（`reasoning_content ... must be passed back to the API`）。
-   AOX 已自动处理，无需你干预。
-2. **`max_tokens` 太小**：推理 token 也占输出额度，额度耗尽会得到一条**空回复**。
-   建议在模型参数里设为 `8192` 以上。
-3. **抓原始报文**：用 `AOX_DEBUG_LLM=1 aox` 启动，每次请求与响应会追加到
-   `logs/llm.jsonl`，可直接看到 `finish_reason`、`usage`、空回复等细节。
-
-AOX 对「空回复」的处置是：先重试 2 次并提示，仍为空则明确报错说明原因，**不会**把
-一句「我先看看……」的前言当成最终答案。
-
-**图形界面里「一用插件 / 插件初始化就弹黑色 python 窗口」？**
-
-GUI 版编译为 `windows` 子系统，**自身没有控制台**。如果拉起插件子进程时不加
-`CREATE_NO_WINDOW`，Windows 会为 `python.exe` 新分配一块**带窗口**的控制台 —— 现象就是
-动不动弹出几个黑窗。宿主已修（`src/plugin/mod.rs::hide_console`，覆盖首次启动恢复插件、
-插件崩溃自愈重启、`rustc` 编译三条路径），装上最新构建的 `AOX-GUI-Setup` 即可。
-留了回归检查：
+**GUI 里闪黑窗。** `aox-gui.exe` 是 `windows` 子系统、没有控制台；拉起 `python.exe` 时不给
+`CREATE_NO_WINDOW`，Windows 就会给它分配一个。宿主在所有 spawn 路径上都加了，新构建不会再有；
+`cargo run` 起来的 **debug 版本身是控制台程序**，看到黑窗是正常的。
 
 ```bash
-python tools/check_no_console_window.py --ab                                  # 机制自检，秒级
+python tools/check_no_console_window.py --ab     # 机制自检
 python tools/check_no_console_window.py --app target/release/aox-gui.exe --cwd .
 ```
 
-注意 `cargo run` 起来的 **debug 版本身就是控制台程序**，看到一个黑窗属于正常现象，
-不是这个 bug。
+**`模型未就绪`。** `models.json` 里没有启用的模型，或 key 还是占位符。打开设置 → 模型；GUI 会告诉你
+它读的是哪个文件。
+
+**python 插件加载不了。** 没找到解释器。`/runtime` 会报告哪一档没命中，`/runtime install python` 就地解决。
 
 ## 目录说明
 
-程序目录（安装目录）下会自动生成：
+```
+<程序目录>/
+  config.toml                你的配置（首次运行生成）
+  aox.toml                   可选的组合清单（bundle / patch / profile）
+  bundles/<名字>.toml        可选，覆盖内置 bundle
+  RULES.md                   可选，项目规则会注入系统提示
+  aox.exe / aox-gui.exe
+  .aox/
+    models.json              模型列表与当前启用的模型
+    spaces.json              空间注册表
+    conversations/*.jsonl    一个会话一个文件
+    backup/                  内容寻址的恢复库
+    memory/*.md              agent 自己的按日笔记
+    remote.json              远程配对
+    ui.json / welcome.json / remote.lock
+    tmp/  web/  files/  run/  toolcache/
+  plugins/<名字>/            模型自己写的插件，另有 sdk/
+  runtime/bash/              busybox-w32 兜底 shell
+  runtime/python/            仅在 -with-python 或 /runtime install python 之后存在
+  workplace/<项目>/          长期交付物
+  temp/                      临时文件
+  logs/llm.jsonl             仅在 AOX_DEBUG_LLM=1 时存在，落在当前工作目录
+```
 
-| 路径 | 说明 |
-| --- | --- |
-| `config.toml` | 你的配置（首次运行自动生成） |
-| `.aox/models.json` | 模型列表与当前启用的模型（见 [模型](#模型)） |
-| `plugins/<名字>/` | 模型自己写的插件，含源码与 `plugin.toml` |
-| `plugins/sdk/` | 宿主提供的插件 SDK 与协议文档，每次启动自动更新 |
-| `history/*.jsonl` | 对话历史，每个对话一个文件（见 [对话历史](#对话历史)） |
-| `RULES.md` | 可选。写在这里的项目规则会被注入系统提示 |
-| `logs/llm.jsonl` | 可选。仅在 `AOX_DEBUG_LLM=1` 启动时记录原始请求/响应，用于排查模型侧问题 |
-
-插件子进程以**安装目录为工作目录**启动，Python 插件已由宿主强制 UTF-8 输出。
+插件子进程以**程序目录**为工作目录启动；Python 插件由宿主强制 UTF-8 输出。
 
 ## 卸载
 
-通过「设置 → 应用」或开始菜单里的卸载项即可。卸载会删除 `<安装目录>/runtime`
-（按需装配或捆绑进来的运行时，机器相关、可随时重建），但**不会删除 `plugins/` 与 `history/`**——
-前者是模型积累出来的插件，后者是你的对话记录，两者都是用户数据。
-如果你确实不再需要，请手动删除安装目录。
+通过「设置 → 应用」或开始菜单卸载项。卸载会删掉 `runtime/`（机器相关、可随时重建）与装进去的
+可执行文件，但**保留** `plugins/`（模型积累出来的能力）与 `.aox/`（会话、模型、快照、配对）——
+两者都是用户数据。真要清干净，手动删除安装目录。
