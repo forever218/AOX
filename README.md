@@ -4,27 +4,29 @@
 
 # AOX
 
-**An AI agent that grows its own tools.**<br>
-Ships with a working set — everything else it writes itself, in Python, Node or Rust.
+**A self-extending AI agent.**<br>
+Ships with a built-in toolset and authors additional tools at runtime as Python, Node.js or Rust plugins.
 
 [![stars][b-stars]][repo] [![rust][b-rust]][repo] [![platform][b-platform]][repo] [![gui][b-gui]][gui] [![plugins][b-plugins]][usage] [![license][b-license]][license]
 
-[Quick start](#quick-start) · [Commands](#commands) · [Build](#build-from-source) · [Docs](#documentation) · [**简体中文**](README.zh-CN.md)
+[Quick start](#quick-start) · [Commands](#commands) · [Build](#build-from-source) · [Documentation](#documentation) · [**简体中文**](README.zh-CN.md)
 
 </div>
 
-- **It writes what it lacks.** Needs a capability? It authors a plugin, injects it, calls it on the very next turn. Plugins are files on disk, restored after a restart; `update_plugin` hot-swaps one in place.
-- **A real working set out of the box.** 18 host tools: files (`read_file` / `write_file` / `edit_file` / `remove`…), `shell` · `shell_job`, `web_fetch`, plus `ask_user`, `find_tools`, `task_state` and `verify` — and `bash` whenever a POSIX shell is found.
-- **Every task is recoverable.** `task_state` holds the goal, the plan and the acceptance criteria; each task leaves a content-addressed snapshot you can preview, roll back and redo.
-- **Boundaries you can see.** Workplace tiers (writes stay under the app root by default), a Job Object fence around plugin subprocesses, four authorization gates.
-- **Two front ends, one core.** CLI and GUI over the same `Agent`; the GUI adds an activity-stream timeline, a cache hit map, a workspace file view and a live context ring.
-- **Answer from your phone.** `aox remote` registers this machine as an AOXChat agent — @ it in a room and the real agent runs here.
+## Features
+
+- **Self-extending.** When a required capability is missing, the agent writes a plugin, loads it, and can call it on the next turn. Plugins persist on disk and are restored after a restart; `update_plugin` hot-swaps a plugin in place.
+- **Built-in toolset.** 18 host tools, including file operations (`read_file`, `write_file`, `edit_file`, `remove`, …), `shell` / `shell_job`, `web_fetch`, `ask_user`, `find_tools`, `task_state` and `verify`. `bash` is also available when a POSIX shell is detected.
+- **Task-level recovery.** `task_state` records the goal, plan and acceptance criteria. Each task produces a content-addressed snapshot that can be previewed, rolled back and redone.
+- **Explicit boundaries.** Workplace tiers (writes are confined to the application root by default), a Job Object fence around plugin subprocesses, and four authorization gates.
+- **CLI and GUI on a shared core.** Both front ends run on the same `Agent`. The GUI adds an activity-stream timeline, a cache hit map, a workspace file view and a live context ring.
+- **Remote access.** `aox remote` registers the local machine as an AOXChat agent; mentioning it in a room runs the agent on that machine.
 
 ## Quick start
 
-**1 · Run it.** `AOX-GUI-Setup-<version>.exe` (Windows 10 1809+ / x64; a Chinese build ends in `-zh`). The first launch opens **Settings → Model** by itself.
+**1. Install.** Run `AOX-GUI-Setup-<version>.exe` (Windows 10 1809+, x64; the Chinese build carries a `-zh` suffix). **Settings → Model** opens automatically on first launch.
 
-**2 · Add a model.** Any OpenAI-compatible endpoint; "Scan models" fills the name for you.
+**2. Configure a model.** Any OpenAI-compatible endpoint is supported. **Scan models** retrieves the available model names.
 
 ```text
 Endpoint   https://api.deepseek.com
@@ -32,54 +34,55 @@ Key        sk-...
 Model      deepseek-flash
 ```
 
-Stored in `.aox/models.json` — the only place a key lives. CLI and GUI read the same file, and the switch takes effect on the next request.
+Credentials are stored only in `.aox/models.json`, which the CLI and GUI share. Model changes take effect on the next request.
 
-**3 · Ask.** The default workspace is the app root, so writes and deletes stay under it (switch tiers with the `Workspace` chip). Try *"read config.example.toml and list its sections"*.
+**3. Start a task.** The default workspace is the application root, and writes and deletes are confined to it; use the `Workplace` chip to change the tier. Example prompt: *"Read config.example.toml and list its sections."*
 
-> **No runtime needed.** The host is statically linked — no VC++ redistributable, no Python, no Node.
-> `bash` ships as busybox-w32; Python is optional (`/runtime install python` or a `-with-python` package).
+> **No runtime dependencies.** The host binary is statically linked and requires no VC++ redistributable, Python or Node.js.
+> `bash` is bundled as busybox-w32. Python is optional and can be added with `/runtime install python` or a `-with-python` package.
 
 ## Commands
 
-| Command | What it does |
+| Command | Description |
 | --- | --- |
-| `/help` | Everything, including the commands below |
-| `/tools` · `/plugins` | What it can call right now, and what each plugin contributes |
-| `/model` | List saved models; `/model 2` switches, effective on the next request |
-| `/workplace` | Show or switch the write boundary — `full` · `default` · `<dir>` |
-| `/task` | The current checkpoint: goal, plan with ticks, acceptance criteria |
-| `/rollback` | Preview the last task's file changes; `--yes` restores, `/redo` undoes it |
-| `/usage` | Token breakdown for this conversation, and the current context size |
-| `/history` | Past conversations — `show 1` · `open 1` · `rm 1` · `dir` |
-| `/remote` | Phone bridge: `status` · `start` · `stop` · `pair …` |
-| `/new` · `/quit` | Start a fresh conversation · exit (`Ctrl+C` interrupts a running task) |
+| `/help` | Show all commands |
+| `/tools` · `/plugins` | List available tools and the tools each plugin provides |
+| `/model` | List saved models; `/model 2` switches to model 2, effective on the next request |
+| `/workplace` | Show or change the write boundary: `full` · `default` · `<dir>` |
+| `/task` | Show the current checkpoint: goal, plan progress and acceptance criteria |
+| `/rollback` | Preview the last task's file changes; `--yes` applies the rollback, `/redo` reverts it |
+| `/usage` | Show the token breakdown and current context size for this conversation |
+| `/history` | Manage past conversations: `show 1` · `open 1` · `rm 1` · `dir` |
+| `/remote` | Manage the remote bridge: `status` · `start` · `stop` · `pair …` |
+| `/new` · `/quit` | Start a new conversation · exit (`Ctrl+C` interrupts a running task) |
 
-`/prompt`, `/hook`, `/loop`, `/config`, `/sandbox`, `/shell`, `/web`, `/checkpoints`, `/backup`, `/attach`, `/demo`, `/expand` and `/runtime` are in the manual.
+Additional commands (`/prompt`, `/hook`, `/loop`, `/config`, `/sandbox`, `/shell`, `/web`, `/checkpoints`, `/backup`, `/attach`, `/demo`, `/expand`, `/runtime`) are covered in the [manual](docs/USAGE.md).
 
 ## Build from source
+
+Requires Rust 1.90+ with the MSVC toolchain.
 
 ```bash
 cargo build -p aox-gui --release                # GUI → target/release/aox-gui.exe
 cargo build                                     # CLI → target/release/aox.exe
-AOX_LANG=zh cargo build -p aox-gui --release    # Chinese UI — the language is compile-time
+AOX_LANG=zh cargo build -p aox-gui --release    # Chinese UI (language is set at compile time)
 ```
 
-Rust 1.90+ with the MSVC toolchain. On Windows + Git Bash the linker and `crt-static` have to be
-pinned in `.cargo/config.toml` — see [USAGE § Building from source](docs/USAGE.md#building-from-source).
+On Windows with Git Bash, the linker and `crt-static` must be pinned in `.cargo/config.toml`. See [USAGE § Building from source](docs/USAGE.md#building-from-source).
 
 ## Documentation
 
-| Doc | What's inside |
+| Document | Contents |
 | --- | --- |
-| [**USAGE**](docs/USAGE.md) | Install, models, every command, GUI windows, conversations, config layers, boundaries, rollback, remote, packaging |
-| [**ARCH-ROADMAP**](docs/ARCH-ROADMAP.md) | The seven design principles, stages 1–7, the size history of every build |
-| [**SANDBOX**](docs/SANDBOX.md) | What a plugin subprocess is actually blocked from doing |
+| [**USAGE**](docs/USAGE.md) | Installation, models, commands, GUI windows, conversations, configuration layers, boundaries, rollback, remote access, packaging |
+| [**ARCH-ROADMAP**](docs/ARCH-ROADMAP.md) | Design principles, development stages 1–7, build size history |
+| [**SANDBOX**](docs/SANDBOX.md) | Restrictions enforced on plugin subprocesses |
 | [**SHELL**](docs/SHELL.md) · [**WEB**](docs/WEB.md) | The built-in command line and `web_fetch` |
 | [**ROLLBACK**](docs/ROLLBACK.md) | Task-level checkpoints: semantics and invariants |
-| [**I18N**](docs/I18N.md) | One language, one build |
-| [**docs/README**](docs/README.md) | The full index — design record, diagrams, working notebooks |
+| [**I18N**](docs/I18N.md) | Localization model: one language per build |
+| [**docs/README**](docs/README.md) | Full index: design records, diagrams, working notes |
 
-Most documents carry a `*.zh-CN.md` copy alongside them.
+Most documents have a `*.zh-CN.md` counterpart.
 
 ---
 
