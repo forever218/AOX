@@ -121,10 +121,6 @@ pub fn run(rt: &Arc<Runtime>, cmd: RecoveryCmd) -> Result<CommandReport, String>
 }
 
 /// Resolve the workspace for a recovery command even before the conversation's first message.
-///
-/// `default`/`fixed` have a deterministic root, so deciding it here is exactly what the first
-/// message would do. `full` has no protected root and must stay unavailable. Without this, a fresh
-/// process could not inspect or roll back tasks from the previous run until the user sent a message.
 pub(super) fn command_workspace(rt: &Arc<Runtime>) -> Result<std::path::PathBuf, String> {
     if let Some(root) = rt.workplace.active_root() {
         return Ok(root);
@@ -324,12 +320,6 @@ fn verify(root: &std::path::Path, cfg: &crate::config::RecoveryConfig) -> Result
 }
 
 /// `/backup prune`: apply retention and sweep unreachable objects.
-///
-/// The lock is the whole safety story: it is what guarantees no turn is mid-write and no restore is
-/// mid-apply, which is the precondition GC has. Nothing here deletes a *current* before-image —
-/// `keep` bounds which undo steps exist, and the sweep only removes what no surviving node, baseline,
-/// safety snapshot or journal mentions.
-/// `clear` — drop every point in this workspace, into the recycle bin.
 fn clear(root: &std::path::Path, cfg: &crate::config::RecoveryConfig) -> Result<CommandReport, String> {
     let store = match open(root, cfg, false) {
         Ok(s) => s,
@@ -413,9 +403,7 @@ fn rollback(
     rollback_spec_with(&store, cfg, spec, yes, force, allow_partial)
 }
 
-/// The shared body of both entry points: the CLI resolves a count or an id, the panel resolves
-/// [`TargetSpec::Before`] on the row the user clicked. Everything after "which node" is identical,
-/// and that is the part that must never diverge between the two doors.
+/// The shared body of both entry points: the CLI resolves a count or an id, the panel resolves TargetSpec::Before...
 pub(super) fn rollback_spec(
     root: &std::path::Path,
     cfg: &crate::config::RecoveryConfig,

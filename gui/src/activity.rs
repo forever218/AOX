@@ -1,59 +1,6 @@
-//! Activity stream: lives in its **own window** (an egui viewport), not in the
-//! main window's side panel.
-//!
-//! Why share state: eframe's `AppCreator` is `FnOnce`, and each viewport gets its
-//! own `App` instance, so the child window can't reach the main window's `App`
-//! through a `&mut self`. Everything the activity stream needs therefore lives in
-//! [`Activity`], shared between the two sides via `Arc<Mutex<_>>` — the main
-//! window only writes, the child window only reads and renders.
-//!
-//! The window is a **borderless top-level window** (a "mini AOX", initially the
-//! same size as the main window). Everything that makes that work — the self-drawn
-//! top bar, dragging, eight-way resize, the DWM rounded corners, the 1px outline,
-//! and the poke that keeps the main window painting — lives in [`crate::gwin`],
-//! shared with the cache-hit window (`cache.rs`). This module draws the
-//! **timeline** and nothing about the window itself.
-//!
-//! # Core: one horizontal timeline (a Gantt chart)
-//!
-//! ```text
-//!  0.0s      2.0s      4.0s      6.0s     8.0s
-//!    │         │         │         │        │
-//!  ①          ②
-//! Input       ▐███▌        ▐███▌
-//! Model       ▐█████▌        ▐███████████▌
-//! filestat_count  ▐██▌
-//! create_plugin        ▐███▌
-//! System              ▐▌
-//! ```
-//!
-//! - **The horizontal axis is time (seconds)**; tasks march left to right, and
-//!   each colored block is a stretch of real elapsed time.
-//! - Rows are the two fixed rows "Input / Model", then **one row per tool**, and
-//!   finally an extra "System" row when needed.
-//! - The horizontal axis can be zoomed freely (Ctrl+wheel / toolbar ±) and panned
-//!   left/right (drag / wheel).
-//! - The vertical axis: when there are too many tool rows to fit, **vertical
-//!   scrolling takes over** (Shift+wheel or the scrollbar on the far right); row
-//!   height itself can also be stretched (toolbar "row height −/+") — we don't
-//!   squash rows unreadably just to fit one screen.
-//! - The anchor button at top-left pins the view to "start / center / latest"; the
-//!   "round" field jumps straight to round N.
-//! - With "link lines" on, the blocks are joined head-to-tail in true execution
-//!   order by one line, colored after the block it leaves.
-//!
-//! **Idle means nothing is recorded**: we only ever write here while a round of
-//! work is running. When the program is idle, not a single pixel grows on the
-//! timeline.
-//!
-//! **Records travel with the conversation**: at the end of each round, the new
-//! blocks are handed to the Agent thread to append to **that conversation's own
-//! `history/*.jsonl`** (`kind:"act"` rows, see `aox::history`). So "open an old
-//! conversation" shows its timeline as it was then, and "delete that conversation"
-//! takes the timeline with it — no extra cleanup logic needed. For the same
-//! reason there is **no "clear" button** here: clearing the UI but not the file
-//! would just let it grow back next time you open it, which is the truly
-//! confusing case.
+//! Activity stream: lives in its own window (an egui viewport), not in the main window's side panel.
+//! Why share state: eframe's `AppCreator` is `FnOnce`, and each viewport gets its own `App` instance, so the child...
+//! The window is a borderless top-level window (a "mini AOX", initially the same size as the main window).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -68,12 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::gwin::{self, Gwin};
 use crate::theme::{self, P};
 
-// ────────────────────────────── Category ──────────────────────────────
+// Category
 
-/// Recording category. `Serialize` is here for persistence (see
-/// [`Activity::export_acts`]): the copy written to the conversation file uses
-/// `snake_case` names (`input` / `tool` …) rather than the Rust enum names —
-/// the file is meant for humans and other tools to read.
+/// Recording category. `Serialize` is here for persistence (see Activity::export_acts): the copy written...
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActKind {
@@ -81,7 +25,6 @@ pub enum ActKind {
     Input,
     /// Activity on the model side (thinking + output)
     Model,
-    /// One tool call (call → execute → return is a single segment)
     Tool,
     /// Authorization request / result
     Auth,
@@ -104,13 +47,7 @@ impl ActKind {
         }
     }
 
-    /// Base color of the block. A low-saturation warm palette, the same language
-    /// as code highlighting: input is gray, model is purple, the rest (auth / notice / error)
-    /// sit in warm yellow and brick red.
-    ///
-    /// **Tool blocks never reach the `Tool` arm below**: [`fill_of`] routes them to
-    /// [`tool_color`] first, so each distinct tool gets its own stable colour instead of every
-    /// call sharing this one flat orange.
+    /// Base color of the block. A low-saturation warm palette, the same language as code highlighting: input is gray...
     fn color(self) -> Color32 {
         match theme::mode() {
             theme::Mode::Light => match self {
@@ -180,9 +117,7 @@ impl Row {
     }
 }
 
-/// Derive the row list from the current records. Tool rows follow first-seen
-/// order, so when a new tool appears mid-stream the existing rows don't
-/// reshuffle (the eye won't be thrown off by rows jumping around).
+/// Derive the row list from the current records.
 fn rows_of(acts: &VecDeque<Act>) -> Vec<Row> {
     let mut rows = vec![Row::Input, Row::Model];
     for a in acts {
@@ -209,23 +144,15 @@ fn row_of(rows: &[Row], a: &Act) -> usize {
     }
 }
 
-// ────────────────────────────── Data ──────────────────────────────
+// Data
 
 /// One record in the activity stream = one colored block on the timeline.
-///
-/// serde is here because it must **persist** (written to the conversation file,
-/// see [`Activity::export_acts`]): after closing and reopening that conversation,
-/// the timeline should grow back exactly as it was. What's persisted is "seconds
-/// relative to the start of that session"; on load it's shifted as a batch (see
-/// [`Activity::load_acts`]).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Act {
     kind: ActKind,
     /// Which round this belongs to (the user's Nth issued instruction)
     round: u32,
-    /// Plugin name (present for tool calls). Kept purely as metadata (and as part of the on-disk
-    /// format) — the block's colour is derived from the tool name itself these days, see
-    /// [`tool_color`].
+    /// Plugin name (present for tool calls).
     plugin: String,
     /// Start time (seconds, absolute time since the app launched)
     at: f32,
@@ -292,28 +219,19 @@ pub struct Activity {
     /// The block the user clicked: it draws the highlight ring, and while it is on screen its
     /// detail popover floats beside it (see `popover`).
     selected: Option<u64>,
-    /// The selected bar's screen rect, recorded by `lanes` as it draws. `None` means the selected
-    /// node is scrolled out of view, so there is nothing to anchor the popover to — in that case
-    /// no popover is shown at all. Pure view state; never persisted.
+    /// The selected bar's screen rect, recorded by `lanes` as it draws. `None` means the selected node is scrolled out...
     pop_anchor: Option<Rect>,
 
     /// The window shell: open / pinned / busy / breathing-dot phase, plus the "do once per window"
     /// flags. Shared verbatim with the cache-hit window — see `gwin`.
     gw: Gwin,
     status: String,
-    /// The main window's clock reading when the current busy stretch began; `None` = idle. The
-    /// header's "· 12.3s" readout is `now - busy_base`.
-    ///
-    /// This used to hold an `Instant`, i.e. a **second, independent clock** — and the two
-    /// disagreed: the main window's clock stops while the user is answering a question, this one
-    /// didn't, so the header could calmly report a turn as having run for several minutes while
-    /// the chart right under it showed a few seconds of work. Deriving both readouts from the one
-    /// time base the main window hands over ([`Activity::tick`]) is what keeps them in step.
+    /// The main window's clock reading when the current busy stretch began; `None` = idle.
     busy_base: Option<f32>,
     /// The main window's time base (seconds), used to compute real-time length for "in-progress" blocks
     now: f32,
 
-    // ── Timeline view ──
+    // Timeline view
     anchor: Anchor,
     /// Pixels per second. `None` = not manually tuned yet, use the default (60s per screen)
     scale: Option<f32>,
@@ -394,11 +312,9 @@ impl Activity {
         }
     }
 
-    // ── Writing (called by main window) ──
+    // Writing (called by main window)
 
-    /// A round begins: the user issues an instruction. The "Input" segment = from
-    /// sending to when the model actually starts speaking — i.e. the "wait for the
-    /// model" time.
+    /// A round begins: the user issues an instruction.
     pub fn round_begin(&mut self, text: &str, at: f32) {
         self.close_open(at);
         self.round += 1;
@@ -503,8 +419,6 @@ impl Activity {
     }
 
     /// System event (info / warning / error / auth) — a transient entry, lands on the "System" row.
-    /// **Only recorded while a round of work is running**: when the program is idle nothing is
-    /// written to the timeline.
     pub fn note(&mut self, kind: ActKind, title: &str, body: &str, at: f32) {
         self.push(Act {
             kind,
@@ -538,11 +452,6 @@ impl Activity {
     }
 
     /// Clear the timeline (used when switching conversations).
-    ///
-    /// **Deliberately no "Clear" button is exposed**: the activity stream is part of this
-    /// conversation's record, so it can only be removed by deleting that conversation — otherwise
-    /// the UI clears it but the file still holds it, and reopening the conversation grows it back,
-    /// which would be genuinely incomprehensible.
     pub fn reset(&mut self) {
         self.acts.clear();
         self.open_input = None;
@@ -564,12 +473,7 @@ impl Activity {
         self.round_input.clear();
     }
 
-    /// Take the records that haven't been persisted yet (serialized to JSON) and advance the
-    /// watermark to the latest.
-    ///
-    /// **Call per round**: if we flushed a half-finished segment (a block still open), it would
-    /// land as a "no end time" stub that can't be recovered on a mid-way rollback. So we hand it
-    /// all over only after a round ends and every segment is closed.
+    /// Take the records that haven't been persisted yet (serialized to JSON) and advance the watermark to the latest.
     pub fn export_acts(&mut self) -> Vec<serde_json::Value> {
         let mut out = Vec::new();
         for a in &self.acts {
@@ -585,14 +489,7 @@ impl Activity {
         out
     }
 
-    /// Load a saved conversation's activity stream back (called when switching to that
-    /// conversation).
-    ///
-    /// `now` = seconds since **this launch**. The save's timestamps come from the last launch's
-    /// coordinate system; loading them directly would be far off from the current `now`, so the
-    /// new blocks would either fly off-screen or shove the old records out. So we shift the whole
-    /// batch: end the last entry slightly before `now`, and the next round naturally continues
-    /// from the right.
+    /// Load a saved conversation's activity stream back (called when switching to that conversation).
     pub fn load_acts(&mut self, rows: &[serde_json::Value], now: f32) {
         self.reset();
         let acts: Vec<Act> = rows
@@ -660,13 +557,7 @@ impl Activity {
         }
     }
 
-    /// Per-round `[start, end]` in axis seconds, indexed by round number (`[0]` is unused; the
-    /// rounds shown to the user are numbered from 1).
-    ///
-    /// Folded out of the records rather than kept in a table, for the same reason as [`rows_of`]:
-    /// the answer is fully determined by the records, so a second copy would only add a way for the
-    /// two to disagree (a dropped front, a rolled-back turn). The vector is indexed by round so the
-    /// ruler can walk one round's ticks at a time without rescanning every record per tick.
+    /// Per-round `[start, end]` in axis seconds, indexed by round number (`[0]` is unused; the rounds shown...
     fn round_spans(&self) -> Vec<(f32, f32)> {
         let tz = self.tz();
         let mut v = vec![(f32::MAX, f32::MIN); self.round as usize + 1];
@@ -679,11 +570,7 @@ impl Activity {
         v
     }
 
-    /// Axis-seconds at which round `r` began (`0.0` when the round has no records left, which is
-    /// what happens after the front of the stream is dropped once it passes [`ACT_LIMIT`]).
-    ///
-    /// This is the origin for "how far into this round did this step happen" — what the ruler
-    /// labels and the hover/popover readouts count from, so every round reads from 0.
+    /// Axis-seconds at which round `r` began (`0.0` when the round has no records left, which is what happens after...
     fn round_start(&self, r: u32) -> f32 {
         let tz = self.tz();
         let mut lo = f32::MAX;
@@ -749,38 +636,26 @@ fn act_id() -> ViewportId {
 /// (see [`gwin::set_round_corners`]), so there must be exactly one copy.
 const WINDOW_TITLE: &str = "AOX Activity Stream";
 
-// ─────────────────────────── Window open/close ───────────────────────────
+// Window open/close
 
 const MIN_W: f32 = 860.0;
 const MIN_H: f32 = 520.0;
 
 /// Open the activity-stream window (idempotent).
-///
-/// Deliberately **not a toggle**: the button in the settings page says "Open activity stream", and a control **labelled "Open" that actually
-/// closes the window** is one of the most program-is-broken-feeling interactions. The window has its own close button (the × at top-right)
-/// and supports system-level Alt+F4, so there is a proper way to close it. When already open it is a no-op —
-/// egui's child viewports are declared by `sync` every frame, and the window gets brought to the front.
 pub fn open(ctx: &egui::Context, a: &Shared) {
     lock(a).gw.open(ctx);
 }
 
 /// Called once per frame by the main window.
-///
-/// egui's viewports are "declarative": **a child viewport not declared this round is simply dropped**.
-/// So even while the window is minimized and untouched, it must be re-declared every frame.
 pub fn sync(ctx: &egui::Context, a: &Shared) {
     let mut st = lock(a);
     if !st.gw.open {
-        // Closing while a turn is running: the window callback stops here, so it would never get to
-        // withdraw this window's claim on the poker — and a claim left standing would keep the main
-        // window repainting at full rate forever.
+        // Closing while a turn is running: the window callback stops here, so it would never get to withdraw...
         drop(st);
         gwin::want(gwin::WIN_ACTIVITY, false);
         return;
     }
-    // Size, position and the "report only what never changes" rule all live in
-    // [`gwin::Gwin::builder`] — this window only supplies what is its own: the title and how small
-    // it may get.
+    // Size, position and the "report only what never changes" rule all live in gwin::Gwin::builder — this window only...
     let size = gwin::initial_size(ctx);
     let b = st.gw.builder(ctx, WINDOW_TITLE, size, Vec2::new(MIN_W, MIN_H), Vec2::ZERO);
 
@@ -789,12 +664,9 @@ pub fn sync(ctx: &egui::Context, a: &Shared) {
     ctx.show_viewport_deferred(act_id(), b, move |ctx, _| window(ctx, &a2));
 }
 
-// ═══════════════════════════ Layout metrics ═══════════════════════════
+// Layout metrics
 
-/// Bounds of the row-name gutter on the left. Its width is **no longer a constant**: it is measured
-/// from this frame's actual rows (see `gutter_w`), so a timeline whose names are all short hugs the
-/// left edge instead of leaving a fixed ~180-point blank strip. These are only the floor (the
-/// column never collapses) and the ceiling (past it, names are elided).
+/// Bounds of the row-name gutter on the left.
 const GUTTER_MIN: f32 = 64.0;
 const GUTTER_MAX: f32 = 182.0;
 /// Nominal size of the click-a-node popover. It shrinks to fit when the window is small, and the
@@ -826,7 +698,7 @@ const LANE_MIN_USER: f32 = 16.0;
 const LANE_MAX_USER: f32 = 104.0;
 
 
-// ─────────────────────────── The child window's content ───────────────────────────
+// The child window's content
 
 fn window(ctx: &egui::Context, shared: &Shared) {
     let mut st = lock(shared);
@@ -843,10 +715,7 @@ fn window(ctx: &egui::Context, shared: &Shared) {
         });
     });
 
-    // The epilogue is split in two on purpose: `step` advances the breathing dot and decides what
-    // this frame wants, then the lock is **released** before `drive` pokes the main window. That
-    // poke lands as a `WM_PAINT` on the main thread, whose own pass takes this same lock — running it
-    // while still holding the lock would stall the main window until this frame finished.
+    // The epilogue is split in two on purpose: `step` advances the breathing dot and decides what this frame wants...
     let d = st.gw.step();
     drop(st);
     gwin::drive(ctx, gwin::WIN_ACTIVITY, d);
@@ -857,9 +726,7 @@ fn body(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
     // with each allocate, and by the end of the function only a sliver at the bottom would be left.
     let full = ui.max_rect();
 
-    // The top bar's state readout is built here rather than inside `gwin::header`: the shell has no
-    // idea what a given window is busy with, and "which round, how many records" is this window's
-    // own vocabulary.
+    // The top bar's state readout is built here rather than inside `gwin::header`: the shell has no idea what a given...
     let status = if st.status.is_empty() { aox::i18n::t("Ready") } else { st.status.as_str() };
     let info = if st.gw.busy {
         format!("{status} · {:.1}s", st.busy_base.map_or(0.0, |b| (st.now - b).max(0.0)))
@@ -881,11 +748,7 @@ fn body(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
         // number of tool rows decides whether vertical scrolling takes over (see `timeline`).
         let rows = rows_of(&st.acts);
         let rest = ui.available_height();
-        // The timeline now owns **all** the remaining height. The big bottom detail card is gone —
-        // a step's content moved into a small popover beside the bar (`popover`), so there is
-        // nothing left to reserve room for, and the chart stops being squeezed into the top half.
-        // Taking the full height also means the blank area below the last row stays part of the
-        // timeline: clicking it still deselects, and dragging it still pans.
+        // The timeline now owns all the remaining height.
         let chart_h = rest.max(170.0);
 
         timeline(ui, ctx, st, &rows, chart_h, full);
@@ -903,17 +766,17 @@ fn body(ui: &mut Ui, ctx: &egui::Context, st: &mut Activity) {
 
 
 
-// ───────────────────────────── Top bar ─────────────────────────────
+// Top bar
 
 
-// ───────────────────────────── Toolbar ─────────────────────────────
+// Toolbar
 
 /// A row of view tools: the left half is "which stretch to look at", the right half is "how to view it".
 fn toolbar(ui: &mut Ui, st: &mut Activity) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
 
-        // ── Anchors: pin a moment to some position on screen ──
+        // Anchors: pin a moment to some position on screen
         if gwin::pill(ui, aox::i18n::t("Start"), st.anchor == Anchor::Start)
             .on_hover_text(aox::i18n::t("Pin the start of the first round to the left edge"))
             .clicked()
@@ -935,7 +798,7 @@ fn toolbar(ui: &mut Ui, st: &mut Activity) {
 
         gwin::vsep(ui);
 
-        // ── View by round ──
+        // View by round
         ui.label(RichText::new(aox::i18n::t("Round")).color(P::text_faint()).size(13.5));
         let edit = ui.add(
             TextEdit::singleline(&mut st.round_input)
@@ -958,11 +821,7 @@ fn toolbar(ui: &mut Ui, st: &mut Activity) {
             RichText::new(aox::tf!("{} rounds", st.round)).color(P::text_faint()).size(13.5),
         );
 
-        // ── Right half: row height + horizontal zoom + link lines ──
-        //
-        // In `right_to_left`, **whatever is added first is rightmost**, so the writing order below is the reverse of
-        // the on-screen left-to-right order: what you finally see is
-        //     Link lines  Fit │ Zoom − + │ Row height − +
+        // ── Right half: row height + horizontal zoom + link lines ──.
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
 
@@ -1007,7 +866,7 @@ fn toolbar(ui: &mut Ui, st: &mut Activity) {
 }
 
 
-// ═══════════════════════════ Timeline ═══════════════════════════
+// Timeline
 
 /// Map time to pixels: the horizontal axis is time, and tasks advance left to right.
 #[derive(Clone, Copy)]
@@ -1086,15 +945,11 @@ fn timeline(
         );
 
         // The plot area's left edge and width: axis, row names and bars all align to it.
-        // The row-name column is measured from this frame's rows rather than fixed, so a timeline
-        // whose names are short hugs the left edge instead of leaving a wide blank strip.
         let gutter = gutter_w(ui, rows);
         let plot_left = band.left() + gutter;
         let plot_w = (band.right() - RSV - plot_left).max(60.0);
         let area_h = (avail_h - AXIS_H - ROUND_H).max(60.0);
-        // The two top bands are not the "plot area": they only borrow the plot's x coordinate,
-        // so a rect with an aligned left edge must be built for them — passing the whole band into
-        // `View::x` would offset the ticks from the bars by a whole gutter width.
+        // The two top bands are not the "plot area": they only borrow the plot's x coordinate, so a rect with an aligned...
         let axis = Rect::from_min_size(Pos2::new(plot_left, band.top()), Vec2::new(plot_w, AXIS_H));
         let ruler =
             Rect::from_min_size(Pos2::new(plot_left, rband.top()), Vec2::new(plot_w, ROUND_H));
@@ -1133,17 +988,8 @@ fn timeline(
         input(ui, ctx, st, lane_rect, plot_left, plot_w, v0, full);
         let v = View::compute(st, plot_w);
 
-        // ── Time scale band ──
-        //
-        // The ruler counts **each round from 0** instead of running on from the first record for
-        // ever. The stream is a sequence of rounds, not one long process, so the number worth
-        // reading is always "how far into *this* round" — a cumulative reading just drifts into
-        // "17:03" a few rounds in and stops saying anything about the step you are looking at.
-        //
-        // Because the clock stops between rounds (see `Clock` in the main window), rounds are laid
-        // flush end to end: a round's 0 tick lands exactly on the previous round's final tick, so
-        // one of the two labels would double up there. The tick is cheap and always drawn; the
-        // *label* is what is skipped when it would collide with the one before it.
+        // ── Time scale band ──.
+        // The ruler counts each round from 0 instead of running on from the first record for ever.
         let base_y = band.bottom() - 1.0;
         {
             let p = ui.painter();
@@ -1205,7 +1051,7 @@ fn timeline(
             );
         }
 
-        // ── Round scale band ──
+        // Round scale band
         {
             let p = ui.painter();
             let tz = st.tz();
@@ -1234,9 +1080,7 @@ fn timeline(
             }
         }
 
-        // ── Rows ──
-        // Row height can be "auto-spread" or a value the user dragged; either may exceed the visible area,
-        // and when it does, the scroll area below handles paging up and down.
+        // ── Rows ── Row height can be "auto-spread" or a value the user dragged; either may exceed the visible area...
         let lane_h = st.row_h.unwrap_or(fit);
         let content_h = n * lane_h + (n - 1.0) * LANE_GAP;
         let overflows = content_h > area_h + 0.5;
@@ -1291,10 +1135,8 @@ impl Activity {
     }
 }
 
-/// Pan / zoom / click-select. All only take effect when landing in the timeline's row area.
-///
-/// The response declaration order matters: this pan area is declared here first (before the scroll area),
-/// and the bars are declared later inside the scroll area — so clicking a bar lets the bar win, clicking blank space lets this win.
+/// Pan / zoom / click-select.
+/// The response declaration order matters: this pan area is declared here first (before the scroll area)...
 fn input(
     ui: &mut Ui,
     ctx: &egui::Context,
@@ -1339,18 +1181,10 @@ fn input(
         return;
     }
 
-    // The popover floats over the timeline, and its content is meant to be read with the wheel:
-    // while the pointer is inside it the wheel belongs to that content alone and the axis behind
-    // must hold still. egui hands a wheel to whichever widget consumes it, but `popover` is drawn
-    // *after* this runs, so it cannot take the delta out of our hands in time — hence the guard
-    // here. (The anchor read is last pass's, since `popover` recomputes `pop_anchor` later in this
-    // same pass; for a settled selection the two are the same rect, and a one-frame lag on the
-    // very frame the selection changes is harmless — a click and a wheel together are not a thing.)
+    // The popover floats over the timeline, and its content is meant to be read with the wheel: while the pointer...
     if let Some(anchor) = st.pop_anchor {
         if popover_rect(anchor, full).contains(p) {
-            // Shift is only ever a "make it vertical" hint in this window; egui has already
-            // collapsed it into a horizontal-only delta, so put it back for the popover's own
-            // vertical scroll area to read.
+            // Shift is only ever a "make it vertical" hint in this window; egui has already collapsed...
             if shift && scroll != Vec2::ZERO {
                 ctx.input_mut(|i| {
                     i.smooth_scroll_delta.y += i.smooth_scroll_delta.x;
@@ -1372,15 +1206,7 @@ fn input(
         }
     } else if shift {
         // Shift+wheel: page the rows.
-        //
-        // "Just let the scroll area have the wheel" is not enough, because by the time we see the
-        // event egui has already rewritten it: `Options::horizontal_scroll_modifier` is **SHIFT** by
-        // default, so `InputState` collapses the wheel into a horizontal-only delta
-        // (`vec2(x + y, 0.0)`). A vertical-only `ScrollArea` reads `smooth_scroll_delta.y` alone
-        // (egui's `always_scroll_the_only_direction` is off by default), so it read a permanent zero
-        // and the rows never moved. Put the delta back on the axis it actually reads — it is ours to
-        // move: nothing else in this window wants the wheel, and the scroll area clears the delta
-        // once it has consumed it.
+        // "Just let the scroll area have the wheel" is not enough, because by the time we see the event egui has already...
         if scroll != Vec2::ZERO {
             ctx.input_mut(|i| {
                 i.smooth_scroll_delta.y += i.smooth_scroll_delta.x;
@@ -1397,38 +1223,9 @@ fn input(
     }
 }
 
-// ── Rows, bars, link lines ──
+// Rows, bars, link lines
 
-/// Where the hand-off between two consecutive records is drawn, and how wide the bezier's control
-/// offset should be — or `None` when the pair should not be linked at all.
-///
-/// Pulled out of the drawing loop so the rules can be pinned by a test rather than re-derived by
-/// eye from a screenshot. `head` / `tail` are the two ends of the earlier bar, `next` the head of
-/// the later one.
-///
-/// **Leave from the tail** — records run left to right, and the tail is where the hand-off happens.
-/// The exception is a pair that **overlaps in time**: records are stored in *write* order, and a
-/// system note (an authorization request, say) is written while the tool bar it belongs to is still
-/// running, so that bar's tail lands *after* the note's own position. Leaving from the tail there
-/// would draw a line running **backwards** through the chart. Joining the two **heads** instead
-/// keeps every hand-off pointing forwards, and it is the honest reading anyway ("the tool started,
-/// then this was noted").
-///
-/// **Both ends off screen → no link.** The painter clips to the visible area, so what reached the
-/// screen was the *middle* of a long segment with no endpoint anywhere in sight: a stray diagonal
-/// floating across the chart. This is the "long flow, small view" case — rows scrolled out of sight
-/// and bars off both ends — and why such marks disappeared again as soon as the view was zoomed
-/// back in far enough to bring one end into view.
-///
-/// **The offset is proportional, with no floor.** The offset used to be clamped up to a 5pt
-/// minimum, so two bars sitting essentially on top of each other still got a 10pt-wide S-wiggle —
-/// and *that* pair is not the exception in this stream, it is the rule: `tool_begin` closes the
-/// model segment at exactly the tool's own start time (and `model_begin` closes the input the same
-/// way), so most hand-offs share one timestamp. Zoomed out, a compressed stretch of them became a
-/// field of little loops; zoomed in, the same spans are wide enough to look like the smooth
-/// connectors they are meant to be. With the floor gone a zero-width hand-off comes out as the
-/// straight line the eye expects, and a *negative* one degenerates to the same straight line rather
-/// than folding into a loop.
+/// Where the hand-off between two consecutive records is drawn, and how wide the bezier's control offset should...
 fn link_offset(head: Pos2, tail: Pos2, next: Pos2, visible: Rect) -> Option<(Pos2, f32)> {
     let from = if tail.x <= next.x { tail } else { head };
     if !visible.contains(from) && !visible.contains(next) {
@@ -1461,7 +1258,7 @@ fn lanes(
     // smear onto the right-side whitespace
     let p = ui.painter_at(plot);
 
-    // ── Rows: baseline + row name ──
+    // Rows: baseline + row name
     for (i, row) in rows.iter().enumerate() {
         let y = plot.top() + i as f32 * step;
         if y > clip.bottom() || y + lane_h < clip.top() {
@@ -1499,7 +1296,7 @@ fn lanes(
         }
     }
 
-    // ── Geometry: computed once, reused by the link lines ──
+    // Geometry: computed once, reused by the link lines
     struct Bar {
         row: usize,
         x0: f32,
@@ -1523,15 +1320,7 @@ fn lanes(
         Rect::from_min_max(Pos2::new(l, y), Pos2::new(r, y + lane_h))
     };
 
-    // ── Link lines: joined head-to-tail in true execution order, coloured after the one it leaves ──
-    //
-    // **Every** consecutive pair gets a line. The only pair that may go unlinked is one whose two
-    // ends are both outside the visible area (a link you could not see the ends of anyway — see
-    // `link_offset`), which in practice means the hand-off from the end of one round to the start
-    // of the next once the view is zoomed in past that gap.
-    //
-    // Which end of the first bar the line leaves from, and how wide the curve is, is decided in
-    // [`link_offset`] rather than inline here, so the rules can be tested.
+    // ── Link lines: joined head-to-tail in true execution order, coloured after the one it leaves ──.
     if st.link {
         let vis = visible.expand(6.0);
         for w in bars.windows(2) {
@@ -1562,7 +1351,7 @@ fn lanes(
         }
     }
 
-    // ── Bars ──
+    // Bars
     let mut hit: Option<u64> = None;
     // Where the selected bar ended up on screen, for `popover` to sit next to. Collected locally
     // and written back after the walk, because the walk borrows `st.acts` immutably.
@@ -1605,9 +1394,7 @@ fn lanes(
                 egui::StrokeKind::Inside,
             );
             let dur = a.dur(now);
-            // Times are read **within the round** (see the ruler note in `timeline`), so the two
-            // numbers match the axis above instead of being a global reading the ruler no longer
-            // shows.
+            // Times are read within the round (see the ruler note in `timeline`), so the two numbers match the axis above...
             let rs = st.round_start(a.round);
             resp.on_hover_text(aox::tf!(
                 "{}\n{} · {} → {} ({}s)",
@@ -1633,7 +1420,7 @@ fn lanes(
     }
     st.pop_anchor = pop_anchor;
 
-    // ── "Now": only meaningful while a task is running ──
+    // "Now": only meaningful while a task is running
     if st.gw.busy {
         let x = v.x(plot, st.now - tz);
         if x >= plot.left() && x <= plot.right() {
@@ -1644,7 +1431,7 @@ fn lanes(
         }
     }
 
-    // ── Empty state: explain "why there is nothing here" ──
+    // Empty state: explain "why there is nothing here"
     if st.acts.is_empty() {
         ui.painter_at(visible).text(
             visible.center(),
@@ -1657,11 +1444,7 @@ fn lanes(
 }
 
 /// The colour of one block.
-///
-/// Tool calls are the interesting case: they used to share a single orange, which made a row of
-/// tool blocks read as one undifferentiated band. Now **each distinct tool gets its own colour**,
-/// picked by hashing the tool name, so `read_file` is always the same hue and two different tools
-/// are told apart at a glance. Failed calls stay brick red, overriding everything.
+/// Tool calls are the interesting case: they used to share a single orange, which made a row of tool blocks read...
 fn fill_of(a: &Act) -> Color32 {
     if a.failed {
         return ActKind::failed_color();
@@ -1673,11 +1456,6 @@ fn fill_of(a: &Act) -> Color32 {
 }
 
 /// Stable per-tool colour: a hash of the tool name indexes a small fixed palette.
-///
-/// Deliberately hashed rather than drawn fresh each frame — a literally random colour would strobe
-/// as the timeline redraws, and would not survive remembering "the green one was the shell call".
-/// The palette is kept in the same low-saturation family as the rest of the chart, just spread
-/// across hues.
 fn tool_color(name: &str) -> Color32 {
     const LIGHT: [Color32; 10] = [
         Color32::from_rgb(0xB3, 0x74, 0x22), // orange
@@ -1710,9 +1488,7 @@ fn tool_color(name: &str) -> Color32 {
     palette[(fnv1a(name) as usize) % palette.len()]
 }
 
-/// FNV-1a over the tool name. Small, dependency-free, and — the point here — **stable across
-/// runs**, unlike `std`'s `DefaultHasher`, which is randomly seeded per process and would repaint
-/// every tool a different colour each time the app starts.
+/// FNV-1a over the tool name.
 fn fnv1a(s: &str) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for b in s.bytes() {
@@ -1749,13 +1525,7 @@ fn fmt_at(t: f32, step: f32) -> String {
     }
 }
 
-/// Width of the left row-name gutter for this frame's rows: the longest name plus padding, clamped
-/// between [`GUTTER_MIN`] and [`GUTTER_MAX`].
-///
-/// Measured rather than fixed on purpose. The column used to be a hard 182 points, which is only
-/// right for the longest tool names — for the common case (`Input` / `Model` / a short tool) it
-/// left a wide blank strip between the window edge and the chart, and that strip is exactly what
-/// made the table look "pushed away from the left".
+/// Width of the left row-name gutter for this frame's rows: the longest name plus padding, clamped between...
 fn gutter_w(ui: &Ui, rows: &[Row]) -> f32 {
     let mut widest: f32 = 0.0;
     for row in rows {
@@ -1768,7 +1538,7 @@ fn gutter_w(ui: &Ui, rows: &[Row]) -> f32 {
 }
 
 
-// ══════════════════════ Below: details of the selected item ══════════════════════
+// Below: details of the selected item
 
 /// The popover's size, decided from its own fixed bounds rather than measured after the fact, so it
 /// can never flip-flop between frames. Shrinks to fit a small window; the body inside then scrolls.
@@ -1800,13 +1570,7 @@ fn popover_rect(anchor: Rect, full: Rect) -> Rect {
     Rect::from_min_size(Pos2::new(x, y), Vec2::new(pop_w, pop_h))
 }
 
-/// The click-a-node popover: a small floating panel that appears beside the selected bar, with a
-/// body that scrolls inside it.
-///
-/// This replaced the big bottom detail card. The card was always present, always eating a third of
-/// the window (which squeezed the chart), and it showed the *latest* step whether or not that was
-/// the one you cared about. A popover belongs to something you actually clicked, and while it is
-/// closed the timeline gets the whole window.
+/// The click-a-node popover: a small floating panel that appears beside the selected bar, with a body that scrolls...
 fn popover(ui: &mut Ui, st: &mut Activity, full: Rect) {
     // No anchor ⇒ the selected node is scrolled out of view (or nothing is selected): nothing to
     // point at, so draw nothing — rather than parking a panel in a corner.
@@ -1852,7 +1616,7 @@ fn popover(ui: &mut Ui, st: &mut Activity, full: Rect) {
                     ui.set_max_height(body_h);
                     ui.spacing_mut().item_spacing.y = 0.0;
 
-                    // ── Header: category badge + round ──
+                    // Header: category badge + round
                     let (head, _) = ui.allocate_exact_size(Vec2::new(w, 22.0), Sense::hover());
                     {
                         let font = FontId::proportional(12.5);
@@ -1889,7 +1653,7 @@ fn popover(ui: &mut Ui, st: &mut Activity, full: Rect) {
                         st.selected = None;
                     }
 
-                    // ── Title ──
+                    // Title
                     ui.add_space(8.0);
                     let font = if kind.mono() {
                         theme::mono_font(15.0)
@@ -1905,7 +1669,7 @@ fn popover(ui: &mut Ui, st: &mut Activity, full: Rect) {
                         P::text(),
                     );
 
-                    // ── When it ran, and for how long ──
+                    // When it ran, and for how long
                     let when = if open {
                         aox::tf!(
                             "{} started · running {}s",
@@ -1938,7 +1702,7 @@ fn popover(ui: &mut Ui, st: &mut Activity, full: Rect) {
                     );
                     ui.add_space(8.0);
 
-                    // ── Body (the scrollable part) ──
+                    // Body (the scrollable part)
                     if text.is_empty() {
                         ui.label(
                             RichText::new(aox::i18n::t("(no more information)"))
@@ -1953,9 +1717,7 @@ fn popover(ui: &mut Ui, st: &mut Activity, full: Rect) {
                         FontId::proportional(14.0)
                     };
                     let col = if failed { ActKind::failed_color() } else { P::text() };
-                    // Pin the width instead of asking for `available_width()`: a `ScrollArea`'s
-                    // scrollbar allocation animates, so a width derived from it changes every frame
-                    // and the text re-wraps (see the note in TRAPS).
+                    // Pin the width instead of asking for `available_width()`: a `ScrollArea`'s scrollbar allocation animates...
                     let sc_w = (w - 10.0).max(80.0);
                     let avail = (ui.available_height() - 6.0).max(40.0);
                     ScrollArea::vertical()
@@ -1999,15 +1761,13 @@ fn popover(ui: &mut Ui, st: &mut Activity, full: Rect) {
         });
 }
 
-// ─────────────────────────── Tests ───────────────────────────
+// Tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Export → load back → keep chatting. Three easy-to-get-wrong spots on this chain, pinned together:
-    /// the same record exported twice (the watermark not advancing), a loaded record treated as new and written again
-    /// (the watermark not aligned to the save), and a new round not continuing after the save.
+    /// The same record exported twice (the watermark not advancing), a loaded record treated as new and written again...
     #[test]
     fn acts_round_trip_and_flush_once() {
         let mut a = Activity::default();
@@ -2057,18 +1817,13 @@ mod tests {
         assert_eq!(a.flushed, 7);
     }
 
-    /// Which hand-offs get a link line, and where it leaves from. The cases are the shapes the
-    /// stream actually produces: mostly zero-width spans (one segment is closed at exactly the next
-    /// one's start time), a few real gaps, and the occasional pair that overlaps in time.
+    /// Which hand-offs get a link line, and where it leaves from.
     #[test]
     fn link_lines_join_every_hand_off_that_is_on_screen() {
         let vis = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(100.0, 50.0));
         let at = |x: f32, y: f32| Pos2::new(x, y);
 
-        // The ordinary case — and the one an over-eager rule dropped by mistake. The next record
-        // starts exactly where the previous one stopped (`tool_begin` closes the model segment at
-        // the tool's own start time), so the span is zero-width: the link must be a *straight* line
-        // between the two rows, not a missing one.
+        // The ordinary case — and the one an over-eager rule dropped by mistake.
         assert_eq!(
             link_offset(at(30.0, 10.0), at(30.0, 10.0), at(30.0, 40.0), vis),
             Some((at(30.0, 10.0), 0.0))
@@ -2099,9 +1854,7 @@ mod tests {
         assert_eq!(link_offset(at(20.0, -200.0), at(20.0, -200.0), at(30.0, -260.0), vis), None);
     }
 
-    /// `input` decides "the wheel belongs to the popover" from this rect, so it has to be the rect
-    /// `popover` actually draws into — otherwise the guard would either let the axis slide while the
-    /// user scrolls the content, or swallow the content's own scrolling.
+    /// `input` decides "the wheel belongs to the popover" from this rect, so it has to be the rect `popover` actually...
     #[test]
     fn popover_rect_matches_where_the_panel_is_drawn() {
         let full = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1000.0, 700.0));

@@ -1,8 +1,6 @@
-//! 远程接管锁：桥在跑就锁住整个界面。
-//!
-//! 桥每 5 秒写一次 `.aox/remote.lock`（带连接者与服务器），这里每 0.5 秒看一次文件。
-//! 文件超过 15 秒没更新就当作桥已死——**不能因为一个崩溃的进程把人永久锁在外面**。
-//! 「取回控制权」= 删文件；桥发现文件没了会在 1 秒内自己退出。
+//! Remote takeover lock: while the bridge runs the whole UI is locked; a crash must not lock users out.
+//! The bridge writes .aox/remote.lock every 5s (connector + server); this polls it every 0.5s.
+//! Stale over 15s means the bridge died; Reclaim control deletes the file and the bridge exits within 1s.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -50,7 +48,7 @@ fn read() -> Option<Info> {
     Some(Info {
         agent: v["agent"].as_str().unwrap_or("agent").to_string(),
         server: v["server"].as_str().unwrap_or_default().to_string(),
-        who: v["who"].as_str().unwrap_or("手机端").to_string(),
+        who: v["who"].as_str().unwrap_or("Phone").to_string(),
         since: v["since"].as_i64().unwrap_or(0),
     })
 }
@@ -60,7 +58,7 @@ pub fn release() {
     *CACHE.lock().expect("remote lock cache") = Some((Instant::now(), None));
 }
 
-/// 画在所有浮层之上：`Modal` 自带遮罩，底层控件收不到点击。
+/// Drawn above all overlays: a Modal carries its own scrim, so controls underneath get no clicks.
 pub fn takeover(ctx: &egui::Context, info: &Info) {
     egui::Modal::new(egui::Id::new("aox-remote-takeover"))
         .backdrop_color(P::scrim())
@@ -89,7 +87,7 @@ pub fn takeover(ctx: &egui::Context, info: &Info) {
             let mins = ((now - info.since) / 60_000).max(0);
             if mins > 0 {
                 ui.label(
-                    RichText::new(aox::tf!("已接管 {} 分钟", mins))
+                    RichText::new(aox::tf!("Under remote control for {} min", mins))
                         .color(P::text_faint())
                         .size(12.0),
                 );

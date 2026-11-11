@@ -1,20 +1,6 @@
-//! A cheap content **fingerprint** for "is this still the file I read?".
-//!
-//! Why it exists: [`crate::tool::edit::EditFileTool`] accepts an optional `expected_hash` so a model
-//! can say "only edit the version I actually looked at". Without it, an edit computed against a stale
-//! read silently lands on a file somebody else changed in between — the rewrite is still syntactically
-//! valid, so nothing complains until much later.
-//!
-//! # Why FNV-1a and not SHA-256
-//!
-//! This is a **change detector, not a security primitive**: the value is printed into read_file's
-//! header and echoed back by edit_file. Nobody can gain anything by forging it — a forged value only
-//! makes the model's own edit land on a version it did not read. So there is no reason to pull in a
-//! crypto hash crate for it; FNV-1a 64 is fifteen lines, has no dependencies, and is stable across
-//! platforms and process restarts (which is the only property that matters here).
-//!
-//! ⚠️ Never describe this value to a user as a checksum for integrity purposes. It detects accidental
-//! drift; it does not resist a deliberate collision.
+//! A cheap content fingerprint for "is this still the file I read?".
+//! Why it exists: crate::tool::edit::EditFileTool accepts an optional `expected_hash` so a model can say "only...
+//! # Why FNV-1a and not SHA-256.
 
 use std::io::Read;
 use std::path::Path;
@@ -22,9 +8,7 @@ use std::path::Path;
 const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// Files larger than this are **not** fingerprinted: the extra full read is not worth it, and a file
-/// that big is not something `edit_file` will touch anyway (see its size cap). A missing fingerprint
-/// is reported honestly (`hash -`), and the model simply omits `expected_hash`.
+/// Files larger than this are not fingerprinted: the extra full read is not worth it, and a file that big...
 pub(crate) const MAX_FINGERPRINT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// How the fingerprint reads in a tool result. One function so read_file's header and edit_file's
@@ -43,11 +27,7 @@ pub(crate) fn of_bytes(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
-/// The fingerprint of a whole file, **streamed** — memory stays constant regardless of file size.
-///
-/// `None` means "could not fingerprint": the file is larger than [`MAX_FINGERPRINT_BYTES`], or it
-/// could not be opened / read. That is deliberately not an error — the caller reports `-` and carries
-/// on, because a fingerprint is an optional convenience, never the point of the call.
+/// The fingerprint of a whole file, streamed — memory stays constant regardless of file size.
 pub(crate) fn of_file(path: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() > MAX_FINGERPRINT_BYTES {
@@ -69,12 +49,7 @@ pub(crate) fn of_file(path: &Path) -> Option<String> {
     Some(format!("{h:016x}"))
 }
 
-/// Accept the several shapes a model might echo back: `abc123`, `fnv1a64:abc123`, `0xabc123`, and
-/// with stray whitespace or capitals.
-///
-/// Being forgiving here costs nothing and removes a whole class of "I gave you exactly the string you
-/// printed" failures. It is **not** forgiving about the value itself: a real mismatch is still a
-/// mismatch.
+/// Accept the several shapes a model might echo back: `abc123`, `fnv1a64:abc123`, `0xabc123`, and with stray...
 pub(crate) fn normalize(s: &str) -> String {
     let t = s.trim().to_ascii_lowercase();
     let t = t.strip_prefix("fnv1a64:").unwrap_or(&t);
@@ -87,10 +62,7 @@ pub(crate) fn normalize(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The published FNV-1a 64 test vectors. Pinning them is what makes "stable across versions"
-    /// checkable instead of a promise in a comment: if somebody swaps the algorithm, the fingerprints
-    /// embedded in a running conversation stop matching and every `expected_hash` edit starts failing
-    /// with "the file changed".
+    /// The published FNV-1a 64 test vectors.
     #[test]
     fn matches_the_published_vectors() {
         assert_eq!(of_bytes(b""), "cbf29ce484222325");

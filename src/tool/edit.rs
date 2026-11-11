@@ -1,33 +1,6 @@
-//! `edit_file` — edit a text file **locally**, by exact `old_text` matches, instead of overwriting it.
-//!
-//! The "rewrite the whole thing" action is the **most expensive error source** here: the model has
-//! to emit the entire file again, and one drifting character changes lines it never meant to touch.
-//! `edit_file` shrinks "what to change" to the minimum: hand over only the fragments that move, and
-//! the host locates them, validates them and writes once.
-//!
-//! # Five hard rules (each one stands for a class of real accident)
-//!
-//! 1. **Every `old_text` must match exactly once.** Zero matches = the text the model saw is stale;
-//!    more than one = the position itself is ambiguous. Neither case is **guessed at**: a guess
-//!    produces a syntactically valid, semantically wrong file, which is far harder to find than a
-//!    plain failure.
-//! 2. **All edits are validated against the same original snapshot.** Apply edit 1 and then search
-//!    for edit 2 in the result, and the second match is affected by the first replacement — its
-//!    offset, even whether it matches at all, can change.
-//! 3. **Write only when everything passed.** One failure means the whole batch stays off disk:
-//!    there is no such thing as a half-edited file.
-//! 4. **One write.** Assemble the final content in memory, then replace via a temp file in the same
-//!    directory plus `rename`.
-//! 5. **Do not touch bytes that did not change.** Splicing happens only over matched ranges and
-//!    every other byte stays as it was — no newline normalisation, no trailing-newline fix-up, no
-//!    BOM stripping.
-//!
-//! # Division of labour with `write_file`
-//!
-//! `write_file` remains the only entry point for "rewrite the whole thing" (new files, generated
-//! artifacts, large refactors). `edit_file` is the **default way to change an existing file**:
-//! smaller arguments, diagnosable failures, smaller diffs. It reuses `hostfs`'s diff rendering, so
-//! the workspace view and the `+N/−N` on the tool row match `write_file` exactly.
+//! `edit_file` — edit a text file locally, by exact `old_text` matches, instead of overwriting it.
+//! The "rewrite the whole thing" action is the most expensive error source here: the model has to emit the entire...
+//! # Five hard rules (each one stands for a class of real accident).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -41,14 +14,10 @@ use super::{host_tool_access, Tool, ToolKind, ToolOutput, HOST_FILE_TOOLS};
 use crate::runtime::Runtime;
 use crate::workplace::PATH_ARG;
 
-/// How many edits one call may carry. Not a performance cap but a **diagnosability** cap: one
-/// failure has to name the edit that failed, and with dozens mixed together the model's self-repair
-/// degenerates into "overwrite the whole file again".
+/// How many edits one call may carry.
 const MAX_EDITS: usize = 64;
 
-/// The largest file `edit_file` will handle. Past it, `write_file` is the right tool (or the file
-/// was never meant to be edited whole by a model): pulling 500 MB into memory and splicing it is a
-/// cost and a risk that one "change a line" call should not carry.
+/// The largest file `edit_file` will handle.
 const EDIT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 pub(crate) struct EditFileTool;
@@ -61,9 +30,7 @@ impl Tool for EditFileTool {
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
-    /// Write: it really changes what is on disk. The read/write split is decided by name (see
-    /// `host_tool_access`), so a new tool only has to join that table and the workplace boundary and
-    /// the authorization path apply automatically — there is no second rule to keep in sync.
+    /// Write: it really changes what is on disk.
     fn access(&self) -> crate::workplace::Access {
         host_tool_access(self.name())
     }
@@ -136,10 +103,7 @@ impl Tool for EditFileTool {
             ));
         }
 
-        // ── Read the original: it must be UTF-8 text ──
-        // Reject strictly instead of decoding lossily: lossy turns invalid bytes into U+FFFD, and on
-        // write-back those bytes are gone for good. For an action called "change one line", silently
-        // destroying a file is the one direction that is never acceptable.
+        // ── Read the original: it must be UTF-8 text ── Reject strictly instead of decoding lossily: lossy turns invalid...
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) => return ToolOutput::err(crate::tf!("failed to read {}: {}", path.display(), e)),
@@ -162,7 +126,7 @@ impl Tool for EditFileTool {
             }
         };
 
-        // ── Optional version check: content only, never mtime ──
+        // Optional version check: content only, never mtime
         let current_hash = fingerprint::of_bytes(original.as_bytes());
         if let Some(expected) = args.get("expected_hash").and_then(|v| v.as_str()) {
             let want = fingerprint::normalize(expected);
@@ -175,7 +139,7 @@ impl Tool for EditFileTool {
             }
         }
 
-        // ── Validate, then splice the final content in memory ──
+        // Validate, then splice the final content in memory
         let updated = match apply_edits(&original, &edits) {
             Ok(s) => s,
             Err(e) => {
@@ -187,9 +151,7 @@ impl Tool for EditFileTool {
             }
         };
         if updated == original {
-            // Semantically this is a successful call in which nothing happened (e.g. new_text is
-            // identical to old_text). Nothing is written and nothing pretends otherwise: the output
-            // carries a path but no diff, so no UI draws +0/−0.
+            // Semantically this is a successful call in which nothing happened (e.g. new_text is identical to old_text).
             return ToolOutput::ok(crate::tf!(
                 "no change: {} already contains the requested text, nothing was written (hash {}).",
                 path.display(),
@@ -198,7 +160,7 @@ impl Tool for EditFileTool {
             .with_path(path);
         }
 
-        // ── One write: temp file in the same directory, then rename ──
+        // One write: temp file in the same directory, then rename
         let capture = match rt.recovery.capture_before(&path) {
             Ok(c) => c,
             Err(b) => return ToolOutput::err(b.model),
@@ -345,11 +307,7 @@ impl EditError {
     }
 }
 
-/// Validate the whole batch, then splice. A **pure function**, which is what lets "exactly once /
-/// ambiguous / overlapping / write nothing on failure" be asserted without touching the filesystem.
-///
-/// Every offset refers to `original` (one snapshot), so a later edit cannot be affected by an
-/// earlier replacement — that is this rule's concrete form.
+/// Validate the whole batch, then splice.
 fn apply_edits(original: &str, edits: &[(String, String)]) -> Result<String, EditError> {
     let mut located: Vec<LocatedEdit> = Vec::with_capacity(edits.len());
 
@@ -374,9 +332,7 @@ fn apply_edits(original: &str, edits: &[(String, String)]) -> Result<String, Edi
         }
     }
 
-    // Overlapping ranges = the result depends on the order => reject outright rather than deciding
-    // on the model's behalf. After sorting, comparing neighbours is enough: does one end past the
-    // next one's start?
+    // Overlapping ranges = the result depends on the order => reject outright rather than deciding on the model's...
     let mut order: Vec<usize> = (0..located.len()).collect();
     order.sort_by_key(|i| located[*i].at);
     for w in order.windows(2) {
@@ -421,19 +377,6 @@ fn clip(s: &str, n: usize) -> String {
 }
 
 /// Atomic replace: temp file in the same directory -> `rename` over the target.
-///
-/// Why not "`fs::write` the original path": a crash or power loss mid-write leaves a **truncated
-/// source file**, and an edit is supposed to be all-or-nothing. `rename` within one volume is an
-/// atomic replace: after a crash you have either the old file or the new one.
-///
-/// The Windows semantics were checked on purpose: `std::fs::rename` maps to
-/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` there and **can replace an existing target** (the same as
-/// POSIX `rename`, and something `space.rs` has relied on for a while). What does fail is "the
-/// target is open elsewhere without sharing" — which could not have been written anyway, so the
-/// error is reported as-is.
-///
-/// The temp name carries the process id so two AOX instances in one directory cannot collide; every
-/// failure path also removes the temp file, leaving no litter behind.
 fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut name = std::ffi::OsString::from(".");
@@ -498,7 +441,7 @@ mod tests {
         assert_eq!(out, "ALPHA\nbeta\nGAMMA\n");
     }
 
-    /// The key rule: zero matches is an error, not "skip this one".
+    /// The key rule: zero matches is an error, not "skip this one"
     #[test]
     fn a_missing_snippet_is_an_error_not_a_skip() {
         let e = apply_edits("abc", &[("zzz".into(), "y".into())]).err().unwrap();
@@ -583,7 +526,7 @@ mod tests {
         assert_eq!(out, "hello title\nbody\n");
     }
 
-    // ───────────────────────── Tool layer (real files) ─────────────────────────
+    // Tool layer (real files)
 
     async fn rt_with_ws(dir: &Path) -> Arc<Runtime> {
         let mut cfg = crate::config::Config::dummy();

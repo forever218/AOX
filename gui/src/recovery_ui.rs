@@ -1,37 +1,6 @@
 //! The recovery panel: "undo the last task", reached from a chip beside the workspace button.
-//!
-//! # Why it lives here and not in the title bar
-//!
-//! The title bar is about **this window** (maximize, close, the drawer). Rolling back is about
-//! **this workspace's files** — the same question the workspace button answers ("under what
-//! permissions does this conversation run / how far back can it go"). So it sits one chip to the
-//! right of that button, in the row the hand is already in when a turn turns out wrong.
-//!
-//! # Conventions (the same three as [`crate::workplace_ui`])
-//!
-//! **① State lives in [`RecoveryUi`], owned by `App`.** This module never touches an `App` field.
-//!
-//! **② Parameters in, requests out.** Every entry point returns `Option<RecoveryReq>`, meaning "the
-//! UI wants the agent thread to do this". The main thread must never read the recovery store: it is
-//! the agent thread that owns `Runtime`, and a synchronous store read here would freeze the window
-//! while a 100 MB tree is being walked.
-//!
-//! **③ The list is pushed in, not asked for.** Rows arrive as [`aox::recovery::view::PointsView`]
-//! through the bridge. The UI keeping its own idea of "which points exist" would be a second source
-//! of truth, and the first thing to drift would be the thing the user acts on.
-//!
-//! # Two steps, never one
-//!
-//! Clicking a row **unfolds a preview** (paths, counts, warnings, and the two things that make a
-//! rollback unsafe: drift and incomplete coverage). The rollback itself needs a second click in a
-//! modal, and — when either hazard is present — a checkbox that says which hazard the user is
-//! accepting. A single click that overwrites files is a bug, not a shortcut.
-//!
-//! # Shapes: a row is a card, not a stripe
-//!
-//! Everything inside the panel is inset from its edges — rows, dividers, the preview block. A fill
-//! that runs edge to edge reads as a selected *list item* (or worse, as a scrollbar track); a fill
-//! with 8 points of air on both sides reads as a card, which is what these are.
+//! # Why it lives here and not in the title bar.
+//! The title bar is about this window (maximize, close, the drawer).
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -60,28 +29,18 @@ const ROWS_FIRST: usize = 20;
 /// The preview's unfold. Short enough to feel immediate, long enough to read as motion — the same
 /// order as the drawer's slide and the plan block's disclosure.
 const DETAIL_ANIM_SECS: f32 = 0.18;
-/// The panel's own appearance clock, separate from the preview's: a popover that takes as long to
-/// arrive as a disclosure to open feels broken, and one that lingers on the way out feels stuck.
-/// Asymmetric on purpose — leaving is quicker than arriving, which is what every desktop menu does.
+/// The panel's own appearance clock, separate from the preview's: a popover that takes as long to arrive...
 const OPEN_SECS: f32 = 0.12;
 const CLOSE_SECS: f32 = 0.15;
 /// How far the panel travels while it arrives and leaves: straight down, toward the chip it belongs
 /// to. Six pixels is enough to read as direction and small enough not to be seen as a slide.
 const SINK: f32 = 6.0;
-/// The foot's metric. All four actions share these, which is the whole point of them: the row used
-/// to be two ghost buttons (13.5 pt, 34 pt hot zone) followed by two bare labels (11 pt, text height
-/// only), so it changed type size, height and hover behaviour halfway along.
-///
-/// `FOOT_H` is [`crate::app::BTN_H`] so the panel's height is exactly what it was — the row got
-/// *narrower*, not taller.
+/// The foot's metric. All four actions share these, which is the whole point of them: the row used to be two ghost...
 const FOOT_H: f32 = crate::app::BTN_H;
 /// 12 pt: a step under the 13.5 of a real button, because these are the panel's third-rate actions,
 /// and a step over the 11 of the meta text, because they are still things you click.
 const FOOT_SIZE: f32 = 12.0;
-/// Horizontal padding. Doubles as the **gap** between two neighbours (`item_spacing.x` is zeroed),
-/// so the row stays even however long one label is: 8 + 8 = 16 pt between them, whatever the text.
-/// The gutter in front of the row is `CARD_INSET + 2 - FOOT_PAD_X`, so the first label starts on
-/// `CARD_INSET + 2` — the same vertical line as the panel's own title and its caption lines.
+/// Horizontal padding. Doubles as the gap between two neighbours (`item_spacing.x` is zeroed), so the row stays...
 const FOOT_PAD_X: f32 = 8.0;
 const FOOT_RADIUS: u8 = theme::R1;
 
@@ -102,18 +61,12 @@ struct Ask {
 
 pub struct RecoveryUi {
     open: bool,
-    /// 0 = not on screen, 1 = fully there. `open` is the **target**, this is what is drawn, so the
-    /// panel stays a single unbroken picture while it dissolves instead of being taken away in one
-    /// frame (which reads as the panel being sliced off at the bottom).
+    /// 0 = not on screen, 1 = fully there. `open` is the target, this is what is drawn, so the panel stays a single...
     open_t: f32,
     /// The same `(started, from, to)` clock as the preview's, for the same reason: a dismissal
     /// reversed by a second click carries on from where it is.
     open_anim: Option<(Instant, f32, f32)>,
     /// Where the chip was on the last frame; the panel anchors to it.
-    ///
-    /// Stored rather than passed because the chip is drawn inside the composer's nested layout,
-    /// while the panel has to be drawn at the top level (above the transcript) — the same split
-    /// `workplace_ui` uses for its menu, and for the same reason.
     anchor: Option<Rect>,
     view: PointsView,
     /// Which row the user asked to unfold. `None` = none, and the preview below starts folding away.
@@ -121,7 +74,7 @@ pub struct RecoveryUi {
     /// The row whose preview is on screen **right now** — kept after `expanded` goes back to `None`
     /// so the block can shrink instead of vanishing.
     detail_id: Option<String>,
-    /// 0 = folded, 1 = open.
+    /// 0 = folded, 1 = open
     detail_t: f32,
     /// `(started, from, to)` — the same frame-by-frame clock the drawer and the plan block use, so a
     /// reversal mid-flight continues from where it is instead of jumping back to zero.
@@ -132,9 +85,7 @@ pub struct RecoveryUi {
     /// The preview for `expanded`, once it arrives.
     plan: Option<PreviewView>,
     confirm: Option<Ask>,
-    /// "Clear every point in this workspace" is waiting for its answer. A separate flag rather than a
-    /// variant of [`Ask`]: that one carries per-row hazards (overwrite / partial / foreign) which mean
-    /// nothing here, and reusing it would make the rollback dialog's promises appear on a delete.
+    /// "Clear every point in this workspace" is waiting for its answer.
     clear_ask: bool,
     /// The last thing that happened, shown inside the panel. `true` = it is a failure.
     notice: Option<(String, bool)>,
@@ -191,9 +142,7 @@ impl RecoveryUi {
                 }
             }
             RecoveryView::Preview(v) => {
-                // Matched on the **requested** id, the one this panel sent. Matching on the resolved
-                // node instead compares "the row I clicked" with "the row before it" — every answer
-                // would be dropped and the row would sit on "reading…" forever.
+                // Matched on the requested id, the one this panel sent.
                 if Some(&v.requested) == self.expanded.as_ref() {
                     self.plan = Some(*v);
                 }
@@ -213,18 +162,12 @@ impl RecoveryUi {
         self.busy = true;
     }
 
-    /// The panel is on screen waiting for the agent thread. The host polls a repaint at ~30 ms while
-    /// this is true: an idle egui window does not repaint itself, so the answer would otherwise sit
-    /// in the channel until the next mouse move.
+    /// The panel is on screen waiting for the agent thread.
     pub fn is_waiting(&self) -> bool {
         self.open && (self.busy || self.waiting_turn)
     }
 
     /// The workspace changed under us (a different conversation / tier): the old rows belong to it.
-    ///
-    /// This one does **not** fade. The rows describe a tree the user is no longer looking at, so a
-    /// slow dissolve would be animation over the top of something that has already stopped being
-    /// true — the panel is simply gone, and the next open starts from a clean slate.
     pub fn close(&mut self) {
         self.open = false;
         self.open_t = 0.0;
@@ -250,8 +193,6 @@ impl RecoveryUi {
     }
 
     /// Draw the chip. `enabled == false` still draws it (dimmed) unless the caller hides it entirely.
-    ///
-    /// Returns the request to send, if this click asked for one.
     pub fn chip(&mut self, ui: &mut Ui, enabled: bool, turn_running: bool) -> Option<RecoveryReq> {
         let count = self.view.rows.len();
         let text = if count > 0 { format!("{count}") } else { String::new() };
@@ -335,10 +276,6 @@ impl RecoveryUi {
         let t = self.open_t;
         let mut out: Option<RecoveryReq> = None;
         // Up, not down: the chip lives at the bottom of the window.
-        //
-        // ⚠️ Coordinates here are **client-area local** (`Area::fixed_pos`) — never mix in
-        // `viewport().inner_rect`, which is monitor space. `workplace_ui::menu` and the usage panel
-        // both learned this the hard way; the symptom is a panel sliding with the window.
         let pos = anchor.left_top() - egui::vec2(0.0, 6.0) + egui::vec2(0.0, (1.0 - t) * SINK);
         let width = PANEL_W.min(ctx.content_rect().width() - 24.0).max(300.0);
         let area = egui::Area::new(Id::new("aox-recovery-panel"))
@@ -366,7 +303,7 @@ impl RecoveryUi {
             })
             .inner;
         if !self.open {
-            // Closing: the panel answers nothing while it leaves.
+            // Closing: the panel answers nothing while it leaves
             return None;
         }
         // A click anywhere else puts it away. Tested after drawing, so the click that opened it
@@ -378,9 +315,7 @@ impl RecoveryUi {
             self.open = false;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            // Two stages: the first Esc folds the preview, the second closes the panel. Losing the
-            // whole panel because you wanted to fold one row is the kind of small theft that makes
-            // people stop using a UI.
+            // Two stages: the first Esc folds the preview, the second closes the panel.
             if self.expanded.is_some() {
                 self.expanded = None;
                 self.plan = None;
@@ -391,9 +326,7 @@ impl RecoveryUi {
         out
     }
 
-    /// Throw away everything the panel was showing. Called once the dissolve is over, and by
-    /// [`Self::close`], so a panel that comes back never shows a preview of a row that was folded
-    /// while it was invisible.
+    /// Throw away everything the panel was showing.
     fn forget_transient(&mut self) {
         self.expanded = None;
         self.plan = None;
@@ -402,16 +335,7 @@ impl RecoveryUi {
         self.detail_anim = None;
     }
 
-    /// Advance the appearance clock — the same idiom as [`Self::step_detail`]: step by elapsed time,
-    /// keep asking for frames until it settles, and reverse from wherever it is.
-    ///
-    /// The easing differs by direction, and that is the whole point of this function:
-    ///
-    /// - **Arriving** uses ease-out: most of the distance in the first third, then a soft landing.
-    /// - **Leaving** uses a smoothstep (zero velocity at *both* ends). Ease-out on the way out is
-    ///   what a naive clock gives you, and it is wrong here: the panel would lose 70% of its opacity
-    ///   in the first 30 ms and then crawl away as a ghost. Dismissal wants the opposite — hold, then
-    ///   go — so `open_t` starts its descent slowly and reaches zero at speed.
+    /// Advance the appearance clock — the same idiom as Self::step_detail: step by elapsed time, keep asking...
     fn step_open(&mut self, ctx: &egui::Context) {
         let target = if self.open { 1.0 } else { 0.0 };
         match self.open_anim {
@@ -443,14 +367,7 @@ impl RecoveryUi {
         self.open_t = self.open_t.clamp(0.0, 1.0);
     }
 
-    /// Advance the unfold clock. Same idiom as the drawer's slide and the plan block's disclosure:
-    /// step by elapsed time, ease out, and keep asking for frames until it settles.
-    ///
-    /// **The clock does not start until the card's height is known.** That is the whole reason this
-    /// panel used to jolt: `detail_full_h` began as a guess, so the first real measurement moved the
-    /// block by tens of pixels in one frame, and the panel (pivoted at its bottom edge) jumped with
-    /// it. Now the preview is laid out at a clip height of zero for one frame — invisible, but
-    /// measured — and only then does the ramp begin, from a number that will not change.
+    /// Advance the unfold clock. Same idiom as the drawer's slide and the plan block's disclosure: step by elapsed...
     fn step_detail(&mut self, ctx: &egui::Context) {
         if let Some(id) = &self.expanded {
             if self.detail_id.as_deref() != Some(id.as_str()) {
@@ -490,21 +407,17 @@ impl RecoveryUi {
             }
             None => {}
         }
-        // `detail_id` means "the row the block is drawn under", so it is kept while the row is
-        // expanded even at zero height — that is where the one-line placeholder lives. It goes only
-        // once the row is no longer the one asked for **and** the fold-out has finished.
+        // `detail_id` means "the row the block is drawn under", so it is kept while the row is expanded even at zero...
         if self.expanded.is_none() && self.detail_t <= 0.001 {
             self.detail_t = 0.0;
             self.detail_id = None;
-            // The preview goes with the block: keeping it would leave a stale card to reappear if
-            // the same row were opened again, and clearing it earlier would fold a card that still
-            // has to be drawn.
+            // The preview goes with the block: keeping it would leave a stale card to reappear if the same row were opened...
             self.plan = None;
         }
     }
 
     fn body(&mut self, ui: &mut Ui, out: &mut Option<RecoveryReq>) {
-        // ── head ──
+        // head
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             ui.add_space(CARD_INSET + 2.0);
@@ -535,9 +448,7 @@ impl RecoveryUi {
             };
             ui.label(RichText::new(sub).size(11.0).color(P::text_dim()));
         });
-        // The chain belongs to the **workspace**, not to this conversation, and a new conversation
-        // opened on the same folder inherits it. Saying so once, at the top, is cheaper than making
-        // the user work it out from a row that says "other conversation".
+        // The chain belongs to the workspace, not to this conversation, and a new conversation opened on the same folder...
         if self.view.rows.iter().any(|r| !r.mine) {
             ui.add_space(3.0);
             ui.horizontal_wrapped(|ui| {
@@ -553,7 +464,7 @@ impl RecoveryUi {
         }
         ui.add_space(9.0);
 
-        // ── list ──
+        // list
         if self.busy && self.view.rows.is_empty() {
             skeleton(ui);
         } else if self.waiting_turn {
@@ -567,12 +478,7 @@ impl RecoveryUi {
             );
         } else {
             let limit = if self.show_all { usize::MAX } else { ROWS_FIRST };
-            // The list's budget grows with the card that is unfolding inside it. Without this the
-            // scroll area hits `LIST_MAX_H` halfway through the unfold and does the worst possible
-            // thing: stops the panel from growing (the card then unfolds *inside* the fixed viewport
-            // and gets clipped), pops a scrollbar in — which narrows the card by 10 px, re-wrapping
-            // its text and changing its height again — and, when the card folds, pops it back out.
-            // Measured on a real window: the panel's top edge stepped 622 → 513 → 464 → 425 px.
+            // The list's budget grows with the card that is unfolding inside it.
             let card = if self.detail_id.is_some() {
                 self.detail_full_h.max(0.0) * self.detail_t.clamp(0.0, 1.0)
             } else {
@@ -597,7 +503,7 @@ impl RecoveryUi {
             }
         }
 
-        // ── notice ──
+        // notice
         if let Some((text, err)) = &self.notice {
             let color = if *err { P::danger() } else { P::text_dim() };
             ui.horizontal_wrapped(|ui| {
@@ -607,17 +513,8 @@ impl RecoveryUi {
             ui.add_space(6.0);
         }
 
-        // ── foot ──
-        //
-        // Four actions, one shape (2026-10-28). They used to be two ghost buttons and two bare
-        // 11 pt labels: two type sizes, two hot-zone heights (34 pt vs. the text's own ~14), and two
-        // answers to "the pointer is on me" — a wash for the first pair, nothing at all for the
-        // second. A foot that changes shape halfway along reads as two groups, and the second group
-        // then reads as inert text that happened to be clickable.
-        //
-        // `horizontal_wrapped` rather than `horizontal`: on a narrow window the four labels are the
-        // first thing in this panel that can run out of width, and wrapping keeps the last one
-        // reachable where clipping would simply hide it.
+        // ── foot ──.
+        // Four actions, one shape. They used to be two ghost buttons and two bare 11 pt labels: two type sizes...
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             // The gap is each action's own padding, not `item_spacing`: that is what keeps the row
@@ -632,10 +529,7 @@ impl RecoveryUi {
                 self.busy = true;
                 *out = Some(RecoveryReq::Prune);
             }
-            // The redo door is only lit when a safety snapshot is actually waiting; a permanently
-            // clickable "undo the undo" that answers "nothing to redo" teaches nothing. Disabled,
-            // not hidden: the four actions must stay in one row, at one height, when one of them is
-            // not available.
+            // The redo door is only lit when a safety snapshot is actually waiting; a permanently clickable "undo the undo"...
             if foot_action_ex(ui, aox::i18n::t("Redo last rollback"), Foot::Quiet, self.view.redoable)
                 .clicked()
             {
@@ -687,9 +581,7 @@ impl RecoveryUi {
         if hov || selected || row.head {
             ui.painter().rect_filled(card, CornerRadius::same(theme::R1), P::hover_fill());
         }
-        // The head marker is a bar, not a second fill: hover would otherwise erase the difference
-        // between "this is current" and "the pointer is here". Inset with the card so it cannot be
-        // mistaken for a scrollbar.
+        // The head marker is a bar, not a second fill: hover would otherwise erase the difference between "this...
         if row.head {
             let bar = Rect::from_min_max(
                 Pos2::new(card.right() - 4.0, card.top() + 10.0),
@@ -699,10 +591,7 @@ impl RecoveryUi {
         }
         let text_left = card.left() + 12.0;
         let title = if row.label.is_empty() { kind_word(row.kind).to_string() } else { row.label.clone() };
-        // Elided by **width**, not by character count: `elide(&title, 46)` was eliding 46 *chars*,
-        // which is 46 Latin letters (~300 px) but 46 Chinese ones (~600 px) — so every Chinese message
-        // painted straight through the panel's right edge (user report, 2026-10-28). `crate::app::elide`
-        // measures with the same font that will be drawn.
+        // Elided by width, not by character count: `elide(&title, 46)` was eliding 46 *chars*, which is 46 Latin letters...
         let text_w = (card.right() - 12.0 - text_left).max(40.0);
         let title_g = crate::app::elide(ui, &title, theme::body_font(13.0), P::text(), text_w);
         ui.painter().galley(Pos2::new(text_left, card.top() + 9.0), title_g, P::text());
@@ -735,15 +624,11 @@ impl RecoveryUi {
         }
         if resp.clicked() && !self.busy {
             if selected {
-                // Only the target flips. `plan` stays: the fold-out still has to draw the card it
-                // is folding, and clearing it here would swap the card for a one-line "reading…"
-                // on the very frame the collapse starts — a 200 px jump for a 16 px click.
+                // Only the target flips. `plan` stays: the fold-out still has to draw the card it is folding, and clearing...
                 self.expanded = None;
             } else {
                 self.expanded = Some(row.id.clone());
-                // Only a **different** row makes the old preview irrelevant. Re-opening a card that
-                // is still folding away keeps it: dropping it would put the one-line placeholder
-                // under a card that is half on screen.
+                // Only a different row makes the old preview irrelevant.
                 if self.detail_id.as_deref() != Some(row.id.as_str()) {
                     self.plan = None;
                 }
@@ -757,10 +642,7 @@ impl RecoveryUi {
             if self.plan.is_some() {
                 self.detail(ui, &row.id);
             } else if !self.busy {
-                // Only the **failure** state is drawn here. While the request is in flight nothing
-                // is added: a one-line "reading…" would push the panel up by a line and then vanish
-                // again when the card arrived — two steps for one gesture, which is exactly the
-                // flicker this block was reported for. The row's own selected fill is the feedback.
+                // Only the failure state is drawn here.
                 self.placeholder(ui);
             }
         }
@@ -772,10 +654,7 @@ impl RecoveryUi {
     }
 
     /// The preview, folding open.
-    ///
-    /// Only the **clip** animates: the content is laid out at its natural size every frame and cut
-    /// off, so nothing re-wraps mid-flight. Animating the content's own width/height would make the
-    /// text reflow on every frame, which is what "janky" actually looks like.
+    /// Only the clip animates: the content is laid out at its natural size every frame and cut off, so nothing...
     fn detail(&mut self, ui: &mut Ui, row_id: &str) {
         let t = self.detail_t;
         let w = ui.available_width();
@@ -784,26 +663,20 @@ impl RecoveryUi {
         let known = self.detail_full_h > 1.0;
         let full = if known { self.detail_full_h } else { 600.0 };
         let shown = if known { (full * t).max(0.0) } else { 0.0 };
-        // Reserve exactly `shown`, then lay the content out underneath at `full` height inside a
-        // clipping child. `allocate_exact_size` + `new_child` is the pair that keeps the reservation
-        // and the layout independent — the same trick the title bar uses for its plates.
+        // Reserve exactly `shown`, then lay the content out underneath at `full` height inside a clipping child....
         let (slot, _) = ui.allocate_exact_size(Vec2::new(w, shown), Sense::hover());
         let area = Rect::from_min_size(slot.min, Vec2::new(w, full.max(1.0)));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area));
         child.set_clip_rect(ui.clip_rect().intersect(Rect::from_min_size(slot.min, Vec2::new(w, shown))));
         let measured = self.detail_body(&mut child, row_id);
-        // Measured every frame, and **only ever allowed to grow**. The layout does not depend on the
-        // clip, so this is stable while it opens; the `max` guards the mid-fold case, where the plan
-        // is deliberately kept and a shrinking number would move the panel twice for one gesture.
+        // Measured every frame, and only ever allowed to grow.
         if measured > 0.5 && measured > self.detail_full_h {
             self.detail_full_h = measured;
         }
     }
 
     fn detail_body(&mut self, ui: &mut Ui, row_id: &str) -> f32 {
-        // `min_rect()` is in absolute coordinates, so the height is `bottom - top` — using
-        // `min_rect().height()` at the end measures a *size* and reads as a different number
-        // entirely (it took a screenshot to notice this class of mistake the first time).
+        // `min_rect()` is in absolute coordinates, so the height is `bottom - top` — using `min_rect().height()`...
         let top = ui.min_rect().top();
         let Some(plan) = self.plan.clone() else {
             // Unreachable from `detail` (it only draws a card once the preview is here), but kept as
@@ -823,9 +696,7 @@ impl RecoveryUi {
                 .inner_margin(Margin::symmetric(14, 13))
                 .show(ui, |ui| {
                     ui.set_width((card_w - 28.0).max(80.0));
-                    // ⚠️ The parent here is a `ui.horizontal` (it exists only to give the card a left
-                    // margin), and `Frame::show` hands its layout down — so without this the title, the
-                    // body and the buttons all lay out **side by side** and the right edge is clipped.
+                    // ️ The parent here is a `ui.horizontal` (it exists only to give the card a left margin), and `Frame::show` hands...
                     ui.vertical(|ui| {
                     ui.label(
                         RichText::new(aox::i18n::t("Restore to before this task"))
@@ -888,18 +759,13 @@ impl RecoveryUi {
                         }
                     }
                     ui.add_space(12.0);
-                    // Buttons only answer once the block has finished unfolding: half a card with a
-                    // live "Roll back" under the pointer is a way to commit to something you have
-                    // not read yet.
+                    // Buttons only answer once the block has finished unfolding: half a card with a live "Roll back" under...
                     ui.add_enabled_ui(self.detail_t > 0.98, |ui| {
                         ui.horizontal(|ui| {
                             ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                                 if danger_button(ui, aox::i18n::t("Roll back…")).clicked() {
                                     self.confirm = Some(Ask {
-                                        // The **row's** id, not the resolved target: the bridge turns it
-                                        // into "the state before this point" (`TargetSpec::Before`).
-                                        // Sending the resolved id instead would resolve a second time
-                                        // and undo one point too many.
+                                        // The row's id, not the resolved target: the bridge turns it into "the state before this point"...
                                         target: self
                                             .expanded
                                             .clone()
@@ -940,10 +806,7 @@ impl RecoveryUi {
         (ui.min_rect().bottom() - top + 8.0).max(0.0)
     }
 
-    /// The "clear every point" question. Nothing is deleted until this returns the request.
-    ///
-    /// A second modal rather than an inline confirm: the rows behind it are the thing being deleted,
-    /// and deleting them under a mis-click is not recoverable by a "cancel" that arrives 200 ms late.
+    /// The "clear every point" question.
     pub fn clear_confirm(&mut self, ctx: &egui::Context) -> Option<RecoveryReq> {
         if !self.clear_ask {
             return None;
@@ -1013,12 +876,7 @@ impl RecoveryUi {
                         .strong(),
                 );
                 ui.add_space(6.0);
-                // ── these sentences are promises ──
-                //
-                // "A safety copy is kept" may only be said when it really is: the snapshot is
-                // written before any file is touched, and if it cannot be written the restore is
-                // refused. The sentence below is the honest version of that rule, and it changes
-                // with the situation instead of being generic reassurance.
+                // ── these sentences are promises ──.
                 let base = if ask.overwrite {
                     aox::tf!(
                         "{} path(s) were changed outside AOX. Rolling back overwrites those edits; a safety copy of the current state is kept first.",
@@ -1088,7 +946,7 @@ impl RecoveryUi {
                 allow_partial: ask.partial,
             }),
             Some(false) => None,
-            // Still open: put it back.
+            // Still open: put it back
             None => {
                 self.confirm = Some(ask);
                 None
@@ -1097,21 +955,9 @@ impl RecoveryUi {
     }
 }
 
-// ─────────────────────────── drawing helpers ───────────────────────────
+// drawing helpers
 
 /// The restore glyph: a ring with a gap on the right and a head at the gap's upper end.
-///
-/// **Fifth shape.** Four hand-drawn "undo arrows" were rejected from real screenshots — a "C" on its
-/// side, a hook, a circle with a sail, and finally a clean line-head arrow that was *correct* and
-/// still not wanted. The reference the user supplied is not an undo arrow at all: it is the
-/// **circular rotate arrow** (a near-complete ring, gap at 3 o'clock, head at the gap's top pointing
-/// clockwise into it). That is what is transcribed here, by measurement rather than by eye — the
-/// reference was 21 px across with r = 10, its gap 21° wide, its head's barbs 0.62 r and 0.52 r, so
-/// every number below is that image divided by its radius. The two deliberate departures are the gap
-/// (opened to 26°, see below) and the barbs (a common 0.60 r instead of two slightly different ones).
-///
-/// Hand-drawn like every other icon in this program: a font's "⟲" changes shape and weight with
-/// whichever font the build picked, and at 16 px a glyph from a fallback font reads as a smudge.
 fn paint_undo(painter: &egui::Painter, center: Pos2, box_size: f32, color: Color32) {
     // Heavier than the reference's 0.08 r: on a dark card a 1 px ring at this size disappears.
     let stroke = Stroke::new((box_size * 0.093).clamp(1.2, 1.8), color);
@@ -1138,12 +984,7 @@ fn ring_shape(center: Pos2, box_size: f32) -> RingShape {
     let s = box_size;
     // The glyph is 2.1 r across, so this leaves the stroke just inside the box the chip allocated.
     let r = s * 0.42;
-    // Gap from −26° (where the head attaches) round to 0°: 334° of visible ring. Drawn from 0°
-    // increasing, so the polyline runs right → bottom → left → top → head.
-    //
-    // The reference's gap is 21°, but its glyph is 21 px and this chip draws at 16 px — at 21° the
-    // head fuses into the ring and the whole thing reads as a closed "O" (checked by rendering both
-    // sizes side by side). Five degrees of extra opening is the smallest change that keeps the notch.
+    // Gap from −26° (where the head attaches) round to 0°: 334° of visible ring.
     let head = -26.0f32.to_radians();
     let sweep = std::f32::consts::TAU + head;
     let steps = 48;
@@ -1165,9 +1006,7 @@ fn ring_shape(center: Pos2, box_size: f32) -> RingShape {
     }
 }
 
-/// Which of the foot's two weights an action wears. Weight is in the **colour only** — the height,
-/// the type size, the padding and the hover wash are shared — so four different weights still read
-/// as one row. Same rule as [`crate::app::Weight`], at the panel's own scale.
+/// Which of the foot's two weights an action wears.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Foot {
     /// A third-rate action ("Verify", "Prune old points", "Redo last rollback").
@@ -1176,13 +1015,7 @@ enum Foot {
     Danger,
 }
 
-/// One action in the panel's foot: no chrome at rest, one fill step on hover, a hand cursor — the
-/// same language as a row and a toolbar icon, at one height for all four.
-///
-/// Hand-drawn instead of [`crate::app::flat_button`] for one measured reason: a ghost button is
-/// 13.5 pt with 12 pt of side padding, and four of those plus the gaps come to ~410 pt inside a
-/// 420 pt panel — the row would silently wrap or clip. These are 12 pt with 8, which fits with room
-/// to spare, and the different padding is invisible because the *height* is still [`FOOT_H`].
+/// One action in the panel's foot: no chrome at rest, one fill step on hover, a hand cursor — the same language...
 fn foot_action(ui: &mut Ui, text: &str, kind: Foot) -> egui::Response {
     foot_action_ex(ui, text, kind, true)
 }
@@ -1190,9 +1023,7 @@ fn foot_action(ui: &mut Ui, text: &str, kind: Foot) -> egui::Response {
 /// [`foot_action`], disabled rather than hidden: identical geometry, faint label, no click. Hiding
 /// one of four would re-space the other three on the frames a redo appears and disappears.
 fn foot_action_ex(ui: &mut Ui, text: &str, kind: Foot, enabled: bool) -> egui::Response {
-    // Measure first, then allocate from that size, then paint the backdrop, then the text — the
-    // order matters (see `app::widgets::paint_text_button`): painting the text first puts the hover
-    // wash **over** it and the label vanishes the moment the pointer arrives.
+    // Measure first, then allocate from that size, then paint the backdrop, then the text — the order matters (see...
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
         theme::body_font(FOOT_SIZE),
@@ -1345,9 +1176,7 @@ mod tests {
         assert_eq!(ago(t, t + 30 * 3600), format!("{m:02}-{d:02}"));
     }
 
-    /// The bug that shipped and was caught in a real screenshot: the answer was matched against the
-    /// **resolved** node, which is one step older than the row the user clicked, so every preview was
-    /// dropped and the row sat on "reading…" forever.
+    /// The bug that shipped and was caught in a real screenshot: the answer was matched against the resolved node...
     #[test]
     fn a_preview_lands_only_on_the_row_that_asked_for_it() {
         let mut rec = RecoveryUi::new();
@@ -1367,10 +1196,7 @@ mod tests {
         assert_eq!(rec.plan.as_ref().map(|p| p.requested.as_str()), Some("rp-a"));
     }
 
-    /// Four hand-drawn arrows were rejected before the user supplied a reference image, so what is
-    /// pinned here is the **reference's** geometry, not a preference: a ring, not a "C"; the gap on
-    /// the right rather than at the top; the head at the gap's *upper* end; and barbs that point up
-    /// and left, which is what makes the head read as pointing clockwise into the gap.
+    /// Four hand-drawn arrows were rejected before the user supplied a reference image, so what is pinned here...
     #[test]
     fn the_restore_glyph_is_a_ring_with_the_gap_at_its_upper_right() {
         let c = Pos2::new(100.0, 100.0);
@@ -1378,7 +1204,7 @@ mod tests {
         let g = ring_shape(c, side);
         let r = side * 0.42;
 
-        // 1. It is a ring: every point of the arc sits at one radius.
+        // 1. It is a ring: every point of the arc sits at one radius
         for p in &g.arc {
             let d = (*p - c).length();
             assert!((d - r).abs() < 1e-3, "{p:?} is off the ring: r = {d}");
@@ -1429,19 +1255,13 @@ mod tests {
         }
     }
 
-    /// The panel's own clock. Two properties are what the user actually asked for, and neither is
-    /// visible in a still screenshot, so both are pinned here:
-    ///
-    /// ① leaving takes **several frames** (a panel that is taken away in one frame reads as sliced);
-    /// ② the opacity **holds, then goes**. A naive ease-out on the way out loses 70% in the first
-    ///    30 ms and then leaves a half-transparent ghost crawling for the rest of the animation,
-    ///    which is exactly the "被切断" feeling this was reported as.
+    /// The panel's clock: exit spans several frames and opacity holds then fades, avoiding a naive ease-out's ghost.
     #[test]
     fn the_panel_leaves_slowly_at_first_then_all_at_once() {
         let ctx = egui::Context::default();
         let mut rec = RecoveryUi::new();
 
-        // Arriving: one clock, ease-out, lands exactly on 1.
+        // Arriving: one clock, ease-out, lands exactly on 1
         rec.open = true;
         rec.step_open(&ctx);
         assert!(rec.open_anim.is_some(), "opening is animated");
@@ -1450,7 +1270,7 @@ mod tests {
         assert_eq!(rec.open_t, 1.0);
         assert!(rec.open_anim.is_none(), "a finished clock is dropped");
 
-        // Leaving: still on screen one frame later, at full strength.
+        // Leaving: still on screen one frame later, at full strength
         rec.open = false;
         rec.step_open(&ctx);
         assert!(rec.open_anim.is_some(), "leaving is animated, not instantaneous");
@@ -1473,10 +1293,7 @@ mod tests {
         assert!(rec.open_anim.is_none());
     }
 
-    /// What a dismissal may **not** do: clear the rows while the panel is still on screen. That is
-    /// the reported bug — the preview is the panel's bottom half, so deleting it a frame early made
-    /// the panel look cut in two. Only [`RecoveryUi::forget_transient`], called once the clock has
-    /// reached zero, is allowed to throw the picture away.
+    /// What a dismissal may not do: clear the rows while the panel is still on screen.
     #[test]
     fn dismissing_keeps_the_preview_until_the_last_frame() {
         let mut rec = RecoveryUi::new();
@@ -1524,13 +1341,7 @@ mod tests {
     const FAST_FORWARD: std::time::Duration =
         std::time::Duration::from_millis(1_000 + (DETAIL_ANIM_SECS.max(OPEN_SECS) * 1000.0) as u64);
 
-    /// The unfold clock: opening reaches 1, closing reaches 0 and then forgets the row, and a
-    /// reversal mid-flight carries on from where it is. Pinned because "the block vanished instead of
-    /// folding" is the kind of regression nobody notices until it looks cheap.
-    ///
-    /// Also pinned here: **the clock waits for the preview**. Starting it on the click would make the
-    /// card unfold from a guessed height and then jump when the real one arrived — at 60 fps that is
-    /// the whole panel lurching, because the panel is pivoted at its bottom edge.
+    /// The unfold clock: opening reaches 1, closing reaches 0 and then forgets the row, and a reversal mid-flight...
     #[test]
     fn the_unfold_clock_waits_for_the_preview_and_then_folds_both_ways() {
         let ctx = egui::Context::default();

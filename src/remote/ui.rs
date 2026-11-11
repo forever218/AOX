@@ -1,14 +1,6 @@
 //! The `Ui` implementation that speaks the wire instead of the terminal.
-//!
-//! Same trait the CLI and GUI implement, so `Agent::run_turn` is unchanged: every event the host
-//! would have painted locally becomes a `task_update` frame the phone can draw.
-//!
-//! Approvals go over the wire in both directions: `approval_req` out, `approval_decide` back in
-//! through the read loop (see [`super::approvals`]). A request that nobody answers inside
-//! [`APPROVAL_TIMEOUT`] is treated as a refusal — silence is never consent.
-//!
-//! **Reasoning tokens are not uploaded.** They are the most private part of a turn and the least
-//! useful on a 6-inch screen.
+//! Same trait the CLI and GUI implement, so `Agent::run_turn` is unchanged: every event the host would have...
+//! Approvals go over the wire in both directions: `approval_req` out, `approval_decide` back in through the read...
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -28,13 +20,13 @@ use crate::ui::{AgentEvent, AuthDecision, Ui};
 
 use super::approvals::Approvals;
 
-/// 一场执行的身份信息：写任务快照时要用，但 `RemoteUi` 自己推不出来。
+/// Identity of one execution, needed for the task snapshot but not derivable by RemoteUi itself.
 pub struct TaskMeta {
     pub agent_id: String,
     pub agent_handle: String,
     pub owner_id: String,
     pub prompt: String,
-    /// 触发这一轮的那条消息（`@agent` 那一句）。手机靠它把"运行中"的呼吸条挂在对的地方。
+    /// The message that triggered this turn, so the phone can attach its running indicator in the right place.
     pub msg_id: String,
 }
 
@@ -42,13 +34,13 @@ pub struct TaskMeta {
 /// short enough that a desk-side turn does not hang forever on a phone left in another room.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// 一个已经落到暂存区的产物。
+/// An artifact already copied into the staging area.
 pub struct Staged {
-    /// 原件路径。只用来去重——原件此刻可能已经不在了。
+    /// Original path, used only for dedup since the original may already be gone.
     pub src: std::path::PathBuf,
-    /// 上传时用的名字。暂存区里的文件名被加了序号前缀，避免同名互相覆盖。
+    /// Upload name; staged filenames get a numeric prefix to avoid same-name collisions.
     pub name: String,
-    /// 暂存副本。上传只读这一份。
+    /// The staged copy, the only file read during upload.
     pub path: std::path::PathBuf,
 }
 
@@ -61,24 +53,18 @@ pub struct RemoteUi {
     last: Option<(u32, String)>,
     final_text: String,
     approvals: Arc<Approvals>,
-    /// Tools the person chose "本任务内都允许" for. Per turn by construction.
+    /// Tools the person allowed for the rest of this task; scoped per turn by construction.
     allowed_for_task: HashSet<String>,
-    /// Files this turn produced (`ToolOutput::path`), deduped, in the order they appeared.
-    /// Uploaded **after** the turn ends — uploading mid-turn would put half-written files in the room.
-    ///
-    /// Each one is **copied out** the moment it is announced, not just remembered by path. The
-    /// agent routinely publishes a temp copy and then deletes it in the same turn ("顺手清掉了
-    /// 工作区里的临时副本"); by the time the turn ends the original is gone and the room gets
-    /// nothing. Staging costs one copy and keeps the bytes.
+    /// This turn's files, deduped and staged on announce, uploaded after the turn so a deleted original still ships.
     artifacts: Vec<Staged>,
     meta: TaskMeta,
     steps: Vec<StepView>,
     started_at: i64,
-    /// 这一轮从房间里取到了什么（见 `context::digest`）。写进快照，手机上可核对。
+    /// What was fetched from the room this turn, recorded in the snapshot for the phone to verify.
     digest: Option<String>,
-    /// 这一轮累计的 token。以前一直是 0：宿主根本没填，手机那边自然什么都看不到。
+    /// Token total for this turn; previously always zero because the host never filled it in.
     usage: UsageView,
-    /// 这一轮产出的文件（上传之后才拿得到视图）。写进收尾快照，引用任务卡就能取回整轮产物。
+    /// Artifacts of this turn (views available only after upload), written to the final snapshot for the task card.
     made: Vec<aoxchat_proto::ArtifactView>,
 }
 
@@ -108,13 +94,12 @@ impl RemoteUi {
         }
     }
 
-    /// 把这一轮的产物记进快照。上传发生在收尾之前，所以拿得到视图；
-    /// 快照里带上它，"引用任务卡 → 取回整轮文件"才成立。
+    /// Record produced artifacts in the snapshot; upload precedes finalization, so views exist for the task card.
     pub fn set_artifacts(&mut self, views: Vec<aoxchat_proto::ArtifactView>) {
         self.made = views;
     }
 
-    /// 这轮执行的最终快照，写到房间历史里。
+    /// The final snapshot of this execution, written into room history.
     pub fn snapshot(&self, status: TaskStatus, error: Option<String>) -> TaskView {
         TaskView {
             id: self.task_id.clone(),
@@ -138,12 +123,12 @@ impl RemoteUi {
         std::mem::take(&mut self.artifacts)
     }
 
-    /// 暂存目录：每轮一个，名字用任务 id（它已经是唯一的，取消也按它路由）。
+    /// Staging directory per turn, named by the unique task id also used to route cancellation.
     fn stage_dir(&self) -> std::path::PathBuf {
         std::env::temp_dir().join("aox-artifacts").join(&self.task_id)
     }
 
-    /// 把产物拷进暂存区。拷不动就退回原路径——原件此刻还在，至少还有一次机会。
+    /// Copy an artifact into staging; fall back to the original path if the copy fails, since it still exists.
     fn stage(&mut self, src: &std::path::Path) -> Staged {
         let name = src
             .file_name()
@@ -154,14 +139,14 @@ impl RemoteUi {
         let path = match std::fs::create_dir_all(&dir).and_then(|()| std::fs::copy(src, &dest)) {
             Ok(_) => dest,
             Err(e) => {
-                eprintln!("产物暂存失败（{}）：{e}，改为直接读原件", src.display());
+                eprintln!("could not stage the artifact ({}): {e}; reading the original directly instead", src.display());
                 src.to_path_buf()
             }
         };
         Staged { src: src.to_path_buf(), name, path }
     }
 
-    /// 任务 id：取消要按它路由，所以必须在开跑前就能拿到。
+    /// Task id, available before the run starts because cancellation is routed by it.
     pub fn task_id(&self) -> &str {
         &self.task_id
     }
@@ -179,7 +164,7 @@ impl RemoteUi {
         let _ = self.out.send(frame);
     }
 
-    /// 一行进度/说明，推到手机上那张任务卡。**不落库**：`TaskUpdate` 本来就是瞬时的。
+    /// A transient progress line pushed to the phone task card, not persisted since TaskUpdate is ephemeral.
     pub fn note(&self, text: impl Into<String>) {
         self.send(Body::TaskUpdate(TaskUpdate {
             task_id: self.task_id.clone(),
@@ -193,11 +178,7 @@ impl RemoteUi {
         }));
     }
 
-    /// "这次它看到了什么"，写进 `context_digest`：先推一帧（手机上立刻能看到），再留一份给
-    /// 收尾时的快照（历史里的任务卡也要有）。
-    ///
-    /// 这个字段从协议 v1 就存在、一直是 `None`。填上它是为了让人能核对：模型说"我看过了"的时候，
-    /// 手机上有据可查它到底看到了几条、几个文件。
+    /// Fill context_digest with what the model saw: push a frame now and keep one for the final snapshot.
     pub fn set_digest(&mut self, digest: String) {
         self.digest = Some(digest.clone());
         self.send(Body::TaskUpdate(TaskUpdate {
@@ -226,8 +207,7 @@ impl RemoteUi {
     }
 }
 
-/// 暂存区跟着这一轮走：正常结束在 `worker` 里删，取消/报错靠这里兜底。
-/// 取消的那一轮产物本来就不该发出去，删掉正好。
+/// Staging is removed at normal end, or by Drop on cancel/error; a cancelled turn's files should not be sent.
 impl Drop for RemoteUi {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(self.stage_dir());
@@ -245,7 +225,7 @@ impl Ui for RemoteUi {
     fn emit(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::ToolCall { name, args } => {
-                println!("  · 调用 {name}");
+                println!("  · calling {name}");
                 self.step += 1;
                 let purpose = args
                     .get("purpose")
@@ -266,11 +246,10 @@ impl Ui for RemoteUi {
             }
             AgentEvent::ToolResult { name, is_error, preview, diff, path, .. } => {
                 if let Some(p) = path {
-                    // 只收真实存在、且本轮没出现过的文件。出现即拷贝：这一轮后面很可能把它删掉。
+                    // Accept only existing, not-yet-seen files and copy them at once, since the turn may delete them later.
                     if p.is_file() {
                         match self.artifacts.iter().position(|x| x.src == p) {
-                            // 同一路径又写了一次（`write_file` 之后 `edit_file`）：换掉暂存副本，
-                            // 让最后落盘的那一版发出去，而不是第一版。
+                            // If the same path is announced again, replace the staged copy so the final on-disk version is what gets sent.
                             Some(i) => {
                                 let dest = self.artifacts[i].path.clone();
                                 let _ = std::fs::copy(&p, &dest);
@@ -306,7 +285,7 @@ impl Ui for RemoteUi {
                 self.update(sv, None);
             }
             AgentEvent::AssistantText(text) => {
-                println!("  · 回复 {} 字", text.chars().count());
+                println!("  · reply, {} characters", text.chars().count());
                 self.final_text = text
             }
             AgentEvent::InterimText(text) => {
@@ -315,7 +294,7 @@ impl Ui for RemoteUi {
             }
             AgentEvent::Warn(text) => self.note(format!("⚠ {text}")),
             AgentEvent::Error(text) => self.note(format!("✗ {text}")),
-            AgentEvent::Recycled(n) => self.note(format!("已移入回收站：{n} 个文件")),
+            AgentEvent::Recycled(n) => self.note(format!("Moved to the recycle bin: {n} file(s)")),
             _ => {}
         }
     }
@@ -343,23 +322,23 @@ impl Ui for RemoteUi {
             expires_at: now_ms() + APPROVAL_TIMEOUT.as_millis() as i64,
         };
         self.send(Body::ApprovalReq(ApprovalReq { approval }));
-        println!("  ? 等待审批：{tool_name}");
+        println!("  ? waiting for approval: {tool_name}");
 
         match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
             Ok(Ok(d)) if d.allow => {
-                println!("  ✓ 已允许");
+                println!("  ✓ allowed");
                 if d.for_task {
                     self.allowed_for_task.insert(tool_name.to_string());
                 }
                 AuthDecision::Allow
             }
             Ok(Ok(_)) => {
-                println!("  ✗ 被拒绝");
+                println!("  ✗ denied");
                 AuthDecision::Deny
             }
             _ => {
                 self.approvals.forget(&id);
-                println!("  ✗ 审批超时，按拒绝处理");
+                println!("  ✗ approval timed out; treating it as denied");
                 AuthDecision::Deny
             }
         }
@@ -372,17 +351,14 @@ impl Ui for RemoteUi {
             source_msg_id: Some(self.meta.msg_id.clone()),
             status: Some(TaskStatus::Done),
             step: None,
-            // 收尾再报一次总量：手机上的实时累加可能因为漏帧少一两个数。
+            // Report the total again at finalization, since the phone's live counter may miss a frame or two.
             usage: Some(self.usage),
             note: None,
             context_digest: None,
         }));
     }
 
-    /// 每次模型调用后更新这轮的 token 账，并立刻推给手机。
-    ///
-    /// 不这么做的话，手机上要等整轮结束才能看到数字——一个跑十轮工具的任务中间全是空白。
-    /// `usage` 是**单次调用**的量，累加在这里做；`TaskUpdate` 带的是累计值。
+    /// After each model call, add its usage to the token ledger and push the cumulative total to the phone.
     async fn call_usage(&mut self, usage: &Usage, _last_prompt: Option<u64>) {
         self.usage.calls = self.usage.calls.saturating_add(1);
         self.usage.prompt = self.usage.prompt.saturating_add(usage.prompt.unwrap_or(0));
@@ -390,7 +366,7 @@ impl Ui for RemoteUi {
             .usage
             .completion
             .saturating_add(usage.completion.unwrap_or(0));
-        // 有些端点只给 total（不拆输入/输出）。什么都不记会让"用了多少"永远是 0。
+        // Some endpoints return only a total without input/output split; record it so usage is not stuck at zero.
         if usage.prompt.is_none() && usage.completion.is_none() {
             self.usage.total = self.usage.total.saturating_add(usage.total.unwrap_or(0));
         }
@@ -436,7 +412,7 @@ fn redact(s: &str) -> String {
     let low = s.to_ascii_lowercase();
     const SIGNS: [&str; 6] = ["sk-", "token", "password", "secret", "api_key", "apikey"];
     if SIGNS.iter().any(|k| low.contains(k)) {
-        "[已隐藏]".to_string()
+        "[redacted]".to_string()
     } else {
         s.to_string()
     }
@@ -462,10 +438,7 @@ mod tests {
         )
     }
 
-    /// 这一轮把临时副本删掉了，产物也必须还在。
-    ///
-    /// 这就是"图片发不出来"的现场：模型 publish 一张桌面截图后顺手删了工作区里的副本，
-    /// 上传发生在整轮结束之后，那时原件已经没了，房间什么也没收到，而回复里还写着"已经发到房间里了"。
+    /// Verify an artifact survives a deleted temp copy, since upload happens after the turn ends.
     #[test]
     fn an_artifact_outlives_the_turn_that_deletes_it() {
         let dir = std::env::temp_dir().join("aox-test-stage-src");
@@ -486,18 +459,18 @@ mod tests {
 
         let arts = ui.take_artifacts();
         assert_eq!(arts.len(), 1);
-        assert_eq!(arts[0].name, "shot.jpg", "上传用的名字必须是原文件名");
+        assert_eq!(arts[0].name, "shot.jpg", "the upload name must be the original file name");
         assert_eq!(
             std::fs::read(&arts[0].path).unwrap(),
             b"jpeg bytes",
-            "原件没了，暂存副本还得在"
+            "the original is gone, so the staged copy must still be there"
         );
 
         drop(ui);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 同一路径报了两次（`write_file` 之后 `edit_file`）：只发一份，且是最后落盘的那一版。
+    /// The same path reported twice should be staged once, and the last on-disk version is what gets delivered.
     #[test]
     fn the_same_file_announced_twice_is_staged_once() {
         let dir = std::env::temp_dir().join("aox-test-stage-dup");
@@ -525,11 +498,11 @@ mod tests {
         });
 
         let arts = ui.take_artifacts();
-        assert_eq!(arts.len(), 1, "同一路径只该占一条");
+        assert_eq!(arts.len(), 1, "the same path should take one slot only");
         assert_eq!(
             std::fs::read(&arts[0].path).unwrap(),
             b"v2",
-            "发出去的是最后一版，不是第一版"
+            "what gets sent is the last version, not the first"
         );
 
         drop(ui);

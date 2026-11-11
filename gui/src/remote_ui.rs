@@ -1,14 +1,6 @@
-//! 设置页里的「远程」：配对列表、启停、日志。
-//!
-//! 桥跑在**独立线程**里（自己的 tokio runtime + 自己的 Runtime），不占 GUI 的 agent 线程。
-//! 锁屏不依赖这里的状态，而是靠桥写的心跳文件——所以即使这个页面没打开，接管锁照样工作。
-//!
-//! 版式跟设置页其它列共用一套词汇：一个操作一行的高度（[`BTN_H`]）、整行当点击区、悬停时
-//! 整行铺一层 `surface_hi`、动作是文字按钮，**不画边框卡片**。
-//!
-//! 之前这一页用的是 egui 原生的 `Button` / `small_button`：24pt 的灰盒子，悬停高亮只有文字
-//! 那么大一圈，而整页其它地方是"整行变色 + 手型光标"。同一屏里出现两套交互语言，看起来就像
-//! 嵌了个别的程序——这不是配色问题，是几何问题。
+//! Remote tab in Settings: pairing list, start/stop, logs. Bridge: own thread, own tokio runtime + Runtime.
+//! Lock uses the bridge's heartbeat file, so it works with the page closed; layout shares Settings vocabulary.
+//! Whole-row hover, text buttons, no border cards; native egui Buttons looked foreign -- geometry, not color.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,16 +18,13 @@ use crate::app::{
 use crate::model_ui::paint_check;
 use crate::theme::{self, P};
 
-/// 配对行的高度。
-///
-/// 和模型列表的 `ROW_H` 一样：名字（14）在上、副标题（11.5）在下，上下各 11。行高固定，
-/// 同一列里两行差 4pt 就会看出来。
+/// Pairing row height (same as model ROW_H): 14pt name over 11.5pt subtitle, 11 padding, fixed for alignment.
 const ROW_H: f32 = 56.0;
 
-/// 行内动作按钮的高度：比整行低一档，两边各留 11，不顶着行的上下沿。
+/// In-row action button height: one step below the row, 11 padding each side, not touching the edges.
 const ACT_H: f32 = BTN_H.min(ROW_H - 12.0);
 
-/// 整列的左沿。名字、标题、空态、表单都用同一个数。
+/// Left edge of the whole column; the same number is used for names, titles, empty states and forms.
 const PAD_L: f32 = 16.0;
 
 enum Act {
@@ -44,7 +33,7 @@ enum Act {
     StartRename(String),
 }
 
-/// 一个行内的编辑动作。就地改名 / 就地确认删除共用。
+/// One in-row edit action, shared by inline rename and inline delete confirmation.
 enum EditAct {
     None,
     Save,
@@ -78,7 +67,7 @@ impl Default for RemoteState {
             pairings: Vec::new(),
         });
         Self {
-            status: if book.pairings.is_empty() { "未配对".into() } else { "已配对，未启动".into() },
+            status: if book.pairings.is_empty() { "Not paired".into() } else { "Paired, not running".into() },
             logs: Vec::new(),
             running: false,
             busy: false,
@@ -105,7 +94,7 @@ impl RemoteState {
 
     fn persist(&mut self) {
         if let Err(e) = self.book.save(&aox::paths::app_root()) {
-            self.status = format!("保存失败：{e:#}");
+            self.status = format!("Save failed: {e:#}");
         }
     }
 
@@ -116,13 +105,12 @@ impl RemoteState {
             got = true;
             match ev {
                 RemoteEvent::Status(s) => {
-                    let stopped = s.contains("已停止") || s.contains("失败") || s.contains("错误");
+                    let stopped = s.contains("Stopped") || s.contains("failed") || s.contains("error");
                     if stopped {
                         self.running = false;
                     }
-                    // 配对成功就把表单收起来、把码擦掉：留着它只会让人以为还能再配一次，
-                    // 而那个 8 位码用过就废了。
-                    if s.contains("配对成功") {
+                    // On success, hide the form and wipe the code; the 8-digit code is single-use, so keeping it misleads.
+                    if s.contains("Paired") {
                         self.adding = false;
                         self.server.clear();
                         self.code.clear();
@@ -136,7 +124,7 @@ impl RemoteState {
         }
         if got {
             self.busy = false;
-            // 配对成功会写进 remote.json，列表要跟着变。
+            // A successful pairing is written to remote.json, so the list must refresh.
             self.reload();
         }
         if self.logs.len() > 80 {
@@ -150,7 +138,7 @@ impl RemoteState {
             return;
         }
         if self.book.active().is_none() {
-            self.status = "先选一条配对".into();
+            self.status = "Pick a pairing first".into();
             return;
         }
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -158,13 +146,13 @@ impl RemoteState {
         self.stop = Arc::new(AtomicBool::new(false));
         let stop = self.stop.clone();
         self.running = true;
-        self.status = "启动中…".into();
+        self.status = "Starting…".into();
 
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(RemoteEvent::Log(format!("无法创建运行时：{e}")));
+                    let _ = tx.send(RemoteEvent::Log(format!("Cannot create the runtime: {e}")));
                     return;
                 }
             };
@@ -174,7 +162,7 @@ impl RemoteState {
                 let resolved = match aox::config::layer::resolve(&root, &cfg_path, None, None) {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = tx.send(RemoteEvent::Status(format!("已停止（配置错误：{e:#}）")));
+                        let _ = tx.send(RemoteEvent::Status(format!("Stopped (config error: {e:#})")));
                         return;
                     }
                 };
@@ -185,15 +173,15 @@ impl RemoteState {
                         Ok(r) => r,
                         Err(e) => {
                             let _ =
-                                tx.send(RemoteEvent::Status(format!("已停止（运行时构建失败：{e:#}）")));
+                                tx.send(RemoteEvent::Status(format!("Stopped (runtime build failed: {e:#})")));
                             return;
                         }
                     };
-                // GUI 没有终端输入可接管：`control_stdin = false`。授权在手机上点。
+                // The GUI has no terminal to take over, so control_stdin is false and authorization happens on the phone.
                 if let Err(e) =
                     aox::remote::serve_with(runtime, root, Some(tx.clone()), stop, false).await
                 {
-                    let _ = tx.send(RemoteEvent::Status(format!("已停止（{e:#}）")));
+                    let _ = tx.send(RemoteEvent::Status(format!("Stopped ({e:#})")));
                 }
             });
         });
@@ -201,7 +189,7 @@ impl RemoteState {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.status = "正在停止…".into();
+        self.status = "Stopping…".into();
     }
 
     pub fn pair(&mut self) {
@@ -211,7 +199,7 @@ impl RemoteState {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.rx = Some(rx);
         self.busy = true;
-        self.status = "配对中…".into();
+        self.status = "Pairing…".into();
 
         let server = self.server.clone();
         let code = self.code.clone();
@@ -220,7 +208,7 @@ impl RemoteState {
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(RemoteEvent::Status(format!("配对失败：{e}")));
+                    let _ = tx.send(RemoteEvent::Status(format!("Pairing failed: {e}")));
                     return;
                 }
             };
@@ -229,23 +217,21 @@ impl RemoteState {
             match rt.block_on(remote::pair_with(&server, &code, &handle, &host, &root)) {
                 Ok(p) => {
                     let _ = tx.send(RemoteEvent::Status(format!(
-                        "配对成功：{} @{}",
+                        "Paired: {} @{}",
                         p.server, p.agent_handle
                     )));
                 }
                 Err(e) => {
-                    let _ = tx.send(RemoteEvent::Status(format!("配对失败：{e:#}")));
+                    let _ = tx.send(RemoteEvent::Status(format!("Pairing failed: {e:#}")));
                 }
             }
         });
     }
 
-    // ── 页面 ────────────────────────────────────────────────────────────
+    // Section divider marking the start of the page layout.
 
     pub fn page(&mut self, ui: &mut egui::Ui) {
-        // 设置对话框把整棵子树的横向间距清成 0（它自己是手写版式，靠 `add_space` 排），
-        // 但这一页全是用 egui 控件拼的：不还原的话圆点和"未运行"会贴在一起，状态和地址也会
-        // 粘成一串。
+        // The dialog zeroes horizontal spacing (hand layout via add_space); this page restores it or dots/text stick.
         ui.spacing_mut().item_spacing.x = 8.0;
         self.status_block(ui);
         ui.add_space(20.0);
@@ -256,20 +242,14 @@ impl RemoteState {
         }
     }
 
-    /// 顶部：一个状态点、一句话、右边一个动作按钮。
-    ///
-    /// 状态点**画**出来而不是打 `●` / `○`：这两个字形不在自带字体里时会变成豆腐块，而圆一定
-    /// 画得出来（勾、叉、折角也都是这个理由）。
+    /// Header: status dot, one line, right action button; the dot is painted, not a glyph that a font may lack.
     fn status_block(&mut self, ui: &mut egui::Ui) {
         let active = self.book.active().map(|p| (p.server.clone(), p.agent_handle.clone()));
         let running = self.running;
         let can_start = active.is_some() && !self.busy;
 
         ui.horizontal(|ui| {
-            // 按钮**先**占住右边，剩下的宽度才留给文字。
-            //
-            // 反过来写（先文字、再用 `right_to_left` 收按钮）时，文字是照它的自然宽度排的，
-            // 一个长地址就能把按钮顶出画面，或者干脆压在上面。
+            // Reserve the right button first, then the rest for text; otherwise a long address pushes the button off-screen.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if running {
                     if button(ui, t("Stop remote"), Weight::Secondary).clicked() {
@@ -308,8 +288,7 @@ impl RemoteState {
             });
         });
 
-        // 状态原文（"已停止（…）"、"配对中…"）。只占一行，超出省略：它是解释不是正文，折成
-        // 两行会把列表整体推下去，而它每帧都可能变。
+        // The status text stays on one elided line; it changes every frame, so wrapping would push the list down.
         if !self.status.is_empty() {
             ui.add_space(3.0);
             ui.add(
@@ -319,11 +298,7 @@ impl RemoteState {
         }
     }
 
-    /// 配对列表：标题 + 行 +（添加中的）表单。
-    ///
-    /// 三件事挤在同一列而不是各自成块，因为它们回答同一个问题——"这台机器接进了哪几个账号"。
-    /// 重命名和删除**就地**变成那一行，不再到列表上方另开一块：点了第三行的"重命名"，输入框
-    /// 却在列表顶上，眼睛得先离开那一行。
+    /// Pairing list (title, rows, add-form) in one column; rename and delete happen inline on that row.
     fn pairings_block(&mut self, ui: &mut egui::Ui) {
         let mut add_clicked = false;
         ui.horizontal(|ui| {
@@ -377,7 +352,7 @@ impl RemoteState {
             .collect();
 
         let active_id = self.book.active.clone();
-        // 草稿借出来改，走完一遍再放回：编辑中的输入框要 `&mut String`，而它还得跟行的顺序对上。
+        // Borrow the draft out for the pass and put it back: an active TextEdit needs a mutable, row-aligned String.
         let mut renaming = self.renaming.clone();
         let mut deleting = self.deleting.clone();
         let mut act: Option<Act> = None;
@@ -394,7 +369,7 @@ impl RemoteState {
                         renaming = None;
                     }
                     EditAct::Cancel => renaming = None,
-                    // 每帧写回：`TextEdit` 的字符串得活过这一帧，光标才跟手。
+                    // Write the draft back every frame so the TextEdit string survives the frame and the caret tracks typing.
                     EditAct::None => renaming = Some((r.id.clone(), draft)),
                 }
                 continue;
@@ -419,7 +394,7 @@ impl RemoteState {
             }
         }
 
-        // 本帧的编辑状态先落盘，再处理点击——点击是"另一个动作"，优先于正在编辑的那一行。
+        // Commit this frame's edit state before handling clicks, since a click outranks the row being edited.
         self.renaming = renaming;
         self.deleting = deleting;
 
@@ -427,7 +402,7 @@ impl RemoteState {
             Some(Act::Select(id)) => {
                 if self.book.select(&id) {
                     self.persist();
-                    self.status = "已切换当前配对（下次启动生效）".into();
+                    self.status = "Switched the current pairing (applies on next start)".into();
                 }
             }
             Some(Act::AskDelete(id)) => {
@@ -459,7 +434,7 @@ impl RemoteState {
         );
         ui.add_space(8.0);
 
-        // 名字列按实测最宽的那一个算，不是写死一个数：英文比中文宽 40%，写死就会压到值上。
+        // Name column width is measured from the widest name, not fixed; English is ~40% wider and would overlap.
         let keys = [t("Server"), t("Pairing code"), t("Agent name")];
         let kw = key_w(ui, &keys);
         let _ = field_row(ui, kw, t("Server"), &mut self.server, "https://chat.example.com");
@@ -489,10 +464,7 @@ impl RemoteState {
         }
     }
 
-    /// 最近日志：一行可点的折角标题 + 一个 well 里的等宽正文。
-    ///
-    /// 不用 `CollapsingHeader`：它自带 egui 的三角和缩进，字号也不跟这一页走，展开时整块会
-    /// 往右缩 8pt——一个零件另一套度量，和上面"悬停只有文字大"是同一类问题。
+    /// Recent logs: clickable fold title plus monospace body in a well; no CollapsingHeader (its indent shifts 8pt).
     fn log_block(&mut self, ui: &mut egui::Ui) {
         let w = ui.available_width();
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
@@ -504,7 +476,7 @@ impl RemoteState {
         let tw = g.size().x;
         ui.painter().galley(Pos2::new(rect.left(), rect.center().y - g.size().y * 0.5), g, fg);
 
-        // 折角：开着朝下，关着朝右。两条线段，不赌字体里有没有 ▸。
+        // The fold chevron points down when open, right when closed, drawn as two segments (no font glyph).
         let c = Pos2::new(rect.left() + tw + 12.0, rect.center().y);
         let s = 3.2;
         let st = Stroke::new(1.3, fg);
@@ -539,32 +511,28 @@ impl RemoteState {
     }
 }
 
-/// 一行配对。
+/// One pairing row.
 struct Row {
     id: String,
     title: String,
     server: String,
     agent: String,
     device: String,
-    /// 标题就是地址（没起名字）时，副标题不再重复地址。
+    /// When the title is just the address (no name set), the subtitle does not repeat the address.
     title_is_server: bool,
 }
 
-/// 画一行配对，返回这一帧发生的动作。
-///
-/// 整行（除右侧动作区）是**点击区**，点了就等于"设为当前"——和模型列表里"整行点了就编辑"是
-/// 同一条规则：手型光标落在哪，哪就能点，而不用为它再画一个按钮。
+/// Draw a pairing row, returning this frame's action; the whole row (minus right actions) sets it as current.
 fn row_ui(ui: &mut egui::Ui, r: &Row, active: bool) -> Option<Act> {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H), Sense::hover());
 
-    // 右侧动作区的宽度**先算出来**，不管这一帧画不画：算进去之后名字的省略宽度才是常数，
-    // 否则鼠标一进一出，名字会先缩短再弹回。
+    // Compute the right action width every frame, drawn or not, so the name's ellipsis stays constant on hover.
     let del_w = button_size(ui, t("Delete"), Weight::Ghost).x;
     let ren_w = button_size(ui, t("Rename"), Weight::Ghost).x;
     let reserved = del_w + ren_w + 10.0;
 
-    // 左半边可点（= 设为当前）。已经是的就不给 sense，免得点出一个"什么也没发生"。
+    // Only the left half is clickable (set as current); the current row gets no sense, so clicks are never no-ops.
     let can_use = !active;
     let hit = Rect::from_min_max(rect.min, Pos2::new(rect.right() - reserved, rect.max.y));
     let hresp = ui.interact(
@@ -573,11 +541,7 @@ fn row_ui(ui: &mut egui::Ui, r: &Row, active: bool) -> Option<Act> {
         if can_use { Sense::click() } else { Sense::hover() },
     );
 
-    // 两个动作的点击区**每帧都建**，只是不悬停时不画。
-    //
-    // 反过来做（悬停才建）看着更省，实际点不中：egui 的 `hovered` 是按**上一帧**的控件表算
-    // 的，指针一落到按钮上，父行这一帧就可能报 `hovered = false` → 按钮被"撤掉" → 点击落在
-    // 空处，按钮原地闪烁。模型列表那几个子控件也是无条件的，同一个理由。
+    // Build both action areas every frame; hovered uses the prior frame, so hover-only buttons flicker.
     let mut right = rect.right() - PAD_L;
     let mut acts: Vec<(Rect, &'static str, egui::Response, fn(String) -> Act)> = Vec::new();
     for (label, bw, make) in [
@@ -593,7 +557,7 @@ fn row_ui(ui: &mut egui::Ui, r: &Row, active: bool) -> Option<Act> {
         right -= bw + 4.0;
     }
 
-    // 整行的悬停态：行本身或它上面的任何一个子点击区，都算"指针在这一行里"。
+    // The row's hover state counts the row or any child hit area over it as pointer-in-row.
     let hov = resp.hovered() || hresp.hovered() || acts.iter().any(|(_, _, r, _)| r.hovered());
     if hov {
         ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
@@ -615,7 +579,7 @@ fn row_ui(ui: &mut egui::Ui, r: &Row, active: bool) -> Option<Act> {
     if can_use && hresp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    // 整行可点这件事得说出来：列表里只有手型光标，没有第二个提示。
+    // Note the whole row is clickable: the list offers only a hand cursor, no other hint.
     let hresp = if can_use { hresp.on_hover_text(t("Set as current")) } else { hresp };
 
     let name_fg = if active { P::ink() } else { P::text() };
@@ -649,7 +613,7 @@ fn row_ui(ui: &mut egui::Ui, r: &Row, active: bool) -> Option<Act> {
     act
 }
 
-/// 就地重命名：一个输入框 + 保存 / 取消，高度和一行一样，列表不跳。
+/// In-place rename: one field plus Save/Cancel, the height of one row so the list does not jump.
 fn rename_row(ui: &mut egui::Ui, draft: &mut String) -> EditAct {
     let mut out = EditAct::None;
     let w = ui.available_width();
@@ -660,8 +624,7 @@ fn rename_row(ui: &mut egui::Ui, draft: &mut String) -> EditAct {
         .show(ui, |ui| {
             ui.set_min_width(w - PAD_L * 2.0);
             ui.horizontal(|ui| {
-                // 输入框按"这一行还剩多少"来定宽，不写死：写死 240 时，列一窄（窗口缩小）
-                // 保存 / 取消就压到框上。上限 280 是为了别让一个改名框横穿整列。
+                // Size the field from the remaining row width, not a fixed value; cap at 280 so it cannot span the column.
                 let bw = button_size(ui, t("Save"), Weight::Primary).x
                     + button_size(ui, t("Cancel"), Weight::Ghost).x
                     + 8.0;
@@ -678,8 +641,7 @@ fn rename_row(ui: &mut egui::Ui, draft: &mut String) -> EditAct {
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     out = EditAct::Save;
                 }
-                // 打开就落在输入框里：点了"重命名"还得再点一次输入框才能打字，那这一步就是白点的。
-                // 只在**没有任何东西**有焦点时要，免得每帧跟别的输入框抢。
+                // Focus the field on open, but only when nothing else has focus, so it does not steal focus every frame.
                 if ui.memory(|m| m.focused()).is_none() {
                     resp.request_focus();
                 }
@@ -696,7 +658,7 @@ fn rename_row(ui: &mut egui::Ui, draft: &mut String) -> EditAct {
     out
 }
 
-/// 就地确认删除：一句话 + 删除 / 取消。红色只出现在这一步，且是实心的——它已经是第二下了。
+/// In-place delete confirm: one line plus Delete/Cancel; red only here, solid since it is the second click.
 fn delete_row(ui: &mut egui::Ui, title: &str) -> EditAct {
     let mut out = EditAct::None;
     let w = ui.available_width();
@@ -707,8 +669,7 @@ fn delete_row(ui: &mut egui::Ui, title: &str) -> EditAct {
         .show(ui, |ui| {
             ui.set_min_width(w - PAD_L * 2.0);
             ui.horizontal(|ui| {
-                // 按钮宽度先算出来，那句话只能用**剩下**的宽度：不这样的话长标题会直接压到
-                // 按钮上（"服务器上的记录还在"就是从 Cancel 底下穿过去的）。
+                // Compute button width first so the message uses only the remaining width, or long titles overlap buttons.
                 let bw = button_size(ui, t("Delete"), Weight::DangerSolid).x
                     + button_size(ui, t("Cancel"), Weight::Ghost).x
                     + 8.0;
@@ -716,7 +677,7 @@ fn delete_row(ui: &mut egui::Ui, title: &str) -> EditAct {
                 ui.add_sized(
                     Vec2::new(tw, BTN_H),
                     egui::Label::new(
-                        RichText::new(aox::tf!("删除「{}」？只删本机凭证，服务器上的记录还在。", title))
+                        RichText::new(aox::tf!("Delete {}? This only removes the local credential; the server record stays.", title))
                             .color(P::text_dim())
                             .size(13.0),
                     )
@@ -733,10 +694,7 @@ fn delete_row(ui: &mut egui::Ui, title: &str) -> EditAct {
     out
 }
 
-/// 名字列宽度：这一组里实测最宽的那个名字 + 18pt 气口，再向上取整。
-///
-/// 照抄设置页 `kv_key_w` 的理由：名字是直接画在 painter 上的，既不裁剪也不参与布局，写死一个
-/// 宽度只会在换语言时压到值上。
+/// Widest name + 18pt rounded up (kv_key_w); painted directly, so fixed widths overlap values on language change.
 fn key_w(ui: &egui::Ui, keys: &[&str]) -> f32 {
     let mut w = 84.0_f32;
     for k in keys {
@@ -750,7 +708,7 @@ fn key_w(ui: &egui::Ui, keys: &[&str]) -> f32 {
     w.ceil()
 }
 
-/// 一行「名字 + 输入框」。输入框的内边距是 8，所以它和 [`BTN_H`] 一样高（14 的字 + 上下 8）。
+/// A row of name plus field; the field's 8px padding makes it as tall as BTN_H (14px text + 8 top/bottom).
 fn field_row(
     ui: &mut egui::Ui,
     key_w: f32,

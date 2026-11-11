@@ -1,22 +1,6 @@
 //! S0 spike for the built-in shell: prove (or disprove) the three facts the boundary rests on.
-//!
-//! Run it with `cargo run --example lowil_probe`. It uses `%TEMP%` only and removes what it
-//! created. Every check prints `PASS` or `FAIL` with the real Windows error, and the process exit
-//! code is the number of failed checks.
-//!
-//! What it establishes, in order:
-//!
-//! 1. **An unprivileged process can label a directory tree Low** (`icacls /setintegritylevel`).
-//! 2. **A process can lower its own token to Low without elevation** — the helper's core trick.
-//! 3. **A child spawned by that process inherits Low** (asked from the inside: `whoami /groups`
-//!    must list `S-1-16-4096`).
-//! 4. **The boundary is real**: a Low child writes inside the labelled workspace, is *refused*
-//!    outside it, and can still **read** outside it.
-//! 5. **The host is not harmed**: the Medium parent can still write the Low workspace after the
-//!    labelling pass (`no-write-up` blocks going up, not down).
-//!
-//! Numbers 2 and 4 are the ones that would sink the design; 1 and 5 are cheap to confirm while we
-//! are here.
+//! Run it with `cargo run --example lowil_probe`. It uses `%TEMP%` only and removes what it created.
+//! What it establishes, in order.
 
 use std::path::Path;
 use std::process::Command;
@@ -56,7 +40,7 @@ fn main() {
     std::process::exit(parent());
 }
 
-// ─────────────────────────────── the Medium side ───────────────────────────────
+// the Medium side
 
 fn parent() -> i32 {
     let root = std::env::temp_dir().join(format!("aox-lowil-spike-{}", std::process::id()));
@@ -128,7 +112,7 @@ fn parent() -> i32 {
     failed as i32
 }
 
-// ─────────────────────────────── the (soon to be) Low side ───────────────────────────────
+// the (soon to be) Low side
 
 fn child(ws: &Path, outside: &Path, root: &Path) -> i32 {
     use aox::shell::lowil;
@@ -161,9 +145,7 @@ fn child(ws: &Path, outside: &Path, root: &Path) -> i32 {
         }
     }
 
-    // ③ the kernel agrees: ask a *grandchild* what it inherited. Its own token is the only thing
-    // asked — `whoami /groups` was tried first and refused to run at all under a Low token
-    // (it printed an error before any line), so the probe answers the question itself.
+    // The kernel agrees: ask a *grandchild* what it inherited.
     match Command::new(std::env::current_exe().expect("current_exe")).arg("--il").output() {
         Ok(o) => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();

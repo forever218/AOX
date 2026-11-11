@@ -1,24 +1,6 @@
-//! S1/S2 smoke test for the built-in `shell` tool — the same A/B discipline as `aox selftest`,
-//! but runnable on its own: `cargo run --example shell_probe`.
-//!
-//! It builds a real `Runtime` with a fixed workspace in `%TEMP%`, registers the shell tools and
-//! drives them exactly as the agent would, then prints `PASS`/`FAIL` per check and exits with the
-//! number of failures. Everything it creates is removed.
-//!
-//! What it establishes:
-//!
-//! | # | Check | Why it matters |
-//! |---|-------|----------------|
-//! | 1 | a write **inside** the workspace succeeds | the boundary is not so tight that the tool is useless |
-//! | 2 | a write outside, spelled so the scanner **cannot** see it (`[IO.File]::WriteAllText`), is refused | this is the kernel doing it, not the scanner |
-//! | 3 | a plain `> <outside path>` is refused **before** running, with the boundary contract | the guard rail produces a readable refusal |
-//! | 4 | the refused file really does not exist | "it got blocked" must not mean "nothing happened" |
-//! | 5 | reading outside the workspace still works | the deliberate read/write asymmetry |
-//! | 6 | a non-zero exit code reaches the model as output, not as a tool error | a compiler error is content |
-//! | 9 | a call past its own `timeout_secs` is killed in about that long | the budget actually binds |
-//! | 10 | a **silent** call is killed by the idle watchdog long before its budget | "wedged" gets reaped |
-//! | 11 | a call that keeps printing is **not** killed by the watchdog | slow ≠ stuck |
-//! | 12 | the ceiling and the model's estimate come back as `(cap, expect)` | what the UI reads |
+//! S1/S2 smoke test for the built-in `shell` tool — the same A/B discipline as `aox selftest`, but runnable...
+//! It builds a real `Runtime` with a fixed workspace in `%TEMP%`, registers the shell tools and drives them...
+//! What it establishes.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,9 +11,7 @@ use aox::config::Config;
 use aox::runtime::Runtime;
 
 fn main() {
-    // Same hidden entry as the two real binaries. It is not optional: `shell` spawns
-    // `current_exe()` to lower the token, so whichever binary hosts the runtime must be able to
-    // answer that switch — otherwise this probe would recursively start itself.
+    // Same hidden entry as the two real binaries.
     if let Some(code) = aox::shell::helper::run_if_requested() {
         std::process::exit(code);
     }
@@ -86,9 +66,7 @@ async fn run() -> anyhow::Result<i32> {
     println!("workspace {}", ws.display());
     println!("outside   {}", outside.display());
 
-    // A subdirectory of a prepared tree **inherits the label**, so a probe workspace created inside one
-    // is already at the right level; only the per-workspace marker is missing. Mirror the nearest
-    // ancestor's marker, so this runs the same path the real tool takes in a prepared project.
+    // A subdirectory of a prepared tree inherits the label, so a probe workspace created inside one is already...
     {
         let mut cur = Some(ws.as_path());
         let mut found = None;
@@ -234,10 +212,7 @@ async fn run() -> anyhow::Result<i32> {
         }
     }
 
-    // 9 ── the total budget actually binds
-    //
-    // `ping -n 30` would run ~29 s; `>nul` keeps it from printing (so the idle watchdog has nothing to
-    // feed it) and `idle_secs: 0` turns that watchdog off, isolating the total timeout.
+    // 9 ── the total budget actually binds.
     {
         let t0 = std::time::Instant::now();
         let args = json!({
@@ -292,11 +267,7 @@ async fn run() -> anyhow::Result<i32> {
         }
     }
 
-    // 11 ── and the watchdog must NOT kill a slow-but-alive command
-    //
-    // `ping` prints one line per second for 6 s while the idle budget is 3 s: if the clock ran from the
-    // start instead of from the last byte, this is the check that would fail — which is the whole
-    // difference between "reaps wedged calls" and "reaps slow builds".
+    // 11 ── and the watchdog must NOT kill a slow-but-alive command.
     {
         let t0 = std::time::Instant::now();
         let args = json!({
@@ -304,10 +275,7 @@ async fn run() -> anyhow::Result<i32> {
             "timeout_secs": 30,
             "idle_secs": 3,
         });
-        // Asserted on **time**, not on the output text: `ping` is localized (a Chinese Windows answers
-        // "来自 … 的回复"), so matching "Reply from" would test the machine's locale instead of the
-        // watchdog. Surviving past the 3 s idle budget while the budget itself is untouched is the
-        // property that matters.
+        // Assert on elapsed time, not localized ping output; surviving the idle budget unchanged tests the watchdog.
         match ask(&rt, args).await {
             Ok(out)
                 if !out.is_error

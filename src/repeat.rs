@@ -1,27 +1,6 @@
 //! The "you already asked that" guard.
-//!
-//! The expensive failure mode this exists for: a model that cannot make progress, so it reads the
-//! same file again, and again. Each repetition is cheap for the disk (≈1 ms) and expensive for the
-//! context (a `read_file` result is capped at 20,000 characters — roughly 5k tokens *per read*).
-//!
-//! # Why the rule is not "same tool + same args"
-//!
-//! Measured on the real history before writing this (18 conversations, 956 tool calls): 40 calls
-//! were repeated within their turn, and **28 of those were shell commands re-run after the script
-//! they execute had been edited**. Same arguments, different world — refusing those would break the
-//! single most common legitimate repeat.
-//!
-//! So a repeat only counts when **nothing at all has happened since**:
-//!
-//! 1. the tool is a **read-only host tool** (`read_file` / `list_dir` / `attach_file`) — a write is
-//!    the model's decision and the host must never quietly decide it already happened;
-//! 2. no non-read call has run in between (any write, delete, shell command or plugin call bumps
-//!    [`Guard::touched`], because their side effects are invisible to us);
-//! 3. the earlier result is **still in the conversation** — trimming and compaction can remove it
-//!    between two calls, and pointing at "the result above" when it is gone would be a lie.
-//!
-//! The guard does not *refuse*: it returns a short notice in place of the 5k-token repeat, and the
-//! model carries on with the content it already has.
+//! The expensive failure mode this exists for: a model that cannot make progress, so it reads the same file again...
+//! # Why the rule is not "same tool + same args".
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,7 +17,7 @@ struct Seen {
     /// The result as it was pushed into the conversation (already capped), for the "is it still
     /// there" check.
     content: String,
-    /// [`Guard::state`] at the moment it was recorded.
+    /// [`Guard::state`] at the moment it was recorded
     state: u64,
 }
 
@@ -47,21 +26,14 @@ struct Seen {
 #[derive(Default)]
 pub struct Guard {
     seen: HashMap<(String, String), Seen>,
-    /// Bumped by every call that is **not** a read.
+    /// Bumped by every call that is **not** a read
     state: u64,
 }
 
 impl Guard {
     /// Is this call a read-only host tool?
-    ///
-    /// Deliberately narrow. Plugins may *declare* `access: "read"`, but that declaration is about the
-    /// workplace boundary, not a promise that calling twice is harmless — and shell tools are
-    /// excluded outright (they have side effects nobody can see).
     pub async fn eligible(rt: &Arc<Runtime>, name: &str) -> bool {
-        // `web_fetch` is a read by the workplace's definition (it touches no model-chosen path), but
-        // "the same URL twice returns the same thing" is false: a page changes between two calls, and
-        // the whole point of fetching it again is to see the new version. Suppressing the second call
-        // would silently replace a fresh result with a stale "you already asked that".
+        // `web_fetch` is a read by the workplace's definition (it touches no model-chosen path), but "the same URL twice...
         if name == crate::tool::web::WEB_TOOL {
             return false;
         }

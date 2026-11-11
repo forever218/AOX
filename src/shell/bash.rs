@@ -1,41 +1,13 @@
-//! Finding a **bash** on this machine, and making it usable from a Windows host.
-//!
-//! Why a separate tool at all: for an agent, POSIX syntax is the difference between one call and five —
-//! pipes, globs, `$(…)`, `sed`/`grep`/`find`. Measured on this machine, a `bash -c true` costs ~180 ms
-//! more than a `cmd` (318 ms vs a 136 ms floor) while `powershell -NoProfile -Command exit` costs
-//! ~1100 ms more; so bash is both cheaper per call and expressively denser. `shell` stays as the
-//! fallback for what bash cannot do (a cmd builtin, a PowerShell object model).
-//!
-//! # Where the bash comes from
-//!
-//! In this order, and **file existence only** — nothing is executed during detection, because that
-//! would put a third of a second on every startup:
-//!
-//! 1. `[shell] bash = "<absolute path>"` (explicit wins, and is the escape hatch);
-//! 2. `<app root>\runtime\bash\bash.exe` — the sidecar pack, when `[shell] bash_pack = "runtime"`;
-//! 3. `%ProgramFiles%\Git\bin\bash.exe`, `%ProgramFiles(x86)%\…`, `%LOCALAPPDATA%\Programs\Git\…`;
-//! 4. derived from `git` on `PATH` (`<git>\cmd\git.exe` → `<git>\bin\bash.exe`);
-//! 5. a `bash.exe` on `PATH` — **except** anything under `\Microsoft\WindowsApps\`, which is the WSL
-//!    launcher and runs a completely different file system.
-//!
-//! The WSL check is not only a path filter: [`Bash::check`] runs `uname -s` on the first real call and
-//! refuses anything that does not say MINGW/MSYS/CYGWIN. A path filter alone would not survive a
-//! symlink or a shim.
-//!
-//! # The PATH trap
-//!
-//! Measured: handing MSYS a Windows-style `PATH` (`C:\Windows\System32;…`) makes it treat each entry as
-//! a **relative** POSIX path and glue it under its own root — `C:/d/…/PortableGit/Windows/System32` —
-//! after which `cargo` is simply missing. So the host converts every entry to `/c/…` form itself and
-//! prepends the bash's own `usr\bin` + `mingw64\bin`. Getting this wrong is the difference between
-//! "bash works" and "bash cannot see any tool you installed".
+//! Finding a bash on this machine, and making it usable from a Windows host.
+//! Why a separate tool at all: for an agent, POSIX syntax is the difference between one call and five — pipes...
+//! # Where the bash comes from.
 
 use std::path::{Path, PathBuf};
 
 use crate::config::ShellConfig;
 use crate::plugin::ProcessFlags as _;
 
-/// A usable bash-like shell.
+/// A usable bash-like shell
 #[derive(Debug, Clone)]
 pub struct Bash {
     pub exe: PathBuf,
@@ -65,13 +37,7 @@ impl Bash {
         (self.exe.display().to_string(), args)
     }
 
-    /// Refuse a `bash.exe` that is not an MSYS/Cygwin shell. Runs `uname -s` — one process, so this is
-    /// done on the first **call**, not during detection.
-    ///
-    /// Bounded on purpose: `Command::output()` waits forever, and this runs **before** any of the
-    /// call's timeouts are armed (`runner::run` calls it first), so a shim that hangs here would hang
-    /// the whole tool call with nothing counting down. Five seconds is ~20× the measured cost of a
-    /// real bash (`uname -s` ≈ 270 ms including the Git Bash start).
+    /// Refuse a `bash.exe` that is not an MSYS/Cygwin shell.
     pub fn check(&self) -> Result<(), String> {
         let mut cmd = std::process::Command::new(&self.exe);
         cmd.args(&self.prefix)
@@ -79,18 +45,7 @@ impl Bash {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
-        // 🚨 `CREATE_NO_WINDOW` is **not optional here**, and leaving it out is what produced the
-        // "a black console flashes the first time the model runs bash, then never again" report
-        // (2026-10-29).
-        //
-        // The GUI host is built as the `windows` subsystem, so it owns no console. Launching
-        // `bash.exe` — a console program — makes Windows **allocate a fresh console window** for it,
-        // which shows up, paints, and dies within a few hundred ms. It only happens once because
-        // `check` runs once per process (the result is cached by the caller), so the flash lives in
-        // the one path nobody exercises twice and is nearly invisible while debugging.
-        //
-        // Every other spawn in the tree already sets this (plugins, `certutil`/`tar`/`powershell`,
-        // `rustc`, the shell helper); this was the last one missing.
+        // 🚨 `CREATE_NO_WINDOW` is not optional here, and leaving it out is what produced the "a black console flashes...
         cmd.hide_console();
         let mut child = cmd
             .spawn()
@@ -140,11 +95,7 @@ impl Bash {
     }
 }
 
-/// Convert a Windows path to its POSIX form (`C:\a\b` → `/c/a/b`).
-///
-/// A UNC path comes out as `//server/share`, which is how MSYS addresses a share, so it keeps its
-/// meaning. A **relative** path returns `None`: there is no POSIX form the host could guess without
-/// inventing a base, and inventing one is how "it pointed somewhere else" bugs start.
+/// A UNC path comes out as `//server/share`, which is how MSYS addresses a share, so it keeps its meaning.
 pub fn posix(p: &Path) -> Option<String> {
     let s = p.to_string_lossy().replace('\\', "/");
     let b = s.as_bytes();
@@ -183,15 +134,9 @@ pub fn path_env(bash: &Bash, inherited: &str) -> String {
 }
 
 /// A short prologue prepended to every bash script.
-///
-/// Two variables only — deliberately **not** `set -e` or `set -o pipefail`: those change what the
-/// model's own script means, and a host that quietly changes semantics is worse than one that exposes
-/// two names. The export forms are separated so ash (busybox) accepts them too.
 pub fn prologue(ws: &Path) -> String {
     let win = ws.display().to_string().replace('\'', "");
-    // Forward slashes, **not** `/e/...`: measured, busybox-w32 accepts `E:/rustapp/Cargo.toml` but not
-    // `/e/rustapp/...` (it does no drive-letter mapping for arguments, only for PATH entries). MSYS bash
-    // accepts both forms, so `E:/...` is the one value that works everywhere.
+    // Forward slashes, not `/e/...`: measured, busybox-w32 accepts `E:/rustapp/Cargo.toml` but not `/e/rustapp/...`...
     let flat = win.replace('\\', "/");
     format!(
         "AOX_WORKSPACE='{win}'; export AOX_WORKSPACE\nAOX_WORKSPACE_U='{flat}'; export AOX_WORKSPACE_U\n"
@@ -222,7 +167,6 @@ pub fn detect(cfg: &ShellConfig, app_root: &Path) -> Option<Bash> {
             PathBuf::from(&la).join("Programs").join("Git").join("bin").join("bash.exe"),
         );
     }
-    // Derived from `git` on PATH: <git>\cmd\git.exe → <git>\bin\bash.exe
     if let Some(git) = which("git.exe") {
         if let Some(root) = git.parent().and_then(|p| p.parent()) {
             candidates.push(root.join("bin").join("bash.exe"));
@@ -235,9 +179,7 @@ pub fn detect(cfg: &ShellConfig, app_root: &Path) -> Option<Bash> {
         if !c.is_file() {
             continue;
         }
-        // The WSL stub lives in WindowsApps and starts a Linux VM; never take it. Separators are
-        // normalised first (a PATH-derived candidate may use `/`), and the target must carry data —
-        // both are the same rule `runtimes::usable` applies, for the same measured reason.
+        // The WSL stub lives in WindowsApps and starts a Linux VM; never take it.
         let lowered = c.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
         if lowered.contains("\\windowsapps\\") {
             continue;
@@ -249,9 +191,7 @@ pub fn detect(cfg: &ShellConfig, app_root: &Path) -> Option<Bash> {
         return Some(from_exe(c));
     }
 
-    // ② the sidecar (`[shell] bash_pack`). A real `bash.exe` dropped here is used before busybox,
-    //    because busybox is an *ash*: no arrays, no `[[ ]]`, and a subset of the applet options. It is
-    //    the last resort, never the first choice.
+    // The sidecar (`shell bash_pack`).
     if cfg.bash_pack.trim().eq_ignore_ascii_case("runtime") {
         let dir = app_root.join("runtime").join("bash");
         let real = dir.join("bash.exe");
@@ -271,10 +211,7 @@ pub fn detect(cfg: &ShellConfig, app_root: &Path) -> Option<Bash> {
     None
 }
 
-/// Detect **and validate** a bash, remembering the verdict per executable path.
-///
-/// The validation runs `uname -s` (one short process). Doing it once per executable keeps the cost off
-/// every call while still refusing a WSL shim or a broken install with a sentence that says why.
+/// Detect and validate a bash, remembering the verdict per executable path.
 pub fn validated(cfg: &ShellConfig, app_root: &Path) -> Result<Bash, String> {
     let b = detect(cfg, app_root).ok_or_else(|| {
         crate::i18n::t(
@@ -298,15 +235,13 @@ fn checked() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
 }
 
 fn from_exe(exe: PathBuf) -> Bash {
-    // `<root>\bin\bash.exe` → `<root>`; anything else gets no derived root.
+    // `<root>\bin\bash.exe` → `<root>`; anything else gets no derived root
     let posix_root = exe
         .parent()
         .filter(|p| p.file_name().map(|n| n.eq_ignore_ascii_case("bin")).unwrap_or(false))
         .and_then(|bin| bin.parent())
         .and_then(posix);
-    // A busybox is *driven* (`busybox sh -c …`), not a bash: without the `sh` prefix it would be asked
-    // for `--noprofile`, which it does not have. An explicit `[shell] bash = "...busybox.exe"` lands here
-    // too, so this has to be decided from the file name.
+    // A busybox is *driven* (`busybox sh -c …`), not a bash: without the `sh` prefix it would be asked...
     let is_busybox = exe
         .file_name()
         .map(|n| n.to_string_lossy().to_ascii_lowercase().contains("busybox"))
@@ -319,7 +254,7 @@ fn from_exe(exe: PathBuf) -> Bash {
     }
 }
 
-/// Minimal `which`: walk `PATH`, no shell involved.
+/// Minimal `which`: walk `PATH`, no shell involved
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -341,9 +276,7 @@ mod tests {
         assert_eq!(posix(Path::new(r"E:\rustapp")).as_deref(), Some("/e/rustapp"));
         assert_eq!(posix(Path::new(r"C:\Program Files\Git")).as_deref(), Some("/c/Program Files/Git"));
         assert_eq!(posix(Path::new("C:")).as_deref(), Some("/c"));
-        // UNC keeps its meaning: `\\server\share` becomes `//server/share`, which is exactly how MSYS
-        // addresses a network share. A *relative* path, on the other hand, has no POSIX meaning the host
-        // could guess, so it is dropped rather than faked.
+        // UNC keeps its meaning: `\\server\share` becomes `//server/share`, which is exactly how MSYS addresses a network...
         assert_eq!(posix(Path::new(r"\\server\share")).as_deref(), Some("//server/share"));
         assert_eq!(posix(Path::new("relative\\dir")), None);
     }

@@ -1,34 +1,6 @@
-//! The **welcome line on the first screen**: which sentence, in what colour, typed or not.
-//!
-//! This module owns three things and nothing else:
-//!
-//! * [`Prefs`] — what the user chose on the Appearance page, and its little on-disk file
-//!   (`<app root>/.aox/welcome.json`, atomic write, "unreadable means default" — the same two rules
-//!   as `uistate`; the reason it is a **separate** file is that this is an appearance preference,
-//!   not a fact about how the history tree was folded, and the tree's version number should not move
-//!   because a colour was added).
-//! * [`Stage`] — the small state machine that decides **when** the line is asked for, **when** it
-//!   starts typing, and when it gives up and says something local instead.
-//! * the painting itself — one centred line, revealed left to right.
-//!
-//! # Where the words come from
-//!
-//! `custom` is text the user typed; `hitokoto` and `model` are fetched by the agent thread (see
-//! `crate::bridge` and `aox::hello`) and arrive as `FromAgent::HelloLine`. This module never does
-//! the I/O itself: it is drawn inside the frame, and a frame must not wait on a network.
-//!
-//! # The rules that keep it from looking broken
-//!
-//! 1. **A real answer may replace the local *fallback*, but never another real answer.** If the
-//!    request is slower than [`GRACE`] (or [`MODEL_GRACE`] for the model), the local pool is typed
-//!    so the screen is never blank; when the real line lands within [`REPLACE_WINDOW`] it takes the
-//!    screen over. Swapping *two real* lines would read as a glitch, so a line that arrives while a
-//!    real line is on screen is filed for the next first screen instead.
-//! 2. **Never type over a blank window forever.** Waiting has a caret and a deadline; after that
-//!    there is always a sentence on screen.
-//!
-//! An explicit "another one" from the settings page always replaces what is there: that is the user
-//! asking for the screen to change.
+//! The welcome line on the first screen: which sentence, in what colour, typed or not.
+//! This module owns three things and nothing else.
+//! * Prefs — what the user chose on the Appearance page, and its little on-disk file (`<app...
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,7 +12,7 @@ use aox::workplace::AOX_DIR;
 
 use crate::theme::{self, P};
 
-// ─────────────────────────── preferences ───────────────────────────
+// preferences
 
 /// Where the line comes from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -86,9 +58,7 @@ impl Source {
 #[derive(Clone, Debug)]
 pub struct Prefs {
     pub source: Source,
-    /// The sentence for [`Source::Custom`]. **Empty means "show nothing"** — that is the only way
-    /// to turn the line off, and it is deliberate: a separate master switch would be a second
-    /// control for the same decision.
+    /// The sentence for Source::Custom.
     pub custom: String,
     pub hitokoto_url: String,
     /// Colour on the light theme.
@@ -111,10 +81,7 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             source: Source::Custom,
-            // A fresh install shows **a sentence**, not an empty screen: the shipped default is the
-            // same line the local pool would offer at any hour, translated through the catalogue so
-            // the zh build opens in Chinese. Empty is still meaningful — it is what the user gets
-            // after clearing the field, and it means "a quiet first screen".
+            // A fresh install shows a sentence, not an empty screen: the shipped default is the same line the local pool...
             custom: aox::i18n::t("Ready when you are.").to_string(),
             hitokoto_url: aox::hello::HITOKOTO_DEFAULT.to_string(),
             light: DEFAULT_LIGHT,
@@ -141,7 +108,7 @@ impl Prefs {
         }
     }
 
-    /// Read the preferences. **Never fails** — see the module docs.
+    /// Read the preferences. **Never fails** — see the module docs
     pub fn load(root: &Path) -> Self {
         let Ok(text) = std::fs::read_to_string(path(root)) else { return Self::default() };
         let Ok(wire) = serde_json::from_str::<Wire>(&text) else { return Self::default() };
@@ -225,12 +192,12 @@ pub fn parse_hex(s: &str) -> Option<Color32> {
     Some(Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
 }
 
-/// Colour → `#RRGGBB` (uppercase, so two saves produce the same bytes).
+/// Colour → `#RRGGBB` (uppercase, so two saves produce the same bytes)
 pub fn hex(c: Color32) -> String {
     format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
 }
 
-// ─────────────────────────── the stage ───────────────────────────
+// the stage
 
 /// First character waits this long after the screen appears. Long enough that the window has
 /// finished settling, short enough not to read as a delay.
@@ -244,14 +211,9 @@ const PUNCT_PAUSE: f32 = 0.16;
 const CARET_FADE: f32 = 0.25;
 /// How long to wait for a quoting API before typing something local instead.
 pub const GRACE: f32 = 1.2;
-/// The same wait for a **model** call. Longer on purpose: a chat completion routinely takes two to
-/// four seconds, and typing "Good afternoon" over it and then swapping is exactly the behaviour the
-/// user reported as broken ("选模型的时候一直显示 good afternoon"). A model source means "wait for
-/// the model" — up to a point.
+/// Longer wait for model calls (2-4s), so a greeting is not typed over the answer and then swapped.
 const MODEL_GRACE: f32 = 6.0;
-/// How long after the first screen appears a late line may **replace** the local fallback that is
-/// already typing. Past this, the answer is filed for the next first screen instead: a sentence that
-/// rewrites itself a minute later is a glitch, not an update.
+/// How long after the first screen appears a late line may replace the local fallback that is already typing.
 const REPLACE_WINDOW: f32 = 10.0;
 /// A fetched line kept for "next time" goes stale: ten minutes later the greeting should be about
 /// *now*, not about the last time the user opened a new conversation.
@@ -298,21 +260,11 @@ pub struct Stage {
     round: usize,
     /// When the current first screen was entered (the replace window is measured from here).
     entered_at: Instant,
-    /// Whether what is on screen is the **local fallback** rather than a real answer.
-    ///
-    /// This is the one flag that allows a late answer to take the screen over: the fallback is a
-    /// stand-in, not the user's choice, so the real line is allowed to replace it (see
-    /// [`Stage::on_line`]).
+    /// Whether what is on screen is the local fallback rather than a real answer.
     fallback_shown: bool,
-    /// What the two colour fields currently **show**, one per mode.
-    ///
-    /// Kept beside the colour rather than read back from it on every frame: a half-typed `#E0` is
-    /// not a colour, and rebuilding the field from the committed value would delete the caret's
-    /// work mid-keystroke.
+    /// What the two colour fields currently show, one per mode.
     drafts: [String; 2],
-    /// The laid-out line, kept between frames: layout is the expensive part of drawing text, and the
-    /// text only changes when a character is revealed... which is every frame, so what is cached is
-    /// the **whole** line; the reveal is a clip, not a re-layout.
+    /// The laid-out line, kept between frames: layout is the expensive part of drawing text, and the text only changes...
     fit: Option<Fit>,
 }
 
@@ -360,10 +312,6 @@ impl Stage {
     }
 
     /// Commit a typed colour. Returns whether the colour actually changed.
-    ///
-    /// Unparseable input is **reverted to the colour in force** rather than resnapped to black: the
-    /// field is small, a typo is easy, and silently painting the first screen black is not a
-    /// correction anyone asked for.
     pub fn commit_draft(&mut self, mode: theme::Mode) -> bool {
         let i = idx(mode);
         match parse_hex(&self.drafts[i]) {
@@ -386,9 +334,7 @@ impl Stage {
         self.note.as_deref()
     }
 
-    /// 设置页不再显示这两行（"下一句在路上" / "首屏正在显示哪一句"）——那两行只是小字，
-    /// 对"改完有没有生效"没有帮助，看一眼首屏更快。读取口留着：`on_line` 仍然按"现在显示
-    /// 还是留给下一次"来决定 `pending`，这两个访问器是它的对外说法。
+    /// Settings drops two small status lines; on_line still decides pending, and these accessors are its public face.
     #[allow(dead_code)]
     pub fn last_line(&self) -> Option<&str> {
         self.last_line.as_deref()
@@ -414,10 +360,7 @@ impl Stage {
         self.drafts = [hex(self.prefs.light), hex(self.prefs.dark)];
     }
 
-    /// Drive the first screen's edge. Call once per frame, **before** drawing.
-    ///
-    /// Returns a request when one is due; the caller is responsible for actually asking (this module
-    /// does no I/O).
+    /// Drive the first screen's edge.
     pub fn sync(&mut self, empty: bool) -> Option<Ask> {
         if !empty {
             if self.active {
@@ -492,11 +435,7 @@ impl Stage {
         if !ok {
             return;
         }
-        // A real answer arriving while the **fallback** is on screen takes the screen over. The
-        // fallback exists so the first screen is never blank while a slow source thinks; it is not
-        // a preference, and leaving it there made "Model" look like it always answered
-        // "Good afternoon" (reported 2026-10-31). Bounded: after `REPLACE_WINDOW` the line is filed
-        // for next time instead, so nothing rewrites itself long after the user stopped looking.
+        // A real answer arriving while the fallback is on screen takes the screen over.
         if self.active
             && self.fallback_shown
             && self.entered_at.elapsed().as_secs_f32() < REPLACE_WINDOW
@@ -570,9 +509,6 @@ impl Stage {
     }
 
     /// Paint the line, centred in `stage` (the column above the composer).
-    ///
-    /// Painted after the transcript so the scroll area cannot clip it; hit-testing deliberately
-    /// absent — this is a sentence on a wall, not a control.
     pub fn draw(&mut self, ui: &Ui, stage: Rect) {
         if stage.height() < 120.0 || stage.width() < 160.0 {
             return;
@@ -620,9 +556,7 @@ impl Stage {
         let left = center_x - box_w * 0.5;
         let top = center_y - galley.size().y * 0.5;
 
-        // The reveal is a **clip**, not a partial layout: laying out the prefix every frame would
-        // re-shape Chinese text 60 times a second for no visual gain, and a clip also keeps the
-        // glyphs already shown from shifting a pixel as the next one arrives.
+        // The reveal is a clip, not a partial layout: laying out the prefix every frame would re-shape Chinese text 60...
         let shown: String = if reveal >= fit.text.chars().count() {
             fit.text.clone()
         } else {
@@ -651,11 +585,7 @@ impl Stage {
         }
     }
 
-    /// The laid-out line for `max_w`, at the largest size that fits (26 → 20), cached across frames.
-    ///
-    /// Takes the `Ui` because layout has to go through **this window's** fonts: building a throwaway
-    /// `Context` here (the obvious shortcut) would lay the line out in a font set nobody is drawing
-    /// and cost a full font atlas per call.
+    /// Takes the `Ui` because layout has to go through this window's fonts: building a throwaway `Context` here (the...
     fn fitted(&mut self, ui: &Ui, text: &str, max_w: f32) -> &Fit {
         let rebuild = match &self.fit {
             Some(f) => f.src != text || (f.max_w - max_w).abs() > 0.5,
@@ -695,7 +625,7 @@ impl Stage {
     }
 }
 
-/// Which of the two drafts / colours a mode refers to.
+/// Which of the two drafts / colours a mode refers to
 fn idx(mode: theme::Mode) -> usize {
     match mode {
         theme::Mode::Light => 0,
@@ -787,7 +717,6 @@ mod tests {
         assert_eq!(back.dark, p.dark);
         assert!(!back.typing && !back.background);
 
-        // Unknown version → defaults, not a half-applied file
         std::fs::write(path(&dir), br#"{"version":99,"source":"model","typing":false}"#).unwrap();
         let back = Prefs::load(&dir);
         assert_eq!(back.source, Source::Custom);
@@ -868,15 +797,11 @@ mod tests {
         assert!(matches!(st.sync(true), Some(Ask::Api(_))));
         assert!(st.sync(true).is_none(), "already waiting");
         assert!(st.sync(true).is_none());
-        // Leaving and coming back is a new edge → a new request
         st.sync(false);
         assert!(matches!(st.sync(true), Some(Ask::Api(_))));
     }
 
-    /// A late answer **replaces the local fallback** — the fallback is a stand-in, not a choice.
-    ///
-    /// This is the regression reported on 2026-10-31: with `Model` selected, every first screen
-    /// showed "Good afternoon — what's next?" and the model's line only ever appeared as "Next up".
+    /// A late answer replaces the local fallback — the fallback is a stand-in, not a choice.
     #[test]
     fn a_late_answer_takes_over_from_the_local_fallback() {
         let mut st = Stage::new(Prefs { source: Source::Hitokoto, ..Prefs::default() });
@@ -914,9 +839,7 @@ mod tests {
         }
     }
 
-    /// A model call is allowed to take much longer than a quoting API before the local pool stands
-    /// in: 6 s versus 1.2 s. Getting this backwards is what produced the "always Good afternoon"
-    /// report, because a chat completion never fits in 1.2 s.
+    /// A model call is allowed to take much longer than a quoting API before the local pool stands in: 6 s versus 1.2...
     #[test]
     fn the_model_gets_a_longer_grace_than_the_api() {
         let api = Stage::new(Prefs { source: Source::Hitokoto, ..Prefs::default() });
@@ -956,12 +879,7 @@ mod tests {
         }
     }
 
-    /// Drawing a long sentence must **shrink and then cut**, never overflow the stage: the line is
-    /// painted straight onto the painter, so nothing else would stop it running under the drawer or
-    /// off the right edge.
-    ///
-    /// Also exercises a real `ui` (fonts installed, a frame actually run) — a layout panic here is a
-    /// blank first screen at runtime, which is not something a screenshot-less CI would ever catch.
+    /// Drawing a long sentence must shrink and then cut, never overflow the stage: the line is painted straight onto...
     #[test]
     fn a_long_line_shrinks_instead_of_overflowing() {
         let ctx = egui::Context::default();

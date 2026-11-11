@@ -1,8 +1,6 @@
-//! 把「一个可用的 Runtime」装起来：构造函数 + 全部宿主工具。
-//!
-//! 从 `main.rs` 抽出来的原因很具体：`aox remote` 支持 `/cwd`，换工作空间意味着用新的
-//! `[workplace]` 重建 Runtime，而重建出来的 Runtime 和启动时那个必须拥有**同一套工具**。
-//! 复制一份注册代码，两份迟早会漂移（漏掉一个 `web_tools` 就会让远程少一整个能力）。
+//! Assemble a usable Runtime: constructor plus every host tool, extracted from main.rs.
+//! /cwd rebuilds the Runtime with a new [workplace]; the rebuilt one must carry the exact same tool set.
+//! Duplicating the registrations lets them drift; one missing web_tools drops a whole remote capability.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,13 +14,12 @@ use crate::tool::{ask, bash, discover, hostfs, job, meta, shell, task, verify, w
 pub async fn build(config: Config, root: PathBuf, plugins_dir: PathBuf) -> Result<Arc<Runtime>> {
     let rt = Runtime::new(config, root, plugins_dir)?;
     register_tools(&rt).await?;
-    // `/cwd` 重建出来的 Runtime 必须和启动时一样带上用户插件，否则换一次目录
-    // 第三方工具就悄悄消失了。失败不致命（插件坏了不该让整个 Runtime 起不来）。
+    // A /cwd-rebuilt Runtime must load user plugins too, or tools vanish on directory switch; failure is non-fatal.
     let _ = crate::plugin::load_all(&rt).await;
     Ok(rt)
 }
 
-/// 注册宿主内置工具。调用方负责 `Runtime::new`（CLI 要在出错时走"按任意键退出"的分支）。
+/// Register built-in tools; the caller owns Runtime::new so the CLI can take its press-any-key exit on error.
 pub async fn register_tools(rt: &Arc<Runtime>) -> Result<()> {
     for t in meta::meta_tools() {
         rt.register(t).await?;
@@ -31,7 +28,7 @@ pub async fn register_tools(rt: &Arc<Runtime>) -> Result<()> {
     for t in hostfs::host_file_tools() {
         rt.register(t).await?;
     }
-    // `ask_user` 与 `task_state` / `verify` 只注册"可见"，真正调用被 Agent 拦截。
+    // ask_user, task_state and verify are registered as visible only; their real calls are intercepted by Agent.
     for t in ask::ask_tools() {
         rt.register(t).await?;
     }

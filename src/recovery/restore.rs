@@ -1,7 +1,5 @@
 //! Restore planning, preflight, safety snapshots, and redo.
-//!
-//! Nothing is written until every affected path has been checked. A failed multi-file restore is
-//! rolled back from the safety snapshot; a crash leaves a journal that the next open can classify.
+//! Nothing is written until every affected path has been checked.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -23,10 +21,6 @@ pub enum TargetSpec {
     /// Restore **to** the state recorded at this checkpoint (the CLI's `/rollback <id>`).
     Id(String),
     /// Undo this checkpoint and everything after it (the GUI's "roll back to before this point").
-    ///
-    /// A different question from [`TargetSpec::Id`], which is why it is a different variant: to a
-    /// person clicking a row, "this task" means the change sitting at that row, not the moment
-    /// after it. Resolving it to the node's parent is what makes the row's promise true.
     Before(String),
 }
 
@@ -487,12 +481,7 @@ fn read_applied(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Resolve journals left by a crash. This never reports success for a half-written checkpoint.
-///
-/// Capture journals end in one of three ways: the node was already published (advance the cursor if
-/// it is still on the parent), the current files prove a net change (publish a `recovered` node), or
-/// nothing changed (drop the journal). Restore journals either finalize a fully applied operation or
-/// put the already-applied paths back to where they were before it started.
+/// Resolve journals left by a crash.
 pub fn recover_pending(store: &RecoveryStore, cfg: &RecoveryConfig) -> RecoveryResult<()> {
     for path in store.journal_paths()? {
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -562,9 +551,7 @@ fn recover_capture_journal(
     }
     let mut cursor = store.cursor()?;
     if cursor.head != parent {
-        // Crash after the cursor was advanced but before the journal was removed: the committed
-        // node is the new head and its parent is this transaction's parent. This process held the
-        // workspace lock for the whole transaction, so that is enough to identify our commit.
+        // Crash after the cursor was advanced but before the journal was removed: the committed node is the new head...
         if let Some(head) = cursor.head.as_deref() {
             if store
                 .load_node(head)
@@ -744,9 +731,7 @@ fn read_events(path: &Path) -> RecoveryResult<Vec<serde_json::Value>> {
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         match serde_json::from_str::<serde_json::Value>(line) {
             Ok(v) => out.push(v),
-            // A crash may truncate the final line. Earlier complete lines still describe the
-            // transaction; a missing begin/applied_all is handled as "cannot finalize", never as
-            // success.
+            // A crash may truncate the final line.
             Err(_) => break,
         }
     }

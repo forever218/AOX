@@ -8,26 +8,8 @@ use crate::attach::{self, Attachment};
 pub struct Message {
     pub role: String,
     /// When an assistant initiates a tool call, `content` may be null, so this field is always serialized.
-    ///
-    /// **The type is `Value`, not `String`** (changed on 2026-10-05 for attachments): in the
-    /// OpenAI-compatible protocol plain text is a JSON string while attachments make it a parts
-    /// array, so the same field carries both shapes. Changing just this one spot is enough —
-    /// `openai.rs`'s `build_body` already passes `messages` through untouched and lets serde do
-    /// the serialization, so the protocol layer needs zero changes.
-    ///
-    /// ⚠️ **Plain text still serializes as a JSON string** (that is how [`Self::plain`] builds it),
-    /// so old conversation files, old endpoints, and the no-image path stay **byte-for-byte
-    /// identical** — this zero-drift guarantee is a hard requirement for this change and is pinned
-    /// by `plain_text_stays_a_json_string`.
     pub content: Option<Value>,
-    /// Reasoning content returned by thinking mode (DeepSeek thinking, e.g. deepseek-flash /
-    /// deepseek-reasoner).
-    ///
-    /// ⚠️ Must be passed back to the API verbatim: as long as a "assistant message with tool_calls"
-    /// exists in the history, DeepSeek requires it to be sent back together with reasoning_content,
-    /// otherwise the whole request is rejected with 400:
-    /// "The `reasoning_content` in the thinking mode must be passed back to the API."
-    /// This is exactly what makes multi-step tasks silently break midway.
+    /// Reasoning content returned by thinking mode (DeepSeek thinking, e.g. deepseek-flash / deepseek-reasoner).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,15 +45,6 @@ impl Message {
     }
 
     /// A user message with attachments.
-    ///
-    /// **Attachments may only go into user messages** — the endpoint returns 400 on the spot if it
-    /// sees an image in a `system` / `assistant` message (explicitly stated in the official "usage
-    /// limits"). This is not a style choice but a hard protocol constraint, so this function is the
-    /// sole entry point for attachments: if you want to sneak an image elsewhere, the function
-    /// signature blocks it first.
-    ///
-    /// With no attachments it degrades to [`Self::user`] (a plain string), keeping the old path
-    /// byte-for-byte identical.
     pub fn user_with_files(text: &str, files: &[Attachment]) -> Result<Self, String> {
         if files.is_empty() {
             return Ok(Self::user(text));
@@ -105,10 +78,7 @@ impl Message {
     }
 
     /// Build an assistant message.
-    ///
-    /// The streamed accumulation also goes through here, so that the "streaming" and
-    /// "non-streaming" paths produce exactly the same fields (in particular
-    /// `reasoning_content`, which thinking models must pass back).
+    /// The streamed accumulation also goes through here, so that the "streaming" and "non-streaming" paths produce...
     pub fn assistant(
         content: Option<String>,
         reasoning_content: Option<String>,
@@ -125,23 +95,11 @@ impl Message {
     }
 
     /// The trimmed body text; all-whitespace counts as "no content".
-    ///
-    /// **Only plain strings are recognized**: a parts array from an attachment returns `None` — when
-    /// a call site wants to show "what the user said" it should use [`Self::flat_text`], whose
-    /// semantics are "one line of text for a human to read" rather than "the model's body". This
-    /// strict semantics is kept because the main loop uses it to decide "did the model say nothing":
-    /// an `assistant` response is always a string, and loosening it would treat empty parts as
-    /// having said something.
     pub fn text(&self) -> Option<&str> {
         self.content.as_ref()?.as_str().map(str::trim).filter(|t| !t.is_empty())
     }
 
-    /// Any shape of content → "a piece of text for a human to read".
-    ///
-    /// History rendering, `.jsonl` re-reading, and UI bubbles all go through it: a parts array
-    /// concatenates the `text` blocks, and image/file blocks are swapped for placeholders like
-    /// `[image]` / `[file: name]` (the attachment body itself isn't in the content; the placeholder
-    /// is what that slice of history actually keeps).
+    /// History rendering, `.jsonl` re-reading, and UI bubbles all go through it: a parts array concatenates the `text`...
     pub fn flat_text(&self) -> String {
         let Some(v) = &self.content else {
             return String::new();
@@ -181,20 +139,7 @@ impl Message {
     }
 }
 
-/// Whether a message list is a **legal request body** for an OpenAI-compatible endpoint.
-///
-/// The rule in one sentence: every `assistant` message that carries `tool_calls` must be followed
-/// by a `tool` message for **each** of its call ids. Anything else is refused with a flat 400 —
-/// and for a thinking model the request dies even earlier, because `reasoning_content` has to
-/// travel back together with the `tool_calls` it belongs to.
-///
-/// **This is the single definition of "a legal boundary" in this crate.** It has two consumers,
-/// and each used to carry its own copy of the argument above:
-/// - the trim point in `agent_loop.rs` — "dropping the oldest turns must not leave a `tool` result
-///   whose `assistant` was dropped";
-/// - the interrupt rollback in `agent.rs` — "rolling back must not leave a dangling `tool_calls`".
-///
-/// When a third one appears, call this instead of writing a third version of the argument.
+/// Whether a message list is a legal request body for an OpenAI-compatible endpoint.
 pub fn is_legal_body(msgs: &[Message]) -> bool {
     msgs.iter().enumerate().all(|(i, m)| {
         if m.role != "assistant" {
@@ -224,10 +169,7 @@ mod tests {
         }
     }
 
-    /// Pin the one definition of a legal boundary against **the real shapes this code produces**
-    /// (see `agent_loop.rs`): only the complete batch is a legal request body. The "half a parallel
-    /// batch" case is the one an interrupt lands on most often, and it is exactly why "keep the
-    /// completed calls" cannot mean "keep everything".
+    /// Pin the one definition of a legal boundary against the real shapes this code produces (see `agent_loop.rs`)...
     #[test]
     fn a_tool_call_without_its_result_makes_the_body_illegal() {
         let sys = Message::system("sys");
@@ -256,9 +198,7 @@ mod tests {
         assert!(is_legal_body(&[sys, user]), "no tool call anywhere is trivially legal");
     }
 
-    /// **The key zero-drift assertion**: with no attachment, a serialised user message must be
-    /// byte-for-byte identical to before the type changed — `content` is a JSON string, not
-    /// `[{...}]`.
+    /// The key zero-drift assertion: with no attachment, a serialised user message must be byte-for-byte identical...
     #[test]
     fn plain_text_stays_a_json_string() {
         let v = serde_json::to_value(Message::user("hi")).unwrap();

@@ -1,13 +1,6 @@
 //! Which command tells this project that it still works.
-//!
-//! The host cannot run a project's tests on its own — it may take minutes, need the network, or have
-//! side effects — but it can say **which command** would answer the question, and that turns "you
-//! should verify this" from advice into an instruction the model can follow in one call.
-//!
-//! Detection is deliberately shallow and honest: a handful of marker files in the workspace root and
-//! its immediate subdirectories, first match wins. It is a **hint**, not a command line — a wrong
-//! guess costs nothing (the model is free to ignore it), while a config knob for it would add one more
-//! "written but not in effect" trap. Projects that want something else can say so in `RULES.md`.
+//! The host cannot run a project's tests on its own — it may take minutes, need the network, or have side effects...
+//! Detection is deliberately shallow and honest: a handful of marker files in the workspace root and its immediate...
 
 use std::path::{Path, PathBuf};
 
@@ -23,10 +16,6 @@ pub struct Check {
 
 impl Check {
     /// The words that must all appear in a shell command for it to count as "the check ran".
-    ///
-    /// Flags are dropped (`pytest -q` → `pytest`) and so are version/size suffixes: what is left is
-    /// the program name and, when there is one, the subcommand — `cargo test` is not satisfied by
-    /// `cargo build`, which compiles the code but proves nothing about its behaviour.
     pub fn words(&self) -> Vec<&str> {
         self.command
             .split_whitespace()
@@ -36,9 +25,6 @@ impl Check {
     }
 
     /// Did a shell command run this check?
-    ///
-    /// Matching is "contains every word", not "equals": `cargo test --lib --all-targets` counts, and
-    /// so does `cargo test 2>&1 | tail -40`.
     pub fn ran_in(&self, command_line: &str) -> bool {
         let words = self.words();
         !words.is_empty() && words.iter().all(|w| command_line.contains(w))
@@ -46,10 +32,6 @@ impl Check {
 }
 
 /// Which directories to look in: the root first, then its immediate children in name order.
-///
-/// One level down matters in practice — this very repository keeps a second `Cargo.toml` under
-/// `gui/`, and plenty of projects put the app in `frontend/` or `server/`. Going deeper would start
-/// to cost real time on big trees and would find `node_modules` before it found anything useful.
 fn candidates(root: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![root.to_path_buf()];
     if let Ok(entries) = std::fs::read_dir(root) {

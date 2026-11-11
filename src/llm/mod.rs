@@ -10,14 +10,10 @@ use serde_json::Value;
 use crate::message::Message;
 
 /// The complete result of one model call.
-///
-/// Besides the assistant message itself it carries protocol-level metadata: `finish_reason`
-/// distinguishes "finished normally / called a tool / was cut off by max_tokens", which is the key
-/// to diagnosing "the task stopped for no apparent reason".
 #[derive(Debug, Clone)]
 pub struct ChatReply {
     pub message: Message,
-    /// stop | tool_calls | length | content_filter | ...
+    /// stop | tool_calls | length | content_filter
     pub finish_reason: Option<String>,
     /// Tokens consumed by this call (each field is `None` when the endpoint does not return usage)
     pub usage: Usage,
@@ -45,15 +41,9 @@ impl ChatReply {
     }
 }
 
-// ────────────────────────────── token accounting ──────────────────────────────
+// token accounting
 
-/// The tokens one model call consumed — record whatever the server reports, and `None` for whatever
-/// is missing.
-///
-/// Different OpenAI-compatible endpoints differ slightly in the fields they return, so this
-/// normalises once: a cache hit may appear as either
-/// `prompt_tokens_details.cached_tokens` (newer OpenAI/DeepSeek) or `prompt_cache_hit_tokens`
-/// (older DeepSeek), and both forms are accepted.
+/// The tokens one model call consumed — record whatever the server reports, and `None` for whatever is missing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Usage {
     /// Input (prompt) tokens
@@ -71,10 +61,7 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// Parse the `usage` from a response. What's passed in may be **the whole response body** or
-    /// already the `usage` object itself — if there's a `usage` key it drills down one level itself,
-    /// saving every call site from writing the `pointer` by hand. Passing `Value::Null` is fine too;
-    /// nothing found means all `None`.
+    /// Parse the `usage` from a response.
     pub fn parse(v: &Value) -> Self {
         let v = v.get("usage").unwrap_or(v);
         let get = |p: &str| v.pointer(p).and_then(Value::as_u64);
@@ -121,11 +108,6 @@ impl Usage {
 }
 
 /// A token estimator for the streaming process (fed incrementally, never rescanning the whole text).
-///
-/// In a streaming response the server provides usage **only on the very last frame**, so to show a
-/// number ticking up mid-stream it has to be estimated: roughly 4 ASCII characters per token, and
-/// about 1 token per full-width CJK character. It is a rough estimate, and at the end the server's
-/// exact value overrides it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TokenEstimate {
     ascii: u64,
@@ -151,19 +133,7 @@ impl TokenEstimate {
     }
 }
 
-/// The **complete** string value of `key` in a JSON object — `None` while it is still arriving.
-///
-/// Same input as [`partial_json_lines`] (tool-call arguments, which stream in fragments), but for
-/// values that have to be shown **whole or not at all**: a `path`, say, where a half-typed
-/// `E:/exam` reads as a glitch rather than as progress. A value whose closing quote has not turned
-/// up yet simply counts as "not there yet".
-///
-/// The object is walked key by key rather than searched for the literal `"key"`: the arguments carry
-/// the model's own text (`write_file`'s `content` is a whole source file), and that text very often
-/// contains the string `"path"` itself — a plain `find` would happily match inside it.
-///
-/// `#[allow(dead_code)]` because `src/main.rs` (the CLI bin) compiles these modules a second time and
-/// has no live display to feed — the same reason [`partial_json_lines`] carries it.
+/// The complete string value of `key` in a JSON object — `None` while it is still arriving.
 #[allow(dead_code)]
 pub fn partial_json_string(args: &str, key: &str) -> Option<String> {
     match object_string_value(args, key) {
@@ -172,24 +142,7 @@ pub fn partial_json_string(args: &str, key: &str) -> Option<String> {
     }
 }
 
-/// How many lines the string value of `key` already holds in a **partially received** JSON object.
-///
-/// While the model streams a `write_file` call its arguments arrive in fragments, so for a while the
-/// value of `content` is a truncated JSON string — the closing quote has not arrived, and the last
-/// line is usually cut in half. This counts the lines that have arrived so far, which is what lets a
-/// front end put a **live, growing** number next to the call instead of going silent until the
-/// whole file is in.
-///
-/// It counts the way `str::lines` does, so the reading matches the tool's own final tally: newlines
-/// seen in the decoded value, plus one for a trailing partial line — but not for one that ended with
-/// a newline. It is deliberately a **lower bound**, never an over-report: the tool's real diff
-/// replaces it the moment the call actually runs.
-///
-/// Returns 0 when the key, or the opening quote of its value, has not arrived yet.
-///
-/// `#[allow(dead_code)]` because `src/main.rs` (the CLI bin) compiles these modules a second time,
-/// and the CLI has no live-progress display to feed — the same reason the `Images` / `ToolResult`
-/// events carry it.
+/// How many lines the string value of `key` already holds in a partially received JSON object.
 #[allow(dead_code)]
 pub fn partial_json_lines(args: &str, key: &str) -> usize {
     match object_string_value(args, key) {
@@ -198,12 +151,7 @@ pub fn partial_json_lines(args: &str, key: &str) -> usize {
     }
 }
 
-/// Walk a (possibly unfinished) JSON object and report the string value stored under `key`: the text
-/// decoded so far, plus whether its closing quote had arrived.
-///
-/// `None` means "not there yet, and cannot be for now": the key was not reached, the object has
-/// ended, or something *in front of* the key is itself still arriving — in which case where it ends
-/// is unknown, and a later key cannot be located at all.
+/// Walk a (possibly unfinished) JSON object and report the string value stored under `key`: the text decoded...
 fn object_string_value(src: &str, key: &str) -> Option<(String, bool)> {
     let mut rest = src.trim_start().strip_prefix('{')?;
     loop {
@@ -233,12 +181,7 @@ fn object_string_value(src: &str, key: &str) -> Option<(String, bool)> {
     }
 }
 
-/// Read one JSON string starting at `s`. `None` as the whole result means `s` does not start with a
-/// quote, so it is not a string at all.
-///
-/// The second half of the pair is what follows the closing quote — `None` while the string is still
-/// in flight, including the case of a lone trailing backslash (the character it escapes does not
-/// exist yet).
+/// Read one JSON string starting at `s`. `None` as the whole result means `s` does not start with a quote...
 fn read_json_string(s: &str) -> Option<(String, Option<&str>)> {
     let mut chars = s.char_indices();
     match chars.next() {
@@ -260,10 +203,6 @@ fn read_json_string(s: &str) -> Option<(String, Option<&str>)> {
                     'f' => out.push('\u{c}'),
                     'u' => {
                         // Four hex digits; if they have not all arrived the value is still in flight.
-                        // A code point from outside the BMP needs a surrogate *pair* to come through
-                        // exactly, so one that arrives alone shows as `?` here — this reading is only
-                        // ever the live one, and the call's own arguments (already parsed JSON)
-                        // replace it as soon as the model has finished writing.
                         let mut hex = String::new();
                         for _ in 0..4 {
                             match chars.next() {
@@ -282,7 +221,7 @@ fn read_json_string(s: &str) -> Option<(String, Option<&str>)> {
             c => out.push(c),
         }
     }
-    // Ran out of input: still arriving.
+    // Ran out of input: still arriving
     Some((out, None))
 }
 
@@ -314,7 +253,7 @@ fn skip_json_value(s: &str) -> Option<&str> {
     None
 }
 
-/// Thousands separators: `12345` → `12,345`. Everything that needs this lives here, so don't reinvent it.
+/// Thousands separators: `12345` → `12,345`. Everything that needs this lives here, so don't reinvent it
 pub fn thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
@@ -328,69 +267,26 @@ pub fn thousands(n: u64) -> String {
 }
 
 /// The sink for streaming deltas.
-///
-/// The provider calls these callbacks **synchronously** as it parses the SSE response chunk by chunk
-/// (no cross-thread work), so implementations should stay lightweight: the UI usually just stuffs
-/// the text into a shared buffer for the render thread to draw.
-///
-/// Methods take `&self` (interior mutability): this lets the sink be passed by shared reference,
-/// avoiding borrow conflicts and making the same implementation reusable in multiple places.
 pub trait StreamSink: Send + Sync {
     /// Deltas of a thinking-mode model's reasoning process (deepseek-flash / deepseek-reasoner, etc.).
     /// May be called at high frequency within one response, each time giving only a small fragment (even a single character).
     fn on_reasoning(&self, _delta: &str) {}
 
     /// Deltas of the actual body text.
-    ///
-    /// Keeping it separate from `on_reasoning` is useful: the reasoning process should "show
-    /// instantly, vanish instantly", whereas the body text stays on screen. The live token counter,
-    /// by contrast, has to count both — output-side spend already includes reasoning — so an
-    /// implementation normally feeds both callbacks into the same estimator.
     fn on_content(&self, _delta: &str) {}
 
-    /// Fragments of a **tool call's arguments**, as the model writes them.
-    ///
-    /// This is the only signal that exists *before* a tool runs: the loop only learns about tool
-    /// calls once the whole response has arrived, so without this callback a long call — writing a
-    /// file, above all — is a silent stretch in which the UI can show nothing at all. `index`
-    /// identifies the call within the response (several may stream at once, and their fragments
-    /// interleave); `name` is non-empty **only on the fragment that first carries it**, so an
-    /// implementation that wants the tool's name should remember the first non-empty one.
-    ///
-    /// `delta` is a raw substring of the argument JSON and may be cut anywhere, including
-    /// mid-escape — never parse it as JSON, treat it as text (see [`partial_json_lines`]).
-    ///
-    /// The default implementation does nothing, so a front end that has nowhere to put a live
-    /// progress reading simply ignores it.
+    /// Fragments of a tool call's arguments, as the model writes them.
     fn on_tool_call(&self, _index: u64, _name: &str, _delta: &str) {}
 
     /// This response ended (whether it succeeded or failed). The UI should tear down the temporarily
     /// displayed reasoning process here, realising "show instantly, vanish instantly".
     fn on_finish(&self) {}
 
-    /// A **new attempt** at the same request is about to start (`attempt` 1 = the first retry).
-    ///
-    /// Called by the agent loop, not by the provider: the retry decision lives there (see
-    /// `crate::llm::failure`), and the provider only ever sees one attempt.
-    ///
-    /// This exists because a retry after a *cut stream* has already shown the user half an answer.
-    /// Whatever is on screen from the abandoned attempt has to go — otherwise the retyped answer
-    /// arrives underneath the fragment and the reply reads as if the model had said it twice. A
-    /// front end is free to ignore this (the default does): the conversation file was never
-    /// polluted, so ignoring it costs only the visual duplication.
+    /// A new attempt at the same request is about to start (`attempt` 1 = the first retry).
     fn on_attempt(&self, _attempt: u32, _delay: std::time::Duration) {}
 }
 
-/// A `reqwest` client for **one endpoint**, with the proxy decision made per endpoint.
-///
-/// Why this is not just `Client::builder()`: `reqwest` honours `HTTP_PROXY` / `HTTPS_PROXY` from the
-/// environment, and on a machine that sets one (a corporate laptop, a dev container, this project's own
-/// sandbox) every request to `http://127.0.0.1:11434` would be sent **to the proxy**, which cannot reach
-/// a server inside the same box — the answer is a 502 whose text blames the upstream, so it reads like
-/// "the local model is down" when it is running fine.
-///
-/// So a loopback endpoint never goes through a proxy. Everything else keeps the ambient behaviour,
-/// because for a remote endpoint the proxy may be the only way out.
+/// A `reqwest` client for one endpoint, with the proxy decision made per endpoint.
 pub(crate) fn endpoint_client(base_url: &str) -> reqwest::ClientBuilder {
     let b = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(failure::CONNECT_SECS));
@@ -406,7 +302,7 @@ pub(crate) fn is_loopback(base_url: &str) -> bool {
     let s = base_url.trim();
     let s = s.split_once("://").map_or(s, |(_, rest)| rest);
     let host = s.split('/').next().unwrap_or(s);
-    // Strip a `:port`, keeping an IPv6 literal's brackets intact.
+    // Strip a `:port`, keeping an IPv6 literal's brackets intact
     let host = if let Some(rest) = host.strip_prefix('[') {
         rest.split(']').next().unwrap_or(rest)
     } else {
@@ -419,12 +315,7 @@ pub(crate) fn is_loopback(base_url: &str) -> bool {
 /// implementing one more Provider.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
-    /// Send the full conversation history and the current tool schema list, and return the model's
-    /// reply (which may contain tool_calls).
-    ///
-    /// `sink` is an optional streaming-delta sink: when passed, the Provider requests in streaming
-    /// mode where possible and pushes the model's reasoning process to it in real time; passing None
-    /// just means waiting quietly for the complete response.
+    /// Send the full conversation history and the current tool schema list, and return the model's reply (which may...
     async fn chat(
         &self,
         messages: &[Message],
@@ -516,9 +407,7 @@ mod tests {
         assert_eq!(a.reasoning, None);
     }
 
-    /// One CJK character is about one token and ASCII about four — the weights on the two sides must
-    /// differ by an order of magnitude, otherwise the live number in a Chinese conversation is too
-    /// low to look like it's moving.
+    /// One CJK character is about one token and ASCII about four — the weights on the two sides must differ...
     #[test]
     fn estimate_weights_cjk_above_ascii() {
         let mut e = TokenEstimate::default();
@@ -564,7 +453,7 @@ mod tests {
         );
         // A trailing newline is not a line of its own -- the same rule as `str::lines`.
         assert_eq!(partial_json_lines(r##"{"path":"a.rs","content":"a\nb\n"##, "content"), 2);
-        // A complete value: the count matches `lines()` exactly.
+        // A complete value: the count matches `lines()` exactly
         assert_eq!(partial_json_lines(r##"{"path":"a.rs","content":"a\nb\nc"}"##, "content"), 3);
         // A lone backslash, with the escaped character still in flight, must not turn into a
         // phantom line.

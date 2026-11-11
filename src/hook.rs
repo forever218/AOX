@@ -1,57 +1,6 @@
 //! Loop hooks (the first shape of the Loop seam).
-//!
-//! Five hook points hang off the loop skeleton **without touching the skeleton itself**: before a
-//! request, after a reply, before a tool call, after a tool result, and when a request errors.
-//! These five points are the 80% solution for "change system behaviour" — the remaining 20%
-//! (replacing the whole loop) belongs to `AgentLoop` in [`crate::agent_loop`] (phase 6 · 6a is
-//! already in place: `StandardLoop` is the skeleton those points used to live in).
-//!
-//! | Hook point | Where | What it can do | On rejection |
-//! |---|---|---|---|
-//! | [`Hook::before_request`] | before the request | swap the tool list, append messages | abort this round |
-//! | [`Hook::after_reply`] | after the reply (**after accounting**) | edit/clear the reply | treated as an invalid reply; takes the empty-reply retry path |
-//! | [`Hook::before_tool`] | before the tool call | edit `args` | the tool is not run; the reason is fed back as the tool result |
-//! | [`Hook::after_tool`] | after the tool result | edit the result | the whole block becomes an error result carrying the reason |
-//! | [`Hook::on_error`] | where `llm.chat` fails | degrade and retry | — |
-//!
-//! # With no hooks, behaviour is exactly as it was before hooks existed
-//!
-//! All five [`Hook`] methods **have default empty implementations**; when `config.toml [hook]` is
-//! empty, `Runtime.hooks` is an empty chain. Every call on an empty chain degenerates into
-//! "check the length and return", so every loop path is **equivalent** to before hooks existed —
-//! that is this phase's hard acceptance criterion.
-//!
-//! # Why hooks don't get `&mut Vec<Message>`
-//!
-//! `before_request` can change things, but it **cannot** get `&mut messages`: it can only put
-//! what it wants to say into [`Request::inject`], and the loop enqueues it via
-//! `Agent::push_message`.
-//!
-//! The reason: the only write path for `messages` is `Agent::push_message`, which **also** writes
-//! the file; rollback goes through `truncate_messages` + `rewrite`. Handing a raw `Vec` to a hook
-//! is opening a back door where "it's in memory but not in the history file" — that isn't a maybe,
-//! it's a certainty one minute later.
-//!
-//! The "trim / rewrite history" hole deliberately left open at the time **has since been filled by
-//! `[loop] max_rounds` in phase 6 · 6a**: trimming naturally belongs to the loop layer (it must
-//! touch memory and the conversation file at once, and rebuild the request after trimming). The
-//! hook layer still only exposes "append".
-//!
-//! # Two sources: config-driven + component contributions (phase 6 · 6b)
-//!
-//! - [`ConfigHook`] — from `config.toml [hook]`, fixed at startup;
-//! - [`ComponentHook`] — from a plugin's `plugin.toml [contributes] hooks`, attached when the
-//!   plugin activates.
-//!
-//! The latter rides on [the existing subprocess JSON-RPC protocol](crate::plugin): a subprocess
-//! plugin is already in the cost class of "one RPC per tool call", so it **can afford hooks** —
-//! no need to stuff a scripting engine into the host for this. That judgement is the biggest
-//! divergence between phase 6's roadmap and the original plan (the original assumed "hooks must be
-//! in-process", which the goal itself does not require).
-//!
-//! A component subprocess dying / timing out / returning garbage = that component **fails
-//! silently**: log one failure and let it through, and the main loop runs to completion as usual.
-//! "Must be degradable" is achieved by giving every exit of [`ComponentHook`] a fallback value.
+//! Five hook points hang off the loop skeleton without touching the skeleton itself: before a request, after...
+//! | Hook point | Where | What it can do | On rejection |.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,16 +29,9 @@ pub enum Verdict {
 
 /// The part of the request that `before_request` can see and change.
 pub struct Request {
-    /// The tool schema list sent to the model this round: the loop fills it from
-    /// `Runtime::tool_schemas_scoped` (already gated by `[tools] inline_max`), **before** this hook
-    /// runs, so a hook can only add to or narrow the list further.
-    /// A hook may replace it wholesale — e.g. pulling a few tools out of this round by policy.
+    /// The tool schema list sent to the model this round: the loop fills it from `Runtime::tool_schemas_scoped`...
     pub tools: Vec<Value>,
-    /// Messages the hook asks to **append**. The loop enqueues them via `Agent::push_message`
-    /// (see the module docs).
-    ///
-    /// Offering only "append" rather than "rewrite" is deliberate: appending is the only change
-    /// that can be persisted without `rewrite`.
+    /// Messages the hook asks to append.
     pub inject: Vec<Message>,
 }
 
@@ -99,24 +41,10 @@ pub enum ErrorAction {
     /// Throw it as-is (the default) — exactly as if there were no hook.
     Propagate,
     /// Swallow this error: inject `note` into the conversation as a host prompt, then retry.
-    ///
-    /// Guarding against infinite loops is **the emitter's own responsibility** (e.g. degrade the
-    /// same error only once). The host side has a config fallback (`[retry]`, plus a delay curve and
-    /// a status-code classification) — retries work without writing a hook or installing a component.
-    /// That fallback is deliberately **independent of this variant**: it lives in the loop, not in
-    /// the hook seam, and it was moved out of `[hook] max_llm_retries` on 2026-10-23.
-    ///
-    /// The real constructor (from phase 6 · 6b on): a component's `hooks/on_error` returns
-    /// `{"action":"retry","note":"…"}`, which [`ComponentHook`] maps here.
     Retry(String),
 }
 
-/// The names of the five hook points — exactly the five method names of [`Hook`], **no more and no
-/// less**.
-///
-/// These are the strings a component writes in `plugin.toml [contributes] hooks`. Deliberately no
-/// "alias table": one extra mapping is one more place to get wrong, and getting it wrong shows up
-/// as "the hook doesn't take effect" — precisely the hardest class to track down.
+/// The names of the five hook points — exactly the five method names of Hook, no more and no less.
 pub const POINTS: [&str; 5] = [
     "before_request",
     "after_reply",
@@ -126,10 +54,6 @@ pub const POINTS: [&str; 5] = [
 ];
 
 /// A loop hook. All five methods are "do nothing by default".
-///
-/// Why the methods are all `async`: hooks often need to query the system's current state (tool
-/// list, plugin table), and those queries are themselves async. Same convention as
-/// [`crate::tool::Tool`] / [`crate::ui::Ui`].
 #[async_trait]
 pub trait Hook: Send + Sync {
     /// The name (used by the `/hook` report and diagnostics)
@@ -146,22 +70,12 @@ pub trait Hook: Send + Sync {
         Verdict::Pass
     }
 
-    /// ② After the reply: may edit this reply (text / tool calls), and may **reject** it.
-    ///
-    /// Reject = treat it as one invalid reply, taking the same retry path as "the model returned
-    /// an empty reply". Note this point sits **after accounting**: the tokens of a rejected call
-    /// really were spent, and cannot go unaccounted just because the reply wasn't used.
+    /// After the reply: may edit this reply (text / tool calls), and may reject it.
     async fn after_reply(&self, _rt: &Arc<Runtime>, _reply: &mut ChatReply) -> Verdict {
         Verdict::Pass
     }
 
-    /// ③ Before the tool call: may edit `args`, and may stop this call (stopping means the tool is
-    /// **not executed**).
-    ///
-    /// ⚠️ At this moment the assistant message carrying `tool_calls` **is already on disk**; what
-    /// the file holds is the model's original arguments. Changes here only affect this execution
-    /// and are **not written back to history** — history must faithfully record "what the model
-    /// asked for", whereas hooks are a host-side execution policy.
+    /// Before the tool call: may edit `args`, and may stop this call (stopping means the tool is not executed).
     async fn before_tool(&self, _rt: &Arc<Runtime>, _name: &str, _args: &mut Value) -> Verdict {
         Verdict::Pass
     }
@@ -172,31 +86,13 @@ pub trait Hook: Send + Sync {
         Verdict::Pass
     }
 
-    /// ⑤ Request failed: may handle it degradably.
-    ///
-    /// **Only errors of the model request itself reach here**. Tool execution failures, and the
-    /// `bail!` for "the model returned empty replies repeatedly", don't count — those are model
-    /// behaviour, not infrastructure faults, and each already has its own diagnostics written.
+    /// Request failed: may handle it degradably.
     async fn on_error(&self, _rt: &Arc<Runtime>, _err: &anyhow::Error) -> ErrorAction {
         ErrorAction::Propagate
     }
 }
 
 /// A set of hooks plus the semantics of "run in registration order, short-circuit on rejection".
-///
-/// `run_loop` only ever talks to this and doesn't know how many hooks there are or who they are —
-/// the same shape as [`crate::store::Store`] / [`crate::auth::Policy`] (principle P2).
-///
-/// # Why the chain is mutable (phase 6 · 6b)
-///
-/// Config-driven hooks are fixed in `Runtime::new`, but **component-contributed hooks can't be** —
-/// plugins are only pulled up by `load_all` **after** `Runtime::new`. For "a component's
-/// declaration to take effect immediately", the chain must support runtime appends, so it went
-/// from a `Vec` to a `RwLock<Vec<_>>` internally.
-///
-/// The hard criterion "installing no components = byte-for-byte identical to today" is unaffected:
-/// with 0 hooks in the chain, each of the five hook points loops 0 times over **an empty vec** —
-/// equivalent path by path to before the change (`empty_chain_never_intervenes` pins exactly this).
 #[derive(Default)]
 pub struct HookChain {
     hooks: std::sync::RwLock<Vec<Arc<dyn Hook>>>,
@@ -208,14 +104,6 @@ impl HookChain {
     }
 
     /// Take a snapshot of the hooks (cloning `Arc`s, N reference-count bumps).
-    ///
-    /// Why not iterate while holding the lock: every hook-point call has to `await` (hooks often
-    /// query async state), and a `std::sync` read guard **is not `Send`** — holding it across an
-    /// `await` makes the whole future non-`Send`, and `tokio::spawn` simply won't compile. So
-    /// honestly clone a copy and drop the lock.
-    ///
-    /// Cloning an empty chain allocates nothing (`Vec::clone` doesn't build a heap for an empty
-    /// vec), so under the default "no hooks at all" configuration this snapshot path is zero-cost.
     fn snapshot(&self) -> Vec<Arc<dyn Hook>> {
         self.hooks.read().unwrap().clone()
     }
@@ -226,16 +114,6 @@ impl HookChain {
     }
 
     /// Drop every hook that belongs to `plugin`.
-    ///
-    /// This is the counterpart of [`HookChain::push`] that used to be unnecessary: with no way to
-    /// replace a live component, a hook could only ever stop by the plugin disappearing from the
-    /// `plugins` table (which `ComponentHook::ask` notices on its own). A **hot swap** breaks that
-    /// assumption — the plugin stays in the table under the same name, so the old hook would sit in
-    /// the chain as a ghost, firing against the new process with the previous declaration. Called
-    /// from `activate_slot` before the new contributions are pushed, it is a harmless no-op on the
-    /// create path (nothing was there yet) and the fix on the update path.
-    ///
-    /// Matching is by [`Hook::name`], which a `ComponentHook` returns as its plugin name.
     pub fn remove_by_plugin(&self, plugin: &str) {
         self.hooks.write().unwrap().retain(|h| h.name() != plugin);
     }
@@ -299,10 +177,6 @@ impl HookChain {
     }
 
     /// The `/hook` report: which hooks are currently registered and what each does.
-    ///
-    /// Like `/prompt`, it deliberately **does not align columns**: names are ASCII while
-    /// descriptions may be non-ASCII, and padding with `{:<12}` only gets knocked crooked by
-    /// double-width characters.
     pub fn report(&self) -> String {
         if self.is_empty() {
             return crate::i18n::t("Loop hooks: 0 registered — behavior is identical to the built-in loop.\n  Two sources: config.toml's [hook] (config-driven, fixed at startup); plugin plugin.toml's [contributes] hooks (component contributions, attached on activation).")
@@ -319,16 +193,9 @@ impl HookChain {
     }
 }
 
-// ─────────────────────────── The config-driven implementation ───────────────────────────
+// The config-driven implementation
 
-/// A hook driven by `config.toml [hook]`.
-///
-/// In this round `[hook]` does exactly one thing: **fill in default arguments** for named tools.
-///
-/// "Forbidding a class of tools" **is not here** — that's an authorization question and belongs to
-/// `[auth]` (since phase 4 its override keys support wildcards like `fs_*`). The two mechanisms
-/// govern two different things: `[auth]` decides "let it through or not", `[hook]` decides
-/// "after letting it through, should the arguments change".
+/// A hook driven by `config.toml hook`.
 pub struct ConfigHook {
     tool_args_default: HashMap<String, Value>,
 }
@@ -346,9 +213,7 @@ impl ConfigHook {
             if tool.is_empty() {
                 continue;
             }
-            // toml::Value → serde_json::Value: the model-side arguments are JSON values to begin
-            // with, and the "fill only missing keys" merge must happen on one shared type, not on
-            // two separate representations.
+            // With, and the "fill only missing keys" merge must happen on one shared type, not on two separate...
             let v = serde_json::to_value(defaults)
                 .with_context(|| crate::tf!("[hook.tool_args_default.{}] cannot be converted to JSON", tool))?;
             map.insert(tool.to_string(), v);
@@ -395,10 +260,7 @@ impl Hook for ConfigHook {
             // to merge, pass quietly, don't guess.
             return Verdict::Pass;
         };
-        // **Fill missing keys only**: keys the model explicitly gave are never touched.
-        // Overriding the model's explicit intent would create the worst failure mode of all,
-        // "the model said A but the tool received B" — far harder to track down than "a default is
-        // missing".
+        // Fill missing keys only: keys the model explicitly gave are never touched.
         for (k, v) in src {
             dst.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -406,33 +268,12 @@ impl Hook for ConfigHook {
     }
 }
 
-// ─────────────────────── Component-contributed hooks (phase 6 · 6b) ───────────────────────
+// Component-contributed hooks (phase 6 · 6b)
 
 /// The wait cap for one hook RPC.
-///
-/// Why hooks get their own cap far smaller than `agent.tool_timeout_secs` (120 seconds by default):
-/// a stuck hook blocks **the entire main loop** (the user watches a spinner), whereas a stuck tool
-/// only blocks that one call. A local script takes well under 10 seconds to make one judgement;
-/// anything beyond is "this component is broken" — treat it as degradable, which is far more
-/// meaningful than making the user wait two minutes.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A hook declared by a plugin's `[contributes] hooks`.
-///
-/// It **contains no policy of its own**; it does three things: turn a hook point into one RPC, map
-/// the result into [`Verdict`] / [`ErrorAction`], and on failure let it through while booking the
-/// failure.
-///
-/// # Why look the handle up by "plugin name" on demand instead of holding an `Arc<PluginHandle>`
-///
-/// ① To avoid a cycle — `Runtime.plugins` already stores the handle, and the hook holding another
-/// copy would make it a two-way reference;
-/// ② You get "uninstalling the component disables it" for free: not found ⇒ pass, with no
-/// deregistration logic needed;
-/// ③ Consistent with [`crate::plugin::PluginTool`] — it too holds a name and looks it up when
-/// used.
-///
-/// The cost is one extra `plugins` lock per hook point — five points per round, negligible.
+/// A hook declared by a plugin's `contributes hooks`.
 pub struct ComponentHook {
     plugin: String,
     /// The points the component declared (already validated; can only come from [`POINTS`])
@@ -448,11 +289,7 @@ pub struct ComponentHook {
 
 impl ComponentHook {
     /// Build one from its "parts".
-    ///
-    /// It deliberately **does not take a `PluginHandle`**: the `hook` layer doesn't need to know
-    /// what a plugin handle looks like, only "plugin name + declaration". One less coupling, and
-    /// the degradation path becomes easier to test in isolation (just pass a nonexistent plugin
-    /// name, as this module's tests do).
+    /// It deliberately does not take a `PluginHandle`: the `hook` layer doesn't need to know what a plugin handle...
     pub fn new(
         plugin: String,
         points: Vec<String>,
@@ -472,13 +309,7 @@ impl ComponentHook {
         *self.last_error.lock().unwrap() = Some(why);
     }
 
-    /// Send one hook RPC. **Every** abnormal path (component absent, timeout, error) collapses
-    /// into `None`, and the caller lets it through accordingly — nothing on the hook path is
-    /// allowed to throw an error back into the main loop.
-    ///
-    /// The RPC goes through `rpc_ready`, not a raw `rpc`: under lazy loading a hook-only component
-    /// is normally **dormant**, and this is what starts it. A component that fires on every turn and
-    /// should not pay for that start each time belongs in `[plugins] eager` — see the config docs.
+    /// Send one hook RPC. Every abnormal path (component absent, timeout, error) collapses into `None`, and the caller...
     async fn ask(&self, rt: &Arc<Runtime>, point: &str, params: Value) -> Option<Value> {
         let handle = rt.plugins.lock().await.get(&self.plugin).cloned();
         let Some(handle) = handle else {
@@ -500,12 +331,7 @@ impl ComponentHook {
     }
 }
 
-/// Map a component's returned `{"verdict": …}` into a [`Verdict`].
-///
-/// Any unrecognised value (misspelled, wrong type, simply absent) counts as `Pass` — this is the
-/// **execution path**, and throwing here would let one bad component kill the whole round, which
-/// directly conflicts with "components must be degradable". Problems that deserve to be seen go
-/// into the `note_failure` tally, not here.
+/// Map a component's returned `{"verdict": …}` into a Verdict.
 fn verdict_of(v: &Value) -> Verdict {
     match v.get("verdict").and_then(|x| x.as_str()) {
         Some("reject") => Verdict::Reject(
@@ -547,10 +373,7 @@ impl Hook for ComponentHook {
         if !self.has("before_request") {
             return Verdict::Pass;
         }
-        // The tool list is only **sent out** for the component to inspect (so it can judge); this
-        // round does not accept a component replacing the whole tool table — that would hand "what
-        // the model can see this round" entirely to the component, a risk out of proportion to the
-        // benefit.
+        // The tool list is only sent out for the component to inspect (so it can judge); this round does not accept...
         let params = json!({ "tools": req.tools });
         let Some(v) = self.ask(rt, "before_request", params).await else {
             return Verdict::Pass;
@@ -571,9 +394,7 @@ impl Hook for ComponentHook {
         if !self.has("after_reply") {
             return Verdict::Pass;
         }
-        // Only the **count** is sent, not the plaintext of the tool calls — this round's component
-        // has no way to change them anyway, and sending them would only tempt people into thinking
-        // they could.
+        // Only the count is sent, not the plaintext of the tool calls — this round's component has no way to change them...
         let params = json!({
             "text": reply.message.text(),
             "tool_calls": reply.message.tool_calls.as_ref().map_or(0, |c| c.len()),
@@ -581,9 +402,7 @@ impl Hook for ComponentHook {
         let Some(v) = self.ask(rt, "after_reply", params).await else {
             return Verdict::Pass;
         };
-        // Only the **text** may be changed. Tool calls are not editable: that is the record of
-        // "what the model wants to do", and letting a component change it amounts to forging model
-        // intent — both the request body and the persisted history would then drift.
+        // Only the text may be changed.
         if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
             reply.message.set_text(t);
         }
@@ -644,16 +463,7 @@ impl Hook for ComponentHook {
     }
 }
 
-/// Build the **config-driven** hook chain for `Runtime::new`: currently `[hook]` is the only
-/// implementation.
-///
-/// Component-contributed hooks don't come from here — they are attached via [`HookChain::push`]
-/// when a plugin activates (plugins are loaded after `Runtime::new`).
-///
-/// Returning a `Vec` rather than the chain itself is so that `Runtime` can see at a glance that
-/// "empty config = empty chain". Anything in the config that can't work (say, a default that
-/// isn't an object) **errors at startup** rather than being silently skipped — the same principle
-/// as `[store] backend`: written but ineffective is the hardest class of problem to track down.
+/// Build the config-driven hook chain for `Runtime::new`: currently `hook` is the only implementation.
 pub fn registry_from_config(cfg: &HookConfig) -> Result<Vec<Arc<dyn Hook>>> {
     let mut hooks: Vec<Arc<dyn Hook>> = Vec::new();
     if let Some(h) = ConfigHook::from_config(cfg)? {
@@ -662,7 +472,7 @@ pub fn registry_from_config(cfg: &HookConfig) -> Result<Vec<Arc<dyn Hook>>> {
     Ok(hooks)
 }
 
-/// The body of the `/hook` command.
+/// The body of the `/hook` command
 pub fn report(rt: &Runtime) -> String {
     rt.hooks.report()
 }
@@ -884,7 +694,7 @@ mod tests {
         assert!(registry_from_config(&empty).unwrap().is_empty());
     }
 
-    /// The config → runtime chain must really connect: 0 by default, 1 once configured.
+    /// The config → runtime chain must really connect: 0 by default, 1 once configured
     #[test]
     fn runtime_builds_chain_from_config() {
         let mut cfg = Config::dummy();
@@ -910,7 +720,7 @@ mod tests {
         assert!(rep.contains("encoding"), "the report must say which key was filled: {rep}");
     }
 
-    // ─────────────── Phase 6 · 6b: runtime appends + component contributions ───────────────
+    // Phase 6 · 6b: runtime appends + component contributions
 
     /// Once an empty chain is `push`ed, the hook points **immediately** start asking it — this is
     /// the mechanism behind "a component's declaration takes effect immediately".
@@ -930,9 +740,7 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), vec!["late"], "a pushed hook must actually be called");
     }
 
-    /// Response mapping: only an **explicit** `"reject"` counts as a rejection; everything else
-    /// (misspelled, missing field, wrong type) counts as passing — this is the execution path, and
-    /// it's better to miss one interception than let one bad component kill the whole round.
+    /// Response mapping: only an explicit `"reject"` counts as a rejection; everything else (misspelled, missing...
     #[test]
     fn verdict_only_rejects_on_an_explicit_word() {
         assert_eq!(verdict_of(&json!({ "verdict": "pass" })), Verdict::Pass);
@@ -951,9 +759,7 @@ mod tests {
         );
     }
 
-    /// Component absent (not installed / uninstalled / failed to load) → pass + book a failure,
-    /// with not one argument touched. This is the minimal evidence for "components must be
-    /// degradable".
+    /// With not one argument touched.
     #[tokio::test]
     async fn component_hook_degrades_when_the_plugin_is_gone() {
         let rt = rt(); // there is not a single plugin in this runtime

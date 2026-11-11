@@ -1,24 +1,12 @@
-//! Turn a decoded bitmap into an egui texture — a single function, but **two** call sites
-//! need it.
-//!
-//! Those two call sites are: showing an image inside the conversation
-//! (`app::App::poll_images`) and the first screen's background ([`crate::brand::Art`]).
-//! Both are exactly the same step: `aox::image::Bitmap` → `TextureHandle`.
-//!
-//! Why this deserves its own module instead of being written twice: **every argument here
-//! fails silently**. Drop `from_rgba_unmultiplied` and the whole image is treated as
-//! premultiplied (shadows go grey); use `NEAREST` sampling and a scaled line drawing turns
-//! fuzzy. With two copies, you would only notice the missed edit if you happened to be
-//! looking at both places at once — which almost never happens.
+//! Turn a decoded bitmap into an egui texture — a single function, but two call sites need it.
+//! Those two call sites are: showing an image inside the conversation (`app::App::poll_images`) and the first...
+//! Why this deserves its own module instead of being written twice: every argument here fails silently.
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 
 use aox::image::Bitmap;
 
 /// A texture named `name`, uploaded onto `ctx`.
-///
-/// `name` is for humans only (debugger, `ctx.texture_ui`); it takes no part in any equality
-/// check. Callers just need something recognisable — uniqueness is not required.
 pub fn upload(ctx: &Context, name: impl Into<String>, bm: &Bitmap) -> TextureHandle {
     ctx.load_texture(
         name,

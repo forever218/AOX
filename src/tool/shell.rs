@@ -1,27 +1,6 @@
-//! The host's built-in **command line** (`shell`), and the guard rail in front of it.
-//!
-//! # What it is
-//!
-//! One tool, four dialects (`cmd` / `powershell` / `pwsh` / `git`), executed by
-//! [`crate::shell::runner`]. Its reason to exist is efficiency: an agent that can pipe, glob and
-//! chain finishes in one call what would otherwise be five tool round trips — and every round trip
-//! is a model request.
-//!
-//! # Where the boundary is (read this before touching the scanner)
-//!
-//! | Layer | What it really does |
-//! |-------|---------------------|
-//! | [`crate::workplace`] | the `cwd` must be an absolute path inside the workspace, so a *relative* write is inside by construction |
-//! | [`scan`] | refuses commands whose **explicit write targets** point outside — a **guard rail**: it produces a readable refusal before half a command has run, and it is the only thing `boundary = "scan"` has |
-//! | Low integrity (`crate::shell::lowil`) | the actual boundary: the command runs at Low and the workspace is labelled Low, so `no-write-up` makes any out-of-workspace write a kernel refusal — including the ones the scanner cannot see (`powershell -e <base64>`, a script file, a child process) |
-//!
-//! ⚠️ **Never describe the scanner as the boundary.** It is bypassable by construction; on Windows
-//! the kernel is what holds, and `/shell` says which of the two is currently in force.
-//!
-//! # Reads are not restricted
-//!
-//! Deliberately the same asymmetry as [`crate::workplace::Access`]: `type C:\logs\x.log` works,
-//! `> C:\logs\x.log` does not. Reading takes information; writing changes the device.
+//! The host's built-in command line (`shell`), and the guard rail in front of it.
+//! # What it is.
+//! One tool, four dialects (`cmd` / `powershell` / `pwsh` / `git`), executed by crate::shell::runner.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,12 +28,7 @@ pub fn shell_tools(cfg: &crate::config::ShellConfig) -> Vec<Arc<dyn Tool>> {
 }
 
 pub(crate) struct ShellTool {
-    /// `[shell] timeout_secs` / `max_timeout_secs`, snapshotted at registration.
-    ///
-    /// The tool needs them in [`Tool::timeout_hint`], which is asked **before** `call` and gets no
-    /// `Runtime` — and the outer guard in `Runtime::execute` is armed from that answer, so "I don't
-    /// know my own budget yet" is not an option. Config is read once at startup; reading it again
-    /// here would be the same numbers.
+    /// `shell timeout_secs` / `max_timeout_secs`, snapshotted at registration.
     timeout: u64,
     max_timeout: u64,
 }
@@ -174,11 +148,8 @@ pub(crate) async fn run_shell(
         lowil: false,
     };
 
-    // ── the recovery window ──
-    //
-    // A shell command is opaque: it never says which paths it touches, so the host has to look. In
-    // strict mode a scan that cannot finish refuses the command *before* anything is written; that is
-    // deliberate, because running it anyway would silently break the rollback guarantee.
+    // ── the recovery window ──.
+    // A shell command is opaque: it never says which paths it touches, so the host has to look.
     let guard = match rt.recovery.begin_opaque(&ws, "shell") {
         Ok(g) => g,
         Err(block) => return Err(block.model),
@@ -229,10 +200,6 @@ pub(crate) async fn run_shell(
 }
 
 /// Everything a command needs before it is spawned, after policy has been applied.
-///
-/// Shared by the one-shot path and `shell_job`: a background command must pass the **same** cwd
-/// check, command scan, bash prologue and environment setup as a foreground one. Keeping this in
-/// one function is what stops "background" from becoming a second, weaker execution path.
 pub(crate) struct Prepared {
     pub dialect: Dialect,
     /// The command's script after the bash prologue (for `cmd` / PowerShell: unchanged).
@@ -276,7 +243,7 @@ pub(crate) fn prepare(
         },
     };
 
-    // ── ① tier + cwd: the only *structural* guarantee in this file ──
+    // ① tier + cwd: the only *structural* guarantee in this file
     let (ws, unrestricted) = match rt.workplace.snapshot() {
         (crate::workplace::Mode::Full, _) => {
             (rt.workplace.active_root().unwrap_or_else(|| rt.root.clone()), true)
@@ -304,29 +271,17 @@ pub(crate) fn prepare(
         return Err(crate::tf!("the working directory {} does not exist", cwd.display()));
     }
 
-    // ── ② the guard rail ──
+    // ② the guard rail
     if !unrestricted {
         if let Some(why) = scan(command, dialect, &cwd, &ws) {
             return Err(why);
         }
     }
 
-    // ── ③ the boundary this call actually gets ──
-    //
-    // One layer, and it is the one that works: the guard rail above, plus the `cwd` check in ①.
-    //
-    // A kernel-enforced boundary was implemented three separate ways (a lowered token inherited by the
-    // child, the same token set on a suspended child, and `CreateProcessAsUser` with duplicated and
-    // restricted tokens) and measured **not to hold** on Windows 11 26200: the child reports
-    // `IL=0x1000 (Low)` yet the kernel refuses its writes even to a Low-labelled directory, so writes
-    // inside the workspace fail too. `docs/SHELL.md` records the measurements and what would have to be
-    // different for it to work. Shipping a `boundary = "kernel"` switch would promise something the
-    // program cannot deliver, so there is no switch.
+    // ── the boundary this call actually gets ──.
     let boundary = if unrestricted { Boundary::Unrestricted } else { Boundary::GuardRail };
 
-    // A bash script gets the host's two exports in front of it (workspace in both path forms). It is a
-    // prefix rather than a file on purpose: no dotfiles, nothing to clean up, and the model's own script
-    // stays byte-identical after those two lines.
+    // A bash script gets the host's two exports in front of it (workspace in both path forms).
     let script = if dialect == Dialect::Bash {
         format!("{}{}", crate::shell::bash::prologue(&ws), command)
     } else {
@@ -348,11 +303,9 @@ pub(crate) fn prepare(
 /// means something different in each case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Boundary {
-    /// The command scan only. A guard rail: it stops the obvious out-of-bounds writes and produces a
-    /// readable refusal, and it is bypassable by construction (`-EncodedCommand`, a script file, a
-    /// child process). The name says "only" so nobody mistakes it for a kernel boundary.
+    /// The command scan only. A guard rail: it stops the obvious out-of-bounds writes and produces a readable refusal...
     GuardRail,
-    /// `full` tier: nothing is restricted.
+    /// `full` tier: nothing is restricted
     Unrestricted,
 }
 
@@ -365,9 +318,7 @@ impl Boundary {
     }
 }
 
-/// The two call-level knobs the `shell` and `bash` schemas share, described **once**: two copies of a
-/// paragraph drift the first time one of them is reworded, and the model would then be reading two
-/// different stories about the same number.
+/// The two call-level knobs the `shell` and `bash` schemas share, described once: two copies of a paragraph drift...
 pub(crate) const IDLE_DESC: &str = "Kill the call if it writes nothing to stdout or stderr for \
      this many seconds (default 30; 0 disables it for this call). Raise it for a command that is \
      legitimately silent for a long time (a `sleep`, a download with no progress output). A build or \
@@ -379,10 +330,6 @@ pub(crate) const EXPECT_DESC: &str = "Your own estimate of how long this will ta
      expect to take more than a few seconds.";
 
 /// This call's ceiling, in seconds — the number the UI shows and the outer guard is built from.
-///
-/// Shared by both shell tools. A flat constant here (it used to be `600 + 5`) meant the backstop was
-/// five times wider than the timeout it backs up — so when the inner kill path failed, the user's only
-/// exit was 615 s away.
 pub(crate) fn hint_cap(args: &Value, timeout: u64, max: u64) -> Option<u64> {
     Some(call_timeout_with(args, timeout, max))
 }
@@ -400,9 +347,7 @@ fn call_timeout(args: &Value, rt: &Arc<Runtime>) -> u64 {
     call_timeout_with(args, cfg.timeout_secs, cfg.max_timeout_secs)
 }
 
-/// The total budget for one call: what the model asked for, else the configured default, clamped to
-/// the ceiling. Shared by the two readers that must never disagree — the spec that runs the command
-/// and the hint that keeps the outer guard out of the way.
+/// The total budget for one call: what the model asked for, else the configured default, clamped to the ceiling.
 fn call_timeout_with(args: &Value, default: u64, max: u64) -> u64 {
     let asked = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(default);
     asked.clamp(1, max.max(1))
@@ -419,14 +364,6 @@ fn call_idle(args: &Value, rt: &Arc<Runtime>) -> Option<Duration> {
 }
 
 /// The environment the command sees.
-///
-/// Two jobs, both about the Low token:
-/// 1. `TMP`/`TEMP`/`TMPDIR` and the build caches point **into the workspace**, because a Low process
-///    cannot write `%TEMP%` or `%USERPROFILE%\.cargo` (both Medium). Without this a `cargo build`
-///    fails inside its own cache with "access denied" — a failure that looks exactly like the
-///    boundary misfiring.
-/// 2. `AOX_WORKSPACE` / `AOX_SHELL_BOUNDARY` tell a script (and the model) where it is and which
-///    boundary is in force, without having to infer it from a failed write.
 fn child_env(rt: &Arc<Runtime>, ws: &Path, boundary: Boundary) -> Vec<(String, String)> {
     let mut env = Vec::new();
     let tmp = ws.join(crate::workplace::AOX_DIR).join(crate::workplace::TMP_DIR);
@@ -467,9 +404,7 @@ fn format_outcome(
             format!("{:.0}", o.elapsed.as_secs_f64()),
             budget.as_secs()
         )),
-        // The idle case carries the "what to do about it" line because the model is the only one who
-        // knows whether silence was expected. Without it the natural next move is to retry the same
-        // call and be killed again.
+        // The idle case carries the "what to do about it" line because the model is the only one who knows whether...
         Some(Stop::Idle(idle)) => s.push_str(&crate::tf!(
             "KILLED after {} s: it wrote nothing to stdout or stderr for {} s, which is how a \
              wedged process looks. The whole tree was terminated; whatever it printed before that is \
@@ -482,9 +417,7 @@ fn format_outcome(
         )),
         None => {}
     }
-    // The command detached something and the fence is about to take it away. Without this sentence
-    // the model sees only "exit 0, no output, port closed" and retries the same command — which is
-    // exactly the loop this feature exists to end.
+    // The command detached something and the fence is about to take it away.
     if o.stopped.is_none() {
         if let Some(n) = o.left_behind.filter(|n| *n > 0) {
             s.push_str(&crate::tf!(
@@ -532,17 +465,9 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-// ─────────────────────────── the guard rail ───────────────────────────
+// the guard rail
 
-/// Refuse a command whose **explicit write targets** land outside the workspace.
-///
-/// Returns the text for the model (`None` = let it run).
-///
-/// The rule is narrow on purpose: **only** absolute paths and `..` segments are judged, because the
-/// cwd is already inside the workspace, so every relative write is inside by construction. That keeps
-/// the false-positive rate near zero (`--output-format json` is not a path, `type C:\x.log` is a
-/// read), which matters more than coverage: this layer exists to produce a *good refusal*, and a
-/// refusal that also blocks legitimate work is worse than no layer at all.
+/// Refuse a command whose explicit write targets land outside the workspace.
 fn scan(command: &str, dialect: Dialect, cwd: &Path, ws: &Path) -> Option<String> {
     let tokens = tokenize(command);
     let words: Vec<String> = tokens.iter().map(|t| t.to_ascii_lowercase()).collect();
@@ -575,7 +500,7 @@ fn scan(command: &str, dialect: Dialect, cwd: &Path, ws: &Path) -> Option<String
         }
     }
 
-    // ③ commands whose *arguments* are destinations.
+    // ③ commands whose *arguments* are destinations
     if let Some(first) = words.first() {
         let base = basename(first);
         let writes = WRITE_PROGRAMS.contains(&base)
@@ -606,9 +531,7 @@ fn scan(command: &str, dialect: Dialect, cwd: &Path, ws: &Path) -> Option<String
     None
 }
 
-/// Programs whose positional arguments are write destinations. Deliberately **not** exhaustive — a
-/// miss here costs nothing on Windows (the kernel still refuses) and costs the boundary in `scan`
-/// mode, which `/shell` says out loud.
+/// Programs whose positional arguments are write destinations.
 const WRITE_PROGRAMS: &[&str] = &[
     "del", "erase", "rm", "rmdir", "rd", "mkdir", "md", "move", "mv", "copy", "cp", "xcopy",
     "robocopy", "ren", "rename", "touch", "truncate", "tee", "dd", "mklink", "ln", "tar", "unzip",
@@ -647,10 +570,6 @@ fn is_operator(t: &str) -> bool {
 }
 
 /// Does this token look like a path at all?
-///
-/// Only absolute-looking things and `..` chains: a bare word is a flag or an argument, and treating
-/// those as paths is how a scanner starts rejecting `git log --graph`. A URL is **not** a path —
-/// `https://…` matches "letter, colon, slash" and would otherwise be judged as drive `h:`.
 fn looks_like_path(t: &str) -> bool {
     if t.contains("://") || t.starts_with("git@") {
         return false;
@@ -760,12 +679,9 @@ fn out_of_bounds_text(raw: &str, resolved: &Path, ws: &Path) -> String {
     )
 }
 
-// ─────────────────────────── what changed ───────────────────────────
+// what changed
 
 /// Files under the workspace whose mtime is at or after `since`.
-///
-/// Bounded on purpose (depth, entry count, skipped directories): this runs after every command, and
-/// `node_modules` alone would otherwise cost more than the command did.
 fn changed_since(ws: &Path, since: Instant) -> Vec<PathBuf> {
     /// A little slack: filesystems round mtime, and a write that lands exactly on the boundary must
     /// not be lost.
@@ -773,9 +689,7 @@ fn changed_since(ws: &Path, since: Instant) -> Vec<PathBuf> {
     const MAX_DEPTH: usize = 8;
     const MAX_ENTRIES: usize = 4000;
     const SKIP: &[&str] = &[".git", "node_modules", "target", "__pycache__", ".venv", "venv", "dist"];
-    // `since` is an `Instant` (monotonic — the right thing to measure a call with) but file mtimes
-    // are `SystemTime`, so the cutoff has to be expressed in the wall clock: "now minus how long ago
-    // the call started, minus the slack".
+    // `since` is an `Instant` (monotonic — the right thing to measure a call with) but file mtimes are `SystemTime`...
     let cutoff = std::time::SystemTime::now()
         .checked_sub(since.elapsed() + SLACK)
         .unwrap_or(std::time::UNIX_EPOCH);
@@ -810,10 +724,6 @@ fn changed_since(ws: &Path, since: Instant) -> Vec<PathBuf> {
 }
 
 /// The body of `/shell`: what the command line may do right now, and what it may not.
-///
-/// The second half is written on purpose. The most common misuse of this feature is assuming the
-/// boundary covers more than it does — printing the limits next to the guarantees is far more
-/// effective than documenting them.
 pub fn report(rt: &Arc<Runtime>) -> String {
     let c = &rt.config.shell;
     let mut s = String::from(crate::i18n::t("Shell (config.toml's [shell])\n\n"));
@@ -1064,9 +974,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A one-shot call that detaches a child must say so. Without this sentence the model sees a
-    /// successful, silent command followed by a closed port, and its only apparent option is to run
-    /// the same thing again.
+    /// A one-shot call that detaches a child must say so.
     #[tokio::test]
     async fn a_detached_child_is_reported_as_terminated() {
         if !cfg!(windows) {

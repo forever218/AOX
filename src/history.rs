@@ -1,13 +1,6 @@
-//! The conversation history's **data model and wording**.
-//!
-//! What remains here is only "what a record looks like" and "how to show it to a human": the four
-//! structs `Meta` / `UsageRecord` / `Summary` / `Loaded`, plus `/history` subcommand parsing and
-//! plain-text rendering.
-//!
-//! **Persisting and reading moved to [`crate::store`]** (the storage seam extracted in stage 3,
-//! implemented in `store::jsonl`). Splitting the two means: swapping the storage backend doesn't
-//! drag the wording along, and changing the wording doesn't touch I/O; callers speak in terms of
-//! **id** rather than assembling history file paths themselves.
+//! The conversation history's data model and wording.
+//! What remains here is only "what a record looks like" and "how to show it to a human": the four structs `Meta` /...
+//! Persisting and reading moved to crate::store (the storage seam extracted in stage 3, implemented...
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,17 +13,9 @@ use crate::llm::Usage;
 use crate::message::Message;
 
 /// How many conversations the list returns by default.
-///
-/// Both the CLI (`/history`) and the backend's "index" parsing use it — an index is counted by this
-/// list's position, and the moment the two disagree, `/history rm 2` deletes something other than
-/// the entry the user saw.
 pub const DEFAULT_LIST_LIMIT: usize = 60;
 
-/// The prefix of a prompt the host injected. Such "user messages" weren't said by a real person and
-/// must not be used as a title.
-///
-/// The backend tests for it when reading a title, and the CLI tests for it when rendering the full
-/// text — one test, written once.
+/// The prefix of a prompt the host injected.
 pub const HOST_PREFIX: &str = "(host hint)";
 
 /// The current Unix seconds.
@@ -38,14 +23,10 @@ pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-// ─────────────────────────── Local time ───────────────────────────
+// Local time
 
 /// A broken-down local time.
-///
-/// **Moved up from `store::jsonl`** (2026-10-08) so that the history filename stamp and the
-/// prompt's "today" line share one implementation. Computing the timezone offset ourselves would
-/// drag in a chrono / time style dependency, but all we need is a human-readable date, so we just
-/// ask the OS — on Windows `GetLocalTime`, with zero new crates.
+/// Moved up from `store::jsonl` so that the history filename stamp and the prompt's "today" line share...
 pub(crate) struct Local {
     pub(crate) year: u16,
     pub(crate) month: u16,
@@ -88,12 +69,6 @@ pub(crate) fn local_now() -> Local {
 }
 
 /// Day of week for a civil date, `0 = Sunday`.
-///
-/// Lives beside [`civil_from_unix`] rather than in the greeting code: whenever a `Local` is built
-/// from a date (never from a `SYSTEMTIME`, which carries the weekday itself), the two must come from
-/// the same reading, or a line written on Sunday can claim it is the weekend on Monday.
-// Only the non-Windows clock (and the tests) need to compute this: on Windows the field is read
-// straight off `SYSTEMTIME`.
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn weekday_of(y: u16, m: u16, d: u16) -> u16 {
     // Month offsets that turn a 12-month year into a 28-day one; Jan/Feb count as months 13/14 of
@@ -105,10 +80,7 @@ pub(crate) fn weekday_of(y: u16, m: u16, d: u16) -> u16 {
     idx as u16
 }
 
-/// Unix seconds → year/month/day/hour/minute/second (Howard Hinnant's civil_from_days).
-///
-/// Available on every platform. On Windows it is a UTC civil conversion (local time still goes
-/// through `local_from_system`); recovery lists use it for a stable display value.
+/// Available on every platform.
 pub fn civil_from_unix(secs: u64) -> (u16, u16, u16, u16, u16, u16) {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
@@ -133,15 +105,12 @@ pub fn civil_from_unix(secs: u64) -> (u16, u16, u16, u16, u16, u16) {
 }
 
 /// Today's local date as `YYYY-MM-DD` (zero-padded, so it sorts correctly).
-///
-/// Injected into the prompt so the model can name its dated memory note (`.aox/memory/<date>.md`)
-/// without guessing the day.
 pub fn local_date() -> String {
     let t = local_now();
     format!("{:04}-{:02}-{:02}", t.year, t.month, t.day)
 }
 
-// ─────────────────────────── Records ───────────────────────────
+// Records
 
 /// The conversation file's header record (the first line of the jsonl).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,27 +121,15 @@ pub struct Meta {
     pub created: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The app root this conversation was created under. **Informational only** — since the single
-    /// conversation store (2026-11-05) the file's own location is the only place that matters, and
-    /// this field exists so "which install was this written by" stays answerable after the file is
-    /// copied somewhere else.
+    /// The app root this conversation was created under.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// Who opened this conversation: `local` (this desktop / the CLI) or `remote` (one turn from a
-    /// phone in an AOXChat room). Written at creation, never changed.
-    ///
-    /// Absent = `local`: a file written before this field existed.
+    /// Who opened this conversation: `local` (this desktop / the CLI) or `remote` (one turn from a phone in an AOXChat...
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
-    /// The space this conversation was **born in** (`builtin:remote` for remote turns; absent for
-    /// local ones, whose group is derived from the workplace records as before).
-    ///
-    /// A hint, not the authority: `spaces.json` still decides where a conversation is shown, and
-    /// "move to another space" only touches that file. This one exists so the list can group a
-    /// conversation correctly even when the registry has never heard of it (a fresh clone, a lost
-    /// `spaces.json`, a file copied in from another machine).
+    /// The space this conversation was born in (`builtin:remote` for remote turns; absent for local ones, whose group...
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space: Option<String>,
     /// The AOXChat room this conversation belongs to, when `origin == "remote"`.
@@ -217,13 +174,6 @@ impl Origin {
 }
 
 /// One turn's token account (corresponding to a `kind:"usage"` line in the jsonl).
-///
-/// **One entry per turn**, rather than a single grand total at the end of the file: a total can only
-/// answer "how much did this conversation cost", not "which turn was the most expensive". And the
-/// most expensive turn is usually exactly the one that went wrong — diagnosis depends on it.
-///
-/// Every field is written "only if it has a value": if the endpoint under-reports, the file has one
-/// fewer key, and reading it back naturally yields `None` — no need to pass off a 0 as "no spend".
 #[derive(Debug, Clone, Default)]
 pub struct UsageRecord {
     /// Which turn (1-based)
@@ -236,9 +186,7 @@ pub struct UsageRecord {
     pub usage: Usage,
     /// The input size of the last request = the current context occupancy
     pub last_prompt: Option<u64>,
-    /// The **conversation total** tokens up to this turn. Stored redundantly so that reading it back
-    /// doesn't require summing by hand, and so "how much this conversation cost in total" is visible
-    /// at a glance in the file.
+    /// The conversation total tokens up to this turn.
     pub session_total: Option<u64>,
     /// The conversation's cumulative call count up to this turn
     pub session_calls: u32,
@@ -308,25 +256,13 @@ pub struct Summary {
     pub title: String,
     /// The message count (excluding meta)
     pub messages: usize,
-    /// The display string for "the time it was last spoken to" ("10-02 15:39"). It uses the same
-    /// time as the list sorting — the moment the sort key and the displayed time aren't the same one,
-    /// the list looks mis-sorted.
+    /// The display string for "the time it was last spoken to" ("10-02 15:39").
     pub time: String,
-    /// The workspace root this conversation is bound to — the `root` of the **last**
-    /// `kind:"workplace"` record in the file (`None` when the file has no such record, or the tier
-    /// had no root at all).
-    ///
-    /// Filled in **during the same pass** that reads the title, so grouping the list by workspace
-    /// costs no second scan of the directory. `None` means "no root" and must not be read as "the app
-    /// root" — what a missing root implies is the reader's call (see [`crate::space`]).
+    /// The workspace root this conversation is bound to — the `root` of the last `kind:"workplace"` record in the file...
     pub ws_root: Option<std::path::PathBuf>,
-    /// Whether that last workplace record's tier was the **unrestricted** one (`mode == "full"`).
-    ///
-    /// Kept next to [`Summary::ws_root`] rather than folded into it because the two answer different
-    /// questions and both are needed: an unrestricted record has no root, and "no root because
-    /// unrestricted" has to be told apart from "no record at all" (an older file) when grouping.
+    /// Whether that last workplace record's tier was the unrestricted one (`mode == "full"`).
     pub ws_full: bool,
-    /// Who opened it (`local` / `remote`), read from the header.
+    /// Who opened it (`local` / `remote`), read from the header
     pub origin: Origin,
     /// The space named in the header, if any. A **hint** for grouping — `spaces.json` still wins
     /// when the user has placed the conversation somewhere.
@@ -342,9 +278,9 @@ pub struct Loaded {
     pub is_error: Option<bool>,
 }
 
-// ─────────────────────────── Commands (shared by CLI / GUI) ───────────────────────────
+// Commands (shared by CLI / GUI)
 
-/// A `/history` subcommand.
+/// A `/history` subcommand
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
     /// List the historical conversations
@@ -359,7 +295,7 @@ pub enum Cmd {
     Remove(String),
 }
 
-/// Whether this line is a `/history` command.
+/// Whether this line is a `/history` command
 pub fn is_cmd(line: &str) -> bool {
     line == "/history" || line.starts_with("/history ")
 }
@@ -388,21 +324,14 @@ pub fn parse_cmd(line: &str) -> Result<Cmd> {
     }
 }
 
-// ─────────────────────────── Text rendering ───────────────────────────
+// Text rendering
 
 /// The plain-text implementation of `/history` (which the CLI prints directly).
-///
-/// It handles layout only: the data is fetched from the storage layer by the caller and passed in —
-/// that way "swapping the backend" and "changing the wording" don't entangle, and this function
-/// doesn't have to read the disk itself.
 pub fn list_text(items: &[Summary], location: &Path, current: Option<&str>) -> String {
     if items.is_empty() {
         return crate::tf!("(no history yet)\n  Directory: {}", location.display());
     }
-    // The path printed is the **default workspace's** directory, not "the" directory: since
-    // 2026-10-14 conversations are stored per workspace, under `<workspace>/.aox/history`. Saying it
-    // out loud keeps this header and `/history dir` from looking contradictory, and stops the user
-    // hunting for a conversation in a folder it was never in.
+    // The path printed is the default workspace's directory, not "the" directory: since 2026-10-14 conversations...
     let mut s = crate::tf!(
         "History ({} conversations, most recently active first)  {}\n  (stored per workspace, under <workspace>/.aox/history; the path above is the default workspace's)",
         items.len(),
@@ -436,9 +365,7 @@ pub fn transcript_text(items: &[Loaded]) -> String {
         let m = &it.msg;
         match m.role.as_str() {
             "user" => {
-                // Use `flat_text`: a user message may carry attachments, in which case `content` is a
-                // parts array (body text + image blocks), and a direct `as_deref` would show not one
-                // character.
+                // Use `flat_text`: a user message may carry attachments, in which case `content` is a parts array (body text +...
                 let text = m.flat_text();
                 let text = text.trim();
                 if text.starts_with(HOST_PREFIX) {
@@ -446,10 +373,7 @@ pub fn transcript_text(items: &[Loaded]) -> String {
                 } else {
                     s.push_str(&format!("\n{} {}\n", style::bold(crate::i18n::t("you:")), text));
                 }
-                // An attachment is only a path reference in the `.jsonl` (see the `attach` module),
-                // so when reviewing history it must be listed explicitly — otherwise a conversation
-                // with images looks no different from a plain-text one, and "what exactly was sent
-                // at the time" is precisely the question reviewing history is meant to answer.
+                // An attachment is only a path reference in the `.jsonl` (see the `attach` module), so when reviewing history...
                 let files = m
                     .content
                     .as_ref()
@@ -481,9 +405,7 @@ pub fn transcript_text(items: &[Loaded]) -> String {
                     if it.is_error == Some(true) { "✗" } else { "✓" },
                     m.name.as_deref().unwrap_or("tool"),
                 );
-                // A tool result can be long (already trimmed by max_result_chars before writing), and
-                // it is trimmed once more for display, so reviewing history doesn't mean scrolling
-                // through a single result.
+                // A tool result can be long (already trimmed by max_result_chars before writing), and it is trimmed once more...
                 let body = m.flat_text().replace('\n', " ⏎ ");
                 s.push_str(&format!("  {} {} {}\n", mark, name, style::dim(&clamp_chars(body.trim(), 300))));
             }
@@ -501,7 +423,7 @@ fn clamp_chars(s: &str, n: usize) -> String {
     }
 }
 
-// ─────────────────────────── Tests ───────────────────────────
+// Tests
 
 #[cfg(test)]
 mod tests {

@@ -1,65 +1,14 @@
-//! A **lightweight checkpoint** for long-horizon tasks: readable, persistable, restorable state.
-//!
-//! # Why it exists
-//!
-//! Three things make a model "forget why it is here": context compaction, an interrupted task, and a
-//! restart. Compaction folds the early user goal into a summary, an interrupt rollback drops the
-//! step in flight, and a restart does not even have the summary. Left with only the last few
-//! messages, a model readily **redoes work that is already done**, or breaks a constraint stated
-//! long ago ("do not touch the public API").
-//!
-//! There is no task engine, no DAG, no sub-agent scheduler here — one struct plus one row in the
-//! conversation file. It answers four questions: what is the goal, what constrains it, how far did
-//! we get, what happens next.
-//!
-//! # Three design constraints
-//!
-//! 1. **No new storage.** The checkpoint is written as a `kind:"task"` row in this conversation's
-//!    `.jsonl` (the last one wins), the same mechanism as `usage` / `workplace` / `title`: when a
-//!    conversation is deleted, trimmed or moved to another backend, the checkpoint goes with it. No
-//!    orphan files, and **nothing dropped into the user's project root**.
-//! 2. **The model writes only what only the model can know.** Goal, constraints, acceptance
-//!    criteria, progress, decisions, open questions — submitted through the `task_state` tool.
-//!    `modified_files`, by contrast, is **accumulated by the host alone** from real
-//!    `ToolOutput::path` values: a file the model changed is a fact, not a claim; letting it fill
-//!    that in would be allowing it to invent evidence.
-//! 3. **Short tasks produce no state.** The host never creates a checkpoint on its own; if the model
-//!    never calls `task_state`, this is `None` and not a single row is written.
-//!
-//! # Evidence, and why `done` is derived rather than declared
-//!
-//! A checkpoint that only records what the model *believes* is half a checkpoint: the moment it
-//! says "done", the next session has no way to tell a finished task from an optimistic one. So the
-//! host keeps its own ledger (`checks`, written only by `verify`) and [`TaskState::gate`] decides.
-//! Two rules do the work:
-//!
-//! - **Every acceptance criterion needs a check that passed** — "I tested it" is not evidence,
-//!   "this file contains that line, hashed at this moment" is.
-//! - **Evidence expires.** Every real file write bumps [`TaskState::epoch`], and a check carries the
-//!   epoch it ran in. A check older than the last write proves something about a workspace that no
-//!   longer exists, so it cannot justify `done`.
-//!
-//! The model still chooses *what* to check and *which criterion* a check covers. That is fine: the
-//! question the gate answers is "did anything real happen", not "was the right thing checked" — the
-//! latter is what the user's review is for.
-//!
-//! # Rules at restore time (more important than "it can be restored")
-//!
-//! What comes back is a **snapshot from then**, and the files on disk may long since look different.
-//! So [`TaskState::context_block`] always ends with "re-check this", and a restore **never** treats
-//! any item as a verified fact — it is only "what was believed last time".
+//! A lightweight checkpoint for long-horizon tasks: readable, persistable, restorable state.
+//! # Why it exists.
+//! Three things make a model "forget why it is here": context compaction, an interrupted task, and a restart.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// On-disk format version. **An unknown version reads as "no checkpoint"** (not as a hard error): a
-/// state written by an older version, read with a guess, would leave the model believing it is still
-/// working on something that ended long ago — far worse than having no state at all.
+/// On-disk format version. An unknown version reads as "no checkpoint" (not as a hard error): a state written...
 pub const VERSION: u32 = 1;
 
-/// Per-field length caps. Not about performance but about being **bounded**: a checkpoint enters the
-/// context again and again (compaction summaries, restore notes), and an unbounded structure sooner
-/// or later becomes a second thing that needs compacting.
+/// Per-field length caps. Not about performance but about being bounded: a checkpoint enters the context again...
 pub const GOAL_MAX: usize = 2000;
 pub const ITEMS_MAX: usize = 40;
 pub const ITEM_MAX: usize = 500;
@@ -85,9 +34,6 @@ pub const CLAIM_SHOW: usize = 48;
 pub const BLOCK_MAX: usize = 2400;
 
 /// Whether the host considers the task finished.
-///
-/// `Done` is **derived, never declared**: the model may *ask* for it (`task_state {status: "done"}`),
-/// but [`TaskState::gate`] has to pass first, and only the host has the evidence to decide that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -109,24 +55,12 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-/// One piece of **host-collected** evidence: a check that really ran, against something really there.
-///
-/// The model chooses *what* to check and *which acceptance item* it proves; it never writes `ok`,
-/// `detail` or `epoch`. That split is the whole point — a field the model can fill in is a field it
-/// can fill in wrongly, and "tests pass" is the single claim agents are most optimistic about.
+/// One piece of host-collected evidence: a check that really ran, against something really there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Check {
     /// Which acceptance item this covers, **1-based** (index into [`TaskState::acceptance`]).
     pub criterion: usize,
-    /// The acceptance text **as it read when the check ran** — the host's copy, not the model's
-    /// paraphrase of it.
-    ///
-    /// This is the cheapest defence available against the one thing the gate cannot judge: whether
-    /// the check actually proves *that* criterion. The host still does not compare meanings, but
-    /// echoing the claim back at the moment of recording — and again in the restore block — makes a
-    /// mismatch ("this check proves the file contains hello, the criterion says the last line is
-    /// bye") impossible to miss. In a live test the model spotted exactly that mismatch on its own
-    /// and had to read the criterion text to do it.
+    /// The acceptance text as it read when the check ran — the host's copy, not the model's paraphrase of it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub claim: String,
     /// What kind of check ran — one of `crate::tool::verify::KINDS`.
@@ -142,11 +76,6 @@ pub struct Check {
 }
 
 /// One line of the model's own plan.
-///
-/// Deliberately **not** evidence: `acceptance` is the contract with the user and needs the host's
-/// `verify` proof, whereas a step is the model's own bookkeeping — it may be revised, reordered or
-/// thrown away at any moment, and the host takes its word for it. Keeping the two apart is the whole
-/// point: a plan that cannot be checked is still worth having, because it is what survives compaction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Step {
     pub text: String,
@@ -177,14 +106,7 @@ pub struct TaskState {
     /// Acceptance criteria: what counts as done (checkable wording wins, e.g. "cargo test passes").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acceptance: Vec<String>,
-    /// The plan: ordered steps with a tick each (see [`Step`]).
-    ///
-    /// Sits between "what counts as done" and "what is done" on purpose: `acceptance` says how the
-    /// task will be judged, `steps` says how the model intends to get there, `completed` is the log
-    /// of what actually happened. Only this middle one can answer "what was I about to do next?".
-    ///
-    /// Omitted entirely when empty, so a checkpoint written before this field existed (or by a model
-    /// that does not use it) produces the **same row** byte for byte.
+    /// The plan: ordered steps with a tick each (see Step).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<Step>,
     /// What is genuinely finished.
@@ -204,25 +126,12 @@ pub struct TaskState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<Check>,
     /// How many times the host has written a file during this task.
-    ///
-    /// This is what makes evidence **expire**: a check is proof about the workspace *at the moment it
-    /// ran*, and a later write can invalidate it. Rather than trying to guess which checks a given
-    /// file touches (a path mapping that would be wrong the first time a check reads two files), any
-    /// real write bumps this counter and every older check becomes stale. Conservative on purpose: a
-    /// re-run costs one tool call, a wrong "done" costs the user's trust.
-    ///
-    /// ⚠️ It only counts writes the host **knows about** — the ones a tool reports through
-    /// `ToolOutput::path`. A plugin that writes a file without filling that field can slip past, so
-    /// this is a strong guard against the common case, not a proof against a careless plugin.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub epoch: u64,
-    /// `open` while work continues; `done` only once [`TaskState::gate`] has passed.
-    ///
-    /// Not written while `open`: a checkpoint that never verified anything must produce the **same
-    /// row** it did before this feature existed (the zero-drift rule this repo holds every stage to).
+    /// `open` while work continues; `done` only once TaskState::gate has passed.
     #[serde(default, skip_serializing_if = "Status::is_open")]
     pub status: Status,
-    /// Open questions / known obstacles.
+    /// Open questions / known obstacles
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
     /// What happens next.
@@ -260,10 +169,6 @@ impl TaskState {
     }
 
     /// Parse the `task` object of a `kind:"task"` row.
-    ///
-    /// Anything unrecognised returns `None`: a missing field, a version mismatch, an empty `goal`.
-    /// Every caller **degrades to "no checkpoint"** and keeps going — a broken checkpoint must never
-    /// block a conversation.
     pub fn from_value(v: &Value) -> Option<Self> {
         let st: Self = serde_json::from_value(v.clone()).ok()?;
         if st.version != VERSION || st.goal.trim().is_empty() {
@@ -277,16 +182,7 @@ impl TaskState {
         serde_json::to_value(self).unwrap_or(Value::Null)
     }
 
-    /// Record a file that was **really modified** (called by the host after a tool returns).
-    ///
-    /// Deduplicated by path string; past [`FILES_MAX`] nothing more is appended — keeping the earliest
-    /// beats keeping the latest: in a long-running task, "which files it started from" is usually the
-    /// clue restore needs most.
-    /// Invalidate every host-collected fact after a workspace restore.
-    ///
-    /// A restore changes files behind the model's back. Keeping a `done` status or a check from the
-    /// pre-restore workspace would be a lie, so all proof is cleared. Human/model-authored progress
-    /// text is deliberately left alone.
+    /// Record a file that was really modified (called by the host after a tool returns).
     pub fn invalidate_after_restore(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.checks.clear();
@@ -314,10 +210,7 @@ impl TaskState {
         }
     }
 
-    /// Record one piece of evidence. Called by the host only (see `crate::tool::verify`).
-    ///
-    /// Past [`CHECKS_MAX`] the oldest entry is dropped: for a bounded checkpoint, "the most recent
-    /// evidence" is the only part that can still justify a `done`, so it is the part worth keeping.
+    /// Record one piece of evidence.
     pub fn record(&mut self, check: Check) {
         if self.checks.len() >= CHECKS_MAX {
             self.checks.remove(0);
@@ -331,10 +224,7 @@ impl TaskState {
         self.steps.iter().filter(|s| !s.done).count()
     }
 
-    /// How many acceptance criteria are currently covered by a **passing, non-stale** check.
-    ///
-    /// Used in the tool's reply ("evidence 2 of 3") so the model can see how far it is from `done`
-    /// without guessing — the gate uses the same rule, one criterion at a time.
+    /// How many acceptance criteria are currently covered by a passing, non-stale check.
     pub fn covered(&self) -> usize {
         (1..=self.acceptance.len())
             .filter(|n| {
@@ -347,15 +237,7 @@ impl TaskState {
             .count()
     }
 
-    /// Can this task be called **done**? `Ok(())` when every acceptance criterion is covered by a
-    /// passing, *current* check; otherwise the list of reasons, each naming a fix.
-    ///
-    /// Four rules, in the order the model should fix them:
-    /// 1. there must be acceptance criteria (nothing to verify otherwise);
-    /// 2. something must actually be reported as completed;
-    /// 3. every criterion needs at least one check (the **latest** one decides — a fixed check
-    ///    supersedes an earlier failure);
-    /// 4. that check must have passed and must not predate the last workspace write.
+    /// Can this task be called done? `Ok(())` when every acceptance criterion is covered by a passing, *current*...
     pub fn gate(&self) -> Result<(), Vec<String>> {
         let mut why = Vec::new();
         if self.acceptance.is_empty() {
@@ -368,9 +250,7 @@ impl TaskState {
         }
         for (i, item) in self.acceptance.iter().enumerate() {
             let n = i + 1;
-            // The criterion text travels with every refusal: "acceptance #2" alone tells the model
-            // nothing about *what* it failed to prove, and that ambiguity is exactly how a check of
-            // the wrong thing slips through.
+            // The criterion text travels with every refusal: "acceptance #2" alone tells the model nothing about *what*...
             let claim = clamp(item, CLAIM_SHOW);
             match self.checks.iter().rev().find(|c| c.criterion == n) {
                 None => why.push(crate::tf!(
@@ -402,14 +282,6 @@ impl TaskState {
     }
 
     /// The text injected into the context on restore.
-    ///
-    /// Ordered by what restoring the work needs first: goal -> constraints -> progress -> unresolved
-    /// -> next steps -> files. That closing "re-check" line is **mandatory**: a checkpoint records
-    /// the state from then, not the facts of now.
-    ///
-    /// ⚠️ Truncation applies to the **body** only; that closing warning is never cut: when the body is
-    /// too long it is trimmed first and the warning is kept — the other order (cut the tail) would
-    /// drop the only warning at exactly the moment it matters.
     pub fn context_block(&self) -> String {
         let caveat = crate::i18n::t(
             "This checkpoint describes the task as it stood when it was written, NOT the current state of the project: re-read any file before you change it, and re-run any check before you call it done. If what you find disagrees with this list, the file wins — then update the checkpoint.",
@@ -430,11 +302,7 @@ impl TaskState {
         format!("{body}\n{caveat}")
     }
 
-    /// The plan, ticked and unticked — `plan: [x] a · [x] b · [ ] c — 2 pending`.
-    ///
-    /// This one line is what the whole field exists for: compaction can drop the conversation, but a
-    /// model that can still read "two of four done, next is run the tests" does not have to
-    /// rediscover where it was — which is exactly the "did three steps, forgot the fifth" failure.
+    /// The plan, ticked and unticked — `plan: x a · x b · [ ] c — 2 pending`.
     fn push_steps(&self, out: &mut String) {
         if self.steps.is_empty() {
             return;
@@ -456,10 +324,6 @@ impl TaskState {
     }
 
     /// One `verification: #1 ok (file_hash) · #2 stale (output_contains)` line.
-    ///
-    /// Only emitted **when there is evidence at all**: a checkpoint that never called `verify` must
-    /// render byte-identically to the version before this feature existed (the zero-drift rule that
-    /// every stage here is held to).
     fn push_verification(&self, out: &mut String) {
         if self.checks.is_empty() {
             return;
@@ -484,28 +348,21 @@ impl TaskState {
 }
 
 /// A checkpoint used by `--demo`, so the plan bar is visible without a model.
-///
-/// Kept in this module rather than in the GUI: the bar reads `plan_line`, the demo data therefore
-/// has to be a real `TaskState`, and inventing one in a second place would be the first step toward
-/// the demo drifting away from what the model actually writes.
 impl TaskState {
     pub fn steps_demo() -> Self {
-        let mut st = TaskState::new("重构 Activity Stream 独立窗口");
+        let mut st = TaskState::new("Refactor the Activity Stream window");
         st.steps = vec![
-            Step { text: "读现有 timeline 渲染".into(), done: true },
-            Step { text: "把 Activity 改成 Arc<Mutex<>>".into(), done: true },
-            Step { text: "接上跨视口共享".into(), done: true },
-            Step { text: "跑 GUI 测试".into(), done: false },
-            Step { text: "构建 release 并验收".into(), done: false },
+            Step { text: "Read the existing timeline rendering".into(), done: true },
+            Step { text: "Turn Activity into Arc<Mutex<>>".into(), done: true },
+            Step { text: "Wire up sharing across viewports".into(), done: true },
+            Step { text: "Run the GUI tests".into(), done: false },
+            Step { text: "Build release and accept it".into(), done: false },
         ];
         st
     }
 }
 
 /// One line a human can read at a glance: `4/6 done · next: run the tests`.
-///
-/// `None` when the plan is empty — a checkpoint without steps has nothing to tick, and a bar that
-/// always says "0/0" is noise. Shared by the two front ends so the wording cannot drift apart.
 pub fn plan_line(st: &TaskState) -> Option<String> {
     if st.steps.is_empty() {
         return None;
@@ -520,10 +377,6 @@ pub fn plan_line(st: &TaskState) -> Option<String> {
 }
 
 /// The whole checkpoint as a human reads it (`/task` in the command line).
-///
-/// Deliberately not [`TaskState::context_block`]: that text ends with a warning addressed to the
-/// *model* ("re-read any file before you change it"), which reads as noise to the person who just
-/// wants to see the plan. The content is the same; the audience is not.
 pub fn report(st: &TaskState) -> String {
     let mut out = crate::tf!("[{}] {}", st.task_id, st.goal);
     if !st.steps.is_empty() {
@@ -568,11 +421,7 @@ pub(crate) fn clamp(s: &str, max: usize) -> String {
     out
 }
 
-/// One update submitted by the model: **only the fields present change**, everything else is kept.
-///
-/// Arrays **replace wholesale** rather than append: the model submits "this column as it stands now",
-/// so it can fix its own mistake, and repeated calls cannot grow without bound. This has to be stated
-/// in the tool description, or the model assumes it is appending.
+/// One update submitted by the model: only the fields present change, everything else is kept.
 #[derive(Debug, Default, Clone)]
 pub struct Patch {
     pub goal: Option<String>,
@@ -581,10 +430,6 @@ pub struct Patch {
     /// The plan (replaced wholesale like every other array).
     pub steps: Option<Vec<Step>>,
     /// Tick these steps (1-based) without resending the plan.
-    ///
-    /// This exists because of *how often* the update happens: ticking is the one change a model makes
-    /// over and over ("step 3 is done"), and making it resend the whole list is why plans ended up
-    /// being ticked once at the end instead of as the work went (2026-10-23). A tick costs a number.
     pub tick: Option<Vec<usize>>,
     /// Untick these steps (1-based) — for a step that turned out not to be finished.
     pub untick: Option<Vec<usize>>,
@@ -599,9 +444,7 @@ pub struct Patch {
     pub reset: bool,
 }
 
-/// The keys allowed in the tool arguments. A **whitelist**, because with lenient "ignore unknown
-/// fields" parsing a typo (`next_step`) fails silently — the model believes it recorded the next step,
-/// nothing was recorded, and it only shows up at restore time.
+/// The keys allowed in the tool arguments.
 const FIELDS: [&str; 13] = [
     "goal",
     "constraints",
@@ -625,9 +468,7 @@ impl Patch {
         let Some(obj) = v.as_object() else {
             return Err(crate::i18n::t("task_state expects an object of fields").to_string());
         };
-        // ⚠️ `tf!` only understands positional `{}` (see `src/i18n.rs`), so the field list is
-        // formatted once here instead of interpolated inline — a `{:?}` in the template would be
-        // left as literal text and silently shift every later argument.
+        // ️ `tf!` only understands positional `{}` (see `src/i18n.rs`), so the field list is formatted once here instead...
         let valid = FIELDS.join(", ");
         for k in obj.keys() {
             if !FIELDS.contains(&k.as_str()) {
@@ -671,9 +512,7 @@ impl Patch {
             }
             Ok(Some(out))
         };
-        // Steps are the one list whose items are objects. A bare string is accepted as "an
-        // unfinished step": the model writes `["read the file", "patch it"]` often enough that
-        // rejecting it would cost a whole round trip for a shape, not a mistake in content.
+        // Steps are the one list whose items are objects.
         let steps = match obj.get("steps") {
             None => None,
             Some(Value::Array(arr)) => {
@@ -706,9 +545,7 @@ impl Patch {
                 ))
             }
         };
-        // `tick` / `untick` take a number or an array of them. Numbers are **1-based**, the same
-        // numbering `verify` uses for acceptance criteria — one convention for "which item" across
-        // the checkpoint, so a model that learned it once does not have to relearn it.
+        // `tick` / `untick` take a number or an array of them.
         let numbers = |k: &str| -> Result<Option<Vec<usize>>, String> {
             let Some(v) = obj.get(k) else { return Ok(None) };
             let items: Vec<&Value> = match v {
@@ -785,10 +622,6 @@ impl Patch {
 }
 
 /// Set the `done` flag of the given 1-based step numbers.
-///
-/// Rejections are **total** (the same rule as the rest of this module): a bad number fails the whole
-/// update and nothing is written, rather than leaving a plan that was half-ticked by a call the model
-/// believed had failed.
 fn flip_steps(steps: &mut [Step], numbers: &[usize], done: bool) -> Result<(), String> {
     if steps.is_empty() {
         return Err(crate::i18n::t(
@@ -811,9 +644,6 @@ fn flip_steps(steps: &mut [Step], numbers: &[usize], done: bool) -> Result<(), S
 }
 
 /// Merge one update into the current state, returning the merged state.
-///
-/// When `current` is `None` (no checkpoint yet) the update must carry `goal` — a state without a
-/// goal cannot be restored, and storing one only confuses the next restore.
 pub fn apply(current: Option<TaskState>, patch: &Patch) -> Result<TaskState, String> {
     if patch.is_empty() && !patch.reset {
         return Err(crate::i18n::t(
@@ -844,9 +674,7 @@ pub fn apply(current: Option<TaskState>, patch: &Patch) -> Result<TaskState, Str
         st.constraints = v.clone();
     }
     if let Some(v) = &patch.acceptance {
-        // Checks are bound to acceptance **indices**, so replacing the list re-points every index.
-        // Keeping the old evidence would attach it to criteria it never proved — strictly worse than
-        // losing it, because the gate would then pass on a coincidence.
+        // Checks are bound to acceptance indices, so replacing the list re-points every index.
         st.checks.clear();
         st.acceptance = v.clone();
     }
@@ -877,9 +705,7 @@ pub fn apply(current: Option<TaskState>, patch: &Patch) -> Result<TaskState, Str
         st.next_steps = v.clone();
     }
     st.version = VERSION;
-    // `done` is a **request**, not an assignment: the gate looks at evidence the host collected, and
-    // refuses with a list of what is missing. Reopening needs no evidence — that direction is always
-    // safe, and it is how the model corrects an over-eager `done`.
+    // `done` is a request, not an assignment: the gate looks at evidence the host collected, and refuses with a list...
     match patch.status {
         Some(Status::Done) => match st.gate() {
             Ok(()) => st.status = Status::Done,
@@ -1058,7 +884,7 @@ mod tests {
         assert!(b.contains("re-read") || b.contains("re-run"), "must tell the model to re-check: {b}");
     }
 
-    // ───────── Evidence and the `done` gate ─────────
+    // Evidence and the `done` gate
 
     fn check(n: usize, ok: bool, epoch: u64) -> Check {
         Check {
@@ -1230,7 +1056,7 @@ mod tests {
         assert!(!row.contains("\"steps\""), "no plan ⇒ no key at all: {}", row);
     }
 
-    /// A human-facing one-liner, shared by the two front ends.
+    /// A human-facing one-liner, shared by the two front ends
     #[test]
     fn the_plan_line_reads_as_progress_and_names_the_next_step() {
         let st = apply(
@@ -1266,7 +1092,7 @@ mod tests {
         let before = st.clone();
         let e = apply(Some(st), &patch(json!({"tick": 5}))).unwrap_err();
         assert!(e.contains("1..=2"), "the message must say what the valid range is: {}", e);
-        // Total rejection: the state is untouched.
+        // Total rejection: the state is untouched
         assert_eq!(before.pending_steps(), 2);
 
         // 0 is not a step number: refused at parse time, before anything is merged.

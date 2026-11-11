@@ -1,9 +1,5 @@
 //! Build script: writes the icon and version information into the Windows exe resources.
-//!
-//! It calls the Windows SDK's rc.exe to produce a .res and hands it to the linker, rather than
-//! using winresource — the latter locates the SDK via reg.exe, and this machine's security policy
-//! forbids reg.exe. Any step failing only produces a warning and never blocks the build (a missing
-//! icon does not affect functionality).
+//! It calls the Windows SDK's rc.exe to produce a.res and hands it to the linker, rather than using winresource —...
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,16 +25,6 @@ fn main() {
     }
 
     // Distribution safety gate: on Windows the CRT must be statically linked.
-    //
-    // A dynamic CRT puts VCRUNTIME140.dll into the exe's import table, and that DLL is **not** a
-    // Windows built-in component (it comes from the VC++ 2015-2022 Redistributable), so on a clean
-    // install the program dies at startup with "VCRUNTIME140.dll not found" — the kind of problem
-    // that can never be reproduced locally, so it has to be caught at build time.
-    //
-    // The signal used is CARGO_CFG_TARGET_FEATURE (cargo's target-feature list for the build
-    // script; measured: it contains crt-static when the flag is set and not when it isn't), which
-    // tracks the target artifact more closely than the build script's own cfg!. Take the OR of the
-    // two, to avoid a miss caused by cargo version differences.
     if !target_features().iter().any(|f| f == "crt-static") {
         println!(
             "cargo:warning=AOX was built without a static CRT: the artifact will depend on \
@@ -124,10 +110,6 @@ END
 }
 
 /// The target platform's currently enabled rustc features.
-///
-/// It prefers CARGO_CFG_TARGET_FEATURE (the target features cargo provides to the build script,
-/// comma separated); when that variable is missing it falls back to the build script's own
-/// `cfg!(target_feature=...)`.
 fn target_features() -> Vec<String> {
     if let Ok(v) = std::env::var("CARGO_CFG_TARGET_FEATURE") {
         return v.split(',').map(|s| s.trim().to_string()).collect();
@@ -159,30 +141,10 @@ fn find_rc() -> Option<PathBuf> {
     found.pop().map(|v| v.join("x64").join("rc.exe"))
 }
 
-/// **The source language** — the literals in the code *are* this variant's final wording, so it
-/// **needs no catalogue**. It must match `SOURCE` in `src/i18n.rs` (i18n.rs's
-/// `catalog_presence_matches_source` test will catch the two drifting apart).
+/// The source language — the literals in the code *are* this variant's final wording, so it needs no catalogue.
 const SOURCE_CODE: &str = "en";
 
 /// Generate the language registry (which `src/i18n.rs` `include!`s).
-///
-/// **One distribution speaks one language** — this is where "one language, one distribution" lands:
-/// the language is fixed at **compile time** and there is no in-app switch. Installing the English
-/// build gives you English throughout; installing the Chinese build gives you Chinese throughout,
-/// system prompt and tool descriptions switching along with everything else.
-///
-/// - `AOX_LANG` (language code, **defaults to `en`**): which language this binary speaks.
-///   For a non-source language only that one catalogue is `include_str!`ed — the other languages'
-///   strings **never enter the binary**; for the source language not even a catalogue is embedded
-///   (the literals are the wording).
-///
-/// The language code maps one-to-one onto `locales/<code>.toml`; a missing file fails the build
-/// outright — "a language was named but no catalogue was shipped" is the kind of trap that compiles
-/// fine and only shows up as an all-source-language screen at runtime, so it is better to blow up
-/// here.
-///
-/// Adding a language = ① `locales/<code>.toml`; ② add a `Lang` variant and detection arm in
-/// `src/i18n.rs`; ③ build with `AOX_LANG=<code>`.
 fn emit_lang(manifest_dir: &Path, out_dir: &Path) {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=locales");

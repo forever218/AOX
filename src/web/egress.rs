@@ -1,22 +1,6 @@
-//! Where one request may go (`[web] egress`).
-//!
-//! # What this is
-//!
-//! A **guard rail**, not a boundary. The shell tool already reaches every host this machine can
-//! reach, so pretending `web_fetch` is a network fence would be the worst kind of option: one that
-//! reads as protection. What it actually does is keep the *new, prompt-free* path from being wider
-//! than the *old, prompt-gated* one — a model that has to ask before `shell` must not be able to
-//! GET `http://127.0.0.1:<port>/admin` silently instead.
-//!
-//! # The classification
-//!
-//! `public` refuses loopback, RFC1918, link-local, CGNAT, multicast, documentation and unspecified
-//! ranges. `hosts` is checked first and applies in every policy, so it is both the
-//! exception list for `public` and the whole list for `allowlist`.
-//!
-//! ⚠️ The check resolves the name and then lets the client resolve it again. A name whose DNS
-//! answer changes between the two (rebinding) is out of scope for M1; closing it means pinning the
-//! address into a per-host client, which gives up connection pooling. See `docs/WEB.md` §9.
+//! Where one request may go (`web egress`).
+//! # What this is.
+//! A guard rail, not a boundary.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -54,11 +38,7 @@ impl Policy {
     }
 }
 
-/// Is `host` covered by one entry of `[web] hosts`?
-///
-/// Matching is on **label boundaries**: `example.com` covers the domain itself and its subdomains,
-/// `*.example.com` covers subdomains only, `127.0.0.1` covers that literal address. Ports are not
-/// part of the match, and the comparison is case-insensitive with a trailing dot ignored.
+/// Is `host` covered by one entry of `web hosts`?
 pub fn host_listed(host: &str, list: &[String]) -> bool {
     let host = normalise(host);
     if host.is_empty() {
@@ -97,7 +77,7 @@ pub fn addr_blocked(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4_blocked(v4),
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            // `::ffff:127.0.0.1` is loopback however it is spelled.
+            // `::ffff:127.0.0.1` is loopback however it is spelled
             Some(v4) => v4_blocked(v4),
             None => v6_blocked(v6),
         },
@@ -114,10 +94,7 @@ fn v4_blocked(ip: Ipv4Addr) -> bool {
         || (a == 172 && (16..=31).contains(&b)) // RFC1918
         || (a == 192 && b == 0 && (c == 0 || c == 2)) // IETF assignments, TEST-NET-1
         || (a == 192 && b == 168) // RFC1918
-        // 198.18.0.0/15 is "benchmarking" on paper, but transparent proxies and VPN clients map
-        // every domain into it (a fake-IP DNS answer). Blocking it would break ordinary browsing in
-        // exactly the environments that use this tool — measured on this machine, where
-        // doc.rust-lang.org resolved to 198.18.0.17 — so it is deliberately allowed.
+        // 198.18.0.0/15 is "benchmarking" on paper, but transparent proxies and VPN clients map every domain into it (a...
         || (a == 198 && b == 51 && c == 100) // TEST-NET-2
         || (a == 203 && b == 0 && c == 113) // TEST-NET-3
         || a >= 224 // multicast (224/4), reserved (240/4), broadcast
@@ -135,13 +112,7 @@ fn v6_blocked(ip: Ipv6Addr) -> bool {
         || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64
 }
 
-/// Is this URL's host **literally** a loopback/private address (or `localhost`)?
-///
-/// Used to bypass an ambient `HTTP_PROXY` for local requests: AOX's own sandbox sets one, and a
-/// proxied request to `127.0.0.1` is sent to the *proxy's* loopback, not this machine's. Same rule
-/// (and the same symptom) as `llm::endpoint_client`. Only literals are recognised — a name that
-/// resolves to a private address still goes through the proxy, because deciding that would mean a
-/// second DNS lookup per request.
+/// Is this URL's host literally a loopback/private address (or `localhost`)?
 pub fn is_local_literal(url: &Url) -> bool {
     match url.host() {
         Some(Host::Ipv4(ip)) => v4_blocked(ip),
@@ -154,7 +125,7 @@ pub fn is_local_literal(url: &Url) -> bool {
     }
 }
 
-/// Does `[web] egress` allow this URL? `Ok(())` = go ahead.
+/// Does `[web] egress` allow this URL? `Ok(())` = go ahead
 pub async fn check(url: &Url, policy: Policy, hosts: &[String]) -> Result<(), WebError> {
     let Some(host) = url.host() else {
         return Err(WebError::new("the URL has no host").hint("pass an absolute http(s) URL"));

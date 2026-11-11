@@ -1,6 +1,5 @@
-//! Self-test: depends on no LLM and directly verifies the whole chain
-//! "create plugin → register → call → uninstall".
-//! How to run: aox selftest
+//! Self-test: depends on no LLM and directly verifies the whole chain.
+//! How to run: aox selftest.
 
 use std::path::PathBuf;
 
@@ -26,11 +25,7 @@ serve("selftest", {
 })
 "#;
 
-/// The plugin for fence verification: its only job is to **try to spawn a child process**.
-///
-/// Judgment uses "did the child process really run (did it print child-ok)" rather than
-/// "did it throw" — assert on content, not on the shape of the error (error codes and
-/// wording change with system versions).
+/// The plugin for fence verification: its only job is to try to spawn a child process.
 const SPAWN_SOURCE: &str = r#"
 import sys, os, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sdk"))
@@ -50,11 +45,7 @@ serve("selftest_spawn", {
 })
 "#;
 
-/// Read-only declaration self-test plugin: the two tools **deliberately differ only in the 4th position (the `access` argument)**.
-///
-/// The point of testing with a pair of tools that "differ by a single field" is that this
-/// change is *entirely* about that one position — if only one side is declared, the SDK could
-/// still send `access` wrong (e.g. as a constant) and the test would pass anyway.
+/// Read-only declaration self-test plugin: the two tools deliberately differ only in the 4th position (the...
 const READ_DECL_SOURCE: &str = r#"
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sdk"))
@@ -99,9 +90,7 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
     if !out.content.contains("中文标记OK") {
         bail!(crate::tf!("non-ASCII content did not round-trip correctly; the encoding pipeline is still broken: {}", out.content));
     }
-    // Regression 2: the plugin process's working directory must be the app root, not
-    //             the plugin's own directory (cwd=plugin dir used to scramble relative
-    //             paths inside plugins)
+    // Regression 2: the plugin process's working directory must be the app root, not the plugin's own directory...
     if out.content.contains(&format!("plugins{}selftest", std::path::MAIN_SEPARATOR)) {
         bail!(crate::tf!("the plugin's working directory is still the plugin's own directory, not the app root: {}", out.content));
     }
@@ -141,11 +130,7 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
         bail!(crate::i18n::t("ghost plugin directory was not cleaned up"));
     }
 
-    // Regression 5: in thinking mode (DeepSeek thinking), messages must pass
-    //             reasoning_content back verbatim. Previously Message dropped the field,
-    //             and replaying a historical message with tool_calls got rejected by the
-    //             API with 400 "reasoning_content must be passed back", showing up as "a
-    //             multi-step task silently dying halfway".
+    // Regression 5: in thinking mode (DeepSeek thinking), messages must pass reasoning_content back verbatim.
     println!("{}", crate::i18n::t("[selftest] regression: thinking-mode reasoning_content round-trip…"));
     let raw = json!({
         "role": "assistant",
@@ -175,10 +160,7 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
         bail!(crate::tf!("plain messages must not serialize reasoning_content: {}", plain));
     }
 
-    // Regression 6: SSE streaming parsing. The reasoning process must be pushed to the
-    //             sink in real time (otherwise no progress is visible while waiting), and
-    //             a tool call's fragmented arguments must reassemble into complete JSON
-    //             (in streaming, arguments get split across several chunks).
+    // Regression 6: SSE streaming parsing.
     println!("{}", crate::i18n::t("[selftest] regression: SSE stream parsing (reasoning + tool-call deltas)…"));
     {
         use crate::llm::openai::StreamAcc;
@@ -286,11 +268,7 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
             bail!(crate::tf!("usage not captured completely: {}", format!("{u:?}")));
         }
 
-        // Regression 6b: the same fragments must reach the sink **live**, with the call's index on
-        //            every one of them and its name only on the first. That is what lets a front end
-        //            open the call's row while the model is still writing it — without it, a long
-        //            `write_file` is a silent stretch and the row only shows up once the call is
-        //            already over (the reason the live line counter can exist at all).
+        // Regression 6b: the same fragments must reach the sink live, with the call's index on every one of them...
         let tools = cap.tools.lock().unwrap().clone();
         if tools.len() != 4 {
             bail!(crate::tf!("tool-call fragments were not pushed to the sink live: {}", format!("{tools:?}")));
@@ -310,25 +288,14 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
         }
     }
 
-    // Regression 7: the process fence (Job Object). A **three-way cross-check** —
-    //        A default quota: the plugin must work as usual and be able to spawn a child
-    //          ("the fence must not block the plugin from working");
-    //        B quota locked to 0: the fence must block it (the fork-bomb protection is
-    //          still there);
-    //        C fence fully disabled: it can spawn again (the control group — if C also
-    //          fails, then B's "blocked" isn't the fence's doing at all, but some other
-    //          problem with python on this machine).
-    //        Only when all three pass do the two conclusions above hold.
+    // Regression 7: the process fence (Job Object).
     println!("{}", crate::i18n::t("[selftest] regression: process fence (Job Object)…"));
     {
         let t = plugin::create_plugin(&rt, "selftest_spawn", "python", crate::i18n::t("fence verification"), SPAWN_SOURCE).await?;
         if !t.contains(&"selftest_spawn_child".to_string()) {
             bail!(crate::i18n::t("the fence-verification plugin registered no tools"));
         }
-        // A: the default quota. This pins "the default config does not stop plugins from
-        // working" — the default used to be 1 (and that 1 was the total process count
-        // **including the plugin itself**), so any plugin relying on `subprocess` got
-        // `WinError 1816 insufficient quota`, which effectively disabled the plugin.
+        // A: the default quota. This pins "the default config does not stop plugins from working" — the default used...
         let ok = rt.execute("selftest_spawn_child", json!({})).await;
         println!("{}", crate::tf!("[selftest]   default quota: {}", ok.content));
         if ok.is_error {
@@ -345,7 +312,7 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
     }
 
     {
-        // B: lock the subprocess quota to 0 ⇒ it must be blocked.
+        // B: lock the subprocess quota to 0 ⇒ it must be blocked
         let mut cfg = Config::dummy();
         cfg.sandbox.max_processes = 0;
         let rt0 = Runtime::new(cfg, rt.root.clone(), rt.plugins_dir.clone())?;
@@ -362,7 +329,7 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
     }
 
     {
-        // C: control group (fence fully disabled).
+        // C: control group (fence fully disabled)
         let mut cfg = Config::dummy();
         cfg.sandbox.enabled = false;
         let rt2 = Runtime::new(cfg, rt.root.clone(), rt.plugins_dir.clone())?;
@@ -378,26 +345,19 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
         plugin::remove_plugin(&rt2, "selftest_spawn").await?;
     }
 
-    // Regression 8: workspace boundary (sandbox approach ③). Likewise an **A/B cross-check** — the restricted tier must block the out-of-bounds write,
-    //         **and the file must genuinely not have been created**; under the `full` tier the same call must succeed.
-    //         Testing only one side, "it got blocked" might just mean the path itself was broken (missing parent dir, etc.),
-    //         which would make this test lie to itself — the same reasoning as Regression 7.
-    //         New semantics (2026-10-04): **reads unrestricted, writes/deletes restricted** — the "relative path rejected" case
-    //         has moved to **writes**, plus a cross-check of "reads outside allowed / deletes outside blocked".
+    // Regression 8: workspace boundary (sandbox approach ).
     println!("{}", crate::i18n::t("[selftest] regression: workspace boundary (file capability returned to the host)…"));
     {
         let ws_root = std::env::temp_dir().join("aox-selftest-ws");
         let outside = std::env::temp_dir().join("aox-selftest-outside.txt");
-        // The "reads unrestricted" case needs to read a **genuinely existing**
-        // out-of-bounds file: reading a non-existent path fails too, and that failure
-        // can't be attributed to the boundary.
+        // The "reads unrestricted" case needs to read a genuinely existing out-of-bounds file: reading a non-existent...
         let outside_read = std::env::temp_dir().join("aox-selftest-outside-read.txt");
         let _ = std::fs::remove_dir_all(&ws_root);
         let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_file(&outside_read);
         std::fs::create_dir_all(ws_root.join("inside"))?;
 
-        // ── A: fixed workplace ⇒ only inside is allowed ──
+        // A: fixed workplace ⇒ only inside is allowed
         let mut cfg = Config::dummy();
         cfg.workplace = crate::config::WorkplaceConfig {
             mode: "fixed".into(),
@@ -438,19 +398,14 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
                 bail!(crate::tf!("the out-of-bounds message is missing the \"{}\" section (the model would keep retrying): {}", needle, bad.content));
             }
         }
-        // A relative path must be refused (**true only for write/delete**): the host and
-        // the plugin subprocess have different cwds, so the same relative path points at
-        // two different files — a risk that only "writing" carries.
+        // A relative path must be refused (true only for write/delete): the host and the plugin subprocess have different...
         let rel = rt_ws
             .execute("write_file", json!({"path": "config.toml", "content": "x"}))
             .await;
         if !rel.is_error {
             bail!(crate::i18n::t("a **write** with a relative path was not rejected under the restricted tier"));
         }
-        // New semantics (2026-10-04): **reads unrestricted, writes/deletes restricted**.
-        // Cross-check both together — testing only one side means "read passed" could just
-        // be because reading never went through the check at all (an implementation leak,
-        // not correct semantics).
+        // New semantics: reads unrestricted, writes/deletes restricted.
         std::fs::write(&outside_read, "区外的内容")?;
         let rd = rt_ws.execute("read_file", json!({"path": outside_read.to_string_lossy()})).await;
         if rd.is_error || !rd.content.contains("区外的内容") {
@@ -493,15 +448,7 @@ pub async fn run(root: PathBuf, plugins_dir: PathBuf) -> Result<()> {
         let _ = std::fs::remove_file(&outside);
     }
 
-    // The plugin-declared **workplace intent** (the 4th position in a tool declaration)
-    // travels all the way from the SDK to the registry.
-    //
-    // This section fills in the **middle hop** that can't be tested elsewhere: the parse
-    // rules (`plugin::parse_access`'s unit test) and how the boundary uses it (`agent`'s
-    // unit test) are each covered, but "did the access a plugin wrote in initialize
-    // actually become the intent on the registry" can only be verified here — it spans
-    // four layers: the Python SDK, protocol parsing, ToolDef and PluginTool, and a gap in
-    // any one of them silently falls back to "writes to disk".
+    // The plugin-declared workplace intent (the 4th position in a tool declaration) travels all the way from the SDK...
     println!("{}", crate::i18n::t("[selftest] regression: plugin-declared read intent…"));
     {
         let tools =

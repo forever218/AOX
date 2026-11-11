@@ -1,40 +1,6 @@
 //! Plugin runtime "resolution" and "installation".
-//!
-//! ## 1. Interpreter resolution (three tiers, shared by CLI / GUI / selftest)
-//!
-//! 1. `config.toml`'s `[runtimes]` has an **explicit path** → use it directly, no guessing;
-//! 2. The field is a **bare command** (`python` / `node` / `rustc`) and that command **resolves on
-//!    `PATH`** → use the system interpreter. This tier exists because a complete install (pip, venv,
-//!    headers, full stdlib) is a better tool than the embeddable runtime this project can ship;
-//!    Windows' "app execution alias" (0 bytes, reparse point, opens the Store) does not count — see
-//!    [`usable`];
-//! 3. Still a bare command, and a built-in runtime exists under `<app_root>/runtime/<lang>/<exe>` →
-//!    use the built-in one.
-//! 4. Neither → keep the bare command and let the spawn fail with the OS's own words.
-//!
-//! `[runtimes] prefer = "builtin"` swaps tiers 2 and 3 for machines whose `PATH` interpreter is broken
-//! in a way no file check can see. An explicit path always wins over both.
-//!
-//! Tier 3 is what makes "drop a runtime into the app directory and it works" true, with no config change
-//! and with **nothing written into the system `PATH`** or the user's environment (non-invasive, gone on
-//! uninstall). Both [`resolve`] and [`status`] go through [`pick`], so what the settings page reports and
-//! what actually gets spawned cannot drift apart.
-//!
-//! ## 2. Installation
-//!
-//! Only Python is installed automatically (a Node single file is over 80 MB, unfit for
-//! bundling; rust plugins need nothing at runtime anyway).
-//! Order: already exists → local offline pack → download (the offline pack and non-default
-//! sources need no network).
-//!
-//! **Deliberately introduces no new crate**:
-//! - Downloading reuses `reqwest`, already in the dependency tree (`chunk()` needs no extra feature);
-//! - Extraction uses the system's own `tar.exe` (bsdtar, Win10 1803+), falling back to PowerShell
-//!   `Expand-Archive`;
-//! - Verification uses the system's own `certutil -hashfile ... SHA256`.
-//!
-//! All three paths are "capabilities the system already has", so the installation chain adds no
-//! size or dependency to the host.
+//! ## 1. Interpreter resolution (three tiers, shared by CLI / GUI / selftest).
+//! 2. The field is a bare command (`python` / `node` / `rustc`) and that command resolves on.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -47,17 +13,13 @@ use crate::config::RuntimesConfig;
 use crate::plugin::ProcessFlags;
 
 /// The agreed filename of the offline runtime pack.
-/// Placing it in the **exe's directory** / the app root / `<app_root>/runtime` /
-/// `%LOCALAPPDATA%\AOX` gets it discovered automatically — a fully offline installation path.
 pub const PACK_NAME: &str = "aox-python-runtime.zip";
 
 /// The default download source: CPython's official "embeddable distribution" (about 10 MB, ~21 MB extracted).
 pub const DEFAULT_PYTHON_URL: &str =
     "https://www.python.org/ftp/python/3.13.7/python-3.13.7-embed-amd64.zip";
 
-/// The official SHA-256 that goes with [`DEFAULT_PYTHON_URL`].
-/// Applies only to the default source; if you use a custom `python_url` and still want
-/// verification, fill in `python_sha256` yourself under `[runtimes]`.
+/// The official SHA-256 that goes with DEFAULT_PYTHON_URL. Applies only to the default source; if you use a custom...
 pub const DEFAULT_PYTHON_SHA256: &str =
     "f6cca216a359be84797cabb54149ce5e062afb16cc7567eb7fc51cacb2d86b65";
 
@@ -66,7 +28,7 @@ pub const NODE_MANUAL_HINT: &str =
     "The Node runtime is over 80 MB as a single file, so it is not suitable for auto-install. Install Node.js \
      yourself and make sure `node` is on PATH, or write its full path under [runtimes] node in config.toml.";
 
-// ─────────────────────────── Languages ───────────────────────────
+// Languages
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
@@ -100,7 +62,7 @@ impl Lang {
     }
 }
 
-// ─────────────────────────── Status ───────────────────────────
+// Status
 
 /// An interpreter's origin, used by the `/runtime` report and the system prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,19 +114,15 @@ pub fn one_line(st: &Status) -> String {
     )
 }
 
-// ─────────────────────────── Resolution ───────────────────────────
+// Resolution
 
-/// A "bare command" = containing no path component, hence safe to be replaced by the built-in
-/// runtime.
-///
-/// Values containing `/`, `\` or `:` (a drive letter) are all treated as paths the user
-/// explicitly specified and are never overwritten.
+/// A "bare command" = containing no path component, hence safe to be replaced by the built-in runtime.
 fn is_bare(cmd: &str) -> bool {
     let t = cmd.trim();
     !t.is_empty() && !t.contains(['/', '\\', ':'])
 }
 
-/// The built-in runtime directory: `<app_root>/runtime/<lang>`.
+/// The built-in runtime directory: `<app_root>/runtime/<lang>`
 pub fn builtin_dir(root: &Path, lang: Lang) -> PathBuf {
     root.join("runtime").join(lang.key())
 }
@@ -195,18 +153,6 @@ fn find_in_path(cmd: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
 }
 
 /// Can this `PATH` candidate actually be run?
-///
-/// The case that matters on Windows is the **app execution alias**:
-/// `%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe` exists on any machine with the Store app
-/// installed, is **0 bytes**, and opens the Microsoft Store instead of starting Python. Preferring
-/// `PATH` without this check would trade "always the bundled runtime" for "sometimes a Store window".
-///
-/// ⚠️ **Links are followed, not rejected.** The first version refused anything with
-/// `FILE_ATTRIBUTE_REPARSE_POINT`, which is wrong: on this very machine `~\.cargo\bin\rustc.exe` is a
-/// 10-byte **symbolic link** to the rustup shim, and a symlinked interpreter is normal (rustup, scoop and
-/// chocolatey all do it). The decisive question is whether the *target* has data, so `metadata` — which
-/// follows links — is used, and only a zero-byte or unreadable result is refused. `stat` only: [`resolve`]
-/// runs on the startup path and must not start a process to answer this.
 fn usable(cand: &Path) -> bool {
     // Normalise first: a `PATH` entry may perfectly well be written with forward slashes, and the
     // comparison must not depend on which separator this particular string happens to use.
@@ -234,10 +180,6 @@ fn cfg_set(cfg: &mut RuntimesConfig, lang: Lang, v: String) {
 }
 
 /// One resolution decision, for one language.
-///
-/// `resolve` and `status` **share this** on purpose. They used to carry the same order written out
-/// twice — and both had it as "bundled first", which is how a settings page ends up faithfully
-/// reporting a policy nobody wanted. Two readers, one function.
 #[derive(Debug, Clone)]
 struct Pick {
     /// The value to actually use: the raw bare command when `PATH` provides it, the bundled
@@ -247,10 +189,6 @@ struct Pick {
 }
 
 /// Decide where a language's interpreter comes from.
-///
-/// Order: **explicit path** → `PATH` (only a usable candidate) → **bundled** → unchanged (missing).
-/// `prefer = "builtin"` drops the `PATH` step, for machines whose system interpreter is broken in a way
-/// that cannot be seen by looking at the file.
 fn pick(root: &Path, lang: Lang, raw: &str, prefer_system: bool, path: &std::ffi::OsStr) -> Pick {
     let raw = raw.trim();
     if !is_bare(raw) {
@@ -278,9 +216,6 @@ fn prefers_system(cfg: &RuntimesConfig) -> bool {
 }
 
 /// Rewrite `cfg` in place so that a bare command becomes whatever will actually be executed.
-///
-/// Only a **bundled** pick rewrites the value: a `PATH` hit already works as the bare command it is, and
-/// an explicit path must never be touched (see [`pick`]).
 pub fn resolve(cfg: &mut RuntimesConfig, root: &Path) {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let prefer_system = prefers_system(cfg);
@@ -293,13 +228,7 @@ pub fn resolve(cfg: &mut RuntimesConfig, root: &Path) {
     }
 }
 
-/// Static judgment only, **starting no subprocess** — this path is walked on every startup and
-/// must not be slowed down for it.
-///
-/// Note: `cfg` must be the **raw** config (not passed through [`resolve`]).
-/// Only the raw value lets us tell whether the "origin" is `config.toml` or `built-in under the
-/// app directory`; passing the resolved snapshot would mislabel every built-in runtime as the
-/// former.
+/// Static judgment only, starting no subprocess — this path is walked on every startup and must not be slowed down...
 pub fn status(root: &Path, cfg: &RuntimesConfig) -> Vec<Status> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let prefer_system = prefers_system(cfg);
@@ -324,9 +253,9 @@ pub fn probe_version(command: &str) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
-// ─────────────────────────── User-facing wording ───────────────────────────
+// User-facing wording
 
-/// The `/runtime` report text.
+/// The `/runtime` report text
 pub fn status_report(root: &Path, cfg: &RuntimesConfig) -> String {
     let mut s = String::from(crate::i18n::t("Plugin runtimes:\n"));
     for st in status(root, cfg) {
@@ -396,19 +325,14 @@ pub fn prompt_section(root: &Path, cfg: &RuntimesConfig) -> String {
     s
 }
 
-// ─────────────────────────── Offline pack discovery ───────────────────────────
+// Offline pack discovery
 
 /// The directory holding the current process's exe.
-///
-/// `crate::paths::exe_dir()` is not reused here: `src/paths.rs` hangs off lib only (the CLI's bin
-/// root doesn't declare it), whereas this module is compiled by both bin and lib — keeping zero
-/// module coupling is what keeps the behaviour consistent.
 fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
-/// Offline pack candidate locations, by priority: exe directory → app root → app root/runtime →
-/// %LOCALAPPDATA%\AOX.
+/// %LOCALAPPDATA%\AOX
 pub fn find_offline_pack(root: &Path) -> Option<PathBuf> {
     let mut v = Vec::new();
     if let Some(d) = exe_dir() {
@@ -422,7 +346,7 @@ pub fn find_offline_pack(root: &Path) -> Option<PathBuf> {
     v.into_iter().find(|p| p.is_file())
 }
 
-// ─────────────────────────── System-capability wrappers ───────────────────────────
+// System-capability wrappers
 
 /// Dependency-free SHA-256: calls the system's own `certutil`.
 /// The only place in the installation chain that needs a hash, so it isn't worth pulling in `sha2`.
@@ -496,7 +420,7 @@ fn flatten_single_dir(dest: &Path) -> Result<()> {
     Ok(())
 }
 
-// ─────────────────────────── Download ───────────────────────────
+// Download
 
 async fn download(url: &str, dest: &Path, progress: &mut dyn FnMut(&str)) -> Result<()> {
     let client = reqwest::Client::builder()
@@ -515,9 +439,7 @@ async fn download(url: &str, dest: &Path, progress: &mut dyn FnMut(&str)) -> Res
         std::fs::File::create(dest).with_context(|| crate::tf!("cannot create {}", dest.display()))?;
     let mut got: u64 = 0;
     let mut last_bucket = u64::MAX;
-    // Write to disk chunk by chunk: `chunk()` needs no extra feature, and a synchronous File is
-    // fine because installation happens only once and what blocks is the agent thread, not the UI
-    // thread.
+    // Write to disk chunk by chunk: `chunk()` needs no extra feature, and a synchronous File is fine because...
     while let Some(chunk) = resp.chunk().await? {
         file.write_all(&chunk)?;
         got += chunk.len() as u64;
@@ -543,9 +465,9 @@ async fn download(url: &str, dest: &Path, progress: &mut dyn FnMut(&str)) -> Res
     Ok(())
 }
 
-// ─────────────────────────── Installation ───────────────────────────
+// Installation
 
-/// Verify (optional) → extract → flatten → existence check.
+/// Verify (optional) → extract → flatten → existence check
 fn unpack(zip: &Path, staging: &Path, expect_sha: Option<&str>, downloaded: bool, progress: &mut dyn FnMut(&str)) -> Result<()> {
     if let Some(expect) = expect_sha {
         let expect = expect.trim();
@@ -578,10 +500,6 @@ fn unpack(zip: &Path, staging: &Path, expect_sha: Option<&str>, downloaded: bool
 }
 
 /// Install the Python runtime to `<app_root>/runtime/python` and return that directory.
-///
-/// Order: already exists → local offline pack → download. `progress` receives line-by-line
-/// progress text meant for humans (the CLI prints it; the GUI discards it or routes it to the
-/// activity stream).
 pub async fn install_python(
     root: &Path,
     cfg: &RuntimesConfig,
@@ -599,12 +517,12 @@ pub async fn install_python(
     }
 
     match find_offline_pack(root) {
-        // ---- 1) Local offline pack: never touches the network
+        // 1) Local offline pack: never touches the network
         Some(pack) => {
             progress(&crate::tf!("offline runtime pack found: {}", pack.display()));
             unpack(&pack, &staging, cfg.python_sha256.as_deref(), false, progress)?;
         }
-        // ---- 2) Download
+        // 2) Download
         None => {
             let url = cfg
                 .python_url
@@ -653,12 +571,10 @@ pub async fn install_python(
     Ok(dest)
 }
 
-// ─────────────────────────── The `/runtime` command ───────────────────────────
+// The `/runtime` command
 
 /// The `/runtime` subcommands.
-///
-/// Parsing and execution both live here; the CLI and GUI only decide "where the result gets
-/// written" — both share one set of logic and wording, so the behaviour can't fork.
+/// Parsing and execution both live here; the CLI and GUI only decide "where the result gets written" — both share...
 pub enum Cmd {
     Status,
     Dir,
@@ -688,9 +604,7 @@ pub fn is_cmd(line: &str) -> bool {
     line == "/runtime" || line.starts_with("/runtime ")
 }
 
-/// Install a runtime and, on success, **make it take effect immediately** (`refresh_runtimes`,
-/// with no process restart).
-/// Returns a summary text meant for humans; `progress` receives line-by-line installation progress.
+/// Install a runtime and, on success, make it take effect immediately (`refresh_runtimes`, with no process...
 pub async fn install(
     rt: &std::sync::Arc<crate::runtime::Runtime>,
     lang: Lang,

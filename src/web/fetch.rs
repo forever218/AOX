@@ -1,18 +1,6 @@
 //! One request, from URL to bytes.
-//!
-//! # What is done by hand, and why
-//!
-//! `reqwest`'s own redirect policy cannot do three things this tool needs: re-check `[web] egress` on
-//! **every** hop, drop custom headers when the host changes, and report the chain to the model. So the
-//! client is built with `Policy::none()` and the loop below follows `Location` itself — thirty lines
-//! that buy all three.
-//!
-//! # Limits, and where they are counted
-//!
-//! The body cap is counted **after decompression** (`chunk()` yields decoded bytes), so a gzip bomb
-//! hits the cap instead of the allocator. The deadline is `reqwest`'s total timeout, which covers the
-//! body read rather than only the response headers — a server that sends a header and then stalls
-//! still ends.
+//! # What is done by hand, and why.
+//! `reqwest`'s own redirect policy cannot do three things this tool needs: re-check `web egress` on every hop...
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -42,7 +30,7 @@ impl WebError {
         self
     }
 
-    /// Two lines at most: what happened, then what to change.
+    /// Two lines at most: what happened, then what to change
     pub fn render(&self) -> String {
         match &self.hint {
             Some(h) => format!("{}\nhint: {}", self.message, h),
@@ -51,7 +39,7 @@ impl WebError {
     }
 }
 
-/// The `User-Agent` sent when `[web] user_agent` is empty.
+/// The `User-Agent` sent when `[web] user_agent` is empty
 pub const DEFAULT_UA: &str = concat!("AOX/", env!("CARGO_PKG_VERSION"), " (local agent)");
 
 /// Everything one call tells the engine. The tool fills this in; nothing here reads config itself.
@@ -81,7 +69,7 @@ pub struct Fetched {
     pub content_type: String,
     pub charset: Detected,
     pub body: Vec<u8>,
-    /// The body hit `max_bytes`; what is in `body` is a prefix.
+    /// The body hit `max_bytes`; what is in `body` is a prefix
     pub truncated: bool,
     pub elapsed: Duration,
     /// `(status, url)` for each hop actually followed, in order.
@@ -219,9 +207,7 @@ fn build_client(req: &Request) -> Result<Client, WebError> {
         .user_agent(if req.user_agent.trim().is_empty() { DEFAULT_UA } else { req.user_agent.trim() })
         .danger_accept_invalid_certs(req.insecure_tls);
 
-    // A local target must not be sent to the ambient proxy: a request to `127.0.0.1` would be
-    // delivered to the proxy's own loopback. AOX sets `HTTP_PROXY` for its own sandbox, so this is
-    // the common case, not an edge case.
+    // A local target must not be sent to the ambient proxy: a request to `127.0.0.1` would be delivered...
     if egress::is_local_literal(&req.url) {
         builder = builder.no_proxy();
     }

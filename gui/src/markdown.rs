@@ -1,18 +1,6 @@
 //! Lightweight Markdown rendering: draw the model's Markdown reply as egui widgets.
-//!
-//! Supports: headings, paragraphs, unordered/ordered lists (including `- [x]` task lists), block
-//! quotes, fenced code blocks, inline code, **bold**, *italic*, links and tables. The goal is
-//! "good-looking and loses nothing", not spec completeness.
-//!
-//! **Clickable targets.** A run of text that names a URL or an absolute local path is clickable: it
-//! goes through `open` on click (see that module for what a click is allowed to do). Detecting them
-//! is split in two, because the two halves have opposite requirements:
-//!
-//! - [`scan`] is **pure string work, no filesystem** — it runs on every frame, since `render` parses
-//!   and lays out the whole reply again each frame.
-//! - hit testing is done against the **laid-out galley**, not by splitting the paragraph into
-//!   widgets. One `Label` for the whole paragraph is what keeps wrapping, text selection and copying
-//!   behaving exactly as before.
+//! Supports: headings, paragraphs, unordered/ordered lists (including `- x` task lists), block quotes, fenced code...
+//! Clickable targets. A run of text that names a URL or an absolute local path is clickable: it goes through...
 
 use egui::{
     text::LayoutJob, Color32, CornerRadius, FontId, Frame, Label, Margin, RichText, Stroke,
@@ -29,15 +17,11 @@ struct Span {
     bold: bool,
     italic: bool,
     code: bool,
-    /// Where a click on this run goes; `None` = ordinary text.
+    /// Where a click on this run goes; `None` = ordinary text
     href: Option<Target>,
 }
 
-/// One clickable stretch of a laid-out paragraph, as **character** offsets into `LayoutJob::text`.
-///
-/// Characters, not bytes: `Galley::cursor_from_pos` answers in character offsets
-/// (`epaint::CCursor::index` — explicitly "NOT byte offset"), so mixing the two units would put
-/// every hit box in the wrong place the moment a path sits next to Chinese text.
+/// One clickable stretch of a laid-out paragraph, as character offsets into `LayoutJob::text`.
 #[derive(Debug, Clone)]
 struct Hot {
     start: usize,
@@ -80,12 +64,7 @@ fn bullet_prefix(s: &str) -> Option<(usize, Option<String>, String)> {
     None
 }
 
-/// A task-list item: `- [ ] todo` / `- [x] done`. Returns the state and the text **without** the
-/// brackets.
-///
-/// GitHub's flavour, because that is what models write when a user asks for a checklist. The brackets
-/// must be followed by whitespace — `- [x]done` is a link-ish sentence, not a checkbox, and turning it
-/// into one would eat text the user never asked to hide.
+/// A task-list item: `- [ ] todo` / `- x done`. Returns the state and the text without the brackets.
 fn task_prefix(text: &str) -> Option<(bool, String)> {
     let rest = text.trim_start().strip_prefix('[')?;
     let mut chars = rest.chars();
@@ -244,7 +223,7 @@ fn find_pair(chars: &[char], from: usize, target: char) -> Option<usize> {
     None
 }
 
-/// Inline parsing: bold / italic / inline code / links.
+/// Inline parsing: bold / italic / inline code / links
 fn inline(s: &str) -> Vec<Span> {
     let chars: Vec<char> = s.chars().collect();
     let mut out: Vec<Span> = Vec::new();
@@ -309,11 +288,7 @@ fn inline(s: &str) -> Vec<Span> {
                         let text: String = chars[i + 1..close].iter().collect();
                         if !text.is_empty() {
                             flush(&mut out, &mut buf);
-                            // The href is the whole point of a link — until now it was parsed and
-                            // then dropped, so a standard `[text](url)` could be written but never
-                            // clicked. A relative href (`[x](docs/a.md)`) classifies to `None` and
-                            // simply stays plain text: the underline is an affordance, and an
-                            // affordance that does nothing is worse than none.
+                            // The href is the whole point of a link — until now it was parsed and then dropped, so a standard `text` could...
                             let href: String = chars[close + 2..paren].iter().collect();
                             out.push(Span {
                                 text,
@@ -335,15 +310,9 @@ fn inline(s: &str) -> Vec<Span> {
     out
 }
 
-// ──────────────────────── Clickable targets: detection ────────────────────────
+// Clickable targets: detection
 
 /// A boundary that ends a path or URL run.
-///
-/// Whitespace, quotes and CJK. The CJK half matters more than it looks: a model writing Chinese puts
-/// a path flush against the sentence — no space before it, a full-width comma right after — so
-/// splitting on whitespace alone would swallow that comma into the path (and `exists()` would then
-/// fail, so the click would silently do nothing). Stopping at *any* CJK character is exactly right in
-/// the other direction too: a path can never contain one.
 fn is_boundary(c: char) -> bool {
     c.is_whitespace()
         || matches!(c, '"' | '\'' | '`' | '<' | '>' | '|' | '“' | '”' | '‘' | '’')
@@ -374,9 +343,6 @@ fn closing_quote(c: char) -> Option<char> {
 }
 
 /// Every URL / absolute path inside one run of prose, as character ranges.
-///
-/// **Pure string work — no filesystem, no allocation of a per-frame cache.** `render` re-parses the
-/// whole reply every frame, so a `stat` in here would turn scrolling into disk I/O.
 fn scan(s: &str) -> Vec<(usize, usize, Target)> {
     let chars: Vec<char> = s.chars().collect();
     let mut out: Vec<(usize, usize, Target)> = Vec::new();
@@ -413,15 +379,9 @@ fn scan(s: &str) -> Vec<(usize, usize, Target)> {
     out
 }
 
-/// End (exclusive) of a bare `http(s)://` URL starting at `i`.
+/// End (exclusive) of a bare `http(s)://` URL starting at `i`
 fn url_end(chars: &[char], i: usize) -> Option<usize> {
     // Glued to a Latin word (`xhttps://`) it is not a URL.
-    //
-    // `is_ascii_alphanumeric` and **not** `is_alphanumeric`: the latter is true for every Unicode
-    // letter including CJK, so a path glued to Chinese text — the most common shape in a Chinese
-    // reply — would be read as "a word ends here, so this is not a path" and nothing would be
-    // clickable. The test `the_sentence_full_stop_is_not_part_of_the_path` is what caught this.
-    // A CJK character before a path is a boundary, not a word continuation.
     if i > 0 && chars[i - 1].is_ascii_alphanumeric() {
         return None;
     }
@@ -447,7 +407,7 @@ fn url_end(chars: &[char], i: usize) -> Option<usize> {
 
 /// End (exclusive) of an absolute Windows path starting at `i` — `X:\…`, `X:/…`, `\\server\share`.
 fn path_end(chars: &[char], i: usize) -> Option<usize> {
-    // ASCII only, for the reason spelled out in [`url_end`].
+    // ASCII only, for the reason spelled out in [`url_end`]
     if i > 0 && chars[i - 1].is_ascii_alphanumeric() {
         return None;
     }
@@ -481,11 +441,7 @@ fn path_end(chars: &[char], i: usize) -> Option<usize> {
     Some(end)
 }
 
-/// Drop the punctuation a sentence leaves glued to the end of a target: `see E:\a.txt.` — that
-/// period belongs to the sentence, not to the file name.
-///
-/// Closing brackets are dropped only when they are **unbalanced**, so a URL ending in
-/// `(disambiguation)` keeps its bracket.
+/// Drop the punctuation a sentence leaves glued to the end of a target: `see E:\a.txt.` — that period belongs...
 fn trim_tail(chars: &[char], start: usize, mut end: usize) -> usize {
     while end > start {
         let c = chars[end - 1];
@@ -511,23 +467,13 @@ fn balanced(chars: &[char], start: usize, end: usize, open: char, close: char) -
 }
 
 /// Turn the targets inside a set of spans into clickable spans.
-///
-/// Runs on the **already-parsed** spans, so a path inside `**bold**` is found as well (`inline`
-/// recurses for emphasis, and each recursion starts from plain runs).
 fn autolink(spans: Vec<Span>) -> Vec<Span> {
     let mut out = Vec::with_capacity(spans.len());
     for sp in spans {
         let (bold, italic) = (sp.bold, sp.italic);
         let plain = |text: String, href: Option<Target>| Span { text, bold, italic, code: false, href };
 
-        // Inline code is a literal value, not prose: the whole run is the candidate, with no scanning
-        // and no trimming. This is the most common shape of all — "written to
-        // `E:\rustapp\dist\x.exe`", in backticks.
-        //
-        // A run that is not absolute is still tried **against the workspace root**, which is what
-        // makes `` `src/tool/shell.rs` `` clickable. That resolution is gated on the file existing
-        // (see `open::resolve_relative`), because unlike a drive letter a relative path is
-        // indistinguishable from ordinary text — `and/or` and `1.5/2` are both shaped like one.
+        // Inline code is a literal value, not prose: the whole run is the candidate, with no scanning and no trimming.
         if sp.code {
             let mut sp = sp;
             if sp.href.is_none() {
@@ -564,24 +510,13 @@ fn autolink(spans: Vec<Span>) -> Vec<Span> {
 }
 
 /// Line-height factor.
-///
-/// Font size only sets how tall the glyphs are; the gap between lines is governed by
-/// `TextFormat::line_height`. A 1.3× leading is cramped for CJK body text — at full line
-/// width the rows nearly touch — so we use 1.5 here. A nice side effect: the inline-code
-/// "chip" background is painted per glyph rectangle, and a looser leading means the chips
-/// no longer glue together vertically.
+/// Font size only sets how tall the glyphs are; the gap between lines is governed by `TextFormat::line_height`....
 const LEADING: f32 = 1.5;
 
 /// The breathing room between blocks. The default 11 is too small; two paragraphs nearly touch.
 const BLOCK_GAP: f32 = 15.0;
 
 /// Lay out one paragraph's spans, and report where the clickable runs ended up.
-///
-/// The two outputs are produced in the same pass on purpose: the offsets must describe **this**
-/// job's text, and the padding spaces an inline code chip prepends are part of that text. Recovering
-/// the offsets afterwards would mean re-deriving them from the spans and re-counting the padding —
-/// two chances to drift by a character per chip, i.e. a hit box that jumps sideways once a path
-/// appears after inline code.
 fn job_of(
     spans: Vec<Span>,
     size: f32,
@@ -613,15 +548,7 @@ fn job_of(
         } else {
             color
         };
-        // An inline-code chip needs its **own** line height, and a top valign.
-        //
-        // The background is painted from the glyph's box, whose height *is* the format's line height —
-        // so requesting the body's 1.5× leading gave the chip 21 pt while its ink is only 13, with the
-        // ink sitting 2.06 pt below the box top: 2 pt of air above, 6 below ("the background hangs
-        // under the text"). A chip of `2 × (2.06 + 13/2) ≈ 17.1 pt` centres the ink instead, and
-        // `Align::TOP` keeps the box top where the body text's is — so the baseline does not move and
-        // a code span still sits level with the CJK around it. `1.32 ×` the mono size tracks that
-        // ratio at every size; `markdown::tests` measures the result rather than trusting the algebra.
+        // An inline-code chip needs its own line height, and a top valign.
         let line_height = if sp.code {
             Some((size - 1.0) * 1.32)
         } else {
@@ -634,12 +561,7 @@ fn job_of(
             valign: if sp.code { egui::Align::TOP } else { egui::Align::BOTTOM },
             italics: sp.italic,
             background: if sp.code { P::code_chip() } else { Color32::TRANSPARENT },
-            // Links get an underline: in body text they're the same color as ordinary text, so
-            // color alone can't tell them apart (in a monochrome scheme "blacker" isn't noticeable).
-            // Code chips must never be underlined — they already look like a value, and a line
-            // through the chip smears the "this is code" signal. A path in backticks is therefore
-            // clickable without a visible cue: the pointer turning into a hand and the tooltip are
-            // the whole affordance there.
+            // Links get an underline: in body text they're the same color as ordinary text, so color alone can't tell them...
             underline: if sp.href.is_some() && !sp.code {
                 Stroke::new(1.0, P::ink_soft())
             } else {
@@ -648,11 +570,7 @@ fn job_of(
             ..Default::default()
         };
         if sp.code {
-            // Inline code is rendered as a "chip": the background is painted only per glyph
-            // rectangle, so code flush to the edge would smear into one highlight — hence a
-            // space of padding on each side. The padding shares the **same font and size** as
-            // the code: the background is merged from each glyph's own rectangle, so a
-            // different size would split it into three pieces with stepped edges.
+            // Inline code is rendered as a "chip": the background is painted only per glyph rectangle, so code flush...
             let pad = TextFormat { background: P::code_chip(), ..fmt.clone() };
             job.append(" ", 0.0, pad.clone());
             // The hit box covers the code itself, not the two padding spaces — hovering the one
@@ -675,19 +593,13 @@ fn job_of(
 }
 
 /// A fenced code block: one LayoutJob section per line, colored token by token.
-///
-/// It must be **split into multiple sections per token** — `TextFormat` is stored per section, and
-/// cramming a whole stretch of code into one section allows only a single color. A blank line must
-/// also append a `"\n"`, otherwise that line's height collapses.
 fn code_job(code: &str, wrap: f32, lang: &str) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap.max(60.0);
     job.wrap.break_anywhere = true;
     let base = TextFormat {
         font_id: theme::mono_font(15.0),
-        // Code line-height is a touch tighter than body text: 1.35 is the convention for code
-        // (VS Code's default is the same value), and any looser and it should be called a
-        // "document" rather than a "code block".
+        // Code line-height is a touch tighter than body text: 1.35 is the convention for code (VS Code's default...
         line_height: Some(15.0 * 1.35),
         ..Default::default()
     };
@@ -711,18 +623,6 @@ fn code_job(code: &str, wrap: f32, lang: &str) -> LayoutJob {
 }
 
 /// Render a whole stretch of Markdown.
-///
-/// `base` is the body color (a brighter one may be used inside user bubbles); `width` is the maximum
-/// available width.
-/// The unified text label: pin the wrap mode to `Wrap`.
-///
-/// This is the UI trap this project trips over most: `Ui::wrap_mode()` returns `Extend` inside a
-/// "non-wrapping horizontal layout" (`ui.horizontal*`, whose `main_wrap == false`), and a `Label`
-/// with the default `wrap_mode = None` inherits it — so epaint treats
-/// `LayoutJob::wrap::max_width` as `f32::INFINITY`, long text runs to the end of a line, punches
-/// straight past the column's right edge and gets clipped by the ScrollArea (showing up as "text
-/// cut off"). Bubbles, list items and table cells are all this kind of horizontal layout, so we pin
-/// it explicitly, one by one, here.
 fn wrap_label(ui: &mut Ui, job: LayoutJob) -> egui::Response {
     ui.add(
         Label::new(job)
@@ -732,14 +632,6 @@ fn wrap_label(ui: &mut Ui, job: LayoutJob) -> egui::Response {
 }
 
 /// Draw a paragraph and make its `hots` clickable.
-///
-/// Still **one `Label`** for the whole paragraph: splitting the text into per-link widgets would put
-/// every link on its own line and throw away text selection, which is the thing people actually use
-/// most on a reply full of paths.
-///
-/// So the hit test runs *after* layout, against the galley: the pointer position is mapped to a
-/// character offset (`Galley::cursor_from_pos`) and looked up in `hots`. This is why `hots` counts
-/// characters, not bytes — see [`Hot`].
 fn text_label(ui: &mut Ui, job: LayoutJob, hots: &[Hot]) -> egui::Response {
     if hots.is_empty() {
         // The overwhelmingly common case, and the cheap one: no galley of our own to keep.
@@ -749,9 +641,7 @@ fn text_label(ui: &mut Ui, job: LayoutJob, hots: &[Hot]) -> egui::Response {
     // Lay out here rather than inside `Label` so the galley survives the call — the hit test needs
     // it, and a `Response` does not carry one.
     let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
-    // Where `Label` is about to put this galley (`allocate_exact_size` starts at the cursor). Knowing
-    // it *before* the widget exists is what lets the hover wash be painted under the text instead of
-    // over it — painting after `ui.add` would draw on top of the glyphs.
+    // Where `Label` is about to put this galley (`allocate_exact_size` starts at the cursor).
     let origin = ui.cursor().min;
     let bounds = egui::Rect::from_min_size(origin, galley.size()).expand(2.0);
     let hovered = ui
@@ -779,15 +669,10 @@ fn text_label(ui: &mut Ui, job: LayoutJob, hots: &[Hot]) -> egui::Response {
 
     if let Some(i) = hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        // The tooltip and the right-click menu are both anchored at the pointer, so with the menu open
-        // they draw over each other — the tooltip's path line lands on the menu's second row and both
-        // become unreadable. The menu already names the target in its own way (its rows are what you
-        // are about to do), so the tooltip steps aside while it is up.
+        // The tooltip and the right-click menu are both anchored at the pointer, so with the menu open they draw over...
         let quiet = resp.context_menu_opened() || ui.input(|i| i.pointer.any_down());
         let t = &hots[i].target;
-        // The hint is phrased from what the click will actually do, and "not found" is stated
-        // before the click rather than after it: a click that quietly does nothing would read as
-        // a broken link.
+        // The hint is phrased from what the click will actually do, and "not found" is stated before the click rather...
         let hint = if !exists_on_hover(ui, resp.id, i, t) {
             aox::i18n::t("Path not found")
         } else if matches!(t, Target::Url(_)) {
@@ -810,9 +695,7 @@ fn text_label(ui: &mut Ui, job: LayoutJob, hots: &[Hot]) -> egui::Response {
         }
     }
 
-    // `clicked()` and not `drag_stopped()`: a selectable label senses `click_and_drag`, and only a
-    // press-and-release **without** movement counts as a click — so dragging a selection across a
-    // link still selects instead of opening something.
+    // `clicked()` and not `drag_stopped()`: a selectable label senses `click_and_drag`, and only a press-and-release...
     if resp.clicked() {
         if let Some(i) = resp.interact_pointer_pos().and_then(|p| hot_at(&galley, hots, p - resp.rect.min)) {
             open::open(ui.ctx(), &hots[i].target);
@@ -823,13 +706,7 @@ fn text_label(ui: &mut Ui, job: LayoutJob, hots: &[Hot]) -> egui::Response {
     resp
 }
 
-/// Right-click menu, **only on a link**.
-///
-/// The "only on a link" part is why this does not just call `Response::context_menu`: that opens on a
-/// secondary click anywhere on the widget, and the widget here is a whole paragraph — a right-click on
-/// ordinary prose would pop an empty menu (or, worse, act on the link the pointer happens to be
-/// nearest to). So the hit is taken at the moment of the click, remembered per widget, and the popup
-/// is force-closed when that click was not on a link.
+/// Right-click menu, only on a link.
 fn context_menu(ui: &mut Ui, resp: &egui::Response, galley: &egui::Galley, hots: &[Hot]) {
     let slot = egui::Id::new("aox-href-menu");
     if resp.secondary_clicked() {
@@ -876,9 +753,7 @@ fn link_menu(ui: &mut Ui, t: &Target) {
                 open::reveal(p);
                 ui.close();
             }
-            // The one action that starts a program. It lives **here** and not on the click for the
-            // reason the whole feature is conservative: a reply full of `.exe` paths is exactly where
-            // a single mis-aimed left click would run something.
+            // The one action that starts a program.
             if menu_row(ui, aox::i18n::t("Open with default app")) {
                 open::open_with_default(p);
                 ui.close();
@@ -896,9 +771,6 @@ fn menu_row(ui: &mut Ui, label: &str) -> bool {
 }
 
 /// The glyph boxes of the characters in `[start, end)`, merged into one rect per row.
-///
-/// Built from `Glyph::logical_rect()` — the same rect the inline-code chip paints its background
-/// from — so a wash under a chip lines up with the chip exactly instead of drifting by the leading.
 fn run_rects(galley: &egui::Galley, start: usize, end: usize) -> Vec<egui::Rect> {
     let mut out = Vec::new();
     let mut idx = 0usize;
@@ -922,11 +794,6 @@ fn run_rects(galley: &egui::Galley, start: usize, end: usize) -> Vec<egui::Rect>
 }
 
 /// Which hot run is under `local`, a position relative to the galley's origin.
-///
-/// The row check is not belt-and-braces: `cursor_from_pos` snaps to the **nearest** caret, so a
-/// pointer in the empty right margin of a short row would otherwise "hit" whatever ends that row —
-/// and since the label's rect is as wide as its widest row, that margin is inside the widget. Two
-/// pixels of slack keep the row's own edge clickable.
 fn hot_at(galley: &egui::Galley, hots: &[Hot], local: egui::Vec2) -> Option<usize> {
     let dist = |r: &egui::epaint::text::PlacedRow| {
         (r.min_y() - local.y).abs().min((r.max_y() - local.y).abs())
@@ -940,15 +807,7 @@ fn hot_at(galley: &egui::Galley, hots: &[Hot], local: egui::Vec2) -> Option<usiz
     hots.iter().position(|h| idx >= h.start && idx < h.end)
 }
 
-/// `Target::exists`, but asked **once per link**, not once per frame.
-///
-/// The tooltip is redrawn every frame the pointer sits on a link, and `exists` is a `stat` — cheap on
-/// a local disk, but on a path over a slow share (or a sleeping network drive) 60 stats a second is
-/// enough to make the whole window stutter while the pointer rests.
-///
-/// Only the **hint** is cached; the click re-checks from scratch (`open::reveal` refuses a path that
-/// is gone), so a stale entry can at worst phrase one tooltip wrongly for as long as the app runs —
-/// it can never open or fail to open something on the strength of it.
+/// `Target::exists`, but asked once per link, not once per frame.
 fn exists_on_hover(ui: &Ui, widget: egui::Id, index: usize, t: &Target) -> bool {
     let slot = egui::Id::new("aox-href-exists");
     let key = (widget, index);
@@ -963,14 +822,6 @@ fn exists_on_hover(ui: &Ui, widget: egui::Id, index: usize, t: &Target) -> bool 
 }
 
 /// A task-list checkbox, painted from a rounded rect and two line segments.
-///
-/// Drawn rather than set as `☐` / `☑`: the app ships no icon font, and a missing glyph in the marker
-/// column is a box with a hex number in it — the same reason as `call_glyph` and `jump_arrow`. The
-/// mark is knocked out in the page colour rather than fixed to white, so a checked item stays legible
-/// in both themes.
-///
-/// The slot is the same 20 points the bullet glyph gets, so a task list and a plain list line up on
-/// the same axis even when they are mixed.
 fn task_box(ui: &mut Ui, done: bool) {
     const SIDE: f32 = 13.0;
     // The height of one body line, so the box centres on the first row of the item rather than on the
@@ -1028,9 +879,7 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                 ui.add_space(if level <= 2 { 15.0 } else { 9.0 });
                 let (job, hots) = job_of(inline(&text), size, P::text(), width, level <= 2);
                 text_label(ui, job, &hots);
-                // Level-1 and level-2 headings each carry a thin line: in a monochrome scheme,
-                // "bigger and bolder" isn't enough — a line separates the heading from the body, and
-                // the hierarchy pops out immediately when scanning.
+                // Level-1 and level-2 headings each carry a thin line: in a monochrome scheme, "bigger and bolder" isn't enough —...
                 if level <= 2 {
                     ui.add_space(6.0);
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
@@ -1080,26 +929,7 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
                 ui.add_space(BLOCK_GAP);
             }
 
-            // ```` ```svg ````: **draw it**, don't show it as code.
-            //
-            // Going through fenced code blocks rather than adding a new tool/protocol: markdown
-            // already has fences, and the model is already good at writing SVG — so "the model draws
-            // a flowchart" works with zero protocol change, and it naturally lands in `.jsonl`
-            // (part of the body text), so it's still there when the conversation is reopened.
-            //
-            // When drawing fails (unparseable), `svg::render` writes a reason line itself and leaves
-            // that stretch **in the body text as-is** (the fallback below), so the user can at least
-            // still see what the model wrote.
-            // ```` ```svg ````: **draw it**, don't show it as code.
-            //
-            // Going through fenced code blocks rather than adding a new tool/protocol: markdown
-            // already has fences, and the model is already good at writing SVG — so "the model draws
-            // a flowchart" works with zero protocol change, and it naturally lands in `.jsonl`
-            // (part of the body text), so it's still there when the conversation is reopened.
-            //
-            // When it can't be drawn, fall back to a **code block**: then the user can at least still
-            // see what the model wrote, rather than staring at one error line (`svg::render` adds a
-            // reason itself).
+            // Going through fenced code blocks rather than adding a new tool/protocol: markdown already has fences...
             Block::Code { lang, lines } if lang.trim().eq_ignore_ascii_case("svg") => {
                 if crate::svg::render(ui, &lines.join("\n"), width - 20.0) <= 0.0 {
                     code_block(ui, width, "svg", &lines);
@@ -1126,7 +956,7 @@ pub fn render(ui: &mut Ui, md: &str, base: Color32) {
     }
 }
 
-// ────────────────────────────── Table ──────────────────────────────
+// Table
 
 /// Cell horizontal/vertical padding, column gap, and outer corner radius.
 const CELL_PAD_X: f32 = 11.0;
@@ -1143,12 +973,7 @@ fn disp_width(s: &str) -> f32 {
 }
 
 /// Column width allocation.
-///
-/// Evenly dividing the widths is the least effort and the ugliest: short columns leave a big gap,
-/// long ones get squeezed into a vertical strip. Here we first compute an ideal width from "that
-/// column's longest cell", then scale proportionally to the available width; finally a lower bound
-/// catches it — if it really doesn't fit, shrink everything together, preferring wrapped text over
-/// overflowing.
+/// Evenly dividing the widths is the least effort and the ugliest: short columns leave a big gap, long ones get...
 fn column_widths(header: &[String], rows: &[Vec<String>], avail: f32) -> Vec<f32> {
     const MIN: f32 = 68.0;
     const CH: f32 = 7.4; // approximate ASCII advance at 15px body size
@@ -1185,10 +1010,6 @@ fn column_widths(header: &[String], rows: &[Vec<String>], avail: f32) -> Vec<f32
 }
 
 /// Table: full outer frame + header band + row separators, with column widths by content.
-///
-/// It used to be just a `Grid` with no frame, no header, no row lines — it read like a few
-/// paragraphs mashed together, with all the table's information resting on "alignment", so a
-/// single wrapped cell would fall apart completely.
 fn table(ui: &mut Ui, width: f32, header: &[String], rows: &[Vec<String>], base: Color32) {
     // 2 = width consumed by the outer stroke (egui counts stroke width inside the Frame's margin)
     let inner = (width - 2.0).max(160.0);
@@ -1204,15 +1025,7 @@ fn table(ui: &mut Ui, width: f32, header: &[String], rows: &[Vec<String>], base:
         .show(ui, |ui| {
             ui.set_width(inner);
             ui.set_max_width(inner);
-            // The column gap is controlled with add_space ourselves. `horizontal` would additionally
-            // insert the style's item_spacing.x, and without zeroing it the whole table would exceed
-            // its budget by (columns - 1) gaps and push out of the column.
-            //
-            // `item_spacing.y` goes to zero for the same reason, one step further: the separators
-            // below are drawn at `ui.cursor().min.y`, which is the top of the row **after** this one.
-            // With the default gap still in place that y sits a few pixels below the row's real
-            // bottom, so the line floats between the header and the first row and reads as an empty
-            // band. Zeroing it puts the line exactly on the boundary it is meant to mark.
+            // The column gap is controlled with add_space ourselves. `horizontal` would additionally insert the style's...
             ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
 
             for (ri, row) in std::iter::once(header)
@@ -1221,9 +1034,7 @@ fn table(ui: &mut Ui, width: f32, header: &[String], rows: &[Vec<String>], base:
             {
                 let head = ri == 0;
                 if head {
-                    // Header band: one strip for the whole row, rounded only on top, so it hugs the outer frame.
-                    // `band()` (4% ink) rather than `surface_hi`: the latter is the hover step, and a
-                    // header painted with it read as one wide disabled button (2026-10-29).
+                    // Header band: one strip for the whole row, rounded only on top, so it hugs the outer frame. `band()` (4% ink)...
                     Frame::NONE
                         .fill(P::band())
                         .corner_radius(CornerRadius { nw: TABLE_R, ne: TABLE_R, sw: 0, se: 0 })
@@ -1257,9 +1068,7 @@ fn cells(ui: &mut Ui, widths: &[f32], row: &[String], head: bool, color: Color32
             ui.add_space(COL_GAP);
         }
         let txt = row.get(ci).map(|s| s.as_str()).unwrap_or("");
-        // A very narrow column (a multi-column table hitting a narrow column slot) yields its
-        // padding too: once "content + padding" exceeds the allotted column width, the whole table
-        // pushes out of the column and gets clipped by the ScrollArea.
+        // A very narrow column (a multi-column table hitting a narrow column slot) yields its padding too: once "content...
         let pad = CELL_PAD_X.min(cw * 0.22);
         let w = (cw - pad * 2.0).max(12.0);
         Frame::NONE
@@ -1278,16 +1087,11 @@ fn cells(ui: &mut Ui, widths: &[f32], row: &[String], head: bool, color: Color32
 const COPIED_TTL: f64 = 1.4;
 
 /// Which code block was copied last, and when — one temp-data slot in egui's memory.
-///
-/// Keyed by a **hash of the block's text** rather than by a per-block index: `render` runs fresh
-/// every frame and has no stable block id, while only one block can have just been copied anyway.
-/// Two byte-identical blocks would both show the tick, which is honest — copying either one puts
-/// exactly the same text on the clipboard.
 fn copied_mark(ui: &Ui) -> Option<(u64, f64)> {
     ui.ctx().data(|d| d.get_temp::<(u64, f64)>(egui::Id::new("aox-code-copied")))
 }
 
-/// The temp-data slot used by [`copied_mark`].
+/// The temp-data slot used by [`copied_mark`]
 fn copy_slot() -> egui::Id {
     egui::Id::new("aox-code-copied")
 }
@@ -1299,11 +1103,7 @@ fn text_hash(s: &str) -> u64 {
     h.finish()
 }
 
-/// The square button in a code block's top-right corner: a "copy" glyph that turns into a green
-/// tick once the code is on the clipboard.
-///
-/// Both glyphs are **drawn**, not typed: a text glyph would come from whatever font happens to be
-/// installed and would not sit on the same optical weight as the rest of the icon set.
+/// The square button in a code block's top-right corner: a "copy" glyph that turns into a green tick once the code...
 struct CopyButton {
     copied: bool,
 }
@@ -1312,9 +1112,7 @@ impl egui::Widget for CopyButton {
     fn ui(self, ui: &mut Ui) -> egui::Response {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
         let hot = resp.hovered() || self.copied;
-        // The fill has to be opaque: it doubles as the "occluder" that makes the front sheet of the
-        // copy icon sit *on top of* the back one. Not hovered = the block's own background, so the
-        // button is invisible until you reach for it.
+        // The fill has to be opaque: it doubles as the "occluder" that makes the front sheet of the copy icon sit *on top...
         let bg = if hot { P::surface_hi() } else { P::code_bg() };
         if hot {
             ui.painter().rect_filled(rect, CornerRadius::same(theme::R1), bg);
@@ -1344,11 +1142,6 @@ impl egui::Widget for CopyButton {
 }
 
 /// One fenced code block: monospace, with a header row (language + copy button) and a backing color.
-///
-/// Extracted because it has two call sites: an ordinary code block, and **the fallback when SVG
-/// drawing fails** (see the `Block::Code { lang, .. } if lang == "svg"` branch). Copying it into two
-/// places would mean remembering to change both when tweaking the spacing — and the one you miss is
-/// only visible when "SVG happens to fail to draw".
 fn code_block(ui: &mut Ui, width: f32, lang: &str, lines: &[String]) {
     let code = lines.join("\n");
     let hash = text_hash(&code);
@@ -1371,9 +1164,7 @@ fn code_block(ui: &mut Ui, width: f32, lang: &str, lines: &[String]) {
             let inner = (width - 34.0).max(100.0);
             ui.set_width(inner);
             ui.set_max_width(inner);
-            // Header row. It is drawn even with no language: giving the button its own row keeps it
-            // off the first line of code, which would otherwise sit right under it (code wraps to
-            // fill the card, so there is no "empty corner" to rely on).
+            // Header row. It is drawn even with no language: giving the button its own row keeps it off the first line...
             ui.horizontal(|ui| {
                 if !lang.is_empty() {
                     ui.label(RichText::new(lang.to_lowercase()).color(P::text_faint()).size(13.0));
@@ -1397,20 +1188,6 @@ mod tests {
     use egui::{pos2, vec2, Rect};
 
     /// The chip's geometry, in points: `(above, below, baseline_delta)`.
-    ///
-    /// - `above` / `below` — the ink's clearance to the chip background's top and bottom edge. The
-    ///   background is painted from `Glyph::logical_rect()`, whose height is the **format's** line
-    ///   height — so a format asking for 1.5× leading gets a 1.5×-tall chip while the ink keeps only
-    ///   its own ascent/descent. That asymmetry is what "the background hangs below the text" looks
-    ///   like; this measures it instead of leaving it to the eye.
-    /// - `baseline_delta` — how far the code's baseline sits from the body text's baseline on the
-    ///   same line. Trimming the chip must not drag the text with it: epaint puts a glyph at
-    ///   `ascent + valign.to_factor() * (max_row_height - line_height)`, so a **shorter** line height
-    ///   is only free because `Align::TOP` makes that term zero — with the default `BOTTOM` the code
-    ///   would drop by the whole trim.
-    ///
-    /// The code span is located by its characters (a glyph does not expose which section it came from),
-    /// and the words used below carry both an ascender and a descender so the ink is not short.
     fn chip_geometry(md: &str, code: &str) -> (f32, f32, f32) {
         let ctx = egui::Context::default();
         // The app's own fonts, so this measures the metric the user actually sees (the fallback font
@@ -1468,16 +1245,10 @@ mod tests {
         );
     }
 
-    /// Replays the column skeleton of `App::transcript`, measuring:
-    /// - the available width the Ui reports when entering Markdown
-    /// - the width the content actually occupies after rendering (beyond the column it gets clipped by the ScrollArea)
+    /// Replays the column skeleton of `App::transcript`, measuring: - the available width the Ui reports when entering...
     fn probe(window_w: f32, md: &str) -> (f32, f32, f32) {
         let ctx = egui::Context::default();
-        // Fonts are **per-Context**, but the "is bold available" flags in `theme` are process-global —
-        // so a Context that skips this silently depends on whichever sibling test ran first: with the
-        // flag left false it lays out in the fallback family, and once anything else has installed
-        // fonts it asks for `aox-strong`, which this Context has never bound, and panics. Installing
-        // here makes the measurement order-independent *and* faithful: it is what the app does.
+        // Fonts are per-Context, but the "is bold available" flags in `theme` are process-global — so a Context...
         crate::theme::install_fonts(&ctx);
         let _ = ctx.run(Default::default(), |_| {});
         let mut avail = 0.0f32;
@@ -1552,13 +1323,9 @@ a code line long enough that it must wrap rather than widen the card beyond the 
         assert!(used <= inner + 0.5, "used {used} > column {inner}");
     }
 
-    // ──────────────────── Clickable targets ────────────────────
+    // Clickable targets
 
-    /// `(text, target)` for each clickable run of `md`, read back **out of the laid-out job**.
-    ///
-    /// Read from `job.text` by character offset rather than from the spans, because that is the
-    /// coordinate space the hit test uses: a miscounted padding space then fails here, as a wrong
-    /// string, instead of failing on screen as a hit box two characters off.
+    /// `(text, target)` for each clickable run of `md`, read back out of the laid-out job.
     fn hot_texts(md: &str) -> Vec<(String, Target)> {
         let (job, hots) = job_of(inline(md), 14.0, egui::Color32::BLACK, 800.0, false);
         hots.iter()
@@ -1626,18 +1393,11 @@ a code line long enough that it must wrap rather than widen the card beyond the 
         assert_eq!(got[1].1, Target::Url("https://2am.top".into()));
     }
 
-    /// The one part a string test cannot cover: a **pointer position** through the real galley.
-    ///
-    /// This is the half of the feature a unit test could otherwise only assume: clicking is out of the
-    /// question here (it would open Explorer), so instead take a pixel that the path's own ink
-    /// occupies and require the hit test to find the path; take a pixel in the words before it and
-    /// require it not to.
+    /// The one part a string test cannot cover: a pointer position through the real galley.
     #[test]
     fn a_pointer_on_the_path_hits_it_and_a_pointer_before_it_does_not() {
         let ctx = egui::Context::default();
-        // Fonts are per-Context; without this the galley is laid out in a family whose metrics are
-        // not the ones on screen (and `theme`'s process-wide flags would make this depend on test
-        // order — see the note in `probe`).
+        // Fonts are per-Context; without this the galley is laid out in a family whose metrics are not the ones on screen...
         crate::theme::install_fonts(&ctx);
         let _ = ctx.run(Default::default(), |_| {});
 
@@ -1661,9 +1421,7 @@ a code line long enough that it must wrap rather than widen the card beyond the 
 
     #[test]
     fn an_inline_code_path_is_clickable_only_when_it_exists_in_the_workspace() {
-        // Relative paths are the one place where the *only* thing separating "a file" from "a string"
-        // is the filesystem, so the existence check is load-bearing rather than a nicety. The root is
-        // a thread-local, so this test cannot disturb any other one.
+        // Relative paths are the one place where the *only* thing separating "a file" from "a string" is the filesystem...
         let dir = std::env::temp_dir().join("aox-md-relative-7c1");
         std::fs::create_dir_all(dir.join("notes")).unwrap();
         std::fs::write(dir.join("notes").join("todo.md"), "# t\n").unwrap();
@@ -1685,13 +1443,9 @@ a code line long enough that it must wrap rather than widen the card beyond the 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── task lists ────────────────────────────────────────────────────────────
+    // task lists
 
-    /// `- [x] done` becomes a checkbox, and the brackets leave the text.
-    ///
-    /// Models write GitHub checklists whenever a user asks for a plan or a todo list, and until now
-    /// the reader got a bullet with a literal `[x]` in front of it (reported 2026-10-31, with a
-    /// screenshot of a "今日清单").
+    /// Task-list items become checkboxes and the brackets are stripped, since models emit GitHub checklists.
     #[test]
     fn task_items_become_checkboxes() {
         let blocks = parse("- [x] 手写 block_on\n- [ ] 用 io_uring 重写\n- [X] upper case counts\n- plain item");
@@ -1719,9 +1473,6 @@ a code line long enough that it must wrap rather than widen the card beyond the 
     }
 
     /// Brackets that are not followed by a space are part of the sentence.
-    ///
-    /// `- [x]done` and `see [x] here` must keep every character — eating text the model wrote is a
-    /// worse failure than showing a checkbox one time too few.
     #[test]
     fn a_bracket_run_without_a_trailing_space_is_not_a_checkbox() {
         assert_eq!(task_prefix("[x]done"), None);

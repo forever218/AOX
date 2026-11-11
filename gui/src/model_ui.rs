@@ -1,42 +1,6 @@
-//! The **model UI**: the settings page, the add/edit dialog, and the chip at the bottom of the input box.
-//!
-//! # The shape, and why it changed (2026-10-27, second cut)
-//!
-//! The first version put one long form on the settings page: endpoint, key, model, window, cap,
-//! temperature, thinking. That is a form for **one** model, and every number lived in it. It reads as
-//! a configuration sheet, not as a list of models — you cannot see what you have, cannot keep two
-//! providers ready, and every glance at the temperature costs a trip through the whole page.
-//!
-//! What replaced it splits along "how often is it touched":
-//!
-//! * **Settings → Model is a list**: `添加模型` / `批量管理` on top, then one row per saved model
-//!   (56pt, whole row clickable, an enable switch on the right). Clicking a row edits it; the switch
-//!   decides whether it shows up in the input box. That is the thing a person has *several* of.
-//! * **The dialog is one model**: endpoint, key (+ 测试连接), model name (+ 扫描模型) — the three
-//!   things only the provider can tell you. Cancel / Save, like any add dialog.
-//! * **The input box's pop-up is the current model's numbers**: window, cap, temperature, thinking.
-//!   Those are tuned *while working*, so they sit where the work happens — and they apply to the model
-//!   being talked to, not to a global setting.
-//!
-//!   The four are a **draft**: typing only moves the draft, and the footer's 确定 is the single thing
-//!   that writes them (`commit_all`) — one edit, one provider swap. Every other way out of the panel
-//!   (click elsewhere, `Esc`, the chip) is a cancel and puts the draft back (`revert_inline`). The
-//!   first cut committed per field on focus loss, which needed four writes and four swaps for one
-//!   visit, and — because it edited a *clone* of the draft and copied it back only on commit — threw
-//!   away every keystroke in between ("改不了数字").
-//!
-//! # Three conventions (unchanged; they are what keeps ownership clear)
-//!
-//! **① State lives in [`ModelUi`], held by `App`.** This module never touches a field of `App`.
-//! **② Parameters in, requests out.** Nothing here calls the bridge or writes a file: the provider
-//! lives in `Runtime`, which only the agent thread owns.
-//! **③ The current state is pushed in** ([`ProviderView`]), so "which model is running" has one answer.
-//!
-//! # Where the data lives
-//!
-//! `config.toml` stays the statement of **what runs now**; `.aox/models.json` is the saved list (see
-//! `gui/src/models.rs`). Activating a record copies its values into `config.toml`, so the CLI and a
-//! hand edit still see exactly one truth.
+//! The model UI: the settings page, the add/edit dialog, and the chip with a numbers pop-up in the input box.
+//! Split by touch frequency: a model list, a one-model dialog, and a numbers pop-up committed as one draft.
+//! ModelUi holds state; no bridge or file writes here; ProviderView is pushed in; config.toml is the live truth.
 
 use std::path::{Path, PathBuf};
 
@@ -56,7 +20,7 @@ use crate::theme::{self, P};
 const CHIP_H: f32 = 28.0;
 /// How wide the chip may get before the model name is elided.
 const CHIP_MAX_W: f32 = 220.0;
-/// The pop-up list.
+/// The pop-up list
 const MENU_W: f32 = 316.0;
 /// One model's card, opened beside the list.
 const CARD_W: f32 = 296.0;
@@ -65,19 +29,12 @@ const CARD_W: f32 = 296.0;
 const ROW_H: f32 = 56.0;
 /// The add/edit dialog's content width (the reference screenshot's proportions).
 const DIALOG_W: f32 = 552.0;
-/// Field padding in the dialog. `text + 2 × this` has to come out at [`BTN_H`] (34), so a label, its
-/// field and the button beside it share one height and one baseline — that is the whole reason the
-/// padding is a constant instead of a taste.
+/// Field padding in the dialog. `text + 2 × this` has to come out at BTN_H (34), so a label, its field...
 const FIELD_PAD: i8 = 8;
 
-// ─────────────────────────── what the UI asks the app to do ───────────────────────────
+// what the UI asks the app to do
 
-/// One frame's worth of requests.
-///
-/// Several at once is the **normal** case, not an edge one: pressing "测试连接" right after typing a
-/// key takes the focus off that field, which commits it — so one click legitimately means "apply this
-/// *and* test it". Carrying them in one struct keeps both; a single `Option` would let one silently
-/// overwrite the other.
+/// One frame's requests; several at once is normal, so a struct keeps them instead of one Option dropping one.
 #[derive(Default)]
 pub struct Requests {
     pub apply: Option<Box<ProviderEdit>>,
@@ -117,36 +74,30 @@ impl Requests {
     }
 }
 
-// ─────────────────────────── state ───────────────────────────
+// state
 
 pub struct ModelUi {
     /// The last state the bridge pushed. `None` before the first one arrives.
     view: Option<ProviderView>,
-    /// The saved models (see `gui/src/models.rs`).
+    /// The saved models (see `gui/src/models.rs`)
     book: Book,
     root: Option<PathBuf>,
     /// The chip's list is open.
     open: bool,
     /// Where the chip was drawn, so the list can anchor to it.
     button_rect: Option<Rect>,
-    /// One line on the settings page: the last outcome.
+    /// One line on the settings page: the last outcome
     notice: Option<(String, bool)>,
-    /// The add/edit dialog, when open.
+    /// The add/edit dialog, when open
     editor: Option<Editor>,
-    /// The record whose card is open **beside** the list (`None` = the list alone). Picking a row does
-    /// not switch anything: it opens this model's own card, which is where 使用 and its numbers are.
+    /// The record whose card is open beside the list (None = list alone); picking a row opens its card, not a switch.
     selected: Option<String>,
     /// Batch mode: `Some(selected ids)` while it is on. `None` is the normal list.
     batch: Option<Vec<String>>,
     /// The batch delete's first press landed; the second one deletes. Reset whenever the selection
     /// changes, so "armed" never carries over to a different set of models.
     batch_armed: bool,
-    /// The running model's numbers, as text (so a half-typed number is not rounded while typing).
-    ///
-    /// These four are a **draft**: they are what the pop-up's fields show, and they do not have to
-    /// agree with what is running. Only 确定 (`commit_all`) turns them into a request; closing the
-    /// panel any other way puts them back (`revert_inline`). Keeping them as `String` is what lets a
-    /// half-typed `100` sit in the box without being read as a window of 100 tokens.
+    /// Four number drafts as String (no rounding of half-typed values); commit_all applies them, other closes revert.
     win: String,
     mtok: String,
     temp: String,
@@ -160,11 +111,9 @@ pub struct ModelUi {
 }
 
 /// The add/edit dialog.
-///
-/// One dialog for both, because they are the same three fields: adding is editing a blank record. The
-/// differences are the title, the verb on the button, and whether "delete" exists.
+/// One dialog for both, because they are the same three fields: adding is editing a blank record.
 struct Editor {
-    /// `None` = adding.
+    /// `None` = adding
     id: Option<String>,
     base_url: String,
     api_key: String,
@@ -176,7 +125,7 @@ struct Editor {
     combo: bool,
     /// Put the cursor in the key field on the next frame.
     focus_key: bool,
-    /// What the last scan / test said.
+    /// What the last scan / test said
     status: Option<(String, bool)>,
     /// "Delete" was pressed once; a second press does it. Cheaper than a confirmation modal for
     /// something this small, and impossible to trigger by accident.
@@ -215,9 +164,6 @@ impl ModelUi {
     }
 
     /// Give the UI the app root once it is known (the first `Boot`), and load the list then.
-    ///
-    /// Not in `new()`: at construction the root is not known, and a list loaded from the wrong place
-    /// would silently look empty — or worse, be saved there.
     pub fn attach_root(&mut self, root: &Path) {
         if self.root.as_deref() == Some(root) {
             return;
@@ -240,10 +186,7 @@ impl ModelUi {
 
     pub fn set_view(&mut self, v: ProviderView) {
         self.reload_book();
-        // A dialog opened before the first `Provider` (which is exactly what happens on a fresh
-        // install: `Boot` opens it, `Provider` follows) would otherwise show an empty endpoint even
-        // though one is known. Fill it in — "add a model on the endpoint I am already on" is the
-        // common case, and retyping the host is not.
+        // A dialog opened before the first `Provider` (which is exactly what happens on a fresh install: `Boot` opens...
         if let Some(e) = &mut self.editor {
             if e.id.is_none() && e.base_url.trim().is_empty() && !v.base_url.trim().is_empty() {
                 e.base_url = v.base_url.clone();
@@ -257,11 +200,7 @@ impl ModelUi {
         if switched {
             self.open = false;
         }
-        // A model is running but the list does not know it — the state a hand-edited `config.toml`
-        // (and every install that upgrades into this design) starts in. Adopt it **once**, so the
-        // settings page never says "no models" while a conversation is being answered. The key is
-        // deliberately left empty: it may come from the environment or from the file, and copying
-        // either into the list would be a guess that outlives the guess.
+        // A model is running but the list does not know it — the state a hand-edited `config.toml` (and every install...
         if !self.adopted
             && self.book.models.is_empty()
             && !v.model.trim().is_empty()
@@ -284,10 +223,7 @@ impl ModelUi {
     }
 
     /// A scan came back.
-    ///
-    /// Routed to the **dialog** when one is open (that is where the button was pressed and where the
-    /// dropdown has to fill), and into the book either way. A result that arrives after the dialog
-    /// closed still lands in the book: dropping it would mean scanning twice for nothing.
+    /// Routed to the dialog when one is open (that is where the button was pressed and where the dropdown has...
     pub fn set_models(&mut self, v: ModelsView) {
         self.busy_scan = false;
         let models: Vec<SavedModel> =
@@ -315,15 +251,13 @@ impl ModelUi {
         self.busy_test = false;
         let _ = (base_url, model);
         match &mut self.editor {
-            // The dialog is where the button was pressed and where the answer is useful. It is also
-            // the only place the endpoint + model it was asked about are still on screen, so a late
-            // reply belongs there rather than in a line nobody is looking at.
+            // The dialog is where the button was pressed and where the answer is useful.
             Some(e) => e.status = Some((text, ok)),
             None => self.notice = Some((text, ok)),
         }
     }
 
-    /// One line about a model operation (applied / saved / failed).
+    /// One line about a model operation (applied / saved / failed)
     pub fn set_notice(&mut self, ok: bool, text: String) {
         self.busy_scan = false;
         self.busy_test = false;
@@ -367,9 +301,7 @@ impl ModelUi {
     /// saved (a hand edit, or a fresh install).
     fn is_active(&self, rec: &ModelRecord) -> bool {
         let Some(v) = &self.view else { return false };
-        // The book says which record is in force (`active`), and that is the answer — comparing by
-        // (endpoint, model) is what once marked two rows as current. The fallback is for a book with
-        // no `active` (version 1, or one written before anything was chosen).
+        // The book says which record is in force (`active`), and that is the answer — comparing by (endpoint, model)...
         match self.book.active.as_deref() {
             Some(id) => id == rec.id,
             None => rec.is_active(&v.base_url, &v.model),
@@ -377,19 +309,14 @@ impl ModelUi {
     }
 
     /// Re-read the list from disk.
-    ///
-    /// The GUI keeps a copy for drawing, the agent thread writes the file (every apply marks the
-    /// record in force), so the copy has to be refreshed when a new state is pushed in — otherwise
-    /// "which one is current" would follow the GUI's idea rather than the runtime's.
+    /// The GUI keeps a copy for drawing, the agent thread writes the file (every apply marks the record in force)...
     fn reload_book(&mut self) {
         if let Some(root) = self.root.clone() {
             self.book = Book::load(&root);
         }
     }
 
-    /// Fill the pop-up's numbers from the running model.
-    /// Refill the draft from what is actually running. Called whenever a `ProviderView` arrives and
-    /// whenever the pop-up closes without 确定.
+    /// Refill the draft from the running model on each ProviderView and on a pop-up close without commit.
     fn sync_inline(&mut self) {
         let Some(v) = self.view.clone() else { return };
         self.win = window_text(v.context_window);
@@ -398,15 +325,12 @@ impl ModelUi {
         self.thy = v.thinking;
     }
 
-    /// Closing the pop-up without 确定 is a **cancel**, so the draft goes back to what is in force.
-    /// Keeping it would leave three fields showing numbers nobody applied — and the chip under them
-    /// saying something else.
+    /// Closing without commit is a cancel, so the draft reverts; keeping it shows numbers the chip disagrees with.
     fn revert_inline(&mut self) {
         self.sync_inline();
     }
 
-    /// Has the draft drifted from what is running? Drives the footer's "unsaved" hint, and makes
-    /// 确定 on an untouched panel a plain close instead of a provider swap.
+    /// Whether the draft differs from the running model: drives the unsaved hint and makes commit a plain close.
     fn inline_dirty(&self) -> bool {
         let Some(v) = &self.view else { return false };
         self.win != window_text(v.context_window)
@@ -422,14 +346,7 @@ impl ModelUi {
         let _ = self.book.save(&root);
     }
 
-    /// Flip one record's switch.
-    ///
-    /// **Always allowed, the one in use included.** An earlier cut refused that case with a status line
-    /// — which is precisely what "clicked 启用/停用 and nothing happened" was: on a fresh install there
-    /// is exactly one model, it is the one running, and it was the one being clicked. "Enabled" here
-    /// means "offered in the input box's list", not "permitted to run": hiding the current model only
-    /// removes it from the picker, and the picker keeps a row for whatever is running anyway (see
-    /// `menu`), so nothing becomes unreachable.
+    /// Flip a record's switch; always allowed, even for the running model, since enabled means listed in the picker.
     fn toggle_enabled(&mut self, id: &str) {
         if let Some(r) = self.book.by_id_mut(id) {
             r.enabled = !r.enabled;
@@ -504,11 +421,7 @@ impl ModelUi {
         }
     }
 
-    /// Open a model's card: remember which one, and load the draft from **it**.
-    ///
-    /// The draft is one set of four strings, but the card can be opened on any record — so selecting
-    /// has to re-point the draft. For the record in force the values come from the `ProviderView`
-    /// (that is what is actually answering); for any other one, from the record itself.
+    /// Open a model's card: remember which one, and load the draft from it.
     pub fn select(&mut self, id: &str) {
         let is_active = self.book.active.as_deref() == Some(id);
         if is_active {
@@ -523,7 +436,7 @@ impl ModelUi {
         self.notice = None;
     }
 
-    /// Whether the draft differs from **that** record — the card's 确定 is disabled when it does not.
+    /// Whether the draft differs from that record; the card's commit is disabled when it does not.
     fn dirty_for(&self, id: &str) -> bool {
         if self.book.active.as_deref() == Some(id) {
             return self.inline_dirty();
@@ -535,27 +448,14 @@ impl ModelUi {
             || self.thy != rec.thinking
     }
 
-    /// Turn the draft into **one** edit: 窗口 / 输出 / 温度 / 思考 together.
-    ///
-    /// One request, because all four land in the same record and the same live swap. The earlier
-    /// shape committed one field at a time — four writes and four provider swaps for one visit to the
-    /// panel, and three of them made with numbers the user had already replaced.
-    ///
-    /// The pop-up edits the model you are talking to (there is no "which record" question in a list
-    /// opened from a conversation), so the record is found by (endpoint, model) and, when there is
-    /// none, **created** — otherwise the numbers would apply to the session and evaporate next launch.
-    ///
-    /// Returns `None` **with the draft untouched** on a bad number: the message goes to `notice` and
-    /// the panel stays open, so the typo can be fixed instead of retyped.
+    /// One edit applies all four numbers; find or create the record by endpoint/model; bad input keeps the draft.
     #[cfg(test)]
     fn commit_all(&mut self) -> Option<ProviderEdit> {
         let id = self.book.active.clone()?;
         self.commit_to(&id).ok().flatten()
     }
 
-    /// Write the draft onto **that** record. `Ok(Some(edit))` means "apply it as well" (it is the
-    /// record in force), `Ok(None)` means "saved only", `Err` means a number did not parse — in which
-    /// case the draft is left exactly as typed and the message is in `notice`.
+    /// Write the draft onto that record. `Ok(Some(edit))` means "apply it as well" (it is the record in force)...
     fn commit_to(&mut self, id: &str) -> Result<Option<ProviderEdit>, ()> {
         let Some(mut rec) = self.book.by_id(id).cloned() else { return Err(()) };
         let Some(window) = parse_num(&self.win) else {
@@ -596,7 +496,7 @@ impl ModelUi {
     }
 }
 
-// ─────────────────────────── small helpers ───────────────────────────
+// small helpers
 
 /// The window as the field shows it, and what `sync_inline` / `inline_dirty` compare against. `0` is
 /// "not known yet", which is an empty box rather than a literal zero.
@@ -616,7 +516,7 @@ fn trim_f32(v: f32) -> String {
     }
 }
 
-/// "128000" → 128000. Also accepts `128k` / `1m`, because that is how people write windows.
+/// "128000" → 128000. Also accepts `128k` / `1m`, because that is how people write windows
 fn parse_num(s: &str) -> Option<u32> {
     let t = s.trim().to_ascii_lowercase().replace(['_', ',', ' '], "");
     if t.is_empty() {
@@ -634,10 +534,7 @@ fn parse_num(s: &str) -> Option<u32> {
     u32::try_from((n * mul as f64).round() as u64).ok()
 }
 
-/// `1000000` → `1M`. Rounding is only ever for reading; the exact number stays in the field.
-///
-/// One implementation, in the library: `/model` in the CLI prints the same windows, and two rounding
-/// rules would eventually disagree on the one number a user compares between the two front ends.
+/// One implementation, in the library: `/model` in the CLI prints the same windows, and two rounding rules would...
 pub use aox::modelbook::window_label as fmt_window;
 
 fn norm(a: &str) -> String {
@@ -654,12 +551,9 @@ pub fn think_label(t: Thinking) -> &'static str {
     }
 }
 
-// ─────────────────────────── the chip ───────────────────────────
+// the chip
 
 /// The chip at the bottom-left of the input box: `◇ deepseek-flash · 1M ⌄`.
-///
-/// Same geometry as the workplace chip next to it (28 high, radius 8, 10pt padding, 15pt glyph, 7pt
-/// gap, 13pt type) — the two sit on one row and any difference reads as two kinds of control.
 pub fn chip(ui: &mut Ui, st: &mut ModelUi, enabled: bool) -> bool {
     let ready = st.ready();
     let name = st.model().unwrap_or("").to_string();
@@ -722,11 +616,7 @@ pub fn chip(ui: &mut Ui, st: &mut ModelUi, enabled: bool) -> bool {
     clicked
 }
 
-/// The chip's mark: a **wireframe cube** — "a model is a box you talk to", drawn as an isometric box.
-///
-/// Outline only, on purpose: at 15pt a filled cube is a blob, and two squares (what this used to be)
-/// is not a box at all. The hexagon is the silhouette; the three edges meeting at the middle are what
-/// turn it into a box, and they are also what survives at this size when everything else mushes.
+/// The chip's mark: a wireframe cube — "a model is a box you talk to", drawn as an isometric box.
 fn paint_model_mark(p: &egui::Painter, r: Rect, fg: Color32) {
     let c = r.center();
     let s = r.width() * 0.42;
@@ -746,7 +636,7 @@ fn paint_model_mark(p: &egui::Painter, r: Rect, fg: Color32) {
     p.line_segment([c, bot], st);
 }
 
-// ─────────────────────────── the pop-up (switch + tune) ───────────────────────────
+// the pop-up (switch + tune)
 
 /// The list the chip opens: the enabled models, then the running model's numbers.
 pub fn menu(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
@@ -758,17 +648,13 @@ pub fn menu(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
         st.open = false;
         return out;
     };
-    // Anchor on the chip's top edge and grow upward (`pivot(LEFT_BOTTOM)`), so the panel is not clipped
-    // by the window's bottom edge — the same maths as the workplace menu, and the same warning: no
-    // coordinate conversion here (these rects are already client-local).
+    // Anchor on the chip's top edge and grow upward (`pivot(LEFT_BOTTOM)`), so the panel is not clipped...
     let anchor = btn.left_top() - Vec2::new(0.0, 6.0);
     let mut close = false;
     let mut save = false;
     let mut apply_rec: Option<ModelRecord> = None;
 
-    // The **enabled** models, each with "is this the one in force" decided here (by id, so twins
-    // cannot both light up). If the running model is not saved, it is shown first anyway: a list that
-    // omits the model you are talking to reads as a bug.
+    // The enabled models, each with "is this the one in force" decided here (by id, so twins cannot both light up).
     let cur_model = st.model().unwrap_or("").to_string();
     let cur_base = st.base_url().to_string();
     let mut rows: Vec<(ModelRecord, bool)> =
@@ -834,9 +720,7 @@ pub fn menu(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
     let mut card: Option<Rect> = None;
     if let Some(id) = st.selected.clone() {
         if let Some(rec) = st.book.by_id(&id).cloned() {
-            // Beside the list, but never off the window: on a narrow window the card slides left
-            // over the list instead of being drawn where it cannot be read (it is a foreground area,
-            // so overlapping is honest — disappearing is not).
+            // Beside the list, but never off the window: on a narrow window the card slides left over the list instead...
             let screen = ctx.content_rect();
             let left =
                 (list.response.rect.right() + 8.0).min(screen.right() - CARD_W - 24.0).max(screen.left() + 8.0);
@@ -924,9 +808,7 @@ pub fn menu(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
                             ui.add_space(12.0);
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                // 使用 only when it is not already the one running: the check in the
-                                // list is the *other* half of that answer, and a live button that does
-                                // nothing is worse than no button.
+                                // Offer Use only when not already running; the list check covers the rest, and a no-op button is worse.
                                 if !active && button(ui, aox::i18n::t("Use"), Weight::Secondary).clicked()
                                 {
                                     apply_rec = Some(rec.clone());
@@ -956,8 +838,7 @@ pub fn menu(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
         }
     }
 
-    // 确定: writes the draft onto the model the card is showing. When that is the model in force it
-    // also applies it (one request, one swap); for any other record it is a plain save.
+    // Commit writes the draft to the shown record; for the running model it also applies it, otherwise a plain save.
     if save {
         let id = st.selected.clone().unwrap_or_default();
         match st.commit_to(&id) {
@@ -975,11 +856,7 @@ pub fn menu(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
         close = true;
     }
 
-    // A click anywhere else closes both panels — and Esc does too. Without this the only ways out
-    // were the chip again or picking something, so the panel sat on top of the conversation.
-    //
-    // The chip's own rect is excluded: that click is what *opens* the list, and on the same frame it
-    // is already "outside" the freshly drawn panel, which would close it again immediately.
+    // A click anywhere else closes both panels — and Esc does too.
     let chip = st.button_rect;
     let inside = |p: Pos2| {
         list.response.rect.contains(p) || card.is_some_and(|r| r.contains(p))
@@ -994,8 +871,7 @@ pub fn menu(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
     if close || clicked_away || escaped {
         st.open = false;
         st.selected = None;
-        // Every way out other than a successful 确定 is a **cancel**, so the draft goes back to what is
-        // in force (or to the record, which `select` reloads next time).
+        // Any exit other than a successful commit is a cancel, so the draft reverts to the running values.
         if out.apply.is_none() && !save {
             st.revert_inline();
         }
@@ -1004,13 +880,7 @@ pub fn menu(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
 }
 
 
-/// One model row in the pop-up: the name, `model · host` under it, and a green check on the one in
-/// force.
-///
-/// The check replaces three earlier attempts at the same job (a 3pt left rule, a filled dot, ink text).
-/// On this monochrome palette those differ from an ordinary row by one grey step; a green check is the
-/// only mark in the whole list that is a colour, so "which one am I on" is answered at a glance without
-/// reading anything.
+/// One model row in the pop-up: the name, `model · host` under it, and a green check on the one in force.
 fn model_row(ui: &mut Ui, name: &str, sub: &str, current: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
     if resp.hovered() {
@@ -1086,7 +956,7 @@ fn pick_row(ui: &mut Ui, rec: &ModelRecord, active: bool, picked: bool) -> egui:
     resp
 }
 
-/// The list's last row: the way to the full list (the reference's "配置自定义模型").
+/// The list's last row: the link to the full list (the reference's configure-custom-model entry).
 fn config_row(ui: &mut Ui) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
     if resp.hovered() {
@@ -1116,15 +986,11 @@ fn config_row(ui: &mut Ui) -> egui::Response {
 }
 
 /// A pen writing a line: "this row is where models are edited" (the reference glyph).
-///
-/// Outline, not a filled pencil: at 13pt the only thing that reads is the **diagonal body plus the
-/// line under it**, so those are drawn first and the cap/nib are one short stroke each — enough to
-/// say "pen", nothing that turns into a smudge at this size.
 fn paint_pencil(p: &egui::Painter, r: Rect) {
     let st = Stroke::new(1.15, P::text_faint());
     let k = r.width();
     let at = |fx: f32, fy: f32| Pos2::new(r.left() + fx * k, r.top() + fy * k);
-    // The body runs lower-left → upper-right; `off` is its half width, perpendicular to that axis.
+    // The body runs lower-left → upper-right; `off` is its half width, perpendicular to that axis
     let off = Vec2::new(0.085 * k, 0.085 * k);
     let nib = at(0.20, 0.74);
     let cap = at(0.80, 0.14);
@@ -1158,10 +1024,6 @@ pub(crate) fn paint_check(p: &egui::Painter, r: Rect) {
 }
 
 /// A checkbox with a label and a hint, on one line.
-///
-/// Hand-drawn for the same reason as everything else here: `ui.checkbox` brings egui's own colours and
-/// metrics into a dialog that has neither, and the box would be a different size from the batch-mode one
-/// two panels over. **The label is part of the hit target** — a 16pt box is not something to aim at.
 fn check_row(ui: &mut Ui, on: &mut bool, label: &str, hint: &str) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
@@ -1189,7 +1051,7 @@ fn check_row(ui: &mut Ui, on: &mut bool, label: &str, hint: &str) {
     });
 }
 
-/// A one-line thinking choice (`默认 / 关 / 低 / 高 / 最高`).
+/// A one-line thinking choice (default / off / low / high / max).
 fn think_chip(ui: &mut Ui, t: Thinking, on: bool) -> egui::Response {
     let label = think_label(t);
     let font = egui::FontId::proportional(11.0);
@@ -1237,10 +1099,7 @@ fn label_col_w(ui: &Ui) -> f32 {
     widest + 8.0
 }
 
-/// One `label + field` pair of the pop-up's number rows. `id` is the field's stable widget id.
-///
-/// Returns `true` when Enter was pressed **in that field** — the panel's 确定 is one keystroke away from
-/// where the number was typed, which is the same thing every other form in this app does.
+/// One label/field row of the number pop-up; id is its stable widget id, and Enter in that field returns true.
 fn num_row(ui: &mut Ui, lw: f32, text: &str, val: &mut String, fw: f32, id: &str) -> bool {
     row_label(ui, lw, text);
     let r = compact_field(ui, val, fw, id);
@@ -1262,16 +1121,10 @@ fn row_label(ui: &mut Ui, w: f32, text: &str) {
     );
 }
 
-/// A compact field for the pop-up: a well with no frame of its own.
-///
-/// The text is edited **in place, on every keystroke** — the caller's `String` *is* the draft, and
-/// nothing is saved until 确定. That is the fix for "改不了数字": the first version handed the widget a
-/// clone and copied it back only on focus loss, so the next frame refilled the box from the old string
-/// and every keystroke (and every backspace) looked inert.
+/// Frameless field edits the caller's String in place each keystroke; saved only on commit, fixing the clone bug.
 fn compact_field(ui: &mut Ui, text: &mut String, w: f32, id: &str) -> egui::Response {
     theme::well(theme::R0)
-        // Same height as a button: `text + 2 × FIELD_PAD` = `BTN_H`, so a field and the 确定 under it
-        // are the same control in two skins.
+        // Same height as a button (text + 2*FIELD_PAD = BTN_H), so a field and the commit button share one metric.
         .inner_margin(Margin::symmetric(8, FIELD_PAD))
         .show(ui, |ui| {
             ui.set_width(w - 16.0);
@@ -1288,20 +1141,13 @@ fn compact_field(ui: &mut Ui, text: &mut String, w: f32, id: &str) -> egui::Resp
         .inner
 }
 
-// ─────────────────────────── the settings page: a list of models ───────────────────────────
+// the settings page: a list of models
 
-/// Settings → Model: two buttons on top, then the list.
-///
-/// A list, not a form. Everything belonging to *one* model is in the dialog behind a row, and the three
-/// numbers you tune while working are in the input box's pop-up — see the module docs.
+/// A list, not a form. Everything belonging to *one* model is in the dialog behind a row, and the three numbers...
 pub fn panel(ui: &mut Ui, st: &mut ModelUi) -> Requests {
     let mut out = Requests::default();
 
-    // ── top: add / batch ──
-    //
-    // Two states of **one** row rather than a bar that appears: "批量管理" becomes "完成", and the four
-    // actions it holds line up on the right. They used to appear only *after* the first tick, which
-    // meant entering batch mode and finding nothing to do with it.
+    // Top add/batch row: one row, two states (Batch becomes Done, four actions right), shown from the start.
     ui.horizontal(|ui| {
         if primary_plus_button(ui, aox::i18n::t("Add model")).clicked() {
             st.open_editor(None, false);
@@ -1372,7 +1218,7 @@ pub fn panel(ui: &mut Ui, st: &mut ModelUi) -> Requests {
     });
     ui.add_space(8.0);
 
-    // ── the list ──
+    // the list
     if st.book.models.is_empty() {
         ui.add_space(10.0);
         ui.label(
@@ -1428,11 +1274,8 @@ pub fn panel(ui: &mut Ui, st: &mut ModelUi) -> Requests {
         st.open_editor(Some(&id), false);
     }
 
-    // ── the status line ──
-    //
-    // Three sources, in order of urgency: what just happened, why the running model is unusable, and
-    // (when neither applies) where the numbers live. The middle one is what a fresh install reads:
-    // "no API key yet" — precisely the sentence that has to be on screen for the panel to make sense.
+    // ── the status line ──.
+    // Three sources, in order of urgency: what just happened, why the running model is unusable, and (when neither...
     ui.add_space(8.0);
     if let Some((text, ok)) = st.notice.clone() {
         ui.label(RichText::new(text).size(11.5).color(if ok { P::text_dim() } else { P::warn() }));
@@ -1441,7 +1284,7 @@ pub fn panel(ui: &mut Ui, st: &mut ModelUi) -> Requests {
     } else {
         ui.label(
             RichText::new(aox::i18n::t(
-                "「使用」switches to a model; the switch on the right only decides whether it appears in the input box's list.",
+                "Use switches to a model; the switch on the right only decides whether it appears in the input box's list.",
             ))
             .size(11.5)
             .color(P::text_faint()),
@@ -1468,9 +1311,6 @@ fn apply_batch(st: &mut ModelUi, ids: &[String], enabled: bool) {
 }
 
 /// Delete the selected records.
-///
-/// The record **in force is left alone** and says so: the session keeps running it either way, and
-/// removing it would also clear `active`, which is the one piece of state the next launch depends on.
 fn delete_batch(st: &mut ModelUi, ids: &[String]) {
     let running = st.book.active.clone();
     let mut removed = 0;
@@ -1509,17 +1349,13 @@ enum RowHit {
     Open,
     /// Flip the enable switch.
     Toggle,
-    /// Batch mode: tick / untick.
+    /// Batch mode: tick / untick
     Select,
-    /// "Use this one": make it the running model.
+    /// "Use this one": make it the running model
     Use,
 }
 
 /// One row of the settings list.
-///
-/// The **whole row** is the click target with a full-height hover fill, because "click a model to edit
-/// it" has to be discoverable without an icon on every line; the switch and the batch checkbox swallow
-/// their own clicks first, so they never open the editor by accident.
 fn model_list_row(
     ui: &mut Ui,
     rec: &ModelRecord,
@@ -1558,10 +1394,7 @@ fn model_list_row(
         return RowHit::Toggle;
     }
     right -= 44.0;
-    // "Use this one" — the verb the page was missing entirely: before this, switching model was only
-    // possible from the input box's pop-up, so a list that shows a green check on one of five rows had
-    // no way to move the check. Hidden in batch mode (there a click means "select") and on the row
-    // that already is the one in force (the check says it).
+    // "Use this one" — the verb the page was missing entirely: before this, switching model was only possible...
     if !batch && !active {
         let text = aox::i18n::t("Use");
         let w = button_size(ui, text, Weight::Secondary).x;
@@ -1587,9 +1420,7 @@ fn model_list_row(
     } else {
         P::text()
     };
-    // The one in force: a **green check right after the name**, and nothing else. Earlier attempts (a
-    // left rule, a bold name, a "当前" label) all lived in the same grey range as everything else, and
-    // one coloured mark is what actually answers "which one am I on".
+    // Mark the running model with one green check after the name; rules, bold names and labels blended into grey.
     let check_w = if active { 22.0 } else { 0.0 };
     let text_w = (right - check_w - rect.left() - 20.0).max(60.0);
     let name_x = rect.left() + 16.0;
@@ -1628,7 +1459,7 @@ fn model_list_row(
     RowHit::None
 }
 
-/// The enable switch: a pill with a knob, filled when on.
+/// The enable switch: a pill with a knob, filled when on
 fn paint_switch(p: &egui::Painter, r: Rect, on: bool, hover: bool) {
     let fill = if on {
         if hover {
@@ -1674,7 +1505,7 @@ fn paint_checkbox(p: &egui::Painter, r: Rect, on: bool, hover: bool) {
     }
 }
 
-// ─────────────────────────── the add / edit dialog ───────────────────────────
+// the add / edit dialog
 
 /// The add/edit dialog. Drawn as an overlay, so `App` calls it from `update` beside the other modals —
 /// not from inside the settings card (a dialog inside a scrolling panel gets clipped by it).
@@ -1704,15 +1535,14 @@ pub fn dialog(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
             ui.label(RichText::new(title).color(P::text()).size(16.0).strong());
             ui.add_space(14.0);
 
-            // ── endpoint ──
+            // endpoint
             caption(ui, aox::i18n::t("API endpoint"));
             tall_field(ui, &mut ed.base_url, DIALOG_W, "https://api.deepseek.com", false);
 
-            // ── key + test ──
+            // key + test
             ui.add_space(12.0);
             caption(ui, "API Key");
-            // The button column is **measured**, not fixed: `96` was chosen against "Test" and the
-            // English "Scan models" runs past its own frame, which is what "按钮被压缩" was.
+            // The button column is measured, not fixed: 96 sized for 'Test' let English 'Scan models' overflow.
             let btn_w = button_w(
                 ui,
                 &[
@@ -1724,9 +1554,7 @@ pub fn dialog(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
             );
             let field_w = DIALOG_W - btn_w - 10.0;
             ui.horizontal(|ui| {
-                // The gap between field and button is decided **here**, not by `item_spacing`: the
-                // theme's 8pt would stack on top of the explicit 10 and push the button 8pt past the
-                // dialog's right edge (the same trap the settings card documents).
+                // The gap between field and button is decided here, not by `item_spacing`: the theme's 8pt would stack on top...
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let r = tall_field_with(
                     ui,
@@ -1772,7 +1600,7 @@ pub fn dialog(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
                 }
             });
 
-            // ── model name + scan ──
+            // model name + scan
             ui.add_space(12.0);
             caption(ui, aox::i18n::t("Model name"));
             ui.horizontal(|ui| {
@@ -1825,7 +1653,7 @@ pub fn dialog(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
                 );
             }
 
-            // ── streaming ──
+            // streaming
             ui.add_space(10.0);
             check_row(
                 ui,
@@ -1834,7 +1662,7 @@ pub fn dialog(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
                 aox::i18n::t("the reply appears as it is written; turn it off for endpoints that reject stream"),
             );
 
-            // ── status ──
+            // status
             ui.add_space(10.0);
             match ed.status.clone() {
                 Some((text, ok)) => {
@@ -1855,7 +1683,7 @@ pub fn dialog(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
                 }
             }
 
-            // ── buttons ──
+            // buttons
             ui.add_space(16.0);
             ui.horizontal(|ui| {
                 // Delete sits on the left, away from Save: a destructive action next to the affirmative
@@ -1943,11 +1771,6 @@ pub fn dialog(ctx: &egui::Context, st: &mut ModelUi) -> Requests {
 }
 
 /// Take the dialog's values into the list. `Err` = the dialog stays open with this message.
-///
-/// Returns `Some(edit)` when the record should also become the **running** model, which happens when
-/// nothing usable is running yet: on a fresh install, "save" is the last step of "make this work", and
-/// making the user then find the chip and pick the model they just created is a step with no
-/// information in it.
 fn save_editor(st: &mut ModelUi) -> Result<Option<ProviderEdit>, String> {
     let Some(ed) = st.editor.take() else { return Ok(None) };
     let base_url = ed.base_url.trim().to_string();
@@ -1973,10 +1796,6 @@ fn save_editor(st: &mut ModelUi) -> Result<Option<ProviderEdit>, String> {
     let api_key = ed.api_key.trim().to_string();
 
     // Keep what the record already had; a new one starts from the defaults plus the scan's window.
-    //
-    // "Add" with an endpoint + model that is **already saved** resolves to that record instead of
-    // adding a twin: two identical rows are indistinguishable, one of them is dead weight, and the
-    // duplicate is exactly what "why are two models shown as in use" was about.
     let mut rec = ed
         .id
         .as_deref()
@@ -2023,9 +1842,7 @@ fn caption(ui: &mut Ui, text: &str) {
     ui.add_space(6.0);
 }
 
-/// A tall single-line field: the height comes from the **margin**, not from a minimum size (a
-/// `TextEdit`'s box is its text plus its margin, and a taller box with the default margin leaves the
-/// text stuck to the top edge).
+/// A tall single-line field: the height comes from the margin, not from a minimum size (a `TextEdit`'s box...
 fn tall_field(ui: &mut Ui, text: &mut String, w: f32, hint: &str, password: bool) -> egui::Response {
     tall_field_with(ui, text, w, hint, password, 12)
 }
@@ -2101,7 +1918,7 @@ fn model_combo(
     r
 }
 
-/// A flat word button at a fixed size (the dialog's "测试" / "扫描模型").
+/// A flat word button at a fixed size (the dialog's Test / Scan models actions).
 
 /// The show/hide eye. `shown` = plain text is on screen (a slashed eye when it is not).
 fn paint_eye(p: &egui::Painter, r: Rect, shown: bool, fg: Color32) {
@@ -2165,9 +1982,6 @@ mod tests {
     }
 
     /// The chip and the lists show a rounded window; the exact number stays in the field.
-    ///
-    /// `1048576` must read as `1M`: the earlier version only rounded numbers that divided evenly, so a
-    /// real 1024² window printed as a seven-digit figure and squeezed the chip it sat in.
     #[test]
     fn the_window_label_rounds_only_what_it_displays() {
         assert_eq!(fmt_window(1_000_000), "1M");
@@ -2203,9 +2017,7 @@ mod tests {
         }
     }
 
-    /// Saving a new record while something already works must **not** switch to it: the user asked for
-    /// "save, then I can pick it in the input box", and silently changing the running model in the
-    /// middle of a conversation is exactly the surprise this design has to avoid.
+    /// Saving a new record while something already works must not switch to it: the user asked for "save, then I can...
     #[test]
     fn saving_does_not_switch_when_a_model_is_already_running() {
         let mut st = ModelUi::new();
@@ -2283,9 +2095,7 @@ mod tests {
         assert_eq!(st.book.by_id("m1").unwrap().model, "deepseek-v4-pro");
     }
 
-    /// A running model that the list does not know about is adopted, once: the settings page must not
-    /// claim "no models" while a conversation is being answered (the state every hand-edited
-    /// `config.toml` is in).
+    /// A running model that the list does not know about is adopted, once: the settings page must not claim "no...
     #[test]
     fn a_running_model_is_adopted_into_an_empty_list_once() {
         let mut st = ModelUi::new();
@@ -2301,10 +2111,6 @@ mod tests {
     }
 
     /// Drive a real pointer at a row and report what the row thought was clicked.
-    ///
-    /// The headless version of "I clicked the switch and nothing happened": press on one frame, release
-    /// on the next (that is when egui reports a click), and read the `RowHit` back. A pure logic test
-    /// would have passed while the actual hit test was broken.
     fn click_at(pos: Pos2) -> RowHit {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
@@ -2329,7 +2135,7 @@ mod tests {
                 );
             });
         };
-        // Frame 0: settle (the area's first layout).
+        // Frame 0: settle (the area's first layout)
         run(&ctx, vec![], &mut hit);
         run(&ctx, vec![egui::Event::PointerMoved(pos)], &mut hit);
         run(
@@ -2355,10 +2161,7 @@ mod tests {
         hit
     }
 
-    /// The enable switch has to swallow its own click. It sits *inside* a row that is itself clickable,
-    /// and if the row wins the overlap then "click the switch" opens the editor instead — which is
-    /// exactly the "点了没反应" report (the editor opening over the list is easy to miss, and the switch
-    /// never moves).
+    /// The switch consumes its own click: nested in a clickable row, a row-winning hit test would open the editor.
     #[test]
     fn the_switch_takes_the_click_and_the_rest_of_the_row_opens_the_editor() {
         // The switch is 40 wide, 20pt in from the row's right edge; the row starts at x=10.
@@ -2370,10 +2173,7 @@ mod tests {
         assert!(matches!(hit, RowHit::Open), "and the label area must open the editor");
     }
 
-    /// The switch always flips — **including the model in use**. Refusing that case was the bug behind
-    /// "clicked 启用/停用 and nothing happened": on a fresh install the only model is the running one, and
-    /// an inert control reads as broken. Hiding it only takes it out of the picker, which keeps a row
-    /// for whatever is running.
+    /// The switch always flips, even for the running model; refusing it caused the inert-control bug.
     #[test]
     fn the_switch_always_flips_even_for_the_model_in_use() {
         let mut st = ModelUi::new();
@@ -2387,9 +2187,7 @@ mod tests {
         assert!(st.book.by_id("m1").unwrap().enabled, "and back");
     }
 
-    /// Editing the pop-up's numbers writes them onto the **record**, not just the session: otherwise
-    /// the value would be forgotten on the next launch. 确定 sends all four at once — one write, one
-    /// provider swap.
+    /// Pop-up edits persist to the record, not just the session; commit sends all four in one write and one swap.
     #[test]
     fn a_popup_change_is_saved_with_the_model() {
         let mut st = ModelUi::new();
@@ -2450,9 +2248,7 @@ mod tests {
         assert!(applied.is_some(), "editing the running model applies it");
     }
 
-    /// The draft is a draft: typing changes nothing on disk, closing without 确定 puts it back, and
-    /// 确定 sends all four values in one edit. Every half of that is a separate promise, and the panel
-    /// is only honest if none of them is skipped.
+    /// Typing changes nothing on disk, closing reverts, and commit sends all four in one edit; all three must hold.
     #[test]
     fn the_popup_draft_is_a_cancel_until_confirm() {
         let mut st = ModelUi::new();
@@ -2472,7 +2268,7 @@ mod tests {
         );
 
         st.revert_inline();
-        assert!(!st.inline_dirty(), "closing without 确定 puts it back");
+        assert!(!st.inline_dirty(), "closing without Confirm puts it back");
         assert_eq!(st.win, "1000000");
         assert_eq!(st.thy, Thinking::Default);
 
@@ -2505,9 +2301,7 @@ mod tests {
         assert_eq!(st.book.by_id("m1").unwrap().context_window, None, "nothing was written");
     }
 
-    /// The bug behind "改不了数字": the field edited a **clone** of the draft and copied it back only
-    /// on focus loss, so the next frame refilled the box from the old string and every keystroke was
-    /// thrown away. Drive a real key into a real `TextEdit` and check the caller's string moved.
+    /// Regression test for the clone-on-blur bug: type a real key into a TextEdit and check the draft changed.
     #[test]
     fn typing_reaches_the_draft_instead_of_being_thrown_away() {
         let ctx = egui::Context::default();

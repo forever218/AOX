@@ -1,41 +1,6 @@
-//! `verify` — **host-collected evidence**, so "done" stops being a claim.
-//!
-//! # Why this exists
-//!
-//! The checkpoint (`crate::task`) records what the model believes. The one belief that matters most
-//! and is most often wrong is "it works now". A model that has just written a file will happily
-//! report "tests pass" without having run them, and the next session has no way to tell.
-//!
-//! So the host keeps its own ledger. This module runs checks the host can genuinely perform, and
-//! [`crate::task::TaskState::gate`] only accepts `done` when every acceptance criterion is covered
-//! by a passing, **current** check.
-//!
-//! # The four kinds, and why exactly these
-//!
-//! | Kind | Proves | Cost |
-//! |---|---|---|
-//! | `file_hash` | the file on disk is exactly the version you reviewed | one streamed read |
-//! | `file_contains` | a specific line/text really is in the file | one bounded read |
-//! | `path_exists` | a file or directory is really there | one `stat` |
-//! | `output_contains` | the **last tool result** really said this | a string search |
-//!
-//! `output_contains` is the degraded path for command-level verification: AOX ships no shell tool,
-//! so "the tests pass" can only be evidenced through whatever command plugin the user installed. The
-//! host cannot run `cargo test` itself, but it *can* read the output the plugin returned — the model
-//! picks the needle, the text is not the model's.
-//!
-//! # What this is not
-//!
-//! Not a test runner, and not a judge of whether the *right* thing was checked. It answers "did
-//! something real happen, recently, that supports this criterion". Choosing good criteria is the
-//! model's job; reviewing them is the user's.
-//!
-//! # Execution path
-//!
-//! Like `task_state`, the call is intercepted by `Agent::authorize_and_execute` **after**
-//! authorization: the evidence has to be attached to *this conversation's* checkpoint, and
-//! `Tool::call` only ever sees `&Runtime`. Registering it in the tool table exists solely so the
-//! model can see the entry point.
+//! `verify` — host-collected evidence, so "done" stops being a claim.
+//! # Why this exists.
+//! The checkpoint (`crate::task`) records what the model believes.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,9 +22,7 @@ pub const VERIFY_TOOL: &str = "verify";
 /// checkpoint row.
 pub const KINDS: [&str; 4] = ["file_hash", "file_contains", "path_exists", "output_contains"];
 
-/// `file_contains` reads the whole file, so it needs a cap. Past this the model is told to use
-/// `file_hash` instead: a substring search over a file this large is not something a single check
-/// should be doing, and the bot would be reading a file the model never meant to inspect.
+/// `file_contains` reads the whole file, so it needs a cap.
 pub const SCAN_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Occurrence counts are reported to reassure ("it is there"), not to measure — cap before counting
@@ -79,10 +42,7 @@ impl Tool for VerifyTool {
     }
 
     fn kind(&self) -> ToolKind {
-        // `Host`: it changes nothing in the project (it only reads), so it belongs to the "let the
-        // host do a job" tier. Concretely it follows `[auth] plugin_tools` (auto by default) — an
-        // authorization dialog in the middle of "prove it works" would teach the model to skip
-        // verification entirely, which is the opposite of the point.
+        // `Host`: it changes nothing in the project (it only reads), so it belongs to the "let the host do a job" tier.
         ToolKind::Host
     }
 
@@ -137,14 +97,6 @@ impl Tool for VerifyTool {
 }
 
 /// Run one check and return the piece of evidence.
-///
-/// `last_output` is the most recent tool result the host has seen (its tail), used by
-/// `output_contains`. `epoch` is the checkpoint's current workspace epoch — the caller fills it in,
-/// because only `Agent` knows which task this evidence belongs to.
-///
-/// `Err` means "the check could not run" (bad arguments, unreadable file). A check that ran and
-/// **failed** is `Ok(Check { ok: false, .. })` — that distinction is what lets the gate say "the
-/// latest check failed" instead of "there is no evidence".
 pub fn run(args: &Value, last_output: Option<&str>, epoch: u64) -> Result<Check, String> {
     let obj = args
         .as_object()
@@ -259,10 +211,7 @@ fn check_exists(obj: &serde_json::Map<String, Value>) -> Result<(String, bool, S
     }
 }
 
-/// `output_contains`: did the **last tool result** really say this?
-///
-/// The text comes from a tool the host ran, so it cannot be invented by the model — that is the only
-/// reason this counts as evidence at all.
+/// `output_contains`: did the last tool result really say this?
 fn check_output(
     obj: &serde_json::Map<String, Value>,
     last_output: Option<&str>,

@@ -1,37 +1,6 @@
 //! The system-prompt "seam".
-//!
-//! The prompt is no longer a compile-time constant but an ordered concatenation of
-//! several **segments**:
-//!
-//! | id | source | content |
-//! |----|------|------|
-//! | `core` | built-in | identity and core facts |
-//! | `protocol` | built-in | plugin protocol, Python template, plugin rules, communication style, reply rules, attachments & images |
-//! | `env` | generated at runtime | the host's real paths and this machine's interpreter situation |
-//! | `rules` | project file | the RULES.md project rules |
-//!
-//! Users can reorder (`order`), disable (`disable`) or append
-//! (`[[prompt.segment]]`) any segment in `config.toml`'s `[prompt]`; a config segment
-//! with the same id **overrides** the built-in one — the same semantics as phase 5's
-//! "later layer overrides earlier layer", only with two layers for now.
-//!
-//! # The byte-for-byte contract
-//!
-//! A segment body carries **no separators**; [`build`] connects them uniformly with
-//! `"\n\n"`. This makes the result under the default config **exactly identical** to
-//! the historical hard concatenation of "constant + `env_section` + project rules".
-//!
-//! This is not pedantry: the server's **prompt cache hit rate depends on byte-stable
-//! prefixes**, and once the prefix changes the cache is entirely wasted, directly
-//! raising cost. The `split_is_lossless` and `default_build_equals_legacy_assembly`
-//! tests at the end of this file pin this down.
-//!
-//! # Why the built-in constant is "one whole block + runtime splitting"
-//!
-//! Splitting that text into two halves by hand and writing them into the source
-//! amounts to importing "mistype one full-width bracket" into the core prompt. So we
-//! keep the **verbatim whole block** [`BUILTIN_PROMPT`], split it by section heading at
-//! runtime, and use a test to prove "split it, put it back == the original string".
+//! The prompt is no longer a compile-time constant but an ordered concatenation of several segments.
+//! | id | source | content |.
 
 use std::path::PathBuf;
 
@@ -41,17 +10,6 @@ use crate::tf;
 use crate::runtime::Runtime;
 
 /// The built-in prompt text, verbatim.
-///
-/// This constant is the **single source of truth** for the built-in prompt: the `core` / `protocol`
-/// segments are cut out of it at runtime, so the text lives in one place instead of two
-/// hand-maintained halves that could drift apart.
-///
-/// It is **not frozen** — it was rewritten once (in the i18n pass) away from the historical
-/// `SYSTEM_PROMPT`. What the tests at the end of this file pin is the *structure*, not the wording:
-/// `split_is_lossless` proves the split/rejoin round-trips, and `default_build_equals_legacy_assembly`
-/// proves the default assembly equals `BUILTIN_PROMPT + env_section`. Edit the wording freely, but
-/// keep those two invariants true — the reason they matter is cost, since the server's prompt cache
-/// keys off byte-stable prefixes and an accidental change wastes the cached prefix.
 const BUILTIN_PROMPT: &str = r#"You are AOX, a Rust-hosted agent on the user's local machine.
 
 [Work]
@@ -126,27 +84,16 @@ Files the user drags in are sent to you along with their text. You can see image
   - Set colors explicitly so the diagram stays clear in both light and dark themes.
 - Don't draw large ASCII diagrams (the +---+ kind). They don't align, and real diagrams are now available."#;
 
-/// The marker that cuts the `protocol` segment out of the built-in text (including
-/// the blank line above it).
-///
-/// In the built-in text there is one blank line between "[Core Facts]" and "[Plugin Protocol]", so
-/// the marker is `\n\n[Plugin Protocol]`.
+/// The marker that cuts the `protocol` segment out of the built-in text (including the blank line above it).
 const PROTOCOL_MARK: &str = "\n\n[Plugin Protocol]";
 
 /// The section heading inside the marker itself.
-///
-/// `split_once` consumes the **entire marker** (heading included), so after splitting
-/// the heading must be put back — otherwise the prompt would mysteriously lose a
-/// "[Plugin Protocol]" line. This is exactly the bug the `split_is_lossless` test caught the
-/// first time it ran.
-///
-/// Invariant: `PROTOCOL_MARK == "\n\n" + PROTOCOL_HEAD`.
 const PROTOCOL_HEAD: &str = "[Plugin Protocol]";
 
-/// The built-in segments' ids.
+/// The built-in segments' ids
 pub const CORE: &str = "core";
 pub const PROTOCOL: &str = "protocol";
-/// The runtime-generated segment's id.
+/// The runtime-generated segment's id
 pub const ENV: &str = "env";
 /// The workspace notes ("what earlier sessions wrote") segment's id.
 pub const MEMORY: &str = "memory";
@@ -169,9 +116,7 @@ pub enum Source {
     Runtime,
     /// A project rules file such as `RULES.md`
     RulesFile,
-    /// A component contribution (enabled in phase 6 · 6b: a plugin declares it via
-    /// `[contributes] prompt_segments`, and the body is fetched from the subprocess by
-    /// `prompt/segment`)
+    /// A component contribution (enabled in phase 6 · 6b: a plugin declares it via `contributes prompt_segments`...
     Plugin,
 }
 
@@ -188,14 +133,12 @@ impl Source {
 }
 
 /// One segment of the prompt.
-///
-/// `body` carries **no** separators — concatenation is [`build`]'s job alone. See the
-/// module docs for why.
+/// `body` carries no separators — concatenation is build's job alone.
 #[derive(Debug, Clone)]
 pub struct PromptSegment {
     /// Globally unique. A config segment with the same id overrides the built-in one.
     pub id: String,
-    /// Display name (used by `/prompt`).
+    /// Display name (used by `/prompt`)
     pub title: String,
     pub body: String,
     /// The default sort key (ascending); the same order keeps registration order (the sort is stable).
@@ -203,9 +146,9 @@ pub struct PromptSegment {
     pub source: Source,
 }
 
-// ─────────────────────────── Built-in segments ───────────────────────────
+// Built-in segments
 
-/// The two built-in segments: `core` / `protocol`.
+/// The two built-in segments: `core` / `protocol`
 pub fn builtin_segments() -> Vec<PromptSegment> {
     let (core, protocol) = split_builtin();
     vec![
@@ -227,9 +170,6 @@ pub fn builtin_segments() -> Vec<PromptSegment> {
 }
 
 /// Split the built-in constant into the `core` / `protocol` segments.
-///
-/// When it can't be split, degrade to "the whole thing counts as core" and **do not
-/// panic** — a prompt missing a segment beats a program that won't start.
 fn split_builtin() -> (String, String) {
     match t(BUILTIN_PROMPT).split_once(t(PROTOCOL_MARK)) {
         Some((core, rest)) => (core.to_string(), format!("{}{rest}", t(PROTOCOL_HEAD))),
@@ -237,15 +177,9 @@ fn split_builtin() -> (String, String) {
     }
 }
 
-// ─────────────────────────── Runtime-generated segment ───────────────────────────
+// Runtime-generated segment
 
 /// The run-environment segment.
-///
-/// **Moved verbatim from `src/agent.rs`** (byte-for-byte, including the leading
-/// `\n\n`, which [`strip_sep`] strips off). It tells the model the host's real paths
-/// and whether this machine actually has python / node / rustc — otherwise the model
-/// would repeatedly create doomed python plugins on a bare machine and burn the whole
-/// round.
 fn env_section(rt: &Runtime) -> String {
     let mut s = tf!(
         "\n\n# Run environment (determined by the host; use as-is, do not guess)\n\
@@ -262,14 +196,7 @@ fn env_section(rt: &Runtime) -> String {
         rt.plugins_dir.display(),
         std::env::consts::OS,
     );
-    // The workspace the model is **actually** confined to. **Read live, never from a startup-time
-    // value**: under the `default` tier the root is only decided on the first turn, and it can
-    // change mid-conversation (`/workplace`, the GUI button). Baking in the app root here is
-    // exactly why the model once answered "should I tidy the documents in my own install
-    // directory?" after the user had picked the Desktop. `Agent::refresh_system_prompt` rebuilds
-    // this whole prompt whenever the root changes, so this line stays honest.
-    //
-    // Kept out of the big `tf!` above so that block's translation key is untouched.
+    // The workspace the model is actually confined to.
     let (ws_mode, ws_root) = rt.workplace.snapshot();
     // No root means "not decided yet" (`Pending`) or the unrestricted tier (`Full`); either way the
     // conventional base is the app root.
@@ -290,9 +217,7 @@ fn env_section(rt: &Runtime) -> String {
         ws.display(),
         ws.display(),
     ));
-    // The project's own check command, when its marker files give it away. It belongs beside the
-    // workspace layout because it is a fact about **this copy of this project**, not a rule about how
-    // to behave — and a named command is what turns "verify your change" from advice into one call.
+    // The project's own check command, when its marker files give it away.
     if let Some(c) = crate::checks::detect(&ws) {
         s.push_str(&tf!(
             "\n- Check command: `{}` (recognised from `{}`). Run it after you change code — compiling is not the same as working. The host will point out writes that have not been checked since.",
@@ -300,9 +225,7 @@ fn env_section(rt: &Runtime) -> String {
             c.from
         ));
     }
-    // The AI's own per-workspace notes (see `src/workplace.rs`: the `.aox/memory/` folder). Today's
-    // local date is passed in so the model can name the file without guessing. Kept in its own `tf!`
-    // so the big "run environment" key above is untouched.
+    // The AI's own per-workspace notes (see `src/workplace.rs`: the `.aox/memory/` folder).
     s.push_str(&tf!(
         "\n\n# Memory (your own notes about this workspace)\n\
          The host sets aside a `.aox\\memory\\` folder at the workspace root for your notes. Record durable work there, in the folder you are actually working in:\n\
@@ -314,23 +237,14 @@ fn env_section(rt: &Runtime) -> String {
         crate::history::local_date(),
     ));
     // Tell the model truthfully whether this machine has python / node / rustc.
-    // Otherwise it would repeatedly create doomed python plugins on a bare machine and
-    // burn the whole round.
     s.push_str(&crate::runtimes::prompt_section(&rt.root, &rt.config.runtimes));
-    // The command line. Its own paragraph (not folded into the block above) because the boundary
-    // rules here are the ones a model is most likely to get wrong — retrying a refused write, or
-    // assuming reads are blocked too.
+    // The command line. Its own paragraph (not folded into the block above) because the boundary rules here...
     if rt.config.shell.enabled {
         let bash = crate::tool::bash::available(rt);
         let prefer_bash = crate::shell::prefers_bash(&rt.config.shell);
 
         s.push_str(&t("\n\n# Command line (`bash` and `shell`)\n"));
-        // The order *is* the whole of `[shell] prefer`: one line states it together with the reason,
-        // and each tool then gets one bullet written order-neutrally. Two small literals instead of two
-        // whole paragraphs, so the ordering is data rather than duplicated prose.
-        //
-        // It cannot be anything more than wording: a command has side effects, so the host must never
-        // run one twice to see which shell accepts it. That is why this reads as advice, not fallback.
+        // The order *is* the whole of `shell prefer`: one line states it together with the reason, and each tool then...
         match (&bash, prefer_bash) {
             (Some(_), true) => s.push_str(&t(
                 "- Preferred order: **bash, then `shell` (cmd.exe), then PowerShell.** bash can do a \
@@ -462,9 +376,6 @@ fn env_segment(rt: &Runtime) -> PromptSegment {
 }
 
 /// The workspace-notes segment: a table of contents for `.aox/memory/`.
-///
-/// `None` when nothing has been written yet — a workspace that never kept notes must produce the
-/// **same prompt** it did before this segment existed.
 fn memory_segment(rt: &Runtime) -> Option<PromptSegment> {
     let (_, ws_root) = rt.workplace.snapshot();
     let root = ws_root.unwrap_or_else(|| rt.root.clone());
@@ -534,14 +445,9 @@ fn strip_sep(s: String) -> String {
     }
 }
 
-// ─────────────────────────── Registry ───────────────────────────
+// Registry
 
-/// For `Runtime::new` to build the initial registry: built-in segments + config
-/// segments (same id overrides built-in).
-///
-/// "Config overrides built-in" is deliberate — it lets `[[prompt.segment]]` both append
-/// new segments and replace the built-in `core` / `protocol` wholesale, without having
-/// to `disable` first and then add a segment.
+/// For `Runtime::new` to build the initial registry: built-in segments + config segments (same id overrides...
 pub fn registry_from_config(cfg: &PromptConfig) -> Vec<PromptSegment> {
     let mut segs = builtin_segments();
     for extra in &cfg.segment {
@@ -563,7 +469,7 @@ pub fn registry_from_config(cfg: &PromptConfig) -> Vec<PromptSegment> {
     segs
 }
 
-// ─────────────────────────── Assembly ───────────────────────────
+// Assembly
 
 /// All currently effective segments (unsorted, unfiltered): those in the registry plus
 /// those generated at runtime.
@@ -592,9 +498,7 @@ pub fn assemble(rt: &Runtime) -> Vec<PromptSegment> {
     // 3. Default order (stable sort; the same order keeps registration order)
     segs.sort_by_key(|s| s.order);
 
-    // 4. Explicit order: the listed ids move to the front in listed order, and the
-    //    unlisted ones keep the default order after them. So `order = ["core", "env"]`
-    //    means "move env after core", without having to list all four segments.
+    // 4. Explicit order: the listed ids move to the front in listed order, and the unlisted ones keep the default...
     if !cfg.order.is_empty() {
         let mut head: Vec<PromptSegment> = Vec::with_capacity(segs.len());
         for id in &cfg.order {
@@ -618,12 +522,7 @@ pub fn build(rt: &Runtime) -> String {
         .join("\n\n")
 }
 
-/// The body of the `/prompt` command: the segment list + each segment's source and
-/// first line.
-///
-/// Deliberately **not column-aligned**: segment ids are ASCII while titles are Chinese,
-/// so padding with `{:<10}` and the like only gets knocked askew by the double-width
-/// characters. Listing them one per line actually reads better.
+/// The body of the `/prompt` command: the segment list + each segment's source and first line.
 pub fn report(rt: &Runtime) -> String {
     let segs = assemble(rt);
     let total: usize = segs.iter().map(|s| s.body.chars().count()).sum();
@@ -721,15 +620,15 @@ mod tests {
 
         std::fs::write(
             dir.join(".aox/memory/2026-10-18.md"),
-            "## 改了输入框\n\n正文，不该出现在提示词里\n",
+            "## Reworked the input box\n\nbody, must not appear in the prompt\n",
         )
         .unwrap();
         let segs = assemble(&rt);
         let seg = segs.iter().find(|s| s.id == MEMORY).expect("the note must be listed");
         assert!(seg.body.contains("2026-10-18.md"), "{}", seg.body);
-        assert!(seg.body.contains("改了输入框"), "{}", seg.body);
+        assert!(seg.body.contains("Reworked the input box"), "{}", seg.body);
         assert!(
-            !seg.body.contains("不该出现在提示词里"),
+            !seg.body.contains("must not appear in the prompt"),
             "the body is read on demand, never injected: {}",
             seg.body
         );
@@ -738,12 +637,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `[shell] prefer` moves **one line** and one bullet order — nothing else in the section.
-    ///
-    /// That is the whole reason the section is assembled from per-sentence literals instead of two
-    /// finished paragraphs: the ordering is data, so it can be flipped in one place and checked the
-    /// same way. It stays advice to the model either way; the host would never run a command twice to
-    /// see which shell accepts it.
+    /// `shell prefer` moves one line and one bullet order — nothing else in the section.
     #[test]
     fn the_command_line_order_follows_the_config() {
         let bash_first = rt_tuned(PromptConfig::default(), "bash");
@@ -773,12 +667,7 @@ mod tests {
         }
     }
 
-    /// The command-line section has to ask for the two things the UI cannot invent: a **spoken**
-    /// announcement before a slow call, and a `purpose` on the call itself.
-    ///
-    /// Pinned because both are pure wording: nothing in the host enforces them, so the only place
-    /// they can silently disappear is a reworded paragraph — and the symptom (rows reading `bash`
-    /// with nothing else, long calls looking frozen) is exactly what they were added to fix.
+    /// The command-line section has to ask for the two things the UI cannot invent: a spoken announcement before...
     #[test]
     fn the_shell_section_asks_for_an_announcement_and_a_purpose() {
         let rt = rt_tuned(PromptConfig::default(), "bash");
@@ -796,9 +685,7 @@ mod tests {
         assert_eq!(format!("{core}\n\n{protocol}"), BUILTIN_PROMPT);
     }
 
-    /// Under the default config, the assembled result must be **byte-for-byte
-    /// identical** to the historical implementation: `SYSTEM_PROMPT + env_section(rt)`
-    /// (the test environment has no RULES.md, hence no project rules segment).
+    /// Under the default config, the assembled result must be byte-for-byte identical to the historical...
     #[test]
     fn default_build_equals_legacy_assembly() {
         let rt = rt_with(PromptConfig::default());
@@ -835,12 +722,7 @@ mod tests {
         );
     }
 
-    /// The layout segment must name the **current** workspace and follow a mid-conversation switch.
-    ///
-    /// Regression: it used to hardcode `rt.root` (the app root / install dir), so after the user
-    /// picked another folder (`/workplace <dir>`, the GUI button) the model still believed it was
-    /// confined to the install directory — it then asked whether it should tidy "its own install
-    /// directory" instead of the folder the user meant.
+    /// The layout segment must name the current workspace and follow a mid-conversation switch.
     #[test]
     fn layout_segment_names_the_current_workspace() {
         let rt = rt_with(PromptConfig::default());
@@ -925,11 +807,6 @@ mod tests {
     }
 
     /// A disabled built-in segment must no longer appear in the final prompt.
-    ///
-    /// The positive half used to name `[Core Facts]`, a heading that the i18n rewrite had already
-    /// replaced with `[Work]` — so this test was failing for a reason that had nothing to do with
-    /// `disable`. It is pinned against the heading that really exists now: the point is "disabling
-    /// `protocol` removes that block and leaves `core` intact".
     #[test]
     fn disabled_builtin_text_is_gone() {
         let rt = rt_with(PromptConfig { disable: vec![PROTOCOL.into()], ..Default::default() });

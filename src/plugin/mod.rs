@@ -1,35 +1,6 @@
 //! Plugin host: each plugin is a separate child process, exchanging "one JSON per line" RPC messages over stdio.
-//!
-//! Protocol:
-//!   1. After starting a plugin, the host sends {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-//!      The plugin replies with result: {"name":..., "tools":[{"name","description","parameters","access"}]}
-//!      `access` is optional: writing "read" means this tool is **read-only** (the workspace boundary is judged as a read — reads are unrestricted),
-//!      everything else is judged as "may write to disk". See [`ToolDef::access`].
-//!   2. The host sends {"jsonrpc":"2.0","id":N,"method":"tools/call","params":{"name","arguments"}}
-//!      The plugin replies with result: {"content":"...","is_error":false}
-//!   3. The host may send the notification {"jsonrpc":"2.0","method":"shutdown"}; the plugin should exit on its own.
-//!
-//! # Slot model: metadata is permanent, the process is not
-//!
-//! A plugin is a **slot**. The permanent half is cheap (name, tool table, contribution declaration —
-//! a few hundred bytes) and lives for the whole session; the process is the expensive half and
-//! exists only while the plugin is actually being used.
-//!
-//! This split is what removes the old startup cost. Under the old model every plugin under
-//! `plugins/` was started at boot and stayed resident forever, so the price of "let the model call
-//! `fs_read` someday" was a permanently-idle interpreter process. The only reason that was ever
-//! necessary is that the tool list can only be learned by asking the process — so the answer is
-//! cached (see [`cache`]) and the process is started by the first real use instead:
-//!
-//! | state | process | tools callable | cost |
-//! |---|---|---|---|
-//! | dormant | none | yes (started on the call) | metadata only |
-//! | active | child + fence | yes (already up) | one interpreter |
-//!
-//! Dormant is **not** disabled: nothing about a plugin's presence in the tool list changes. See
-//! [`crate::config::PluginsConfig`] for the knobs (`[plugins]` in `config.toml`), and
-//! [`PluginHandle::rpc_ready`] for the single entry point that hides "there may be no process yet"
-//! from every caller.
+//! Protocol: 1. After starting a plugin, the host sends {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}...
+//! # Slot model: metadata is permanent, the process is not.
 
 /// The on-disk metadata cache that makes a lazy start possible: `plugins/<name>/plugin.cache.json`.
 pub mod cache;
@@ -56,43 +27,17 @@ use crate::runtime::Runtime;
 const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 const RUST_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// How many plugins may be **probed** at once during startup (`load_all`).
-///
-/// Only a cache miss starts a process, so with a warm cache nothing is ever throttled by this. The
-/// cap exists for the cold-cache case: probing means starting a real interpreter, so this keeps the
-/// boot-time memory spike close to the old one-at-a-time behaviour while turning the old
-/// "one plugin after another, N × `INIT_TIMEOUT` worst case" into "a few at a time".
+/// How many plugins may be probed at once during startup (`load_all`).
 const PROBE_CONCURRENCY: usize = 4;
 
 /// Suppress the console black window that child processes pop up on Windows.
-///
-/// **Creation flags** for child processes.
-///
-/// Two things share this one spot:
-///
-/// ① **`CREATE_NO_WINDOW`** — a plugin process's stdin/stdout are pipes and stderr goes to
-///    `stderr.log`, so it **never needs a console**. But in the GUI build the host is compiled as the `windows` subsystem
-///    (with no console of its own); launching console programs like `python.exe` / `node.exe` / `rustc.exe` at that point
-///    makes Windows allocate a fresh console just for it — what the user sees is
-///    "black windows popping up out of nowhere". Adding this flag everywhere makes CLI and GUI behave the same.
-/// ② **The fence's `CREATE_SUSPENDED`** (`src/sandbox.rs`) — freeze the process first so the host
-///    can stuff it into a Job Object before it runs its first line of code.
-///
-/// There are **two** kinds of `Command`: plugin child processes use `tokio::process::Command` (async),
-/// while the runtime-provisioning chain (certutil / tar / powershell) uses `std::process::Command` (sync).
-/// Both implement `creation_flags`, so a small trait unifies them here,
-/// avoiding a copy of the platform details at every call site.
 pub(crate) trait ProcessFlags {
     /// Only requires "no console window pops up". That is exactly what the provisioning call sites need.
     fn hide_console(&mut self) {
         self.process_flags(0);
     }
 
-    /// Set the creation flags: `CREATE_NO_WINDOW` **OR'd with** `extra`.
-    ///
-    /// ⚠️ The underlying call **overwrites** rather than appends, so everything must be given at once — that is also why `extra`
-    /// comes in as a parameter instead of letting the caller call `creation_flags` again (which would wipe
-    /// out `CREATE_NO_WINDOW` and bring the black window back).
+    /// Set the creation flags: `CREATE_NO_WINDOW` OR'd with `extra`.
     fn process_flags(&mut self, extra: u32);
 }
 
@@ -126,27 +71,15 @@ impl ProcessFlags for std::process::Command {
 }
 
 /// What a plugin contributes besides tools (stage 6 · 6b).
-///
-/// All fields are optional — an old plugin's `plugin.toml` has no `[contributes]` at all,
-/// so it deserializes to "contributes nothing", byte-identical in behaviour to today.
-///
-/// `PartialEq` is used for one thing: noticing that a plugin's live declaration has drifted from
-/// what was cached, so the cache can be refreshed (see [`PluginHandle::reconcile`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Contributes {
-    /// Which hook points to attach to. **Only the five names in `hook::POINTS` are recognized** (they are the trait method names);
-    /// a single misspelling means **activation fails** — the same principle as `[store] backend` / `[loop] impl`:
-    /// a setting written but never taking effect is the hardest class of bug to track down; better to argue loudly on the spot.
+    /// Which hook points to attach to.
     pub hooks: Vec<String>,
     /// Prompt-segment ids to contribute. **The body is not written here** — it is fetched with `prompt/segment` at activation,
     /// so the prompt content is not stored in two places and the body forgotten when the manifest is edited.
     pub prompt_segments: Vec<String>,
     /// Whether to contribute a theme patch (fetched with `theme/patch` at activation).
-    ///
-    /// This cycle only does "fetch + validate + display"; merging in the GUI is **deferred**: the UI theme is fixed **before**
-    /// the window is created (`gui/src/main.rs`'s `load_theme` runs on the main thread while plugin loading runs on a background thread),
-    /// so a component patch is inherently later than the theme. Set up the protocol now to avoid redoing the RPC later.
     pub theme: bool,
     /// Capability requests. When non-empty, **this plugin's tool calls all go through `Ask`** (see `auth::Policy::level_for`):
     /// having declared what capabilities it wants, a human must nod once; it may not silently ride on `[auth] plugin_tools`.
@@ -162,11 +95,7 @@ impl Contributes {
             && self.caps.is_empty()
     }
 
-    /// Effective value = manifest ← overridden by `initialize` (**last writer wins**, the same idea as the stage-5 layer stack).
-    ///
-    /// Why not recognize only one place: the manifest is an **offline declaration** (visible without starting the plugin, and the model writes against it),
-    /// while `initialize` is the **live process state** (the plugin knows better, e.g. it decides which points to attach to from environment variables).
-    /// When both are present the process wins; an old plugin that only writes the manifest still works.
+    /// Why not recognize only one place: the manifest is an offline declaration (visible without starting the plugin...
     pub fn overridden_by(self, live: Option<Self>) -> Self {
         let Some(live) = live else { return self };
         Self {
@@ -181,10 +110,7 @@ impl Contributes {
         }
     }
 
-    /// Validate and normalize: trim, drop empties, dedupe; hook points are then sorted into [`crate::hook::POINTS`]'s fixed order.
-    ///
-    /// An unrecognized hook point is a hard error (see the field docs). The sort also makes the question of what order hooks run in
-    /// depend only on the declared content, not on the order written — the same manifest yields the same execution order every time.
+    /// Validate and normalize: trim, drop empties, dedupe; hook points are then sorted into crate::hook::POINTS's...
     pub fn normalize(mut self) -> Result<Self> {
         let mut hooks: Vec<String> = Vec::new();
         for p in self.hooks.drain(..) {
@@ -227,10 +153,7 @@ pub struct PluginManifest {
     pub description: String,
     /// For a script plugin this is the entry file name (main.py); for a rust plugin it is the compiled artifact's file name
     pub entry: String,
-    /// What it contributes besides tools (stage 6 · 6b). Default = tools only, same as today.
-    ///
-    /// `skip_serializing_if`: `save()` does not write an empty
-    /// `[contributes]` section for a plugin that "contributes nothing" — an old plugin re-persisted still matches the old format.
+    /// What it contributes besides tools (stage 6 · 6b).
     #[serde(default, skip_serializing_if = "Contributes::is_empty")]
     pub contributes: Contributes,
 }
@@ -251,19 +174,7 @@ pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub parameters: Value,
-    /// The **declared intent** of this tool: read-only, or possibly writing to disk.
-    ///
-    /// A plugin declares it with `"access": "read"` in the `initialize` tool object (default = write).
-    /// The host uses it for exactly one thing: which tier to apply when judging the **workspace boundary** — reads are unrestricted, writes/deletes must be inside.
-    ///
-    /// Why the plugin itself must say: a plugin is a **black box**, the host cannot see what it does with that path,
-    /// and can only scan argument names for "path-like" strings (`workplace::scan_paths`). That coarse net is right for writes
-    /// (conservative), but for reads it is collateral damage — a read-only tool that scans the D drive gets blocked as a write.
-    /// Declaring this bit fills in the information "the host cannot guess".
-    ///
-    /// ⚠️ It is a **declaration, not enforcement**: a plugin can still declare `read` and then write. This host-side boundary guards against
-    /// "the model casually writing outside the area", not against a deliberately malicious plugin process (that is a different threat model,
-    /// see `docs/SANDBOX.md`). So no validation is done here, only faithful acceptance.
+    /// The declared intent of this tool: read-only, or possibly writing to disk.
     pub access: crate::workplace::Access,
 }
 
@@ -275,9 +186,6 @@ struct RpcChannel {
 
 impl RpcChannel {
     /// Read one line. Tolerates non-UTF-8 bytes (lossy decode); returning None means child EOF.
-    ///
-    /// If a child process mixes GBK/binary bytes into a protocol line, the old implementation would report
-    /// "stream did not contain valid UTF-8" and break the whole RPC; here we decode on a best-effort basis.
     async fn next_line(&mut self) -> Result<Option<String>> {
         let mut buf: Vec<u8> = Vec::new();
         let n = self.out.read_until(b'\n', &mut buf).await.context(t("failed to read from the plugin's stdout"))?;
@@ -294,11 +202,7 @@ impl RpcChannel {
     }
 }
 
-/// A **live plugin process** and everything whose lifetime is tied to it.
-///
-/// Dropping this struct *is* "stop the plugin": `fence` closes the Job handle, and
-/// `KILL_ON_JOB_CLOSE` then takes the plugin away together with its descendants. So there is no
-/// second teardown path that could be forgotten.
+/// A live plugin process and everything whose lifetime is tied to it.
 struct LiveProc {
     rpc: RpcChannel,
     child: Child,
@@ -316,16 +220,12 @@ pub struct SlotStat {
     pub idle_secs: u64,
     /// Whether the fence is really fitted (meaningless while dormant).
     pub fence_active: bool,
-    /// The fence's own one-line status text.
+    /// The fence's own one-line status text
     pub fence_text: String,
 }
 
 impl SlotStat {
-    /// The human-facing one-liner: which of the two states the slot is in, and — when a process is
-    /// up — how long it has been idle plus its fence status.
-    ///
-    /// One implementation, because this text appears both in `/plugins` and in whatever the GUI
-    /// shows later, and two copies would eventually describe the same state in two ways.
+    /// The human-facing one-liner: which of the two states the slot is in, and — when a process is up — how long...
     pub fn label(&self) -> String {
         if !self.running {
             return t("dormant (no process)").to_string();
@@ -334,28 +234,20 @@ impl SlotStat {
     }
 }
 
-/// A plugin slot: the permanent metadata, plus an **optional** process.
-///
-/// The two halves have wildly different costs — a few hundred bytes of metadata against a whole
-/// interpreter — so they are kept apart and only the metadata is guaranteed to be loaded.
+/// A plugin slot: the permanent metadata, plus an optional process.
 pub struct PluginHandle {
     pub name: String,
     pub language: String,
     pub description: String,
     /// The tool table.
-    ///
-    /// Behind a lock rather than a plain field for one reason: at start time the live `initialize`
-    /// answer is compared against what was assumed, and when they differ the table is corrected in
-    /// place (see [`PluginHandle::reconcile`]). Everything else about a slot is fixed once loaded.
+    /// Behind a lock rather than a plain field for one reason: at start time the live `initialize` answer is compared...
     pub tool_defs: std::sync::RwLock<Vec<ToolDef>>,
-    /// The effective component declaration (`plugin.toml [contributes]` ← the result after `initialize` overrides).
+    /// The effective component declaration (`plugin.toml [contributes]` ← the result after `initialize` overrides)
     pub contributes: Contributes,
     /// The theme patch fetched and validated at activation (same shape as `config.toml [theme]`).
     /// This cycle only **stores and displays** it; GUI merging is deferred (see [`Contributes::theme`]).
     pub theme_patch: Option<Box<crate::config::ThemeConfig>>,
-    /// The failure ledger for hook RPC — **shares the same Arc pair** with [`crate::hook::ComponentHook`]:
-    /// the hook side only reads (display), this side only writes (accounting). Hooks may not throw (throwing would break the main loop),
-    /// so failure can only be recorded this way — degrade silently, but never vanish silently.
+    /// The failure ledger for hook RPC — shares the same Arc pair with crate::hook::ComponentHook: the hook side only...
     pub hook_failures: Arc<AtomicU64>,
     pub hook_last_error: Arc<std::sync::Mutex<Option<String>>>,
     /// Config for building the fence (a fresh Job is created on every start, so this is only a template).
@@ -364,11 +256,7 @@ pub struct PluginHandle {
     root: PathBuf,
     dir: PathBuf,
     manifest: PluginManifest,
-    /// **The process slot.** `None` = dormant: no process, and everything about the plugin still
-    /// works — its tools are registered, callable, and listed for the model. The first call starts it.
-    ///
-    /// The same lock doubles as the "in flight" flag the reaper consults (see [`reap_slot`]), so
-    /// there is no separate counter that could drift out of step with reality.
+    /// The process slot. `None` = dormant: no process, and everything about the plugin still works — its tools...
     proc: Mutex<Option<LiveProc>>,
 }
 
@@ -383,7 +271,7 @@ impl PluginHandle {
         self.proc.lock().await.is_some()
     }
 
-    /// A read-only view of the slot, for the human-facing listings.
+    /// A read-only view of the slot, for the human-facing listings
     pub async fn stat(&self) -> SlotStat {
         let g = self.proc.lock().await;
         match g.as_ref() {
@@ -397,15 +285,9 @@ impl PluginHandle {
         }
     }
 
-    /// **One RPC, starting the process first if it is dormant.**
-    ///
-    /// This is the only way anything talks to a plugin — tool calls and component hooks both come
-    /// through here — so "there may not be a process yet" is handled in exactly one place instead of
-    /// being a precondition every caller has to remember (and get wrong).
+    /// One RPC, starting the process first if it is dormant.
     pub async fn rpc_ready(self: &Arc<Self>, rt: &Arc<Runtime>, method: &str, params: Value) -> Result<Value> {
-        // Make room *before* taking our own lock: this walks the other slots and takes **their**
-        // locks, and doing that while holding ours would be a lock-order inversion — two plugins
-        // starting at the same moment could each hold one lock and wait for the other.
+        // Make room *before* taking our own lock: this walks the other slots and takes their locks, and doing...
         if !self.is_running().await {
             reap_over_cap(rt, rt.config.plugins.max_resident).await;
         }
@@ -432,17 +314,6 @@ impl PluginHandle {
     }
 
     /// Correct the slot against the live `initialize` answer.
-    ///
-    /// The cached tool table is a **prediction**; this is where a wrong prediction is fixed. The two
-    /// halves are deliberately handled differently:
-    ///
-    /// - **tools** are corrected immediately. The model may be holding a tool name it read from the
-    ///   cache, so leaving it wrong means a guaranteed failed call; re-registering is also purely
-    ///   local — the schema list is rebuilt on every round, so the very next step sees the new table.
-    /// - **`[contributes]`** only refreshes the cache, taking effect on the next start. Repointing
-    ///   hooks mid-session would mean mutating a chain that is already running: the hooks, prompt
-    ///   segments and capability requests are registered with their old values, and a half-applied
-    ///   update is worse than a deferred one.
     async fn reconcile(self: &Arc<Self>, rt: &Arc<Runtime>, init: &InitInfo) {
         let assumed = self.tools();
         if !same_tools(&assumed, &init.tools) {
@@ -479,11 +350,7 @@ impl PluginHandle {
         Ok(())
     }
 
-    /// **Close the process, if there is one.** The slot stays: the tools remain registered and
-    /// callable, and the next call starts a fresh process.
-    ///
-    /// The reaper, the exit path and `respawn` all come through here, so "stop the plugin" has one
-    /// implementation rather than three that could drift apart.
+    /// Close the process, if there is one.
     pub async fn stop(&self) {
         let live = { self.proc.lock().await.take() };
         if let Some(live) = live {
@@ -493,9 +360,7 @@ impl PluginHandle {
 
     /// Close one process politely, then make sure it is gone.
     async fn close(&self, mut live: LiveProc) {
-        // Ask first, so the plugin can leave on its own terms (flush, clean up) — but only for a
-        // moment: a plugin that ignores the notification must not be able to hold the host up. The
-        // old code waited for EOF with no cap at all, which is a hang waiting to happen.
+        // Ask first, so the plugin can leave on its own terms (flush, clean up) — but only for a moment: a plugin...
         if notify(&mut live, "shutdown", Value::Null).await.is_ok() {
             let _ = tokio::time::timeout(Duration::from_millis(300), live.rpc.next_line()).await;
         }
@@ -506,15 +371,6 @@ impl PluginHandle {
 }
 
 /// Whether two tool tables describe the same tools.
-///
-/// Order-insensitive: a plugin that lists the same tools in a different order has not changed, and
-/// treating it as changed would mean pointless unregister/re-register churn on every start.
-///
-/// It compares the whole declaration, not just the name — a tool that kept its name but changed its
-/// parameters is precisely the case that would make the model send the wrong arguments, so it has to
-/// count as a difference. One implementation, used both for "does the cache still describe this
-/// plugin" (`cache::Cached`'s tests) and for "did the process just contradict what we registered"
-/// ([`PluginHandle::reconcile`]).
 pub(crate) fn same_tools(a: &[ToolDef], b: &[ToolDef]) -> bool {
     a.len() == b.len()
         && b.iter().all(|d| {
@@ -537,11 +393,7 @@ async fn notify(live: &mut LiveProc, method: &str, params: Value) -> Result<()> 
     Ok(())
 }
 
-/// One request/response exchange on an **already started** process.
-///
-/// Split out of [`PluginHandle::rpc_ready`] so that the handshake, the tool call and the hook call
-/// all speak byte-for-byte the same protocol — there is one place that decides how a line is framed
-/// and how a reply is matched, not three.
+/// One request/response exchange on an already started process.
 async fn rpc_inner(name: &str, live: &mut LiveProc, method: &str, params: Value) -> Result<Value> {
     live.rpc.next_id += 1;
     let id = live.rpc.next_id;
@@ -569,21 +421,14 @@ async fn rpc_inner(name: &str, live: &mut LiveProc, method: &str, params: Value)
     }
 }
 
-// ─────────────────────────── Idle reaping ───────────────────────────
+// Idle reaping
 
 /// How often the reaper looks at the slots.
-///
-/// Derived from the timeout so that a deliberate short setting (say 10 s) does not sit waiting a
-/// full 5 s to act, while the default stays at a rate that costs nothing measurable.
 fn reap_tick(cfg: &PluginsConfig) -> Duration {
     Duration::from_secs((cfg.idle_timeout_secs / 4).clamp(1, 5))
 }
 
-/// Start the background reaper. Called once per Runtime, from [`load_all`].
-///
-/// It holds a **weak** reference: the task must never be the reason the Runtime outlives the
-/// program's own exit path. When the Runtime goes, the next tick fails to upgrade and the task
-/// returns by itself.
+/// Start the background reaper.
 fn spawn_reaper(rt: &Arc<Runtime>) {
     let cfg = rt.config.plugins.clone();
     if !cfg.lazy {
@@ -598,9 +443,7 @@ fn spawn_reaper(rt: &Arc<Runtime>) {
         loop {
             tokio::time::sleep(tick).await;
             let Some(rt) = weak.upgrade() else { return };
-            // Snapshot the slots under the lock and release it before touching any of them: a slot's
-            // `stop` can await for a few hundred milliseconds, and the plugin table must stay usable
-            // for everything else meanwhile.
+            // Snapshot the slots under the lock and release it before touching any of them: a slot's `stop` can await...
             let slots: Vec<Arc<PluginHandle>> = rt.plugins.lock().await.values().cloned().collect();
             for h in slots {
                 if cfg.eager.iter().any(|n| n == &h.name) {
@@ -616,11 +459,6 @@ fn spawn_reaper(rt: &Arc<Runtime>) {
 }
 
 /// Close a slot's process if it has been idle for at least `min_idle`. Returns whether it closed one.
-///
-/// **`try_lock` is the safety catch, not an optimisation**: holding the proc lock *is* "an RPC is in
-/// flight" (see [`PluginHandle::rpc_ready`]), so a slot we cannot lock is a slot in use, and that is
-/// what keeps a long tool call from being killed halfway through. A slot that is already dormant
-/// fails the same check, so "reap an empty slot" is not a case that needs handling.
 async fn reap_slot(h: &Arc<PluginHandle>, min_idle: Duration) -> bool {
     let mut g = match h.proc.try_lock() {
         Ok(g) => g,
@@ -636,18 +474,12 @@ async fn reap_slot(h: &Arc<PluginHandle>, min_idle: Duration) -> bool {
 }
 
 /// The slot's idle seconds, or `None` when it is dormant or currently busy.
-///
-/// `None` for "busy" rather than blocking: this is a reporting/deciding helper, and stalling the
-/// caller on a lock held by a running tool call would be worse than an incomplete answer.
 fn idle_secs_if_free(h: &Arc<PluginHandle>) -> Option<u64> {
     let g = h.proc.try_lock().ok()?;
     g.as_ref().map(|l| l.last_used.elapsed().as_secs())
 }
 
 /// Keep at most `cap` plugin processes alive, giving up the longest-idle ones first. `0` = no cap.
-///
-/// This is the "while I am using one, close the ones I am not using" rule. It runs on the start path
-/// rather than on a timer because that is when the pressure is: a process is about to be added.
 async fn reap_over_cap(rt: &Arc<Runtime>, cap: usize) {
     if cap == 0 {
         return;
@@ -710,10 +542,7 @@ impl crate::tool::Tool for PluginTool {
             Err(_) => tf!("plugin {} response timed out ({} s)", self.handle.name, timeout.as_secs()),
         };
 
-        // A failure on a process we had to start is a **start** failure (no interpreter, a plugin
-        // that cannot import itself). Restarting would do the same thing a second time and report it
-        // twice, so the restart-and-retry dance below is kept for the case it was written for: a
-        // process that was already up and then hung or died.
+        // A failure on a process we had to start is a start failure (no interpreter, a plugin that cannot import itself).
         if !was_running {
             return ToolOutput::err(first_err);
         }
@@ -739,12 +568,7 @@ fn parse_tool_result(v: Value) -> crate::tool::ToolOutput {
         .map(|s| s.to_string())
         .unwrap_or_else(|| v.to_string());
     let is_error = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
-    // `"attach": ["<absolute path>", …]` — files **produced by the plugin**, which the host attaches for the model to see.
-    //
-    // This is the landing spot for "plugins can upload too": a plugin is a separate process and cannot call the host's `attach_file` tool,
-    // but it can **declare** the produced files in its own return value. What the host gets is a path, going through exactly the same
-    // check as a user drag-and-drop (`Attachment::probe`) — so "plugin screenshots → the model really sees that image" holds,
-    // rather than just stuffing the path into the context as a string. Protocol shape in `prompt::BUILTIN_PROMPT`.
+    // `"attach": ["<absolute path>", …]` — files produced by the plugin, which the host attaches for the model to see.
     let attach = v
         .get("attach")
         .and_then(|a| a.as_array())
@@ -774,10 +598,7 @@ fn spawn_command(
     let mut cmd = match manifest.language.as_str() {
         "python" => {
             let mut c = Command::new(&cfg.python);
-            // -X utf8 + PYTHONUTF8/PYTHONIOENCODING: force the child's stdin/stdout through UTF-8.
-            // This is the key, from the host side, to curing "Windows' default GBK output breaks the JSON protocol",
-            // no longer relying on the model hand-writing an encoding patch in every plugin.
-            // -u: disable buffering so protocol lines are visible immediately.
+            // X utf8 + PYTHONUTF8/PYTHONIOENCODING: force the child's stdin/stdout through UTF-8.
             c.args(["-X", "utf8", "-u"]).arg(&entry);
             c.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
             c
@@ -803,9 +624,6 @@ fn spawn_command(
 }
 
 /// Start the process (no handshake yet) and put it under its fence.
-///
-/// The fence goes on **immediately**, before the suspended process ever runs a line of its own code:
-/// this is the only place that can guarantee "inside the Job from the first instruction".
 fn spawn_process(
     cfg: &RuntimesConfig,
     root: &Path,
@@ -828,27 +646,17 @@ fn spawn_process(
 }
 
 /// What one `initialize` handshake told us, plus the contribution content fetched with it.
-///
-/// Deliberately the same struct for "build a fresh slot" and "refresh the cache", so the two can
-/// never drift into disagreeing about what a plugin's metadata consists of.
 struct InitInfo {
     tools: Vec<ToolDef>,
-    /// The effective contribution declaration (manifest ← overridden by `initialize`).
+    /// The effective contribution declaration (manifest ← overridden by `initialize`)
     contributes: Contributes,
-    /// Prompt-segment bodies, as returned by `prompt/segment`.
+    /// Prompt-segment bodies, as returned by `prompt/segment`
     prompt_segments: BTreeMap<String, String>,
     /// The raw `theme/patch` result, validated later by [`theme_of`].
     theme_patch: Option<Value>,
 }
 
-/// Start the plugin process, complete the initialize handshake, and fetch whatever the declared
-/// contributions promise.
-///
-/// Returns the process **still running**: both callers want it that way (one is about to use it, the
-/// other has just paid for it and will keep it), so nothing here closes it. A caller that decides it
-/// does not need the process calls [`PluginHandle::stop`]. A failure anywhere after the spawn drops
-/// the `LiveProc`, which kills the child and closes its Job — a half-started plugin cannot be left
-/// behind.
+/// Start the plugin process, complete the initialize handshake, and fetch whatever the declared contributions...
 async fn spawn_and_init(
     cfg: &RuntimesConfig,
     root: &Path,
@@ -862,9 +670,7 @@ async fn spawn_and_init(
         .await
         .map_err(|_| anyhow!(tf!("plugin {} initialize handshake timed out ({} s)", manifest.name, INIT_TIMEOUT.as_secs())))??;
 
-    // ---- Tools (**not a single field of the old shape was changed**) ----
-    // A missing `tools` is treated as empty: a component that only contributes hooks/prompt segments and
-    // provides no tools has no reason to build an empty array. If it is meant to be an array but is not (wrong type), it still errors on the spot.
+    // Tools (not a single field of the old shape was changed) ---- A missing `tools` is treated as empty: a component...
     let tools: Vec<Value> = match result.get("tools") {
         None | Some(Value::Null) => Vec::new(),
         Some(v) => v
@@ -901,9 +707,7 @@ async fn spawn_and_init(
         .normalize()
         .with_context(|| tf!("plugin {}'s contribution declaration is malformed", manifest.name))?;
 
-    // **The one thing stage 6 · 6b loosened**: previously "declared no tools at all" was a straight failure, so
-    // a component that "only contributes hooks, provides no tools" had no path to life at all. Now it takes the union —
-    // there must be **at least one** of tools and contributions; having neither is a genuine config error (it does nothing).
+    // The one thing stage 6 · 6b loosened: previously "declared no tools at all" was a straight failure...
     if defs.is_empty() && contributes.is_empty() {
         bail!(tf!(
             "plugin {} declares neither tools nor any [contributes] — it would do nothing",
@@ -911,9 +715,7 @@ async fn spawn_and_init(
         ));
     }
 
-    // ---- ① Fetch the contributions that need RPC (prompt segment bodies / theme patch) ----
-    // They are fetched here, at the one moment the process is guaranteed to be alive and freshly
-    // handshaken, and then travel with the slot (and into the cache) rather than being re-fetched.
+    // Fetch the contributions that need RPC (prompt segment bodies / theme patch) ---- They are fetched here...
     let mut prompt_segments: BTreeMap<String, String> = BTreeMap::new();
     for id in &contributes.prompt_segments {
         match rpc_inner(&manifest.name, &mut live, "prompt/segment", json!({ "id": id })).await {
@@ -940,10 +742,7 @@ async fn spawn_and_init(
     Ok((live, InitInfo { tools: defs, contributes, prompt_segments, theme_patch }))
 }
 
-/// Validate a raw `theme/patch` result into `[theme]` shape.
-///
-/// A patch that is not shaped like `[theme]` is warned about and dropped — never fatal: a component
-/// is degradable by design, and one bad theme must not cost the plugin the tools it does provide.
+/// Validate a raw `theme/patch` result into `theme` shape.
 fn theme_of(plugin: &str, raw: Option<Value>) -> Option<Box<crate::config::ThemeConfig>> {
     let raw = raw?;
     match serde_json::from_value::<crate::config::ThemeConfig>(raw) {
@@ -956,11 +755,6 @@ fn theme_of(plugin: &str, raw: Option<Value>) -> Option<Box<crate::config::Theme
 }
 
 /// Extract the "workspace intent" from a tool declaration.
-///
-/// **Only `"read"` is recognized** (case-insensitive, trimming tolerated); everything else — writing `"write"`, misspelling `"ReadOnly"`,
-/// typing it as a number, or simply having no such field — all fall through to "write". This asymmetry is deliberate:
-/// the two consequences of a wrong direction differ by orders of magnitude — **a misspelling only blocks the tool one extra time (the user sees it, the model can fix it),
-/// whereas getting it wrong lets an out-of-bounds write land directly on disk** (irreversible). So better to recognize too little than too much.
 fn parse_access(t: &Value) -> crate::workplace::Access {
     match t.get("access").and_then(|a| a.as_str()).map(str::trim) {
         Some(s) if s.eq_ignore_ascii_case("read") => crate::workplace::Access::Read,
@@ -973,19 +767,11 @@ fn parse_access(t: &Value) -> crate::workplace::Access {
 const COMPONENT_SEGMENT_ORDER: i32 = 60;
 
 /// A notice for when a component contribution goes wrong.
-///
-/// It goes to stderr rather than a UI event: activation happens **while the Runtime is being assembled** (the CLI has not entered the REPL,
-/// the GUI has not built its window), and at that moment there is no ui to send to. Runtime accidents have
-/// [`crate::hook::ComponentHook`]'s failure ledger to fall back on (visible in `/hook`).
 fn component_warn(plugin: &str, why: impl std::fmt::Display) {
     eprintln!("{}", tf!("[component] {}: {}", plugin, why));
 }
 
 /// A notice about a plugin going wrong outside activation.
-///
-/// stderr rather than a UI event, for the same reason as [`component_warn`] — and more so: a lazy
-/// start happens on the agent thread at an arbitrary moment, so there may well be a running UI and
-/// no channel to put this on. It is also never fatal: every path that calls it has already degraded.
 fn plugin_warn(plugin: &str, why: impl std::fmt::Display) {
     eprintln!("{}", tf!("[plugin] {}: {}", plugin, why));
 }
@@ -996,15 +782,10 @@ struct SlotParts {
     contributes: Contributes,
     theme_patch: Option<Box<crate::config::ThemeConfig>>,
     /// The process, when one has already been started.
-    ///
-    /// A cache miss had to start the process to ask for its tool list; that process is handed over
-    /// here rather than thrown away and started again on the first call.
     live: Option<LiveProc>,
 }
 
-/// Build a slot. **Nothing is started here**, and no I/O happens at all — keeping the constructor
-/// inert is what makes the metadata/process split obvious at a glance rather than a promise in a
-/// comment.
+/// Build a slot. Nothing is started here, and no I/O happens at all — keeping the constructor inert is what makes...
 fn assemble(
     dir: &Path,
     root: &Path,
@@ -1029,22 +810,9 @@ fn assemble(
     })
 }
 
-/// Register the slot's **tools and contributions** into the Runtime and bring it under management.
-///
-/// Order: **tools first, then contributions** — and unlike the old activation path, **no RPC at
-/// all**: everything needed is already in the slot. That is exactly what makes a lazy start
-/// possible, since this is the function that used to require a live process.
-///
-/// The two error-handling lines are deliberately separate:
-/// - **tool registration failure = the whole plugin fails to install**, rolling back what was registered;
-/// - a contribution that fails to attach is that contribution's own problem (a malformed hook point
-///   was already rejected earlier, by `Contributes::normalize`).
+/// Register the slot's tools and contributions into the Runtime and bring it under management.
 async fn activate_slot(rt: &Arc<Runtime>, handle: Arc<PluginHandle>, segments: Vec<(String, String)>) -> Result<Vec<String>> {
-    // ---- ① Clear this plugin's previous *non-tool* contributions ----
-    // On the create path nothing is there and both are no-ops. On the update/hot-swap path they are
-    // essential: the plugin keeps its name, so a hook or prompt segment the new version dropped would
-    // otherwise survive as a ghost and keep firing against the new process with the old declaration.
-    // Tools are handled separately (unregister + re-register by name), so they are not touched here.
+    // Clear this plugin's previous *non-tool* contributions ---- On the create path nothing is there and both...
     rt.hooks.remove_by_plugin(&handle.name);
     rt.remove_prompt_segments_by_plugin(&handle.name);
 
@@ -1113,10 +881,7 @@ pub async fn create_plugin(
         other => bail!(tf!("language must be python / node / rust, got: {}", other)),
     };
     let dir = rt.plugins_dir.join(name);
-    // A name that is already live is no longer a hard error: rebuilding in place is exactly what a
-    // `update_plugin` does, and the source is in hand, so the two collapse into one path. This is
-    // also what the system prompt has always promised the model ("reuse the original name"), which
-    // used to be a promise the code did not keep.
+    // A name that is already live is no longer a hard error: rebuilding in place is exactly what a `update_plugin`...
     if rt.plugins.lock().await.contains_key(name) {
         return update_plugin(rt, name, source, None).await;
     }
@@ -1134,28 +899,7 @@ pub async fn create_plugin(
     result
 }
 
-/// Implementation of the `update_plugin` meta-tool: replace an existing plugin's source **in place**,
-/// retiring the old process and atomically re-registering the new one — a hot swap, no delete.
-///
-/// # Why this exists
-///
-/// Before it, "change a plugin" had no direct route. The model's only instinct was `write_file` on
-/// `plugins/<name>/main.py`, which **appears to do nothing**: the plugin is already registered and
-/// its process is already running, so the edit sits on disk while every call still reaches the old
-/// process. The model then reached for `remove_plugin` + `create_plugin` — three authorizations and
-/// a window in which the capability is simply gone — which is also what the old `create_plugin`
-/// error ("is running; remove_plugin first") forced.
-///
-/// # Semantics
-///
-/// - `language` is **not** a parameter: changing it is a rebuild, not an update (the entry file, the
-///   build step and the runtime all differ), so it stays whatever the plugin was created with.
-/// - `description` is optional; `None` keeps the existing one.
-/// - The old process is stopped **after** the new one has handshaken successfully, and the old source
-///   is restored if anything fails — so a failed update leaves a working plugin, not a dead one.
-///
-/// Errors when `name` is not a known plugin: that is a `create_plugin` job, and saying so is more
-/// useful to the model than silently creating one.
+/// Implementation of the `update_plugin` meta-tool: replace an existing plugin's source in place, retiring the old...
 pub async fn update_plugin(
     rt: &Arc<Runtime>,
     name: &str,
@@ -1201,10 +945,7 @@ pub async fn update_plugin(
         }
     }
 
-    // Handshake the new version **before** dismantling the old one. If the new plugin is broken
-    // (bad syntax, an interpreter that will not start, a 20 s timeout), the error surfaces here and
-    // the old process is still up and serving — the capability never disappears, and the rollback
-    // only has to put the source file back.
+    // Handshake the new version before dismantling the old one.
     let handshake = spawn_and_init(&rt.runtimes(), &rt.root, &dir, &manifest, &rt.sandbox).await;
     let (live, init) = match handshake {
         Ok(v) => v,
@@ -1214,19 +955,15 @@ pub async fn update_plugin(
         }
     };
 
-    // ---- Dismantle the old slot (the new version has handshaken, so this is the safe moment) ----
-    // Unregister the old tools first: `Runtime::register` refuses a name that is taken, and the new
-    // version almost always reuses the same names.
+    // Dismantle the old slot (the new version has handshaken, so this is the safe moment) ---- Unregister the old...
     for def in &old.tools() {
         rt.unregister(&def.name).await;
     }
-    // Close the old process. Otherwise `rpc_ready` on the stale handle would keep a second
-    // interpreter alive behind the same plugin name. The old hooks / prompt segments are removed
-    // by `activate_slot` below.
+    // Close the old process. Otherwise `rpc_ready` on the stale handle would keep a second interpreter alive behind...
     old.stop().await;
     rt.plugins.lock().await.remove(name);
 
-    // ---- Install the new slot ----
+    // Install the new slot
     let theme_patch = theme_of(&manifest.name, init.theme_patch.clone());
     write_cache(&dir, &manifest, &init);
     let segments: Vec<(String, String)> = init.prompt_segments.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -1250,9 +987,6 @@ pub async fn update_plugin(
 }
 
 /// Put the previous source back after a failed update, and recompile it for a rust plugin.
-///
-/// Failure to roll back is a warning, not an error: the update's own error is the one worth
-/// reporting, and `create_plugin` can rebuild the plugin from scratch if the file is left damaged.
 async fn restore(entry_path: &Path, previous: Option<&str>, rt: &Arc<Runtime>, name: &str, language: &str, dir: &Path) {
     match previous {
         Some(text) => {
@@ -1296,10 +1030,7 @@ async fn create_plugin_inner(
     };
     manifest.save(dir)?;
 
-    // A just-created plugin is started **now**, not deferred: the model almost always calls it on the
-    // very next step, and "creation failed" is a far better moment to find out a plugin is broken
-    // than the first real call. It is also the only moment the source is in hand, so the metadata
-    // cache is written straight away and the plugin is on the fast path from here on.
+    // A just-created plugin is started now, not deferred: the model almost always calls it on the very next step...
     let (live, init) = spawn_and_init(&rt.runtimes(), &rt.root, dir, &manifest, &rt.sandbox).await?;
     let theme_patch = theme_of(&manifest.name, init.theme_patch.clone());
     write_cache(dir, &manifest, &init);
@@ -1314,7 +1045,7 @@ async fn create_plugin_inner(
     activate_slot(rt, handle, segments).await
 }
 
-/// The compiled artifact's name for a rust plugin (`main.rs` → `<name>[.exe]`).
+/// The compiled artifact's name for a rust plugin (`main.rs` → `<name>[.exe]`)
 fn rust_entry(name: &str) -> String {
     if cfg!(windows) {
         format!("{name}.exe")
@@ -1324,19 +1055,13 @@ fn rust_entry(name: &str) -> String {
 }
 
 /// Compile a rust plugin's `main.rs` in place, writing `rust_entry(name)` next to it.
-///
-/// Split out of [`create_plugin_inner`] so [`update_plugin`] recompiles through the **same** command
-/// line: a second copy of the flags (edition, `-O`, the Windows-only `+crt-static`) is exactly the
-/// kind of drift that makes "works on create, breaks on update".
 async fn compile_rust_plugin(rt: &Arc<Runtime>, name: &str, dir: &Path) -> Result<()> {
     let exe = rust_entry(name);
     // Use the resolved rustc (possibly the one bundled in the app directory), not the raw value from config
     let runtimes = rt.runtimes();
     let mut cmd = Command::new(&runtimes.rustc);
     cmd.arg("--edition=2021").arg("-O");
-    // Statically link the CRT, consistent with the host's own build (see .cargo/config.toml).
-    // Only added on windows: on other platforms +crt-static has different semantics (it affects libc's static/dynamic linking),
-    // whereas the goal here is exactly one thing: "stop the plugin exe depending on VCRUNTIME140.dll".
+    // Statically link the CRT, consistent with the host's own build (see.cargo/config.toml).
     if cfg!(windows) {
         cmd.args(["-C", "target-feature=+crt-static"]);
     }
@@ -1351,9 +1076,7 @@ async fn compile_rust_plugin(rt: &Arc<Runtime>, name: &str, dir: &Path) -> Resul
     }
     Ok(())
 }
-///
-/// A failure is a warning, never an error: the cache is an optimisation, and the plugin it describes
-/// works exactly the same without it — it would just take the slow path on the next start.
+/// A failure is a warning, never an error: the cache is an optimisation, and the plugin it describes works exactly...
 fn write_cache(dir: &Path, manifest: &PluginManifest, init: &InitInfo) {
     let captured = cache::Cached::capture(
         dir,
@@ -1398,29 +1121,12 @@ pub async fn remove_plugin(rt: &Arc<Runtime>, name: &str) -> Result<Vec<String>>
 }
 
 /// On startup, scan the plugins/ directory and bring every persisted plugin under management.
-///
-/// **Under lazy loading this starts nothing** in the steady state: each plugin's tools, contributions
-/// and prompt-segment bodies come from `plugins/<name>/plugin.cache.json`, and its process is left
-/// for the first real use. The one exception is a plugin whose cache is missing or out of date (the
-/// first run after this feature, or after its source was edited) — there the process is the only
-/// thing that knows its own answer, so it is started once, cached, and handed back — the slot goes
-/// dormant again, so **no startup path ever leaves a plugin process resident**.
-///
-/// Returns a list of (plugin name, result); failures do not block startup.
-///
-/// The plugins are handled **concurrently** (at most [`PROBE_CONCURRENCY`] at a time) and the result
-/// list still comes back in the on-disk order. Concurrency is about the cold-cache case only: a
-/// plugin that has to be probed is a real interpreter, and the old sequential loop made a startup
-/// with N broken plugins cost `N × INIT_TIMEOUT` (measured: two bad plugins = 40 s). The cap keeps
-/// the boot-time memory spike close to the old one-at-a-time behaviour while cutting the wait.
 pub async fn load_all(rt: &Arc<Runtime>) -> Vec<(String, Result<Vec<String>>)> {
     let Ok(entries) = std::fs::read_dir(&rt.plugins_dir) else {
         return vec![];
     };
 
-    // ── Phase 1: scan. Cheap and synchronous, so it stays sequential and keeps the on-disk order.
-    // A directory whose manifest will not parse becomes an immediate failure; everything else becomes
-    // a job to run.
+    // ── Phase 1: scan. Cheap and synchronous, so it stays sequential and keeps the on-disk order. A directory whose...
     enum Job {
         Broken(anyhow::Error),
         Ready(PathBuf, PluginManifest),
@@ -1446,9 +1152,7 @@ pub async fn load_all(rt: &Arc<Runtime>) -> Vec<(String, Result<Vec<String>>)> {
         }
     }
 
-    // ── Phase 2: probe + register, a few at a time. The result vector is filled **by on-disk index**
-    // rather than by completion order, so the output (and therefore the warnings the two frontends
-    // print) does not depend on which plugin happens to finish first.
+    // ── Phase 2: probe + register, a few at a time.
     enum Slot {
         Immediate(Result<Vec<String>>),
         Task(tokio::task::JoinHandle<Result<Vec<String>>>),
@@ -1477,9 +1181,7 @@ pub async fn load_all(rt: &Arc<Runtime>) -> Vec<(String, Result<Vec<String>>)> {
     for (name, slot) in slots {
         let result = match slot {
             Slot::Immediate(r) => r,
-            // A join error means the task panicked. `load_one` is written to return errors rather than
-            // panic, but if one ever does it must count as *that plugin* failing, not take the whole
-            // startup down.
+            // A join error means the task panicked. `load_one` is written to return errors rather than panic, but if one ever...
             Slot::Task(h) => h.await.unwrap_or_else(|e| Err(anyhow!(tf!("loading panicked: {}", e)))),
         };
         out.push((name, result));
@@ -1491,17 +1193,7 @@ pub async fn load_all(rt: &Arc<Runtime>) -> Vec<(String, Result<Vec<String>>)> {
     out
 }
 
-/// Bring **one** plugin under management, without (usually) starting anything.
-///
-/// Two paths, one shape:
-///
-/// - **cache hit** — the steady state. Tools, contributions, prompt-segment bodies and the theme
-///   patch all come from `plugin.cache.json`; no process exists afterwards.
-/// - **cache miss** — the first run after this feature, after the plugin was edited, or after its
-///   cache file was deleted. The process is the only thing that knows its own tool list, so it is
-///   started once, cached, and handed straight back (see the `stop` below — a cold cache must not
-///   leave a resident process either). Note that this is a **fallback**, not the normal path:
-///   it is what keeps the design honest when the prediction cannot be trusted.
+/// Bring one plugin under management, without (usually) starting anything.
 async fn load_one(rt: &Arc<Runtime>, dir: &Path, manifest: &PluginManifest) -> Result<Vec<String>> {
     if let Some(cached) = cache::load(dir, &manifest.entry) {
         let contributes = cached
@@ -1538,12 +1230,7 @@ async fn load_one(rt: &Arc<Runtime>, dir: &Path, manifest: &PluginManifest) -> R
         &rt.sandbox,
         SlotParts { defs: init.tools, contributes: init.contributes, theme_patch, live: Some(live) },
     );
-    // The process existed only to report its own tool list, and the cache now holds that answer
-    // (both paths reach here through `start`, which reconciles the cache). Retire it **before** the
-    // slot goes live, so even the first run after this feature — the one with a cold cache — keeps
-    // **zero resident plugins**. Stopping here rather than after `activate_slot` also means there is
-    // no window in which a call could reach the just-registered tool and be killed by this cleanup.
-    // This is the fallback path's whole point: probe once, cache, and hand the process back.
+    // The process existed only to report its own tool list, and the cache now holds that answer (both paths reach...
     handle.stop().await;
     activate_slot(rt, handle, segments).await
 }
@@ -1794,11 +1481,7 @@ def serve(plugin_name, tools, contributes=None, hooks=None, prompt_segments=None
 mod tests {
     use super::*;
 
-    /// A hot swap must leave no ghost of the previous version behind. The plugin keeps its name, so
-    /// a hook or prompt segment the new source no longer declares would otherwise keep firing against
-    /// the new process. Both removals are keyed on the plugin name; here we prove they are selective
-    /// (another plugin's contributions survive) and that they are no-ops when nothing matches
-    /// (the create path, which runs through the same `activate_slot`).
+    /// A hot swap must leave no ghost of the previous version behind.
     #[test]
     fn swapping_a_plugin_drops_only_its_own_contributions() {
         use crate::hook::{Hook, HookChain};
@@ -1937,10 +1620,8 @@ mod tests {
             ..Default::default()
         };
 
-        // initialize said nothing → use the manifest entirely
         assert_eq!(manifest.clone().overridden_by(None).hooks, vec!["before_tool"]);
 
-        // initialize spoke → the fields it names are its call, the rest stay with the manifest
         let live = Contributes { hooks: vec!["on_error".into()], theme: true, ..Default::default() };
         let eff = manifest.overridden_by(Some(live));
         assert_eq!(eff.hooks, vec!["on_error"], "the process's live answer overrides the manifest");
@@ -1948,11 +1629,7 @@ mod tests {
         assert_eq!(eff.caps, vec!["fs_read"], "initialize does not mention caps; keep the manifest's");
     }
 
-    /// How the declared **read intent** is parsed.
-    ///
-    /// This pins an **asymmetry**: the two consequences of a wrong direction differ by orders of magnitude — failing to recognize a read
-    /// blocks the tool one extra time (the user sees it, the model can fix it); recognizing a write as a read lets an out-of-bounds write
-    /// land directly on disk (irreversible). So only `"read"` is recognized; everything else falls to the most conservative "write".
+    /// How the declared read intent is parsed.
     #[test]
     fn access_declaration_is_read_only_when_it_exactly_says_so() {
         use crate::workplace::Access;

@@ -1,24 +1,6 @@
-//! The GUI's own little state file: **which workspace groups the user has folded or unfolded**, plus
-//! **whether the history drawer was left open**.
-//!
-//! Why this is not part of the space registry (`src/space.rs`): that file answers "which workspaces
-//! exist, and what lives in them" — identity and membership. This one answers "what does the tree
-//! look like" — a view. They also differ in what they can name: a space is a fact about the disk,
-//! while a fold is a preference about a row, and a fold may legitimately point at a group the
-//! registry has never heard of (the `auto:` groups drawn for roots nobody registered). Keeping the
-//! two apart means the registry's on-disk version never has to be bumped for a UI tweak, and no
-//! viewer has to reason about a `Space` field that is not about spaces.
-//!
-//! Two properties, both copied from `space.rs` because the same reasoning applies:
-//!
-//! - **Reading never fails.** A missing / unreadable / half-written file yields "nothing folded",
-//!   which is exactly the default the tree already runs on — so a broken file is indistinguishable
-//!   from a fresh install, never an error the user has to resolve.
-//! - **Writing is atomic** (temp file + rename). The GUI can be killed at any moment, and a
-//!   half-written file is one the next launch silently discards — taking every fold with it.
-//!
-//! The file lives at `<app root>/.aox/ui.json` — beside `spaces.json`, for the same reason: it
-//! describes the one window, not any single workspace, so it cannot be scattered across them.
+//! The GUI's own little state file: which workspace groups the user has folded or unfolded, plus whether...
+//! Why this is not part of the space registry (`src/space.rs`): that file answers "which workspaces exist...
+//! Two properties, both copied from `space.rs` because the same reasoning applies.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -27,27 +9,14 @@ use serde::{Deserialize, Serialize};
 
 use aox::workplace::AOX_DIR;
 
-/// The file's name, inside `<app root>/.aox/`.
+/// The file's name, inside `<app root>/.aox/`
 const FILE_NAME: &str = "ui.json";
 
 /// The on-disk layout version — **rejected, not guessed at**, when it does not match. The same call
 /// `space.rs` makes: a newer layout read by an older build is the hardest class of bug to trace.
 const VERSION: u32 = 1;
 
-/// Which groups are **explicitly** open / closed, by [`aox::space::Group::id`], and the drawer's own
-/// position.
-///
-/// The two sets mirror `App::hist_open` / `App::hist_closed` one-to-one: an id in neither set has no
-/// explicit choice and falls back to the tree's default (drawn open iff it holds the conversation
-/// being chatted in). **Only explicit choices are written**, so that default stays defined in exactly
-/// one place (`App::group_is_open`) instead of being frozen into the file.
-///
-/// The drawer is the third piece of the same "how the window looked" question, and it is here since
-/// 2026-10-25 (user request: "记住上次退出时的状态"). Between 2026-10-18 and then it was
-/// deliberately left out, on the argument that a sidebar you open when you want it should not come
-/// back by itself. A week of use showed the opposite reading: the first thing done on every launch
-/// was re-open it — the tree layout made the drawer the place the work happens, not an occasional
-/// reference, so "always folded" was never the state anyone wanted to start from.
+/// Explicit group states and drawer position; only explicit choices are stored, default in App::group_is_open.
 #[derive(Debug, Default, Clone)]
 pub struct FoldState {
     /// Groups the user has explicitly unfolded.
@@ -55,19 +24,10 @@ pub struct FoldState {
     /// Groups the user has explicitly folded.
     pub closed: HashSet<String>,
     /// Whether the history drawer was open when this state was last written.
-    ///
-    /// A file written before 2026-10-18 may carry a `drawer` key with **exactly this meaning** (the
-    /// field was dropped on save for the week in between, so most files have no key at all). It is
-    /// read as-is rather than bumped away with a version change: rejecting the file would throw away
-    /// every fold along with one stale boolean.
     pub drawer: bool,
 }
 
-/// The on-disk shape. Both lists are sorted on write, so the file is stable across saves (an
-/// unchanged tree rewrites the same bytes rather than shuffling `HashSet` order into the diff).
-///
-/// `drawer` is missing in every file written between 2026-10-18 and 2026-10-25 (the field was
-/// dropped then), and `default` reads those as folded — which is exactly what those launches did.
+/// The on-disk shape. Both lists are sorted on write, so the file is stable across saves (an unchanged tree...
 #[derive(Debug, Serialize, Deserialize)]
 struct Wire {
     version: u32,
@@ -80,7 +40,7 @@ struct Wire {
 }
 
 impl FoldState {
-    /// Read the fold state. **Never fails** — see the module docs.
+    /// Read the fold state. **Never fails** — see the module docs
     pub fn load(app_root: &Path) -> Self {
         let Ok(text) = std::fs::read_to_string(file_path(app_root)) else {
             return Self::default();
@@ -131,9 +91,7 @@ mod tests {
         d
     }
 
-    /// The two sets have to survive a round trip, or "fold a group, restart" — the whole point of
-    /// this file — would quietly do nothing. Same for the drawer, both ways round: "open last time"
-    /// has to come back open, and a file that says folded must not be read as open.
+    /// The two sets have to survive a round trip, or "fold a group, restart" — the whole point of this file — would...
     #[test]
     fn round_trip_keeps_the_two_sets_and_the_drawer() {
         let dir = temp_dir("rt");
@@ -152,9 +110,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A file written while the drawer was **not** persisted (2026-10-18 .. 2026-10-25) has no
-    /// `drawer` key at all. It must still read as "folded" — that is what those launches did — and
-    /// the folds beside it must be intact: a version bump would have thrown them away with it.
+    /// A file written while the drawer was not persisted has no `drawer` key at all.
     #[test]
     fn a_file_without_a_drawer_key_reads_as_folded() {
         let dir = temp_dir("nodrawer");
@@ -171,9 +127,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A file from **before** 2026-10-18 carries a `drawer` key with the very same meaning, and it is
-    /// honoured — not dropped, and not a reason to reject the file. The value is written back on the
-    /// next save, so an open drawer stays open across a launch even from a stale file.
+    /// A file from before 2026-10-18 carries a `drawer` key with the very same meaning, and it is honoured —...
     #[test]
     fn a_pre_2026_10_18_drawer_key_is_honoured() {
         let dir = temp_dir("legacydrawer");

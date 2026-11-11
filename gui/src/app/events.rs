@@ -1,9 +1,5 @@
 //! Pumping the agent's channel, and turning its events into window state.
-//!
-//! This is the one module that touches most of `App`'s fields, which is exactly why it is a module: the
-//! rules for "what an event does to the window" (a retried request rolls its own rows back, a finished
-//! turn moves the live area into the transcript, a checkpoint replaces the plan) sit in one place
-//! instead of being interleaved with painting.
+//! This is the one module that touches most of `App`'s fields, which is exactly why it is a module: the rules...
 
 use super::*;
 
@@ -31,21 +27,7 @@ impl App {
                     }
                     self.status = if b.provider_ready { aox::i18n::t("Ready").to_string() } else { aox::i18n::t("No model configured").to_string() };
                     let ready = b.provider_ready;
-                    // A fresh install lands here: `config.toml` was just written by the host, so the one
-                    // thing that can make the window useful opens by itself, with the cursor in the key
-                    // field. Doing nothing would leave a first-time user looking at a disabled input box
-                    // and a sentence telling them to edit a file — the exact friction this removes.
-                    //
-                    // The **dialog alone** (2026-10-28, user request). It used to also open the settings
-                    // page, so an install's first screen was a modal on top of another modal saying the
-                    // same thing — two windows for one question. The page is one keystroke away if it is
-                    // ever wanted; the tab is still preselected, so opening Settings later lands on Model
-                    // rather than on whichever tab was last visited.
-                    //
-                    // Offered **once** per launch: the not-configured path boots twice (once before the
-                    // save, once after it), and both used to carry `first_run`, which is why saving left
-                    // a second, empty dialog on screen. The bridge now spends the flag on the first of
-                    // the two; this latch makes it impossible to stack the dialog even if it comes back.
+                    // A fresh install lands here: `config.toml` was just written by the host, so the one thing that can make...
                     if b.first_run && !self.setup_asked {
                         self.setup_asked = true;
                         self.settings_tab = SettingsTab::Model;
@@ -54,9 +36,7 @@ impl App {
                     // The address book lives beside `ui.json` / `spaces.json` under the app root, and
                     // the root is only known once `Boot` arrives — so the model UI is handed it here.
                     let root = PathBuf::from(&b.paths.root);
-                    // The boot info has to be in place **before** the first refresh: `refresh_history`
-                    // reads the app root out of it (`App::app_root`) to find the space registry, and a
-                    // refresh that landed first would build an empty history tree.
+                    // The boot info has to be in place before the first refresh: `refresh_history` reads the app root out...
                     self.boot = Some(*b);
                     self.mdl.attach_root(&root);
                     self.refresh_history();
@@ -73,16 +53,12 @@ impl App {
                 }
                 FromAgent::Snapshot(s) => self.apply_snapshot(s),
                 FromAgent::Runtimes(v) => self.runtimes = v,
-                // Current workplace state: the tier name on the button and the ticked row
-                // in the list both come from it. The bridge re-sends one at startup, at the
-                // end of every turn, and after every tier change.
+                // Current workplace state: the tier name on the button and the ticked row in the list both come from it.
                 FromAgent::Workplace(v) => self.ws.set_view(*v),
                 // The recovery panel. Rows are data, never text parsed back out of the CLI's output
                 // (see `bridge::RecoveryView`); the panel only decides how they look.
                 FromAgent::Recovery(v) => self.rec.set_view(*v),
-                // The model in force. Three things read it, and all three must change together:
-                // the chip in the input box, the "Model in use" row on the System tab, and the
-                // context ring's denominator — switching to a smaller model has to shrink the ring.
+                // The model in force. Three things read it, and all three must change together: the chip in the input box...
                 FromAgent::Provider(v) => {
                     // Read before the update below overwrites it: "the window could not talk until
                     // now" is the condition for dropping the notices that say so.
@@ -96,31 +72,11 @@ impl App {
                     } else {
                         aox::i18n::t("No model configured").to_string()
                     };
-                    // The input box's "chat unavailable" state is driven by `Boot`'s `provider_ready`
-                    // one-shot. A model configured **after** boot has to unblock it, or the panel would
-                    // work while the box stayed greyed out until a restart — the exact bug this whole
-                    // feature is about.
+                    // The input box's "chat unavailable" state is driven by `Boot`'s `provider_ready` one-shot.
                     if let Some(b) = self.boot.as_mut() {
                         b.provider_ready = v.ready;
                     }
                     // The window can talk for the first time: drop everything that said it could not.
-                    //
-                    // Those rows describe a **state**, not an event in a conversation — the template
-                    // notice, "LLM not ready: …", "Open Settings → Model and fill in the endpoint" and
-                    // the `log_error` card drawn by the empty state. Left in place they outlive their
-                    // truth: the user fills the dialog in, the session starts, and the first screen
-                    // still reads "no endpoint configured" (2026-10-28, user request).
-                    //
-                    // Guarded by `!was_ready` on purpose: switching models in the middle of a long
-                    // conversation also arrives here with `ready == true`, and that conversation's own
-                    // error rows are history, not a stale caption. Note that `Warn` rows survive —
-                    // "python is missing" has nothing to do with the model being configured.
-                    //
-                    // The two shapes are both here because the host says it twice: `Boot`'s `note`
-                    // becomes an `Item::Error` card, while `AgentEvent::Error` ("LLM not ready: …")
-                    // becomes an `Item::Note(Error)` line — clearing only one of them left half the
-                    // screen still claiming the model was unconfigured (seen in the first run of
-                    // this fix).
                     if v.ready && !was_ready {
                         self.log_error = None;
                         self.items.retain(|i| {
@@ -142,9 +98,7 @@ impl App {
                 // the next first screen is the stage's decision -- see `welcome`'s module docs.
                 FromAgent::HelloLine { ok, text, why } => self.welcome.on_line(ok, text, why),
                 FromAgent::HistoryCurrent(id) => {
-                    // Keep counts/titles fresh while the sidebar is open; while it is closed
-                    // only "the conversation file changed" is worth a directory scan
-                    // (otherwise every turn re-reads the disk for nothing).
+                    // Keep counts/titles fresh while the sidebar is open; while it is closed only "the conversation file changed"...
                     let changed = self.current_history != id;
                     self.current_history = id;
                     if changed || self.show_history {
@@ -156,15 +110,10 @@ impl App {
                     // The rows belonged to the conversation (and workspace) we just left. Keeping them
                     // on screen would offer a rollback against a tree the user is no longer looking at.
                     self.rec.close();
-                    // The *workspace* chain is still there, and "which of these are mine" is answered
-                    // per conversation — so re-read it for the conversation we just opened. Without
-                    // this the chip keeps the previous chat's count and every row keeps its old
-                    // attribution.
+                    // The *workspace* chain is still there, and "which of these are mine" is answered per conversation — so re-read...
                     self.refresh_recovery();
                     if let Some(e) = error {
-                        // When loading fails the agent's context was never touched, so change
-                        // nothing here either -- otherwise the UI has already "jumped" while
-                        // the model is still in the old conversation.
+                        // When loading fails the agent's context was never touched, so change nothing here either -- otherwise the UI has...
                         self.items.push(Item::Error(e));
                         continue;
                     }
@@ -191,17 +140,13 @@ impl App {
                     });
                     self.busy = true;
                     self.status = aox::i18n::t("Thinking").into();
-                    // A new turn rewrites the context from scratch: whatever the last compaction
-                    // left on the gauge is no longer the reading anyone needs (and if the previous
-                    // turn died mid-compaction, the "compacting…" hint must not survive it either).
+                    // A new turn rewrites the context from scratch: whatever the last compaction left on the gauge is no longer...
                     self.ctx_reset = None;
                     self.compacting = None;
                     // Defensive: a call still marked as "being written" from the previous turn would
                     // otherwise be adopted by a call of the same name in this one.
                     self.stream_calls.clear();
-                    // Last turn's writes stop being "this turn's". The workspace view lists what the
-                    // turn in flight is touching; the transcript already keeps every earlier edit,
-                    // with its own diff, where it happened.
+                    // Last turn's writes stop being "this turn's". The workspace view lists what the turn in flight is touching...
                     wsview::begin_turn(&self.wsview);
                 }
                 FromAgent::Status(s) => {
@@ -211,14 +156,7 @@ impl App {
                     }
                 }
                 FromAgent::Content(d) => {
-                    // The body delta serves two purposes: (1) keep the token counter climbing;
-                    // (2) **show it immediately** -- appending to `streaming` lets the UI type it
-                    // out character by character (user request, 2026-10-05: the reply only popped
-                    // in once everything was finished, and until then the conversation was
-                    // blank).
-                    // The activity stream's model segment is still advanced by
-                    // `Event(AssistantText)`: inserting it again here would put the same stretch
-                    // of text on the timeline twice.
+                    // The body delta serves two purposes: (1) keep the token counter climbing; (2) show it immediately -- appending...
                     if let Some(l) = self.live.as_mut() {
                         l.out.add(&d);
                         l.streaming.push_str(&d);
@@ -234,11 +172,7 @@ impl App {
                     // If the endpoint reports no numbers, hide the whole block -- don't fob it off
                     // with 0s
                     if !rec.is_empty() {
-                        // The cache-hit window reads the same record, but only for what the record
-                        // alone can say: the lifetime totals and the fallback reading for endpoints
-                        // that report nothing per call. Its grid was already fed by `CallUsage`
-                        // above -- a turn's `usage` is a *sum* over its calls, so letting it
-                        // overwrite the grid would paint blocks the last request never sent.
+                        // The cache-hit window reads the same record, but only for what the record alone can say: the lifetime totals...
                         cache::lock(&self.cache).observe_turn(&rec);
                         // The breakdown goes right after this turn's reply (by now the turn has
                         // ended and the tail of `items` is exactly that).
@@ -246,54 +180,35 @@ impl App {
                         self.usage_log.push(*rec);
                         // A real reading is in: the post-compaction placeholder has done its job.
                         self.ctx_reset = None;
-                        // No `force_follow`: the row lands at the tail, which the sticky scroll
-                        // already follows whenever the view is at the bottom. When it is not, the
-                        // user is reading history, and appending a line off-screen must not drag
-                        // them away from it (2026-10-28: forcing here is what made "read back, then
-                        // get yanked to the end when the turn finished" possible).
+                        // No `force_follow`: the row lands at the tail, which the sticky scroll already follows whenever the view...
                     }
                 }
                 FromAgent::CallUsage { usage, last_prompt } => {
-                    // One finished model call, mid-turn. This is what makes the cache map move: the
-                    // turn's aggregate only arrives once the whole turn is over, which for a tool
-                    // loop can be a dozen calls later.
+                    // One finished model call, mid-turn.
                     cache::lock(&self.cache).observe_call(&usage, last_prompt);
                 }
                 FromAgent::UsageLog(log) => {
                     // The whole ledger the agent read back from file after a conversation switch.
-                    // The per-turn breakdowns have to go back into the transcript -- when an old
-                    // conversation is opened, each turn's bill should be stuck back where it was,
-                    // not heaped up at the top.
                     self.usage_log = log;
                     // The gauge belongs to the conversation on screen; a switch replaces the reading
                     // wholesale, and a leftover override from the previous one would be a lie.
                     self.ctx_reset = None;
                     self.compacting = None;
                     self.rebuild_usage_rows();
-                    // Rebuild the cache map from that ledger. The map is a history — one tile per
-                    // recorded round — so it is replayed whole rather than seeded with the last
-                    // line: opening a conversation with 30 turns should show 30 tiles, not one.
-                    // Only sums survive in the file, which is why a replayed tile stands for a
-                    // round and says so in its tooltip.
+                    // Rebuild the cache map from that ledger.
                     let mut cv = cache::lock(&self.cache);
                     cv.reset();
                     cv.replay(&self.usage_log);
                 }
                 FromAgent::ContextMap(segs) => {
-                    // The section breakdown of the request just sent. Converted into the window's own
-                    // `Seg` here rather than over there: the message crosses from the core crate, and
-                    // the window's type belongs to the GUI crate.
+                    // The section breakdown of the request just sent.
                     cache::lock(&self.cache).observe_context(
                         segs.into_iter().map(|(label, tokens)| cache::Seg { label, tokens }).collect(),
                     );
                 }
                 FromAgent::Reasoning(d) => {
                     if let Some(l) = self.live.as_mut() {
-                        // `self.now()` cannot be used here (it borrows all of self), while `l` is
-                        // holding a mutable borrow of `self.live`. `self.clock` is a *different*
-                        // field, so borrowing it alone is fine — and it has to be this clock, not
-                        // `Instant::now()`, or the model segment would start on the wall clock and
-                        // drift away from every other record the moment a pause happened.
+                        // `self.now()` cannot be used here (it borrows all of self), while `l` is holding a mutable borrow...
                         let at = self.clock.now();
                         if !l.reasoning_live {
                             l.reasoning_live = true;
@@ -311,9 +226,7 @@ impl App {
                     self.status_back_to_thinking();
                             }
                 FromAgent::ReasoningEnd => {
-                    // Reasoning ending does not mean the model's segment has ended: it may go on
-                    // to emit body text or to call a tool, and either of those closes this segment
-                    // on its own.
+                    // Reasoning ending does not mean the model's segment has ended: it may go on to emit body text or to call a tool...
                     if let Some(l) = self.live.as_mut() {
                         l.reasoning_live = false;
                     }
@@ -366,10 +279,7 @@ impl App {
                         at,
                     );
                 }
-                // A multiple-choice question asked via `ask_user`. Same pattern as an
-                // authorization request, but it **does not block input** (the user has to be able
-                // to type an answer), so the `input` / `can_send` switches are left alone here --
-                // only the card is hung up and the state changed.
+                // A multiple-choice question asked via `ask_user`. Same pattern as an authorization request, but it does...
                 FromAgent::ChoiceRequest { question, options, reply } => {
                     self.status = aox::i18n::t("Waiting for your choice").into();
                     self.choice = Some(ChoiceCard { question: question.clone(), options });
@@ -377,10 +287,7 @@ impl App {
                     // produces "I haven't typed anything yet, but there's text in the box"
                     self.choice_text.clear();
                     self.choice_reply = Some(reply);
-                    // The option slot sits above the input box and the user is probably looking at
-                    // the end of the transcript right now -- it is only visible once you scroll to
-                    // the bottom. Without the scroll it reads as "the model asked something and then
-                    // nothing happened".
+                    // The option slot sits above the input box and the user is probably looking at the end of the transcript right...
                     self.force_follow = true;
                     let at = self.now();
                     activity::lock(&self.act).note(ActKind::Info, aox::i18n::t("Waiting for your choice"), &question, at);
@@ -396,12 +303,7 @@ impl App {
         }
     }
 
-    /// A fragment of a tool call the model is **still writing**: open its row once, then keep the
-    /// reading next to it climbing as the fragments arrive.
-    ///
-    /// Without this the entire stretch in which the model writes a call is invisible — the tool
-    /// itself has not started, so there is nothing on screen to look at, and for `write_file`
-    /// (whose arguments *are* the file) that stretch is the whole job.
+    /// A fragment of a tool call the model is still writing: open its row once, then keep the reading next...
     pub(super) fn stream_tool_delta(&mut self, index: u64, name: String, delta: String) {
         if self.live.is_none() {
             return;
@@ -438,17 +340,13 @@ impl App {
         } else {
             0
         };
-        // The path is the first thing in the arguments, so it is normally in hand within a fragment
-        // or two — and naming the file is most of what this row has to say. Only the whole value is
-        // taken: a half-typed `E:/exam` would read as a glitch rather than as progress.
+        // The path is the first thing in the arguments, so it is normally in hand within a fragment or two — and naming...
         let subject = if SUBJECT_TOOLS.contains(&call_name.as_str()) {
             aox::llm::partial_json_string(&self.stream_calls[slot].args, "path")
         } else {
             None
         };
-        // Same reasoning for the purpose: `purpose` is a short string and `command` is the first
-        // argument of a shell call, so either is normally complete within a fragment or two. Taking
-        // only whole values keeps a half-arrived command from being drawn as if it were the command.
+        // Same reasoning for the purpose: `purpose` is a short string and `command` is the first argument of a shell...
         let purpose = match aox::llm::partial_json_string(
             &self.stream_calls[slot].args,
             aox::tool::PURPOSE_ARG,
@@ -470,9 +368,7 @@ impl App {
                 plugin,
                 purpose: purpose.clone(),
                 subject: subject.clone(),
-                // Left empty until the call really runs: the row shows no arguments (see
-                // `step_row`), and what the model eventually sends is filled in by the `ToolCall`
-                // arm, which adopts this row.
+                // Left empty until the call really runs: the row shows no arguments (see `step_row`), and what the model...
                 args: String::new(),
                 result: None,
                 diff: None,
@@ -510,15 +406,9 @@ impl App {
         }
     }
 
-    /// The model is producing text again, so no tool can be running: put the status line back to
-    /// "Thinking".
-    ///
-    /// Called on every delta, hence the comparison before anything is built — this costs a string
-    /// compare in the common case and allocates nothing.
+    /// The model is producing text again, so no tool can be running: put the status line back to "Thinking".
     pub(super) fn status_back_to_thinking(&mut self) {
-        // A tool cannot be running while the model is writing, so this is also where the call's own
-        // clock retires. Cleared unconditionally: leaving it behind would show a frozen "0:47 / 2:00"
-        // next to a "Thinking" label.
+        // A tool cannot be running while the model is writing, so this is also where the call's own clock retires.
         if let Some(l) = self.live.as_mut() {
             l.call = None;
         }
@@ -532,9 +422,7 @@ impl App {
     }
 
     pub(super) fn on_event(&mut self, ev: AgentEvent) {
-        // The activity stream records only "how a turn ran": events outside a turn (switching
-        // conversations, the tail left behind after a fatal error, ...) never go on the
-        // timeline.
+        // The activity stream records only "how a turn ran": events outside a turn (switching conversations, the tail...
         let live = self.live.is_some();
         match ev {
             AgentEvent::AssistantText(t) => {
@@ -547,9 +435,7 @@ impl App {
                         if let Some(prev) = l.pending_final.replace(t.clone()) {
                             l.interim.push(prev);
                         }
-                        // The deltas are done, so reconcile against the authoritative text once: if a
-                        // frame is dropped while typing, the characters on screen end up a few off the
-                        // real text, and that has to be smoothed out at the very end.
+                        // The deltas are done, so reconcile against the authoritative text once: if a frame is dropped while typing...
                         l.streaming = t;
                     }
                     None => self.items.push(Item::Assistant(t)),
@@ -559,9 +445,7 @@ impl App {
                 if let Some(l) = self.live.as_mut() {
                     let at = self.clock.now();
                     activity::lock(&self.act).model_begin(at);
-                    // The stage note is final here: it goes into `interim` (which stays in the live
-                    // area and ends up in the process card afterwards) and `streaming` is cleared --
-                    // the next stretch of body text starts typing from a fresh line.
+                    // The stage note is final here: it goes into `interim` (which stays in the live area and ends up in the process...
                     l.streaming.clear();
                     l.interim.push(t);
                     // Record "how many steps ran before this sentence": the live area uses it to
@@ -571,16 +455,11 @@ impl App {
             }
             AgentEvent::ToolCall { name, args } => {
                 let plugin = self.plugin_of(&name);
-                // Read the file name off the parsed arguments *before* they are flattened to text --
-                // this is the authoritative reading, and the streaming one (which has to decode a
-                // half-arrived string) is only ever a preview of it.
+                // Read the file name off the parsed arguments *before* they are flattened to text -- this is the authoritative...
                 let subject = subject_from_value(&name, &args);
                 let purpose = purpose_from_value(&name, &args);
                 let args = compact_json(&args);
-                // The model has just finished writing this call, so its row is normally already on
-                // screen (opened by the streaming fragments — see `stream_tool_delta`). Adopt that
-                // row rather than pushing a second one for the same call; `position` takes the first
-                // unclaimed entry, which is the right one when a response calls the same tool twice.
+                // The model has just finished writing this call, so its row is normally already on screen (opened...
                 let mut adopted = false;
                 if let Some(i) = self
                     .stream_calls
@@ -625,9 +504,7 @@ impl App {
                     }
                 }
                 if live {
-                    // Only one bar is opened on the activity stream: call -> execute -> return is a
-                    // single thing, and splitting it into three makes it impossible to see how long
-                    // the step actually took.
+                    // Only one bar is opened on the activity stream: call -> execute -> return is a single thing, and splitting...
                     activity::lock(&self.act).tool_begin(
                         &name,
                         plugin.as_deref().filter(|p| *p != "meta"),
@@ -647,10 +524,7 @@ impl App {
                 }
             }
             AgentEvent::ToolResult { name, is_error, preview, diff, diff_detail, path } => {
-                // A file write is also a row in the workspace view: that window answers "what did
-                // this turn touch", which is the one thing this event knows and the transcript can
-                // only say in prose. Recorded before the step is adopted, so the list and the
-                // "+N / −N" on the transcript row appear on the same frame.
+                // A file write is also a row in the workspace view: that window answers "what did this turn touch"...
                 if let Some(p) = path {
                     wsview::note_edit(&self.wsview, p, diff, diff_detail.clone());
                 }
@@ -684,25 +558,14 @@ impl App {
                 }
             }
             AgentEvent::Task(t) => {
-                // Nothing is drawn here: the bar above the input reads it on every frame (see
-                // `plan_bar`). Storing it is enough, and it must survive the end of the turn --
-                // a plan outlives the work that wrote it.
+                // Nothing is drawn here: the bar above the input reads it on every frame (see `plan_bar`).
                 self.plan = PlanView::of(&t);
                 self.task = Some(*t);
             }
             AgentEvent::Recycled(n) => {
-                // Two audiences, two shapes (the same split as `Images` below): the activity stream
-                // gets a bar — "how this turn ran" — and the human gets a **toast** that fades on
-                // its own.
-                //
-                // The toast is set unconditionally, not only while a turn is running: a delete the
-                // user asked for can easily finish after the turn that ordered it has ended, and
-                // "where did my file go" is precisely the moment this has to be visible.
+                // Two audiences, two shapes (the same split as `Images` below): the activity stream gets a bar — "how this turn...
                 self.note_act(ActKind::Info, aox::i18n::t("Recycle bin"), &aox::recycle::notice(n));
                 // One `remove` call takes one path, so "delete two files" arrives as two events.
-                // Merge the new one into the total already on screen — two flashes of "1 file"
-                // read as a bug, and the number is the part the user is actually looking at.
-                // Restarting the timer keeps the merged toast up long enough to be read.
                 match &mut self.toast {
                     Some((count, shown_at)) if shown_at.elapsed().as_secs_f32() < TOAST_SECS => {
                         *count += n;
@@ -710,20 +573,12 @@ impl App {
                     }
                     _ => self.toast = Some((n, Instant::now())),
                 }
-                // The tree is redrawn only when something asks for it, and a recycled conversation is
-                // exactly such a thing: without this, a row right-clicked away would sit in the list
-                // until the next turn ended. Done **here** rather than at the point the delete was
-                // requested -- the move happens on the agent thread, so a refresh issued then would
-                // race it and put the row straight back on screen.
+                // The tree is redrawn only when something asks for it, and a recycled conversation is exactly such a thing...
                 if self.show_history {
                     self.refresh_history();
                 }
             }
-            // ── Context compaction (`aox::compact`) ──
-            // Two events, because the user sees two different things: while the summary call is in
-            // flight the input box shows "compacting…" (the one moment the turn genuinely pauses),
-            // and when it lands the gauge drops to the new figure instead of staying pinned at full
-            // until the next request comes back.
+            // ── Context compaction (`aox::compact`) ── Two events, because the user sees two different things...
             AgentEvent::ContextCompacting { used, budget } => {
                 self.compacting = Some(std::time::Instant::now());
                 self.note_act(
@@ -748,14 +603,7 @@ impl App {
                 );
             }
             AgentEvent::ToolImages { tool, paths } => {
-                // Images produced by a tool: **attached to that call's own row**.
-                //
-                // It used to be a separate `Item::Images`, which could only sit in the transcript's
-                // normal flow -- and because the host message carrying the attachments starts a new
-                // user message, that meant the picture appeared at the top of a fresh block, with a
-                // visible "(host hint) …" sentence beside it. The hint is protocol, not content: it
-                // stays in the model's request but is no longer drawn. The picture now belongs to
-                // the call that produced it.
+                // Images produced by a tool: attached to that call's own row.
                 if let Some(l) = self.live.as_mut() {
                     attach_tool_images(&mut l.steps, &tool, &paths);
                 } else {
@@ -781,12 +629,7 @@ impl App {
         self.waiting_auth = false;
         self.auth = None;
         self.auth_reply = None;
-        // At the end of a turn there shouldn't be an option slot hanging around (the model has
-        // moved on). If there is, the UI failed to clean up -- so drop it too: the peer isn't
-        // waiting any more (that turn's `choose()` returned long ago) and `tx.send` fails
-        // silently. Keeping it is actually dangerous: if someone calls `answer_choice` before the
-        // next `ChoiceRequest`, that lands on a channel nobody is listening to, and the UI looks
-        // like "I clicked it and nothing happened".
+        // At the end of a turn there shouldn't be an option slot hanging around (the model has moved on).
         self.choice = None;
         self.choice_reply = None;
         self.status = aox::i18n::t("Ready").into();
@@ -794,12 +637,7 @@ impl App {
             self.stream_calls.clear();
             return;
         };
-        // A call the model was still writing when the turn ended never ran — the response was cut
-        // off, or the turn was aborted. Its row has to go, otherwise the process card keeps a
-        // marquee spinning forever for a step that never happened.
-        //
-        // They are always the *trailing* rows (a streaming row is appended at the tail, and a row
-        // stops streaming once its `ToolCall` arrives), so one truncation removes exactly them.
+        // A call the model was still writing when the turn ended never ran — the response was cut off, or the turn was...
         if !self.stream_calls.is_empty() {
             let first = self
                 .stream_calls
@@ -838,20 +676,13 @@ impl App {
             if aborted {
                 act.note(ActKind::Warn, aox::i18n::t("Task interrupted"), &aox::tf!("Ran for {}s", format!("{elapsed:.1}")), at);
             }
-            // Once closed, take this turn's new records and hand them to the agent thread to
-            // write into **this conversation's file**. Hand them over rather than opening the file
-            // from the UI: the handle is on the agent side, and "new conversation / rollback on
-            // interrupt" also happens on that thread; this message goes to the back of the queue,
-            // so the ordering is naturally right -- it can't leak into the next conversation.
+            // Once closed, take this turn's new records and hand them to the agent thread to write into this conversation's...
             act.export_acts()
         };
         if !pending.is_empty() {
             let _ = self.tx.send(ToAgent::Act(pending));
         }
-        // The turn's rows are being swapped in for the live block here, so the content height
-        // changes either way; the sticky scroll keeps a view that is at the bottom at the bottom.
-        // Deliberately **not** `force_follow`: the user may be half-way up re-reading what the turn
-        // said, and finishing the turn must not yank them to the end.
+        // The turn's rows are being swapped in for the live block here, so the content height changes either way...
     }
 }
 

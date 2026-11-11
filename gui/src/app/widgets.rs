@@ -1,19 +1,10 @@
 //! Small painting primitives shared by more than one screen.
-//!
-//! Anything here takes a `&mut Ui` (or a `&Painter`) and **nothing else**: no `App`, no state, no
-//! side effects beyond what it paints. That is the admission rule -- a helper that needs one of the
-//! screens' state belongs to that screen's module, not here. It is what keeps this file usable from
-//! anywhere without dragging a dependency along.
-//!
-//! The `pub(crate)` items (the menu row, the three text buttons, `column`, `MENU_W`) are the ones other
-//! modules already reach into; `mod.rs` re-exports them so `crate::app::x` keeps working.
+//! Anything here takes a `&mut Ui` (or a `&Painter`) and nothing else: no `App`, no state, no side effects beyond...
+//! The `pub(crate)` items (the menu row, the three text buttons, `column`, `MENU_W`) are the ones other modules...
 
 use super::*;
 
 /// A stroke-drawn trash can, sized to sit at the left of a toast line.
-///
-/// Hand-drawn like the other glyphs in this file (`sidebar_button` / `gear_button`): the
-/// project carries no icon font, and a dozen line segments on a 20×20 grid cost less than a dependency.
 pub(super) fn trash_glyph(ui: &mut Ui, size: f32, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     // Everything below is laid out on a 20×20 grid, then scaled to `size`.
@@ -25,7 +16,7 @@ pub(super) fn trash_glyph(ui: &mut Ui, size: f32, color: Color32) {
     // Handle, then lid.
     painter.line_segment([p(8.0, 3.0), p(12.0, 3.0)], w);
     painter.line_segment([p(3.0, 6.0), p(17.0, 6.0)], w);
-    // Body: two slightly tapered sides and the base.
+    // Body: two slightly tapered sides and the base
     painter.line_segment([p(5.2, 6.0), p(6.4, 17.0)], w);
     painter.line_segment([p(14.8, 6.0), p(13.6, 17.0)], w);
     painter.line_segment([p(6.4, 17.0), p(13.6, 17.0)], w);
@@ -34,11 +25,9 @@ pub(super) fn trash_glyph(ui: &mut Ui, size: f32, color: Color32) {
     painter.line_segment([p(11.1, 9.0), p(11.1, 14.4)], w);
 }
 
-// ─────────────────────────── demo data (--demo) ───────────────────────────
+// demo data (--demo)
 
 /// The transcript column's measure: returns (content width, left/right padding).
-/// Over-wide lines are hard to read, so there is an upper bound and it is centred in the
-/// window.
 pub(crate) fn column(available: f32) -> (f32, f32) {
     let inner = (available - 96.0).min(880.0).max(280.0);
     let pad = ((available - inner) * 0.5).max(18.0);
@@ -46,33 +35,15 @@ pub(crate) fn column(available: f32) -> (f32, f32) {
 }
 
 /// Width of a right-click menu's rows.
-///
-/// Fixed rather than "as wide as the longest label": the two menus (a conversation's and a
-/// workspace's) would otherwise come out different widths, and a menu that resizes itself when the
-/// pointer crosses rows reads as the UI twitching under the hand.
-///
-/// `pub(crate)`: the transcript's link menu (`markdown::link_menu`) draws its rows with the same
-/// widget and the same width, so a menu opened on a path is indistinguishable from one opened on a
-/// conversation.
 pub(crate) const MENU_W: f32 = 178.0;
 
 /// Ease-out curve (cubic ease-out): quick off the mark, slow to settle.
-///
-/// Used instead of the built-in `ctx.animate_bool_with_time` (which interpolates **linearly**):
-/// constant-speed motion makes hard corners at both ends -- it kicks off as if flicked and stops
-/// as if it hit a wall.
 pub(crate) fn ease_out_cubic(t: f32) -> f32 {
     let u = 1.0 - t.clamp(0.0, 1.0);
     1.0 - u * u * u
 }
 
-/// A single line of text, closed off by **pixels**: anything past `max_w` is elided.
-///
-/// Truncating by character count (`clamp_str`) doesn't work: 34 Han characters are ~476px, twice
-/// the sidebar's width, and the excess draws right out of the panel and gets sliced off hard by
-/// the sidebar / main-transcript divider -- which looks like the title escaping its bounds. Let
-/// `LayoutJob` decide where to cut from the actual rendered width, and it follows automatically
-/// when the panel is dragged wider or narrower.
+/// A single line of text, closed off by pixels: anything past `max_w` is elided.
 pub(crate) fn elide(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::single_section(
         text.to_owned(),
@@ -90,17 +61,6 @@ pub(crate) fn elide(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f3
 }
 
 /// One row of a right-click menu.
-///
-/// Full width and left-aligned, unlike [`flat_button`] (which hugs its text): the whole row should be
-/// the click target, so the pointer never has to land on the glyphs. `enabled == false` draws the
-/// label faint and swallows the click -- the row stays **visible** rather than being dropped, so a
-/// menu is never a different shape depending on which row it was opened over (the reason then rides
-/// on the tooltip, which the caller attaches).
-///
-/// `strong` marks the consequential row ("Delete"): it is emphasised by **contrast, not hue**, which
-/// is this palette's own rule -- hue is reserved for [`P::danger`], and that is a deep brick red the
-/// theme docs forbid spending on anything recoverable. A deletion that lands in the recycle bin is
-/// exactly that, so the row reads stronger rather than louder.
 pub(crate) fn menu_item(ui: &mut Ui, label: &str, w: f32, enabled: bool, strong: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
     let hov = pointer_if(ui, &resp) && enabled;
@@ -128,10 +88,6 @@ pub(crate) fn menu_item(ui: &mut Ui, label: &str, w: f32, enabled: bool, strong:
 }
 
 /// That S-shaped flow line meaning "information flows from here to there".
-///
-/// **Extracted** from the old top bar's `flow_toggle`: that button has been removed (the activity
-/// stream is opened from the settings page now), but the curve still appears on the settings
-/// page's "open activity stream" button -- one shape should have only one drawing.
 pub(super) fn draw_flow_curve(painter: &egui::Painter, rect: Rect, fg: Color32) {
     // One control point above and one below gives a smooth S
     let a = Pos2::new(rect.left(), rect.bottom());
@@ -173,13 +129,6 @@ pub(super) fn draw_flow_curve(painter: &egui::Painter, rect: Rect, fg: Color32) 
 }
 
 /// Switch to the "hand" cursor while hovering a clickable area, and return whether it is hovered.
-///
-/// egui doesn't change the cursor for hand-drawn widgets automatically:
-/// `allocate_exact_size(.., Sense::click())` only registers an interaction area, and the cursor
-/// stays the default arrow. Together with `selectable_labels` (on by default) the label inside a
-/// button even turns the cursor into the text-selection I-beam -- giving you "an input cursor on
-/// top of a button". Route everything through this function and a clickable place is always a
-/// hand.
 pub(crate) fn pointer_if(ui: &Ui, resp: &egui::Response) -> bool {
     let hov = resp.hovered();
     if hov {
@@ -189,10 +138,6 @@ pub(crate) fn pointer_if(ui: &Ui, resp: &egui::Response) -> bool {
 }
 
 /// The skin for text buttons: sizing plus a colour pair for resting / hover.
-///
-/// Buttons come in exactly **three heights** (see [`flat_button`], [`primary_button`],
-/// [`danger_button`]); the height is a field rather than "text + padding" so that two buttons
-/// standing side by side always line up, whatever their labels are.
 #[derive(Clone, Copy)]
 pub(super) struct Btn {
     pub(super) size: f32,
@@ -213,13 +158,7 @@ pub(super) struct Btn {
     pub(super) interactive: bool,
 }
 
-/// The one control metric: **every** button in the window is this tall, on this radius, with the
-/// same type size. A dialog's fields are built to the same height, so a row of
-/// `label + field + button` is one height and one baseline.
-///
-/// Before this existed the app had three heights (32 / 38 / 44) and three radii (6 / 8 / 10), all
-/// chosen one button at a time; the result was that the Model dialog's "Test" stood taller than the
-/// field beside it and shorter than "Save" under it.
+/// The one control metric: every button in the window is this tall, on this radius, with the same type size.
 pub(crate) const BTN_H: f32 = 34.0;
 pub(crate) const BTN_RADIUS: u8 = 8;
 
@@ -318,36 +257,14 @@ pub(crate) fn button_sized(ui: &mut Ui, text: &str, weight: Weight, w: f32) -> e
 }
 
 /// A hand-drawn text button.
-///
-/// The key is the **order of drawing**: measure the text first -> allocate a hot zone from that
-/// size -> lay down the backdrop -> draw the text last.
-///
-/// The empty-state example buttons used to do it the other way round: `ui.label()` painted the
-/// text first and the hover backdrop was then laid over the hot zone -- landing above the text
-/// layer, so the moment the mouse arrived the text vanished. Here it is backdrop first, text last,
-/// so in both themes and every state they naturally can't occlude each other.
-/// The footer of a dialog: **Cancel on the left, the affirmative action on the right**.
-///
-/// User request, 2026-10-25. Every dialog in this window had it the other way round -- confirm on the
-/// left, Cancel on the right -- which is the reverse of the rest of the desktop and of what the hand
-/// expects: the one you reach for last sat under the pointer's resting place, and the one that
-/// **commits** was the easy mis-click. Flipping it in one function rather than five places means the
-/// next dialog cannot quietly get it wrong again.
-///
-/// `confirm` draws the affirmative button and says whether it was pressed; the verb and its weight
-/// differ per dialog (`primary_button`, or `danger_button` for the one that crosses every
-/// protection), the **position** does not.
-///
-/// `None` = neither button was pressed this frame, `Some(true)` = go ahead, `Some(false)` = cancel.
+/// The key is the order of drawing: measure the text first -> allocate a hot zone from that size -> lay down...
 pub(crate) fn dialog_footer(ui: &mut Ui, confirm: impl FnOnce(&mut Ui) -> bool) -> Option<bool> {
     let mut answer = None;
     ui.horizontal(|ui| {
         if flat_button(ui, aox::i18n::t("Cancel")).clicked() {
             answer = Some(false);
         }
-        // `right_to_left` takes the rest of the row, so the first thing added inside it lands flush
-        // with the right edge -- that is the whole trick, and the reason the affirmative button is
-        // drawn in here rather than before the Cancel.
+        // `right_to_left` takes the rest of the row, so the first thing added inside it lands flush with the right edge...
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if confirm(ui) {
                 answer = Some(true);
@@ -377,11 +294,6 @@ fn btn_extent(ui: &Ui, text: &str, b: Btn) -> Vec2 {
 }
 
 /// Paint a text button into a rect the caller owns.
-///
-/// Split out of [`text_button`] for rows that are drawn by hand: `model_ui`'s list has its content
-/// painted inside one allocated rect (a click anywhere means "edit"), so a real `ui.allocate` for its
-/// per-row action would push the row's own layout around. The **appearance** still comes from here, so
-/// a button inside a row is the same button as one in a dialog footer.
 fn paint_text_button(ui: &Ui, rect: Rect, text: &str, b: Btn, hov: bool) {
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
@@ -393,9 +305,7 @@ fn paint_text_button(ui: &Ui, rect: Rect, text: &str, b: Btn, hov: bool) {
     if b.stroke != Stroke::NONE {
         painter.rect_stroke(rect, CornerRadius::same(b.radius), b.stroke, egui::StrokeKind::Inside);
     }
-    // The layout is done with PLACEHOLDER and the real colours are applied here -- so a hover
-    // recolour doesn't have to re-lay-out the text. Centred in both axes: with a fixed height the
-    // baseline can no longer be derived from the padding.
+    // The layout is done with PLACEHOLDER and the real colours are applied here -- so a hover recolour doesn't have...
     painter.galley(
         Pos2::new(
             rect.center().x - galley.size().x * 0.5,
@@ -417,10 +327,6 @@ pub(crate) fn paint_button(ui: &Ui, rect: Rect, text: &str, weight: Weight, hove
 }
 
 /// A ghost button: no chrome at rest, one fill step on hover ("Cancel", "Done", "Manage models…").
-///
-/// The same hover language as a list row, a menu row and a toolbar icon, so "the pointer is on
-/// something clickable" always looks identical — and, since 2026-10-28, the same **geometry** as
-/// every other button (see [`BTN_H`]).
 pub(crate) fn flat_button(ui: &mut Ui, text: &str) -> egui::Response {
     text_button(ui, text, btn_style(Weight::Ghost))
 }
@@ -432,24 +338,11 @@ pub(crate) fn primary_button(ui: &mut Ui, text: &str) -> egui::Response {
 }
 
 /// The dangerous-action button (the "full access" confirmation, a confirmed delete).
-///
-/// [`P::danger`] is the backdrop and the text colour is still [`P::on_reverse`] -- not a
-/// coincidence: `danger` is a deep brick red in the light theme (needing light text) and a pale
-/// brick red in the dark theme (needing dark text), which matches the reversed block's light/dark
-/// direction exactly, so no separate foreground colour has to be computed for it.
-///
-/// For the *first* press of a two-step delete use [`Weight::Danger`], which is only outlined: the
-/// colour goes solid on the second press, so "armed" looks different from "about to".
 pub(crate) fn danger_button(ui: &mut Ui, text: &str) -> egui::Response {
     text_button(ui, text, btn_style(Weight::DangerSolid))
 }
 
-/// The primary button with a leading `＋`, drawn as two strokes.
-///
-/// The plus is **not** a character: a font's "＋" changes shape and weight with whichever face the
-/// build picked, and a text button with one glyph inline cannot be centred against it. Two strokes at
-/// the label's optical centre can. Everything else — size, radius, fill, hover — is the primary
-/// button's, so it sits in a row with the others without a second metric.
+/// Primary button with a leading plus drawn as two strokes, not a font glyph that varies in weight.
 pub(crate) fn primary_plus_button(ui: &mut Ui, text: &str) -> egui::Response {
     let b = btn_style(Weight::Primary);
     let galley =
@@ -477,11 +370,7 @@ pub(crate) fn primary_plus_button(ui: &mut Ui, text: &str) -> egui::Response {
     resp
 }
 
-/// The × on the right of a chip. Returns `true` if it was clicked.
-///
-/// Hand-drawn from two line segments rather than typesetting the `×` character -- the same reason
-/// as the ✓/✗ in the call stream: no betting on whether the font has the glyph (a missing glyph
-/// draws as a tofu box, which is worse than not drawing it).
+/// The × on the right of a chip.
 pub(super) fn close_x(ui: &mut Ui) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(17.0), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(aox::i18n::t("Remove"));
@@ -494,11 +383,7 @@ pub(super) fn close_x(ui: &mut Ui) -> bool {
     resp.clicked()
 }
 
-/// When too long, **elide in the middle**: keep both ends, cut the middle out.
-///
-/// Why cut the middle rather than the tail: the most useful bit in this information is the
-/// **extension** (`.png` or `.pdf`, which decides whether the user has to compress it first), and
-/// the tail is exactly that. `keep` is the number of characters retained (ellipsis included).
+/// When too long, elide in the middle: keep both ends, cut the middle out.
 pub(crate) fn middle_elide(s: &str, keep: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     // Too short, no need to elide; and when `keep` is too small to fit "head + ellipsis + tail",
@@ -598,11 +483,6 @@ pub(super) fn paint_tri(painter: &egui::Painter, center: Pos2, size: f32, down: 
 }
 
 /// A duration as a clock: `0:47`, `2:00`.
-///
-/// `m:ss` for every size rather than a decimal below a minute: this readout's whole job is
-/// "elapsed over ceiling", and two different formats side by side (`47.0s / 2:00`) reads as a unit
-/// mistake. Seconds are truncated, not rounded, so the number never claims a second that has not
-/// passed.
 pub(super) fn clock(secs: f32) -> String {
     let s = secs.max(0.0) as u32;
     format!("{}:{:02}", s / 60, s % 60)
@@ -626,13 +506,7 @@ pub(super) fn spinner_dot(ui: &mut Ui, spin: f32, color: Color32) {
     }
 }
 
-/// How wide a sent attachment chip is (**estimated**).
-///
-/// Used only to give the bubble a width **lower bound** -- measuring it properly would mean drawing
-/// it once first, which isn't worth it; estimating loosely only leaves the bubble a hair wider or
-/// narrower than the chip, and `horizontal_wrapped` wraps to catch it.
-/// ⚠️ The font size / padding / stroke must match the ones in [`sent_chip`]; changing that side
-/// means changing this one too.
+/// How wide a sent attachment chip is (estimated).
 pub(super) fn chip_width(ui: &Ui, name: &str) -> f32 {
     const PAD_X: f32 = 11.0;
     const STROKE: f32 = 1.0;
@@ -645,10 +519,6 @@ pub(super) fn chip_width(ui: &Ui, name: &str) -> f32 {
 }
 
 /// The attachment chip inside an already-sent message bubble -- read-only (no ×).
-///
-/// **The same shape and the same elision rules** as the pending-upload one, just missing an ×: that
-/// way the act of sending is visually "the chip dims and the × disappears", with no other marker
-/// needed to explain it.
 pub(super) fn sent_chip(ui: &mut Ui, name: &str) {
     Frame::NONE
         .fill(P::surface())
@@ -679,9 +549,6 @@ mod tests {
     use super::*;
 
     /// The readout that makes a long call legible: elapsed over ceiling, plus the model's estimate.
-    ///
-    /// Truncating rather than rounding is deliberate — a clock that says `1:59` while the kill fires
-    /// would be the one number the user is watching, so it must never run ahead of the truth.
     #[test]
     fn the_running_call_reads_elapsed_over_ceiling() {
         assert_eq!(clock(0.0), "0:00");
@@ -692,18 +559,7 @@ mod tests {
         assert_eq!(span(5.0, 600.0), "0:05 / 10:00");
     }
 
-    /// Why `step_row` re-registers the file name **after** the row's own click, instead of just
-    /// adding a clickable label inside it.
-    ///
-    /// Two widgets laid over the same rect: egui gives the click to the **last** one registered, which
-    /// is the opposite of what "the row's own click wins" (the older comment in `step_row_inner`) is
-    /// usually read to mean. Both facts are true at once — the row wins over the labels built *inside*
-    /// it because it is registered after them, and it loses to the name because the name is registered
-    /// after the row. That ordering is the whole feature ("click a tool call's file name to reveal it,
-    /// instead of folding the diff"), and it is invisible in the source: deleting the second
-    /// `ui.interact` would leave a file name that looks clickable and folds the row instead.
-    ///
-    /// A test rather than a manual click, because a click here has to open a real Explorer window.
+    /// Why `step_row` re-registers the file name after the row's own click, instead of just adding a clickable label...
     #[test]
     fn a_click_goes_to_the_widget_registered_last_on_the_same_rect() {
         use egui::{Event, PointerButton, Sense};
@@ -754,23 +610,7 @@ mod tests {
         );
     }
 
-    /// Nail down, as an executable statement, why the settings dialog **has to pin** its content
-    /// width.
-    ///
-    /// This tests **a behaviour of egui**, not our code: a `ScrollArea` allocates the scrollbar's
-    /// width **animated frame by frame** via `animate_bool_responsive`, so the content width inside
-    /// it keeps changing. Any widget that sizes itself from `available_width()` widens and narrows
-    /// along with it, and wrapped text re-wraps every frame -- which is exactly the root cause of
-    /// the 2026-10-05 "move the mouse and the settings panel shivers slightly with blurry text"
-    /// (the animation doesn't advance without a repaint, so it only shows up while the mouse is
-    /// moving).
-    ///
-    /// Why it is worth pinning separately: in the source that behaviour amounts to two lines of
-    /// subtraction (`current_bar_use = animated amount x allocated_width()`), and reading the code
-    /// gives no hint that it moves the layout around; and the moment someone deletes
-    /// `ui.set_width(content_w)` from `settings_overlay` as redundant, the jitter comes back
-    /// unchanged -- while manual testing may well never run into it. So this test's **failure
-    /// message** says exactly which comment to go and check.
+    /// Nail down, as an executable statement, why the settings dialog has to pin its content width.
     #[test]
     fn egui_animates_the_scroll_bar_allocation() {
         let ctx = egui::Context::default();

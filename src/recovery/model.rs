@@ -196,7 +196,7 @@ pub struct RestorePath {
     pub path: String,
     /// What the file should be for the restore to be safe.
     pub current: Option<BlobRef>,
-    /// What to write (None = remove the path).
+    /// What to write (None = remove the path)
     pub restore: Option<BlobRef>,
 }
 

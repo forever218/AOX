@@ -1,9 +1,5 @@
-//! The `--demo` data: a fake conversation and a fake live turn, so the layout can be looked at
-//! without a model.
-//!
-//! Kept in the build rather than behind `#[cfg(test)]` on purpose: `--demo` is how the interface gets
-//! reviewed on a machine with no API key, and it has to exercise the **real** painter -- every row it
-//! invents goes through the same code a real turn does.
+//! The `--demo` data: a fake conversation and a fake live turn, so the layout can be looked at without a model.
+//! Kept in the build rather than behind `#[cfg(test)]` on purpose: `--demo` is how the interface gets reviewed...
 
 use super::*;
 
@@ -12,9 +8,7 @@ pub(super) fn seed_demo(app: &mut App) {
     app.config_path = "config.toml".into();
     app.plugins = vec!["filestat".to_string()];
     app.status = aox::i18n::t("Ready").into();
-    // Demo mode reads history from the real application root too: a preview should look real,
-    // and making up a few fake conversations would just make people think the sidebar is
-    // ornamental.
+    // Demo mode reads history from the real application root too: a preview should look real, and making up a few...
     let root = aox::paths::resolve_workplace().0;
     let store = aox::store::default_store(&root, 0);
     // One store, one directory (2026-11-05): `--demo` reads the same conversations the real window
@@ -32,17 +26,13 @@ pub(super) fn seed_demo(app: &mut App) {
         // the very layout `--demo` exists to show.
         first_run: false,
         note: None,
-        // Demo mode gets a real path listing as well: the settings page's "System" column is
-        // exactly the kind of "one glance is enough" diagnostic data, so previewing it with fake
-        // paths is pointless (and the real paths are readable in demo mode anyway).
+        // Demo mode gets a real path listing as well: the settings page's "System" column is exactly the kind of "one...
         paths: BootPaths::new(
             &root,
             std::path::Path::new(&app.config_path),
             &root.join("plugins"),
             store.location().to_path_buf(),
-            // `--demo` never loads the config, so the shell row uses the defaults (`[shell] bash =
-            // "auto"`). Detection itself only stats files, so this is a real answer for this machine,
-            // not a placeholder.
+            // `--demo` never loads the config, so the shell row uses the defaults (`shell bash = "auto"`).
             &aox::config::ShellConfig::default(),
         ),
         store: store.clone(),
@@ -56,14 +46,10 @@ pub(super) fn seed_demo(app: &mut App) {
     app.plan = PlanView::of(&demo_task);
     app.task = Some(demo_task);
 
-    // The workplace button's initial value: in demo mode the bridge won't send
-    // `FromAgent::Workplace`, so one is stuffed in locally, letting `--demo` show the tier name
-    // on the button and the ticked row in the list.
+    // The workplace button's initial value: in demo mode the bridge won't send `FromAgent::Workplace`...
     app.ws.set_view(WorkplaceView { mode: Mode::Default, root: None });
 
-    // The model chip's initial value, for the same reason: no `FromAgent::Provider` is ever sent in
-    // demo mode, and a chip reading "not configured" in every preview screenshot would hide the state
-    // that matters — a model with a window, and a list behind it.
+    // The model chip's initial value, for the same reason: no `FromAgent::Provider` is ever sent in demo mode...
     app.mdl.set_view(crate::bridge::ProviderView {
         base_url: "https://api.deepseek.com".into(),
         model: app.model.clone(),
@@ -75,9 +61,7 @@ pub(super) fn seed_demo(app: &mut App) {
         error: None,
     });
 
-    // The "Σ usage" chip **is only drawn when there is a ledger**, and `--demo` has no real
-    // calls -- so two records are added, letting the preview show it and the breakdown panel it
-    // expands on hover (which is also the only way to verify the panel's position).
+    // The "Σ usage" chip is only drawn when there is a ledger, and `--demo` has no real calls -- so two records...
     app.usage_log = vec![
         UsageRecord {
             round: 1,
@@ -144,10 +128,7 @@ pub(super) fn seed_demo(app: &mut App) {
                 name: "write_file".into(),
                 plugin: None,
                 purpose: Some(aox::i18n::t("write the plugin").into()),
-                // A file that is **really there**: this row is the demo of "click a tool call's file
-                // name and it opens in the file manager", and a path that resolves to nothing would
-                // demonstrate the opposite (`plugins/filestat/main.py` only exists if you built the
-                // demo plugin). See `open::resolve_relative`.
+                // A file that is really there: this row is the demo of "click a tool call's file name and it opens in the file...
                 subject: Some("plugins/sdk/plugin_sdk.py".into()),
                 args: r#"{"path":"plugins/sdk/plugin_sdk.py"}"#.into(),
                 result: Some((false, aox::i18n::t("Overwrote plugins/sdk/plugin_sdk.py (2.4 KB)").into())),
@@ -185,13 +166,7 @@ pub(super) fn seed_demo(app: &mut App) {
         "Your `filestat` plugin is ready; it provides the tool **filestat_count**.\n\n## Usage\n\n```json\n{ \"path\": \".\", \"ext\": null }\n```\n\nLeave `ext` empty to count all extensions. Result for the current directory:\n\n| Ext | Count |\n|------|------|\n| .rs | 14 |\n| .py | 9 |\n| .toml | 4 |\n| .md | 2 |\n\n> The plugin is persisted under `plugins/filestat/`; it loads automatically on the next start -- no need to rebuild."
             .into(),
     ));
-    // ▼▼▼ diagnostics: over-wide content (long code lines / long inline code / long words /
-    //      lists / tables) -- to verify that content wider than the measure wraps at the right
-    //      edge instead of being clipped.
-    //
-    // The bare path is **this binary's own path**, not a made-up one: the whole point of that line is
-    // that clicking it opens a real Explorer window, and a placeholder that resolves to nothing would
-    // only ever show the "path not found" tooltip — which is the opposite of a demo.
+    // Diagnostics: over-wide content (long code lines / long inline code / long words / lists / tables) -- to verify...
     let self_path = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "E:\\rustapp\\dist\\aox-gui.exe".into());
@@ -205,9 +180,7 @@ pub(super) fn seed_demo(app: &mut App) {
         aox::i18n::t("Plugin filestat restored (1 tool)").into(),
     ));
 
-    // The activity stream: lay out a typical sequence of events in time order (horizontal
-    // timeline: bar width = real elapsed time). Demo mode opens the activity-stream window as
-    // well -- it is a big part of the UI already, so a preview should show it.
+    // The activity stream: lay out a typical sequence of events in time order (horizontal timeline: bar width = real...
     {
         let mut a = activity::lock(&app.act);
         a.force_open();
@@ -238,11 +211,6 @@ pub(super) fn seed_demo(app: &mut App) {
         a.tick(11.9, aox::i18n::t("Ready"), false);
 
         // Second turn: the cross-turn, cross-plugin connector effect is demonstrated too.
-        //
-        // It starts at 11.9, exactly where the first turn ended. That is not a cosmetic choice:
-        // the clock stops between turns (`Clock`), so in a real session the gap between one round's
-        // last record and the next round's instruction is always zero. Seeding an idle gap here
-        // would make the preview show a layout the program can no longer produce.
         a.round_begin(aox::i18n::t("Write the plugin's usage into the README"), 11.9);
         a.model_begin(12.5);
         a.model_push(aox::i18n::t("Just add a \"filestat usage\" section to the README."));
@@ -254,28 +222,7 @@ pub(super) fn seed_demo(app: &mut App) {
         a.tick(16.8, aox::i18n::t("Ready"), false);
     }
 
-    // The cache-hit map gets the same treatment: `--demo` must show it too, because "what it looks
-    // like while it is working" is most of what a preview is for, and the window is worthless to
-    // judge from an empty grid.
-    //
-    // There is one clock now, so the demo cannot pre-fill an array — it has to **run the front**, and
-    // the front only walks while a turn is in flight. So the demo declares itself "in flight" for the
-    // length of this block: it is standing in for exactly the one situation that ever fills this map.
-    //
-    // Two hundred-odd readings, a shade over one lap, so the preview opens on a **full** square
-    // instead of one that stops a third of the way round. Each reading holds for one or two tiles, so
-    // the map has bands rather than a single dot in the corner.
-    //
-    // Deterministic rather than random (a fixed pattern, not a generator), so two launches of
-    // `--demo` show the same picture and a screenshot can be compared against the previous one.
-    //
-    // The last tile is written by the call below, so the frame lands on the current reading, and the
-    // final numbers are the ones a live window would show: a 31K context of which 24.4K came back
-    // from the cache, with the four sections adding up to exactly that context size.
-    //
-    // Fed through the **real** sequence rather than the shortcuts: sections, then the per-call
-    // figures, then the turn's ledger — the same three messages a live turn sends, in the same
-    // order. A preview that skipped a step would stop being evidence that the live path works.
+    // The cache-hit map gets the same treatment: `--demo` must show it too, because "what it looks like...
     {
         use aox::llm::Usage;
         let mut cv = cache::lock(&app.cache);
@@ -283,10 +230,7 @@ pub(super) fn seed_demo(app: &mut App) {
         cv.gw.busy = true;
         for k in 0..200u32 {
             let prompt = 6_000 + u64::from(k) * 140;
-            // The mix is a *warm* conversation, which is what a long one looks like: most calls land
-            // at 93% cached — a hit band with a thin brick strip, the case where the old picture
-            // showed nothing at all — a few at 55% (a message appended that the cached prefix could
-            // not absorb), and the odd 2% cold start.
+            // The mix is a *warm* conversation, which is what a long one looks like: most calls land at 93% cached — a hit...
             let share = match k % 12 {
                 3 | 8 => 0.55,
                 5 => 0.02,
@@ -339,24 +283,13 @@ pub(super) fn seed_demo(app: &mut App) {
             session_total: Some(74_600),
             session_calls: 7,
         });
-        // One step for the live reading, so the frame lands on **it**: the seeded loop ends on a 93%
-        // call, and a preview whose newest tile is a hit would show neither the 22%-missed strip nor
-        // the partial band the last call really produced.
+        // One step for the live reading, so the frame lands on it: the seeded loop ends on a 93% call, and a preview...
         cv.advance(0.1);
-        // The launch lands with the square all but full and the frame on the live reading. It then
-        // **stops**, because nothing is in flight in demo mode — the same rule a real window follows
-        // when the turn ends.
+        // The launch lands with the square all but full and the frame on the live reading.
         cv.gw.busy = false;
     }
 
-    // The workspace view is seeded too: a file browser previewed on an empty directory would prove
-    // nothing about the layout. The root is the **current directory** rather than the app root,
-    // because in demo mode the app root is `target/release` — which contains no source to browse —
-    // while the current directory is where `--demo` is normally launched from.
-    //
-    // The two edits are illustrative: the counts and the diff lines are written out here rather
-    // than produced by a turn, because in demo mode no turn ever ran. The **paths are real**, so the
-    // "File" half of the pane shows actual code from this repository.
+    // The workspace view is seeded too: a file browser previewed on an empty directory would prove nothing about...
     {
         let root = std::env::current_dir().unwrap_or_default();
         wsview::force_open(&app.wsview);

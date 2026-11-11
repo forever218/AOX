@@ -1,13 +1,6 @@
-//! 房间口令加密：AES-256-GCM，密钥由口令 + 房间 id 经 PBKDF2 派生。
-//!
-//! 服务端**只看到密文**：文本字段里放 `enc:v1:<base64(nonce||ciphertext)>`，服务端按普通字符串
-//! 存取、索引、转发，一行都不用改。手机和电脑各自输入同一个口令，口令不上网。
-//!
-//! 边界要说清楚：
-//! - **不是前向保密**。口令不变，密钥就不变；拿到口令 + 历史密文就能解开全部历史。
-//! - PBKDF2 10 万次只挡得住弱口令的离线暴力，挡不住"口令就是 123456"。
-//! - 只管文本消息。任务快照、产物、审批摘要仍是明文——它们本来就带本地路径与文件内容。
-//! - 房间 id 作为盐：同一口令在不同房间里派生出不同密钥。
+//! Room passphrase encryption: AES-256-GCM, key from passphrase plus room id via PBKDF2.
+//! Server sees only enc:v1:<base64(nonce||ciphertext)> as a plain string; the passphrase never goes online.
+//! Text only, no forward secrecy; PBKDF2 slows weak-passphrase cracking; room id as salt gives per-room keys.
 
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
@@ -17,7 +10,7 @@ use base64::Engine;
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 
-/// 前缀就是格式版本：解不开或版本不认识的字符串原样显示，不会被当成密文吞掉。
+/// The prefix is the version: failed or unknown-version strings show as-is, never swallowed as ciphertext.
 pub const PREFIX: &str = "enc:v1:";
 
 const ITERATIONS: u32 = 100_000;
@@ -46,8 +39,7 @@ pub fn encrypt(key: &[u8; 32], plain: &str) -> String {
     format!("{PREFIX}{}", STANDARD.encode(raw))
 }
 
-/// 解不开就返回 `None`：口令不对、密文被改、格式不认识，三种情况在这里不可区分，
-/// 也不应该区分——调用方只需要知道"这段内容现在显示不了"。
+/// Return None on failure: wrong passphrase, tampering and unknown format are deliberately indistinguishable.
 pub fn decrypt(key: &[u8; 32], text: &str) -> Option<String> {
     let b64 = text.strip_prefix(PREFIX)?;
     let raw = STANDARD.decode(b64).ok()?;
@@ -99,9 +91,7 @@ mod tests {
     }
 
 
-    /// 这条密文是 Dart 侧 `app/tool/crypto_check.dart` 生成的。
-    /// 它能解开，说明两边的 KDF 参数、nonce/tag 排布、base64 都一致——
-    /// 任何一边改参数，这条测试会先失败。
+    /// Dart's crypto_check.dart vector: decrypting pins KDF params, nonce/tag and base64; any change fails this test.
     #[test]
     fn decrypts_a_dart_produced_vector() {
         let key = derive_key("correct horse battery staple", "room-test-1");

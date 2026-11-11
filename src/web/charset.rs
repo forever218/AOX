@@ -1,22 +1,6 @@
 //! Charset: what the bytes say they are, and then decoding them.
-//!
-//! # Order, and why
-//!
-//! 1. an explicit `charset` argument (the caller saw mojibake and is correcting us);
-//! 2. a BOM;
-//! 3. `Content-Type: …; charset=…`;
-//! 4. `<meta charset=…>` / `<meta http-equiv=…>` in the first 4 KiB;
-//! 5. **strict** UTF-8 validation — the modern default, and a real answer rather than a guess;
-//! 6. `[web] charset_fallback` (GB18030 by default), then UTF-8-with-replacement.
-//!
-//! Step 5 before 6 matters: "is this valid UTF-8?" is a question `MultiByteToWideChar` cannot answer,
-//! which is why this module uses `encoding_rs` instead of the zero-cost Win32 path (docs/WEB.md D2).
-//!
-//! # GB2312 / GBK are upgraded to GB18030
-//!
-//! They are nested subsets, and a page labelled `gb2312` that actually contains a 4-byte GB18030
-//! character is common enough in the wild. Decoding with the superset can only turn a replacement
-//! character into the right glyph, never the other way around.
+//! # Order, and why.
+//! 1. an explicit `charset` argument (the caller saw mojibake and is correcting us); 2. a BOM; 3. `Content-Type...
 
 use encoding_rs::{Encoding, GB18030, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
 
@@ -32,8 +16,6 @@ pub struct Detected {
 }
 
 /// Decide how to decode `head` (the first bytes of the body — enough for a meta scan).
-///
-/// `content_type` is the raw header value, if any. `fallback` is `[web] charset_fallback`.
 pub fn detect(
     head: &[u8],
     content_type: Option<&str>,
@@ -65,9 +47,7 @@ pub fn detect(
     }
 
     if std::str::from_utf8(head).is_ok() {
-        // A truncated body can end mid-character, so "the head is valid UTF-8" is necessary but not
-        // sufficient; `decode` below would report replacement characters if the rest disagrees. The
-        // label is still the best available answer, and the header line says where it came from.
+        // A truncated body can end mid-character, so "the head is valid UTF-8" is necessary but not sufficient; `decode`...
         return Ok(Detected { encoding: UTF_8, source: "sniffed" });
     }
 
@@ -81,8 +61,6 @@ pub fn detect(
 }
 
 /// Decode, returning the text and how many replacement characters it contains.
-///
-/// The count is what lets the tool say "this may be mis-decoded" without pretending to be sure.
 pub fn decode(bytes: &[u8], det: &Detected) -> (String, usize) {
     let (text, _, _) = det.encoding.decode(bytes);
     let bad = text.matches('\u{FFFD}').count();
@@ -116,7 +94,7 @@ fn bom(head: &[u8]) -> Option<(&'static Encoding, &'static str)> {
     }
 }
 
-/// `text/html; charset=gbk` → `gbk`. Case-insensitive, tolerates quotes and extra parameters.
+/// `text/html; charset=gbk` → `gbk`. Case-insensitive, tolerates quotes and extra parameters
 pub fn charset_param(value: &str) -> Option<String> {
     let low = value.to_ascii_lowercase();
     let at = low.find("charset")?;

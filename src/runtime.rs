@@ -12,138 +12,46 @@ use crate::plugin::PluginHandle;
 use crate::prompt::PromptSegment;
 use crate::tool::{Tool, ToolKind, ToolOutput};
 
-/// Shared runtime state: the tool registry + plugin management + the session-level
-/// authorization allowlist.
-/// Meta tools use it to "grow" the system itself.
+/// Shared runtime state: the tool registry + plugin management + the session-level authorization allowlist.
 pub struct Runtime {
     pub config: Config,
     /// The authorization policy (the Policy seam, see `src/auth.rs`).
-    ///
-    /// Holds a trait object rather than a concrete type: `Agent` only asks "does this call
-    /// get through", and doesn't care whether the decision was read from
-    /// `config.toml [auth]` or computed elsewhere.
-    /// `Send + Sync` is guaranteed by the `Policy` bound — it is shared between the agent
-    /// thread and the GUI main thread.
     pub auth: Arc<dyn Policy>,
     /// The session storage backend (the Store seam, see `src/store.rs`).
-    ///
-    /// Fixed by `config.toml [store] backend` in `Runtime::new`; the agent thread uses it
-    /// to create/open conversation files, and the UI side builds a separate read-only
-    /// instance of the same backend (`location` points at the same place).
     pub store: Arc<dyn crate::store::Store>,
     /// The application root. Plugin subprocesses use it as their working directory, so
     /// relative paths inside plugins match the host's view.
     pub root: PathBuf,
     pub plugins_dir: PathBuf,
-    /// The interpreter resolution result (a snapshot of `config.runtimes` after the
-    /// three-tier resolution).
-    ///
-    /// Kept as a separate copy instead of reading `config.runtimes` directly so that
-    /// "installing a runtime takes effect immediately" becomes possible: refresh this in
-    /// place after installation and the next plugin subprocess spawn uses the new
-    /// interpreter, with no process restart needed. A tiny struct, so clone cost is
-    /// negligible.
-    ///
-    /// Uses `std::sync::RwLock` rather than tokio's: reads/writes happen only in
-    /// synchronous contexts and the lock is never held across an `await` —
-    /// `spawn_command` is a synchronous function and must be able to take it directly.
+    /// The interpreter resolution result (a snapshot of `config.runtimes` after the three-tier resolution).
     runtimes: std::sync::RwLock<RuntimesConfig>,
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
     pub plugins: Mutex<HashMap<String, Arc<PluginHandle>>>,
     /// Long-lived shell jobs (`shell_job`, see `src/jobs.rs`).
-    ///
-    /// One record owns one fenced process tree. The registry — not the launching tool call — is what
-    /// keeps the fence alive, so a dev server survives across calls and is still killed when the
-    /// record is dropped (explicit stop, lifetime expiry, or host exit).
     pub jobs: Mutex<crate::jobs::Jobs>,
     /// Tool names the user chose "always allow" for in this session
     pub session_allowed: RwLock<HashSet<String>>,
-    /// The system prompt's **segment registry** (`src/prompt.rs`).
-    ///
-    /// The built-in `core` / `protocol` segments and the appended segments in
-    /// `config.toml [[prompt.segment]]` are all registered in `Runtime::new`; the run-env
-    /// segment and the project-rules segment are generated on demand by the `prompt`
-    /// module (they depend on `root` and the filesystem, so they don't belong baked into
-    /// the registry).
-    ///
-    /// Uses `std::sync::RwLock` rather than tokio's: reads/writes happen only in
-    /// synchronous contexts (`Agent::new` → `prompt::build`), and the lock is never held
-    /// across an `await`.
+    /// The system prompt's segment registry (`src/prompt.rs`).
     prompt_segments: std::sync::RwLock<Vec<PromptSegment>>,
     /// The loop hook chain (the Loop seam, see `src/hook.rs`).
-    ///
-    /// Fixed by `config.toml [hook]` in `Runtime::new`. Under the default config it is an
-    /// **empty chain**, in which case `Agent::run_loop`'s five hook points all degrade to
-    /// "check the length and return" — that is how this phase achieves "no hooks = the
-    /// behaviour is equivalent to today, item by item".
-    ///
-    /// Like `store` / `auth` it holds a concrete type rather than adding another layer of
-    /// trait object: the chain itself is that indirection (what it holds inside is the
-    /// `Vec<Arc<dyn Hook>>`), and wrapping another ABC around it would be pointless.
     pub hooks: crate::hook::HookChain,
     /// The main-loop implementation (the Loop seam's second form, see `src/agent_loop.rs`).
-    ///
-    /// Fixed by `config.toml [loop] impl` in `Runtime::new`; **an unrecognized name errors
-    /// at startup**, with no silent fallback to `standard`. `Agent::run_turn` takes a loop
-    /// from here to run — so "swap in a different execution model" is a config change, not
-    /// a code change.
     pub loop_impl: Arc<dyn crate::agent_loop::AgentLoop>,
-    /// The plugin subprocess **fence** (Job Object, see `src/sandbox.rs`).
-    ///
-    /// Fixed by `config.toml [sandbox]` in `Runtime::new`. It is itself only a holder of
-    /// config; the real kernel object is created fresh on every spawn (one Job per
-    /// plugin) — so changing this **while a plugin is running** does not affect an
-    /// already-started process, only the next spawn / restart.
+    /// The plugin subprocess fence (Job Object, see `src/sandbox.rs`).
     pub sandbox: crate::sandbox::Sandbox,
-    /// The model's **file boundary** (the workplace, see `src/workplace.rs`).
-    ///
-    /// Sits beside `sandbox` but manages something else: `sandbox` restricts how plugin
-    /// subprocesses run, while `workplace` restricts "which files can be touched this
-    /// time". Under `full` it is unrestricted; under `default` / `fixed` writes and
-    /// deletes may only land in the designated plot (reads are unrestricted).
-    /// **The config default is `default` (restricted)** — changed from `full` on
-    /// 2026-10-05, honouring the user's "restricted by default on every startup". So
-    /// omitting `[workplace]` now **no longer** means "behaviour unchanged".
-    ///
-    /// Internally a `std::sync::Mutex`, read/written only in synchronous contexts (the
-    /// decision runs on the tool-call path) — the same reason as `runtimes` /
-    /// `prompt_segments`: the lock is never held across an `await`.
+    /// The model's file boundary (the workplace, see `src/workplace.rs`).
     pub workplace: crate::workplace::Workplace,
     /// Task-level file checkpoints and rollback (see `src/recovery`).
-    ///
-    /// The active transaction lives here, not inside `run_turn`: a GUI abort drops that future, and
-    /// a local transaction would never get a chance to record its post-images.
     pub recovery: crate::recovery::RecoveryManager,
-    /// The **live model provider** (see `src/provider_live.rs`).
-    ///
-    /// It lives on the runtime, not on `Agent`, for one reason: the GUI's Model tab has to be able to
-    /// change the model while a conversation is open, and the thing it changes must be the same thing
-    /// the next request reads. `Agent` therefore holds an `Arc` of this rather than its own provider.
-    ///
-    /// It also owns the config snapshot the request path reads — the context window (which feeds
-    /// `compact::Policy`'s budget **and** the GUI's context ring) and `max_tokens` — so a switch moves
-    /// all of them at once instead of leaving a mix of old and new.
+    /// The live model provider (see `src/provider_live.rs`).
     pub provider: Arc<crate::provider_live::LiveProvider>,
 
-    /// The **space registry** (see `src/space.rs`): which workspaces exist, what they are called, and
-    /// which conversation sits where.
-    ///
-    /// Lives on the runtime rather than in each front end so the agent thread and the UI read the same
-    /// list. A `RwLock` because the editing phase (creating / removing a workspace) writes it at
-    /// runtime; today it is only read. The lock is never held across an `await` — the same rule as
-    /// `runtimes` / `prompt_segments`.
-    ///
-    /// `allow(dead_code)`: written at startup and read by the overlay that groups history by workspace,
-    /// which lands in the next phase — the phase that ships this field only needs it to exist and to
-    /// have fed `Store::set_workspaces`.
+    /// The space registry (see `src/space.rs`): which workspaces exist, what they are called, and which conversation...
     #[allow(dead_code)]
     pub spaces: std::sync::RwLock<crate::space::Registry>,
 }
 
-/// One tool as the **discovery search** sees it (see `crate::tool::discover`).
-///
-/// A borrowed-free snapshot rather than a reference into the registry: the search is `async` and
-/// must not hold the tools lock while it formats a result the model will read.
+/// One tool as the discovery search sees it (see `crate::tool::discover`).
 pub struct ToolEntry {
     pub name: String,
     /// `true` when the tool belongs to a plugin — the only kind that may be held back from the
@@ -156,62 +64,28 @@ pub struct ToolEntry {
 }
 
 impl Runtime {
-    /// Assemble the runtime. It returns `Result` so that "a wrong storage backend name"
-    /// errors **at startup** (an unrecognized `[store] backend` value fails outright
-    /// rather than silently falling back to jsonl — see `store::backend`).
+    /// Assemble the runtime. It returns `Result` so that "a wrong storage backend name" errors at startup (an...
     pub fn new(config: Config, root: PathBuf, plugins_dir: PathBuf) -> Result<Arc<Self>> {
-        // Three-tier interpreter resolution: explicit config path > built-in runtime under
-        // the app directory > PATH.
-        // Done here rather than at each entry point so the CLI / GUI / selftest all follow
-        // the same path, with no logic fork like "the GUI runs but the CLI doesn't".
-        //
-        // Note: `config` itself is **left untouched**. The resolution result goes only
-        // into the `runtimes` field — the presentation layer (/runtime report, system
-        // prompt) needs the raw value to explain "where the interpreter came from", and
-        // once an absolute path is written back into config, every origin gets misreported
-        // as "specified in config.toml".
+        // Three-tier interpreter resolution: explicit config path > built-in runtime under the app directory > PATH. Done...
         let mut resolved = config.runtimes.clone();
         crate::runtimes::resolve(&mut resolved, &root);
         let auth: Arc<dyn Policy> = Arc::new(ConfigPolicy::from_config(&config.auth));
         // Compute the prompt registry before `config` is moved into Self.
-        // Built-in segments are registered in the prompt module; config segments go in
-        // here as well (same id overrides built-in).
         let prompt_segments = crate::prompt::registry_from_config(&config.prompt);
         // Fix the storage backend before `config` is moved into Self (it needs config.store / config.history).
         let store = crate::store::backend(&config.store.backend, &root, config.history.keep)?;
-        // The space registry, read before `root` is moved into Self. It used to be handed to the
-        // store ("which workspaces to scan"), which is gone since the single conversation store
-        // (2026-11-05): the registry is now **only** the UI's grouping, and reading it here just
-        // keeps one copy that both the agent thread and the overlay see.
+        // The space registry, read before `root` is moved into Self.
         let spaces = crate::space::Registry::load(&root);
-        // The loop hook chain is likewise fixed before `config` is moved.
-        // `?` is used here: something unintelligible in `[hook]` (not an object, a value
-        // that won't convert to JSON) errors **at startup** rather than quietly not taking
-        // effect — the same principle as `[store] backend`.
+        // The loop hook chain is likewise fixed before `config` is moved. `?` is used here: something unintelligible...
         let hooks = crate::hook::HookChain::new(crate::hook::registry_from_config(&config.hook)?);
-        // The main-loop implementation is likewise fixed before `config` is moved.
-        // `?` is used here: an unrecognized name in `[loop] impl` errors **at startup**
-        // rather than silently falling back to standard — the same principle as
-        // `[store] backend`.
+        // The main-loop implementation is likewise fixed before `config` is moved. `?` is used here: an unrecognized name...
         let loop_impl = crate::agent_loop::build(&config.loop_config)?;
         // Take the fence config before `config` is moved into Self (`Sandbox` is just a cheap config holder).
         let sandbox = crate::sandbox::Sandbox::new(config.sandbox.clone());
-        // The workplace is likewise fixed before `config` is moved. **`?` is used here**:
-        // an unrecognized `[workplace] mode` value, or `fixed` without a `root`, both error
-        // **at startup** — the same principle as `[store] backend` / `[loop] impl`
-        // (something configured but not taking effect is the hardest to diagnose).
+        // The workplace is likewise fixed before `config` is moved. `?` is used here: an unrecognized `workplace mode`...
         let workplace = crate::workplace::Workplace::new(config.workplace.clone(), &root)?;
         let recovery = crate::recovery::RecoveryManager::new(config.recovery.clone(), root.clone());
-        // Before `config` is moved: the live provider keeps its own snapshot of `[provider]`, and it is
-        // built here (never at a front end) so the CLI and the GUI start from exactly the same state.
-        // Note it does **not** fail: an unusable `[provider]` (no key yet) yields a placeholder that
-        // reports itself, which is what lets a fresh install open the GUI and be configured in place.
-        //
-        // Since 2026-10-28 the model configuration lives in **`.aox/models.json`**, not in
-        // `config.toml`: the active record is the truth, and the layered `[provider]` is only the
-        // fallback for a book that has never been written (a fresh install). `adopt` moves a
-        // `[provider]` into the book once, so the fallback is used at most a single time; after that
-        // an edit to `config.toml`'s `[provider]` is inert by design.
+        // Before `config` is moved: the live provider keeps its own snapshot of `provider`, and it is built here (never...
         let mut book = crate::modelbook::Book::load(&root);
         book.adopt(&config.provider, &root);
         let provider_cfg = book.active_config().unwrap_or_else(|| config.provider.clone());
@@ -240,13 +114,7 @@ impl Runtime {
         Ok(rt)
     }
 
-    /// Terminate `shell_job` trees that outlive `[shell] background_max_hours`, even when nobody is
-    /// talking to the model.
-    ///
-    /// The same check runs before every request and every `shell_job` action; this task is what makes
-    /// the cap true for an idle window too. A `Weak` is used so the reaper never keeps the runtime (or
-    /// its process fences) alive. `try_current` keeps `Runtime::new` usable from a synchronous test
-    /// context — there is simply no timer to spawn there.
+    /// Terminate `shell_job` trees that outlive `shell background_max_hours`, even when nobody is talking to the model.
     fn start_job_reaper(self: &Arc<Self>) {
         let hours = self.config.shell.background_max_hours;
         if hours == 0 {
@@ -268,10 +136,6 @@ impl Runtime {
     }
 
     /// A snapshot of the space registry.
-    ///
-    /// Cloned rather than borrowed: a registry is small (a handful of spaces), and handing out a
-    /// reference would mean holding the lock across whatever the caller does next — the same hazard
-    /// `Workplace::report` documents ("take a snapshot first, then release the lock").
     #[allow(dead_code)] // read by the history overlay in the next phase; see the `spaces` field
     pub fn spaces(&self) -> crate::space::Registry {
         self.spaces.read().unwrap_or_else(|e| e.into_inner()).clone()
@@ -282,13 +146,7 @@ impl Runtime {
         self.prompt_segments.read().unwrap().clone()
     }
 
-    /// Append a prompt segment. When the id already exists it **replaces** it wholesale —
-    /// the same semantics as `[[prompt.segment]]` overriding a built-in segment in
-    /// `config.toml` (last registered wins).
-    ///
-    /// Caller (since phase 6 · 6b): when a plugin activates it attaches the prompt segment
-    /// contributed by the component — the body is fetched from the subprocess by
-    /// `prompt/segment`, see `plugin::activate`.
+    /// Append a prompt segment. When the id already exists it replaces it wholesale — the same semantics...
     pub fn add_prompt_segment(&self, seg: PromptSegment) {
         let mut g = self.prompt_segments.write().unwrap();
         match g.iter_mut().find(|s| s.id == seg.id) {
@@ -298,26 +156,12 @@ impl Runtime {
     }
 
     /// Drop every prompt segment contributed by `plugin`.
-    ///
-    /// Segment ids are prefixed with the owning plugin (`<plugin>:<id>`, see `activate_slot`), which
-    /// is the only thing that makes this decidable. Needed for the same reason as
-    /// [`crate::hook::HookChain::remove_by_plugin`]: a hot swap must not leave behind a segment the
-    /// new version no longer declares. On the create path nothing matches and this is a no-op.
     pub fn remove_prompt_segments_by_plugin(&self, plugin: &str) {
         let prefix = format!("{plugin}:");
         self.prompt_segments.write().unwrap().retain(|s| !s.id.starts_with(&prefix));
     }
 
     /// Append a loop hook at runtime (component-contributed hooks come in here).
-    ///
-    /// Why "at runtime" is needed: plugins are loaded **after** `Runtime::new`, whereas
-    /// config-driven hooks are fixed inside `new`. A hook point takes a snapshot before
-    /// iterating, so a hook added here takes effect immediately for the **next** hook-point
-    /// call (see `hook::HookChain::snapshot`).
-    ///
-    /// The reverse direction (uninstall) needs no counterpart: `ComponentHook` looks up
-    /// its handle by **plugin name** each time, so it stops working on its own the moment
-    /// the plugin disappears from `plugins` (see the comment on `hook::ComponentHook`).
     pub fn add_hook(&self, hook: Arc<dyn crate::hook::Hook>) {
         self.hooks.push(hook);
     }
@@ -328,8 +172,6 @@ impl Runtime {
     }
 
     /// Redo the three-tier resolution.
-    /// Call it after installing a runtime, or after the user edits `config.runtimes` by
-    /// hand, to make the change take effect immediately.
     pub fn refresh_runtimes(&self) {
         let mut g = self.runtimes.write().unwrap();
         *g = self.config.runtimes.clone();
@@ -351,12 +193,7 @@ impl Runtime {
         self.tools.write().await.remove(name);
     }
 
-    /// Regenerated every round — a plugin tool the model just injected is visible in the
-    /// very next round.
-    /// ⚠️ **The request path no longer calls this** — `AgentLoop` asks for
-    /// [`Runtime::tool_schemas_scoped`]. What remains here is the **unscoped baseline** (every
-    /// registered tool), which the scoping tests compare against to prove that `inline_max = 0` is
-    /// byte-identical to the behaviour before the feature existed.
+    /// Regenerated every round — a plugin tool the model just injected is visible in the very next round. ️...
     #[allow(dead_code)]
     pub async fn tool_schemas(&self) -> Vec<serde_json::Value> {
         let tools = self.tools.read().await;
@@ -367,16 +204,7 @@ impl Runtime {
         v
     }
 
-    /// The same list as [`Runtime::tool_schemas`], minus the tools this conversation is not
-    /// advertising right now (see `crate::tool::scope`).
-    ///
-    /// ⚠️ **Hiding is advertising only.** Name resolution — `execute`, `tool_kind`, `tool_access`,
-    /// `caps_for` — always goes through the registry, so a tool that is hidden here still runs if
-    /// the model calls it. That is deliberate: hiding must not create a new failure mode.
-    ///
-    /// The decision is re-made on **every** call from the live registry size, so "a plugin was
-    /// installed / removed" needs no bookkeeping: the next round lands on the right side of the
-    /// threshold on its own.
+    /// The same list as Runtime::tool_schemas, minus the tools this conversation is not advertising right now (see...
     pub async fn tool_schemas_scoped(&self, scope: &crate::tool::scope::Scope) -> Vec<serde_json::Value> {
         let tools = self.tools.read().await;
         let hide = scope.hides(tools.len());
@@ -393,11 +221,7 @@ impl Runtime {
         v
     }
 
-    /// A snapshot of the registry for the tool-discovery search: name, whether it belongs to a
-    /// plugin, and the full schema (which carries the description the search matches against).
-    ///
-    /// Sorted by name so the same query always renders in the same order — the output goes into the
-    /// context, and an arbitrary order would make the prompt cache miss for no reason.
+    /// A snapshot of the registry for the tool-discovery search: name, whether it belongs to a plugin, and the full...
     pub async fn tool_entries(&self) -> Vec<ToolEntry> {
         let tools = self.tools.read().await;
         let mut v: Vec<ToolEntry> = tools
@@ -413,12 +237,7 @@ impl Runtime {
         v
     }
 
-    /// Every tool registered by one plugin (by plugin name). Empty when the plugin isn't installed.
-    ///
-    /// Used right after `create_plugin` / `update_plugin`: a tool the model just built has to be
-    /// **visible in the next request** — making it search for its own creation first would be a
-    /// pointless round trip, and it is exactly the moment the model is most likely to give up on
-    /// the idea of using it.
+    /// Every tool registered by one plugin (by plugin name).
     pub async fn plugin_tool_names(&self, plugin: &str) -> Vec<String> {
         let tools = self.tools.read().await;
         let mut v: Vec<String> = tools
@@ -440,13 +259,7 @@ impl Runtime {
         self.tools.read().await.get(name).map(|t| t.kind())
     }
 
-    /// Whether one call of this tool counts as "read" or "writes to disk" — this is what
-    /// the workplace boundary uses (see [`crate::tool::Tool::access`] and
-    /// `agent::Agent::workplace_reject`).
-    ///
-    /// Returns **writes to disk** when the tool isn't in the table: callers always look up
-    /// the name first, so if this really happens it means the registry and the caller
-    /// disagree, and the conservative direction is still "block one time too many".
+    /// Whether one call of this tool counts as "read" or "writes to disk" — this is what the workplace boundary uses...
     pub async fn tool_access(&self, name: &str) -> crate::workplace::Access {
         match self.tools.read().await.get(name) {
             Some(t) => t.access(),
@@ -454,14 +267,7 @@ impl Runtime {
         }
     }
 
-    /// The **capabilities requested** by this call (from a plugin's `[contributes] caps`,
-    /// since phase 6 · 6b).
-    ///
-    /// Only plugin tools can have them — meta tools belong to the host and request
-    /// capabilities on nobody's behalf.
-    /// Returns empty when the plugin isn't there (not installed / uninstalled / failed to
-    /// load): **the capability request vanishes together with the component**, leaving no
-    /// half-state of "the plugin is gone but the restriction remains".
+    /// The capabilities requested by this call (from a plugin's `contributes caps`, since phase 6 · 6b).
     pub async fn caps_for(&self, kind: &ToolKind) -> Vec<String> {
         let ToolKind::Plugin(name) = kind else {
             return Vec::new();
@@ -475,11 +281,6 @@ impl Runtime {
     }
 
     /// The two numbers a running call reports to the UI: `(cap_secs, expect_secs)`.
-    ///
-    /// Lives here rather than in `Agent` because the tool registry is private to `Runtime`, and
-    /// because these are the same hooks [`Self::execute`] builds its outer guard from — one reader,
-    /// one answer. Either half is `None` when the tool has no opinion (which is every tool except the
-    /// shell ones).
     pub async fn call_hints(&self, name: &str, args: &serde_json::Value) -> (Option<u64>, Option<u64>) {
         let tool = { self.tools.read().await.get(name).cloned() };
         match tool {
@@ -493,14 +294,7 @@ impl Runtime {
         let Some(tool) = tool else {
             return ToolOutput::err(crate::tf!("no such tool: {}", name));
         };
-        // Fallback timeout: plugin tools already have a tool_timeout_secs timeout +
-        // restart-and-retry internally; add 30 seconds of headroom here to guard against a
-        // permanent block on any path.
-        //
-        // A tool may ask for a **longer** leash than the flat rule allows (the shell tools do: a
-        // build can legitimately take minutes) — see `Tool::timeout_hint`. Without it the outer
-        // guard would fire first and report "the tool timed out" while the tool's own, more precise
-        // timeout never ran.
+        // Fallback timeout: plugin tools already have a tool_timeout_secs timeout + restart-and-retry internally; add 30...
         let timeout = match tool.timeout_hint(&args) {
             Some(d) => d + Duration::from_secs(10),
             None => Duration::from_secs(self.config.agent.tool_timeout_secs + 30),

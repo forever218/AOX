@@ -1,16 +1,6 @@
-//! The recovery store, described as **data** for a UI to draw.
-//!
-//! The CLI prints text; the panel in `gui/` lays the same facts out itself. Both read the same store
-//! through the same helpers — a UI that parsed the CLI's text would be a second implementation of
-//! every rule, and the first one to drift would be the one users act on.
-//!
-//! # Why this is its own file
-//!
-//! These items are called by exactly one consumer, the GUI crate. `src/main.rs` compiles this module
-//! tree a second time for the `aox` binary, which never calls them — so without the allow below, a
-//! release build of the CLI reports fifteen "never used" warnings that are not defects. Keeping them
-//! in one file means the `allow` covers one clearly-scoped module instead of being sprinkled over
-//! `command.rs`, where it would also hide a genuinely dead CLI helper.
+//! The recovery store, described as data for a UI to draw.
+//! The CLI prints text; the panel in `gui/` lays the same facts out itself.
+//! # Why this is its own file.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -30,7 +20,7 @@ pub struct PointRow {
     pub label: String,
     /// `task` / `external` / `manual` — a stable code, **not** localized text: the GUI picks the word.
     pub kind: &'static str,
-    /// `complete` / `partial` / `unknown`.
+    /// `complete` / `partial` / `unknown`
     pub status: &'static str,
     pub paths: usize,
     pub created_at: u64,
@@ -38,15 +28,7 @@ pub struct PointRow {
     pub head: bool,
     /// The conversation that recorded this point, when it recorded one.
     pub conversation: Option<String>,
-    /// Whether it was **this** conversation.
-    ///
-    /// The store is per workspace, so the chain is shared: opening a new conversation in the same
-    /// folder still sees the points the previous one left. That is correct (the files are the same
-    /// files, and undoing them from anywhere is legitimate) but it must not **look** like the new
-    /// conversation did that work. This flag is what lets the panel say whose point it is.
-    ///
-    /// `true` also covers "cannot tell": a point with no recorded conversation (a `/checkpoint` from
-    /// the CLI, a test) is not accused of belonging to someone else.
+    /// Whether it was this conversation.
     pub mine: bool,
 }
 
@@ -75,12 +57,7 @@ pub struct PathLine {
 
 #[derive(Clone, Debug, Default)]
 pub struct PreviewView {
-    /// The point the caller **asked about** — echoed back unchanged.
-    ///
-    /// This is what any UI matches its answer against. It is deliberately *not* the resolved node:
-    /// resolving "undo this point" walks to the parent, so the two ids differ by one step, and a
-    /// panel that compared the resolved id against the row it clicked would silently drop every
-    /// answer except the one row whose parent happens to be genesis. (That was a real bug.)
+    /// The point the caller asked about — echoed back unchanged.
     pub requested: String,
     /// The node the restore would actually walk back to; `None` = genesis (the beginning of the
     /// retained chain). Shown in diagnostics, never matched against.
@@ -115,11 +92,6 @@ fn coverage_code(c: super::model::CoverageState) -> &'static str {
 }
 
 /// The chain the cursor can actually walk: newest first, ending at the root.
-///
-/// This is the only set a rollback can reach. Everything else on disk is unreachable by definition —
-/// either a node written by a crash before the cursor moved, or a point left behind by rolling back
-/// past it. The panel lists **this**, because a row you cannot roll back to is a promise you cannot
-/// keep.
 pub(super) fn chain_nodes(store: &Arc<RecoveryStore>) -> Vec<RecoveryPoint> {
     let mut out = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -149,15 +121,7 @@ pub(super) fn orphan_count(store: &Arc<RecoveryStore>) -> usize {
         .unwrap_or(0)
 }
 
-/// The points in **chain order, newest first**, with any orphan appended. Used by `/checkpoints`,
-/// which is a report about what is *stored* — the panel's list is a report about what can be *undone*
-/// and therefore filters the orphans out (see [`chain_nodes`]).
-///
-/// Sorting by `created_at` alone looks right until two points share a second — which they routinely
-/// do, because a turn can finish in under a second — and then the order is whatever the file names
-/// happen to sort to. The cursor chain is the authoritative answer to "what can I undo, in what
-/// order", so that is what this returns. Orphans (a node written by a crash that never published a
-/// cursor) come last: they cannot be rolled back to, but they exist on disk until GC sweeps them.
+/// The points in chain order, newest first, with any orphan appended.
 pub(super) fn ordered_nodes(store: &Arc<RecoveryStore>) -> Vec<RecoveryPoint> {
     let mut out = chain_nodes(store);
     let seen: std::collections::BTreeSet<String> = out.iter().map(|n| n.id.clone()).collect();
@@ -170,10 +134,6 @@ pub(super) fn ordered_nodes(store: &Arc<RecoveryStore>) -> Vec<RecoveryPoint> {
 }
 
 /// Open the store without creating one. `None` = this workspace has never recorded a point.
-///
-/// Deliberately not routed through [`open`]: that helper turns "no store" into an error message
-/// meant for a person reading a terminal, whereas the panel needs to tell "nothing to show yet"
-/// apart from "something went wrong" — they look completely different on screen.
 fn open_soft(
     root: &std::path::Path,
     cfg: &crate::config::RecoveryConfig,
@@ -271,10 +231,7 @@ pub fn preview_view(rt: &Arc<Runtime>, target: &str) -> Result<PreviewView, Stri
     Ok(view)
 }
 
-/// Apply a rollback to `target`. `force` overwrites files changed outside AOX; `allow_partial`
-/// crosses points whose coverage is incomplete. Both are **separate** consents, exactly as in the
-/// CLI: they answer different questions and a UI that merged them would be asking for one and
-/// getting the other.
+/// Apply a rollback to `target`. `force` overwrites files changed outside AOX; `allow_partial` crosses points...
 pub fn rollback_to(
     rt: &Arc<Runtime>,
     target: &str,
@@ -399,10 +356,7 @@ mod tests {
         let view = points_view(&rt, None).unwrap();
         assert!(view.redoable, "the safety snapshot is exactly what `/redo` needs");
         assert!(!d.join("a.txt").exists(), "the file really went away");
-        // Rolling back past the only point leaves the cursor at genesis: nothing is undoable, and the
-        // node that described the vanished tree is **unreachable**. It must not stay in the list —
-        // a row nobody can roll back to is a promise nobody can keep. `/checkpoints` still reports it,
-        // because that command is about what is stored.
+        // Rolling back past the only point leaves the cursor at genesis: nothing is undoable, and the node that described...
         assert!(view.rows.is_empty(), "{:?}", view.rows.iter().map(|r| &r.id).collect::<Vec<_>>());
         assert_eq!(view.orphans, 1);
         let _ = std::fs::remove_dir_all(&d);

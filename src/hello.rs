@@ -1,31 +1,6 @@
-//! The **one line on the empty first screen** — where it comes from, and how it is cleaned up.
-//!
-//! Three sources, one shape. The GUI picks which one (a preference), this module answers with a
-//! short piece of plain text:
-//!
-//! * **custom** — the user's own sentence. Nothing to do here; the GUI already holds it.
-//! * **hitokoto** — one `GET` against a plain-text quoting API (default
-//!   [`HITOKOTO_DEFAULT`], documented at <https://developer.hitokoto.cn/sentence/>). The URL is
-//!   user-editable, including one on this machine, which is why it goes through
-//!   [`crate::llm::endpoint_client`] rather than the `web_fetch` egress policy: the address was
-//!   typed by hand, so it sits at the same trust level as the model endpoint — and `web_fetch`'s
-//!   "no private addresses" rule would silently break a self-hosted service on `127.0.0.1`.
-//! * **model** — one tiny chat call with **no tools** and a prompt built from the local clock and
-//!   (optionally) the title of the most recent conversation.
-//!
-//! # What this module refuses to do
-//!
-//! - **Never invent a line that reads like UI copy.** Every fallback is an ordinary sentence a
-//!   person could say out loud; the point of the feature is warmth, and "Loading…" is the opposite.
-//! - **Never throw the reason away.** The GUI shows the failure only in the settings panel, never on
-//!   the first screen — a greeting that apologises for itself is worse than the local fallback.
-//! - **Never take longer than it must.** The fetch is bounded by [`FETCH_TIMEOUT`]; the greeting
-//!   sits on the startup path, where "slow" and "broken" have to look different quickly.
-//!
-//! # Privacy
-//!
-//! Only the model source sends anything, and it sends exactly two things: the local time string and
-//! the most recent conversation **title** (not its content). The settings panel says so in one line.
+//! The one line on the empty first screen — where it comes from, and how it is cleaned up.
+//! Three sources, one shape. The GUI picks which one (a preference), this module answers with a short piece...
+//! * custom — the user's own sentence.
 
 use std::time::Duration;
 
@@ -45,36 +20,23 @@ pub const HITOKOTO_DOCS: &str = "https://developer.hitokoto.cn/sentence/";
 /// first screen does not sit blank while the user wonders whether the feature is on.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// Longest line accepted (in `char`s). Beyond this it stops being a greeting and becomes a paragraph
-/// on the first screen; the surplus is cut and an ellipsis added, so the cut is visible rather than
-/// mistaken for the API having returned a short line.
+/// Longest line accepted (in `char`s).
 pub const MAX_LINE: usize = 60;
 
 /// One source's answer, as the GUI consumes it.
-///
-/// A plain `Result` would do, but the GUI has to tell "the network said no" (worth a line in the
-/// settings panel) from "the model is not configured" (already reported elsewhere) — so the reason
-/// travels as text either way.
 pub enum Line {
     Text(String),
     Failed(String),
 }
 
-// ─────────────────────────── the clock ───────────────────────────
+// the clock
 
-/// The local hour, `0..24`. Straight from the OS through the one implementation the project
-/// already has (`history::local_now`), so the greeting and the dated memory note never disagree
-/// about what time it is.
+/// The local hour, `0..24`. Straight from the OS through the one implementation the project already has...
 pub fn hour() -> u16 {
     crate::history::local_now().hour
 }
 
-/// A **vague** label for this moment — the only thing the model is told about the clock.
-///
-/// Deliberately coarse, and it never names the weekday: told "Saturday 14:20", a model reliably
-/// writes "Happy Saturday afternoon!" no matter what style it was given. Reducing the clock to a
-/// mood ("lazy weekend afternoon") keeps the same information at the resolution a person would
-/// actually bring up, and leaves room for the line to be about something else entirely.
+/// A vague label for this moment — the only thing the model is told about the clock.
 fn time_label(t: &crate::history::Local) -> &'static str {
     // Fully qualified on purpose: `t` is already the parameter name here, and importing the
     // translation function would shadow it.
@@ -91,12 +53,9 @@ fn time_label(t: &crate::history::Local) -> &'static str {
     }
 }
 
-// ─────────────────────────── the local pool ───────────────────────────
+// the local pool
 
 /// Which part of the day it is — the only thing the local lines vary on.
-///
-/// Five buckets rather than "morning / afternoon / evening": the two edges (still awake at 03:00,
-/// eating at 12:30) are exactly the moments where the right line lands and a generic one does not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Daypart {
     LateNight,
@@ -119,10 +78,6 @@ impl Daypart {
 }
 
 /// The local fallback: used when the chosen source cannot answer in time.
-///
-/// Written to be sayable — short, warm, occasionally a little silly, never a status message. `index`
-/// exists so the caller can vary the line (two new conversations in a row should not open with the
-/// same sentence) without this module owning any clock or RNG.
 pub fn fallback_line(part: Daypart, index: usize) -> String {
     let pool: [&str; 3] = match part {
         Daypart::LateNight => [
@@ -160,20 +115,9 @@ pub fn ready_line() -> String {
     crate::i18n::t("Ready when you are.").to_string()
 }
 
-// ─────────────────────────── cleaning ───────────────────────────
+// cleaning
 
-/// Turn whatever came back into **one plain line**, or nothing.
-///
-/// Everything hostile about remote text is handled here rather than at the call site, because there
-/// are two callers (the API and the model) and they fail differently: an API may return HTML, a
-/// model loves to wrap its answer in quotes and add a sentence of commentary. Rules, in order:
-///
-/// 1. strip a BOM (some services emit one before the first character);
-/// 2. keep the **first non-empty line** — a model that ignores "one line only" is common, and the
-///    second line is always commentary;
-/// 3. collapse every run of whitespace/tabs into a single space;
-/// 4. drop matching wrapping quotes (`"` `'` `“”` `「」`) — a quoted greeting renders as a quote;
-/// 5. cut at [`MAX_LINE`] chars with an ellipsis.
+/// Normalize remote replies into one plain line; centralized because the API and model callers fail differently.
 pub fn sanitize(raw: &str) -> Option<String> {
     let raw = raw.trim_start_matches('\u{feff}');
     let first = raw
@@ -223,12 +167,9 @@ fn trim_wrapping_quotes(s: &str) -> &str {
     s
 }
 
-// ─────────────────────────── the network ───────────────────────────
+// the network
 
 /// Ask the quoting API for one line.
-///
-/// The body **is** the line (`encode=text`), so there is nothing to parse; what comes back still
-/// goes through [`sanitize`], because "plain text" from a proxy error page is plain text too.
 pub async fn hitokoto(url: &str) -> Result<String> {
     let url = url.trim();
     if url.is_empty() {
@@ -245,17 +186,9 @@ pub async fn hitokoto(url: &str) -> Result<String> {
     sanitize(&body).ok_or_else(|| anyhow!(crate::i18n::t("the answer was empty")))
 }
 
-// ─────────────────────────── variety ───────────────────────────
+// variety
 
-/// The writing styles the model is asked to follow — **one per call**.
-///
-/// Variety comes from code rather than from asking the model to "be varied": a model told only
-/// "write a greeting" converges on the same two sentences all day, and each extra instruction it
-/// invents for itself ("say good morning!") is one more thing every launch has to live with. Naming
-/// one style per call makes the spread real, and extending it is one line here.
-///
-/// The literals are the English wording **and** the catalogue keys; [`generate`] translates the one
-/// it drew, so a Chinese build hands the model a Chinese style instruction.
+/// The writing styles the model is asked to follow — one per call.
 const STYLES: &[&str] = &[
     "a short noun phrase naming the moment, like a scene title",
     "a quiet, cozy murmur",
@@ -266,15 +199,7 @@ const STYLES: &[&str] = &[
     "a half-finished thought that invites the user to continue",
 ];
 
-/// The system prompt. One line of output, and the list of things that make a line feel generated
-/// (greetings, questions, "what do you want to talk about") is **closed off by name**: telling a
-/// model what not to do is worth more than asking it to "be natural".
-///
-/// The output language is stated explicitly, and **each catalogue states its own** — `t()` swaps
-/// the whole paragraph, so the English build says "English" and the Chinese build says 中文. Relying
-/// on "the model will answer in the language of the prompt" is not enough: the model's training data
-/// is full of English one-liners for empty screens, and without this line a Chinese build reliably
-/// came back with "Good afternoon".
+/// System prompt: require one line, name banned cliches, and pin each build's output language per catalogue.
 const MODEL_PROMPT: &str = concat!(
     "You write the short line shown on an empty chat screen, like a tiny scene ",
     "title or a murmur. It is not a question and not a status message. ",
@@ -295,20 +220,10 @@ const MODEL_PROMPT: &str = concat!(
 );
 
 /// A tiny dependency-free RNG.
-///
-/// The same trade the GUI's background picker makes (`brand::roll`): this module needs "one of
-/// seven" and "three in ten", not a distribution library, and `rand` would be paid for out of the
-/// binary-size budget the project tracks. xorshift64*, seeded from the clock and a call counter —
-/// the counter matters because `SystemTime` on Windows is coarse enough that two calls in the same
-/// millisecond would otherwise pick the same style.
+/// The same trade the GUI's background picker makes (`brand::roll`): this module needs "one of seven" and "three...
 struct Picker(u64);
 
 /// Scramble a seed before xorshift touches it (splitmix64's finalizer).
-///
-/// xorshift is **linear**: two seeds a few hundred milliseconds apart — which is exactly what two
-/// launches in a row look like — walk out of it to nearby states, and `n % 7` then lands in the same
-/// bucket often enough to be noticed ("it gave me the same line twice"). A finalizer is what breaks
-/// that: neighbouring inputs come out as unrelated outputs.
 fn mix(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -348,10 +263,7 @@ impl Picker {
     }
 }
 
-/// The weekday's name, for the precise-time draw.
-///
-/// Translated: a Chinese build has to hand the model 星期六, not "Saturday" — an English token in the
-/// middle of an otherwise Chinese message is exactly what pulls the answer back into English.
+/// Weekday name, translated; an English token in a Chinese prompt pulls the answer back to English.
 fn weekday_name(index: u16) -> &'static str {
     const NAMES: [&str; 7] = [
         "Sunday",
@@ -365,10 +277,7 @@ fn weekday_name(index: u16) -> &'static str {
     crate::i18n::t(NAMES[(index as usize) % 7])
 }
 
-/// `Saturday, 15:20` — the day and the hour, and **no date**.
-///
-/// The weekday is what makes "Saturday afternoon" possible, and the hour is the "precise time" this
-/// draw exists for. The date is left out on purpose: a model handed `2026-10-31` prints it back.
+/// `Saturday, 15:20` — the day and the hour, and no date.
 fn exact_time(t: &crate::history::Local) -> String {
     format!("{}, {:02}:{:02}", weekday_name(t.weekday), t.hour, t.minute)
 }
@@ -380,15 +289,11 @@ enum Clock {
     Exact,
     /// A vague mood ("lazy weekend afternoon").
     Mood,
-    /// Nothing at all — the line has to stand on its own.
+    /// Nothing at all — the line has to stand on its own
     None,
 }
 
 /// How often each kind of clock comes up, in percent of calls.
-///
-/// The exact reading gets the largest share because it is the one that makes a line feel written for
-/// *this* moment; the mood is its quieter version, and the empty draw is what keeps the feature from
-/// turning into a clock that recites the time every launch.
 const CLOCK_EXACT: usize = 45;
 const CLOCK_MOOD: usize = 35;
 
@@ -401,10 +306,6 @@ fn pick_clock(pick: &mut Picker) -> Clock {
 }
 
 /// What one call tells the model about this moment.
-///
-/// Split out from [`generate`] so the prompt can be inspected without a network: which of the three
-/// clock draws is in play changes the wording a lot, and that is easier to pin down as a pure
-/// function of its inputs.
 fn user_prompt(style: &str, clock: Clock, local: &crate::history::Local) -> String {
     let mut user = crate::tf!("Style for this one: {}", style);
     match clock {
@@ -421,14 +322,7 @@ fn user_prompt(style: &str, clock: Clock, local: &crate::history::Local) -> Stri
 }
 
 /// Ask the model for one line.
-///
-/// Everything variable about the request — the style, and which of the three clock draws is used —
-/// is decided here, in code, by [`Picker`]. The model is handed one instruction and no choices; that
-/// is what keeps two launches from producing the same sentence.
-///
-/// **Nothing from the conversation is sent.** An earlier version passed the last conversation's
-/// title as optional inspiration; it was removed on 2026-10-31 because a greeting that refers to
-/// yesterday's work reads as surveillance, not as a welcome.
+/// Everything variable about the request — the style, and which of the three clock draws is used — is decided...
 pub async fn generate(llm: &dyn LlmProvider) -> Result<String> {
     let mut pick = Picker::new();
     // The drawn style is translated here, not inside `STYLES`: the catalogue keys have to stay the
@@ -450,9 +344,7 @@ pub async fn generate(llm: &dyn LlmProvider) -> Result<String> {
 mod tests {
     use super::*;
 
-    /// A quoted / multi-line / padded answer has to come out as exactly one clean line. These are
-    /// the three shapes a model actually produces, and each of them looks broken on the first
-    /// screen if it leaks through.
+    /// A quoted / multi-line / padded answer has to come out as exactly one clean line.
     #[test]
     fn sanitize_keeps_one_clean_line() {
         assert_eq!(sanitize("  \"Morning!\"  \n\nSure, here you go.").as_deref(), Some("Morning!"));
@@ -579,12 +471,12 @@ mod tests {
         assert!(exact.contains("Local time: Saturday, 15:20"), "{exact}");
         assert!(!exact.contains("2026"), "the date must not reach the model: {exact}");
 
-        // The mood draw: a vague label, never a weekday.
+        // The mood draw: a vague label, never a weekday
         let mood = user_prompt("a mood label", Clock::Mood, &local);
         assert!(mood.contains("lazy weekend afternoon"), "{mood}");
         assert!(!mood.contains("Saturday"), "{mood}");
 
-        // The empty draw: explicitly told not to bring up the time.
+        // The empty draw: explicitly told not to bring up the time
         let none = user_prompt("a scene title", Clock::None, &local);
         assert!(none.contains("Do not refer to the time of day"), "{none}");
         assert!(!none.contains("Saturday"), "{none}");
@@ -638,13 +530,7 @@ mod tests {
         assert_eq!(HITOKOTO_DOCS, "https://developer.hitokoto.cn/sentence/");
     }
 
-    /// **Two launches in a row must not produce the same style.**
-    ///
-    /// The seeds one launch apart differ by a few hundred milliseconds — neighbouring numbers, which
-    /// is exactly the shape a linear generator (xorshift) maps to neighbouring states. Measured
-    /// before [`mix`] existed: three runs in a row drew the same style *and* the same clock branch,
-    /// which reads as "the feature is stuck". Seven styles across 64 nearby seeds is a low bar that a
-    /// raw seed fails and a scrambled one clears by a wide margin.
+    /// Two launches in a row must not produce the same style.
     #[test]
     fn nearby_seeds_do_not_all_land_on_one_style() {
         let mut seen = std::collections::BTreeSet::new();

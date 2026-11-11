@@ -1,7 +1,6 @@
-//! 房间口令 → 密钥，按房间保存在 `.aox/room-keys.json`。
-//!
-//! 存的是**口令**而不是派生的密钥：密钥的盐是房间 id，口令才是人能重新输入的那份东西。
-//! 文件在 Unix 下 0600；Windows 没有等价物，这一点写在 README 里，不假装它是保险箱。
+//! Map room passphrases to keys, stored per room in .aox/room-keys.json.
+//! Store the passphrase, not the key: keys are salted by room id, and only the passphrase can be re-typed.
+//! File is 0600 on Unix; Windows has no equivalent, so this is not treated as a secure vault.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +12,7 @@ use super::crypto;
 
 pub struct RoomKeys {
     path: PathBuf,
-    /// room_id → 口令
+    /// Maps room_id to its passphrase.
     phrases: Mutex<HashMap<String, String>>,
 }
 
@@ -65,7 +64,7 @@ impl RoomKeys {
         }
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_string_pretty(&snapshot)?)
-            .with_context(|| format!("写入 {}", tmp.display()))?;
+            .with_context(|| format!("writing {}", tmp.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

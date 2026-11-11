@@ -1,20 +1,6 @@
-//! Asking an endpoint **which models it serves** — the "scan" behind the Model tab's model list.
-//!
-//! There is no standard here, only a convention and a pile of near-misses, so this module is written
-//! to be forgiving on the way in and explicit on the way out:
-//!
-//! * **Where the list lives** is decided by [`crate::config::ProviderConfig::models_urls`] (a
-//!   versioned base gets one candidate, a bare host gets two). This module just walks the list.
-//! * **401 / 403 stop immediately.** Trying the second URL after a rejected key would turn "the key is
-//!   wrong" into "the endpoint does not support listing", which is a different and much more
-//!   expensive conclusion.
-//! * **Three response shapes** are accepted (`data[]`, `models[]`, a bare array), because OpenAI,
-//!   Ollama and several gateways disagree.
-//! * **A context window is only reported when the endpoint states one.** It is never inferred here —
-//!   see [`super::catalog`] for why guessing it is worse than leaving it blank.
-//!
-//! The call is bounded to [`SCAN_TIMEOUT`]: this runs while a person is looking at a panel, so "slow"
-//! and "broken" have to look different within a few seconds.
+//! Asking an endpoint which models it serves — the "scan" behind the Model tab's model list.
+//! There is no standard here, only a convention and a pile of near-misses, so this module is written...
+//! * Where the list lives is decided by crate::config::ProviderConfig::models_urls (a versioned base gets...
 
 use std::time::Duration;
 
@@ -52,9 +38,6 @@ const WINDOW_KEYS: [&str; 6] = [
 ];
 
 /// List the models served by `base_url`.
-///
-/// `key` is optional: local servers (Ollama, vLLM without auth) need none, and sending an empty
-/// `Authorization: Bearer ` header is worse than sending none at all.
 pub async fn list(base_url: &str, key: Option<&str>) -> Result<Scan> {
     let cfg = crate::config::ProviderConfig {
         base_url: base_url.trim().to_string(),
@@ -80,9 +63,7 @@ pub async fn list(base_url: &str, key: Option<&str>) -> Result<Scan> {
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                // No HTTP status at all: DNS, refused connection, TLS, timeout. Report the URL — the
-                // most common cause is a typo in the host, and "which address did it try" is the
-                // first thing needed to see that.
+                // No HTTP status at all: DNS, refused connection, TLS, timeout.
                 return Err(anyhow!(crate::tf!(
                     "cannot reach {}: {}",
                     url,
@@ -135,15 +116,6 @@ pub async fn list(base_url: &str, key: Option<&str>) -> Result<Scan> {
 }
 
 /// Send one tiny chat request, to answer "does this endpoint + key + model actually work".
-///
-/// Distinct from [`list`] on purpose, and both exist because they fail differently: a key can be fine
-/// for listing yet the endpoint may use a different path for chat, the model name may be misspelled
-/// in a way listing does not reveal, and a gateway may answer `/models` from a cache while the chat
-/// route is down. This is the only check that exercises the route a conversation will really use.
-///
-/// `max_tokens: 1` because the answer's *content* is worthless here; what is being tested is the
-/// round trip. The reply is summarised rather than returned: the point is a sentence a person can act
-/// on, not a `ChatReply` nobody will read.
 pub async fn probe(base_url: &str, key: Option<&str>, model: &str) -> Result<String> {
     let cfg = crate::config::ProviderConfig {
         base_url: base_url.trim().to_string(),
@@ -206,9 +178,6 @@ pub async fn probe(base_url: &str, key: Option<&str>, model: &str) -> Result<Str
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Parse the three shapes a "model list" comes in.
-///
-/// Malformed entries are **skipped, not fatal**: one odd object in a fifty-model list should not cost
-/// the user the other forty-nine.
 pub fn parse(v: &Value) -> Vec<ModelEntry> {
     let arr = v
         .get("data")
@@ -332,20 +301,12 @@ mod tests {
         assert_eq!(parse(&v)[0].window, Some(32_768));
     }
 
-    // ── end to end, against a server in this process ──
-    //
-    // The unit tests above cover parsing and URL derivation separately. These cover the part in
-    // between them — the fallback loop, the auth header, and the status codes that mean different
-    // things — because that is where "the panel says the endpoint does not support listing" actually
-    // comes from. A real socket on loopback, no external network, no dependency added.
+    // ── end to end, against a server in this process ──.
 
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
     /// Serve a fixed little OpenAI-compatible surface on an ephemeral port; return the port.
-    ///
-    /// * `GET /v1/models` → 404 (so the scanner has to fall through to the second candidate)
-    /// * `GET /models` → 200 with two models, but **only** for `Bearer sk-stub`
     fn stub() -> u16 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
         let port = listener.local_addr().expect("addr").port();
@@ -383,9 +344,7 @@ mod tests {
         port
     }
 
-    /// The whole path a "Scan" press takes: the first candidate 404s, the second answers, and the
-    /// window that came with it is kept. Without the fallback, an endpoint written as a bare host
-    /// (`https://api.deepseek.com`, the documented form) would look like it cannot list.
+    /// The whole path a "Scan" press takes: the first candidate 404s, the second answers, and the window that came...
     #[tokio::test]
     async fn a_scan_falls_through_to_the_second_candidate_and_keeps_the_window() {
         let port = stub();
@@ -484,9 +443,7 @@ mod tests {
         port
     }
 
-    /// A loopback endpoint must bypass the proxy: this project's own sandbox sets `HTTP_PROXY`, and a
-    /// request to `127.0.0.1` through it comes back as a 502 blaming the upstream — which reads as
-    /// "your local model is broken" while it is answering fine.
+    /// A loopback endpoint must bypass the proxy: this project's own sandbox sets `HTTP_PROXY`, and a request...
     #[test]
     fn a_local_endpoint_is_not_sent_through_a_proxy() {
         assert!(super::super::is_loopback("http://127.0.0.1:11434"));

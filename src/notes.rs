@@ -1,19 +1,6 @@
 //! What earlier sessions wrote down, listed so the model can find it.
-//!
-//! `.aox/memory/` was **write-only** until 2026-10-23: the prompt told the model to record notes
-//! there, and then nothing on the host side ever mentioned the folder again — so a note only helped
-//! if a later session happened to think "maybe I should look". The folder is a filing cabinet; this
-//! module is the label on its drawer.
-//!
-//! # Why a table of contents and not the notes themselves
-//!
-//! Measured on this repository: one note, 4.6 KB ≈ 1.5k tokens. The system prompt is rebuilt into
-//! message 0 and therefore travels with **every** request, so injecting the body would cost that on
-//! a one-line question that has nothing to do with the note. The headings cost ~60 tokens and carry
-//! enough for the model to decide whether to open the file — which is one `read_file` away.
-//!
-//! Relevance is the real argument, not cost: the work in front of you is often unrelated to what
-//! last week's session wrote, and only the model can tell.
+//! `.aox/memory/` was write-only until 2026-10-23: the prompt told the model to record notes there, and then...
+//! # Why a table of contents and not the notes themselves.
 
 use std::path::Path;
 
@@ -110,9 +97,7 @@ fn headings_of(path: &Path) -> Vec<String> {
     heads
 }
 
-/// `4.6 KB` / `812 B` / `54.3 MB` — the size is what tells the model whether opening the file is
-/// cheap. The MB branch exists because a built artifact (an APK, a log) is routinely tens of
-/// megabytes, and `55216.0 KB` makes the reader do arithmetic to answer "is this big?".
+/// `4.6 KB` / `812 B` / `54.3 MB` — the size is what tells the model whether opening the file is cheap.
 pub fn human_size(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
@@ -165,12 +150,12 @@ mod tests {
         note(
             &d,
             "2026-10-18.md",
-            "# 2026-10-18\n\n## AOX GUI：左侧历史栏\n\n正文\n\n## 另一个小节\n\n正文\n\n## 第三个\n\n## 第四个\n",
+            "# 2026-10-18\n\n## AOX GUI: left history column\n\nbody\n\n## Another section\n\nbody\n\n## Third\n\n## Fourth\n",
         );
         let got = recent(&d, 1);
         assert_eq!(
             got[0].headings,
-            vec!["AOX GUI：左侧历史栏", "另一个小节", "第三个"],
+            vec!["AOX GUI: left history column", "Another section", "Third"],
             "at most three titles, in file order"
         );
     }
@@ -178,15 +163,15 @@ mod tests {
     #[test]
     fn a_note_without_sections_falls_back_to_its_first_content_line() {
         let d = tmp("plain");
-        note(&d, "2026-10-18.md", "# 2026-10-18\n\n今天把输入框改成了浮动卡片。\n\n更多细节。\n");
+        note(&d, "2026-10-18.md", "# 2026-10-18\n\nToday the input box became a floating card.\n\nMore detail.\n");
         let got = recent(&d, 1);
-        assert_eq!(got[0].headings, vec!["今天把输入框改成了浮动卡片。"]);
+        assert_eq!(got[0].headings, vec!["Today the input box became a floating card."]);
     }
 
     #[test]
     fn other_files_are_ignored() {
         let d = tmp("only-md");
-        note(&d, "2026-10-18.md", "## 有内容\n");
+        note(&d, "2026-10-18.md", "## Has content\n");
         std::fs::write(d.join(".aox/memory/notes.txt"), "x").unwrap();
         std::fs::create_dir_all(d.join(".aox/memory/sub.md")).unwrap();
         let got = recent(&d, 5);

@@ -1,39 +1,6 @@
 //! Context budget and automatic compaction (stage 3).
-//!
-//! # In one sentence
-//!
-//! Compaction is a **request projection**, not a rewrite of history: `Agent::messages` (which *is*
-//! the conversation file) always stays complete, and a "compacted view" is built only just before the
-//! request goes out.
-//!
-//! This is not fastidiousness. The existing `drop_oldest` / `truncate_messages` also call
-//! `Session::rewrite`; if compaction rewrote `messages`, then **any interrupt rollback after a
-//! compaction would write the compacted remnant back to the file**, silently shortening the user's
-//! long conversation. So this module only ever produces a `Vec<Message>` and touches no write path.
-//!
-//! # The four-rung ladder (climb only, stop as soon as it fits)
-//!
-//! | Rung | Condition | Action | Cost |
-//! |---|---|---|---|
-//! | L0 | estimate <= budget | send as-is (return `None`; the request is byte-identical) | 0 |
-//! | L1 | over budget | stub out old tool results | 0 calls |
-//! | L2 | still over after L1 | one summary of the oldest complete user turns | 1 LLM call |
-//! | L3 | still over | a `Warn` that says so, then send anyway | 0 |
-//!
-//! # The watermark
-//!
-//! Once L2 has summarized, the folded prefix stops changing (messages only append; a rollback
-//! shortens, and then the prefix is invalid). The cache remembers `covered` (folded through message
-//! N) and the summary text: the next compaction **continues from the watermark** and only summarizes
-//! what is new. Without it a long task would re-summarize everything every round — the real waste.
-//!
-//! # Three invariants
-//!
-//! 1. `messages[0]` (the system prompt) never takes part;
-//! 2. the cut falls only on `user` messages (the same rule as `agent_loop::trim_point`), so there can
-//!    never be "a tool result whose assistant is gone", and a thinking model's
-//!    `reasoning_content <-> tool_calls` pairing is never split;
-//! 3. idempotent: one batch of messages is computed once, and a cache hit calls no model at all.
+//! # In one sentence.
+//! Compaction is a request projection, not a rewrite of history: `Agent::messages` (which *is* the conversation...
 
 use serde_json::Value;
 
@@ -69,27 +36,11 @@ pub struct Policy {
 
 impl Policy {
     /// Read the budget from config.
-    ///
-    /// Priority: `[agent] context_budget_tokens` (explicit, used directly as the input cap) ->
-    /// `[provider] context_window x compact_ratio - max_tokens` -> **neither means `None` (no
-    /// compaction)**.
-    ///
-    /// That last branch is deliberately not a guess: an unknown window used to mean "compact
-    /// nothing". Since 2026-10-23 the two provider keys have defaults
-    /// ([`crate::config::DEFAULT_CONTEXT_WINDOW`] / [`crate::config::DEFAULT_MAX_TOKENS`]), so a plain
-    /// config does compact — `None` here now only happens when a caller clears the window
-    /// explicitly (tests, or a config whose model genuinely has no known limit).
     pub fn from_config(cfg: &crate::config::Config) -> Option<Self> {
         Self::from_parts(&cfg.agent, &cfg.provider)
     }
 
     /// The same derivation, from the two sections separately.
-    ///
-    /// This is the form the request path uses: the **provider half comes from the live provider**
-    /// (`rt.provider.cfg()`), not from the config that was read at startup — otherwise switching to a
-    /// model with a smaller window in the GUI would keep compacting against the old denominator for
-    /// the rest of the session, which shows up as "the endpoint returns 400 on a long conversation
-    /// even though the window is set correctly".
     pub fn from_parts(
         agent: &crate::config::AgentConfig,
         provider: &crate::config::ProviderConfig,
@@ -113,10 +64,6 @@ impl Policy {
 }
 
 /// Estimated tokens for one request (messages + tool schemas + per-message protocol overhead).
-///
-/// It uses the same estimator the streaming display uses (ASCII/4 + wide characters 1:1), so it is
-/// **only an estimate**: the real number comes from the endpoint's usage. The one requirement here is
-/// "rather too high than too low" — underestimating pushes the request past the window.
 pub fn estimate(msgs: &[Message], schemas: &[Value]) -> u64 {
     let mut e = TokenEstimate::default();
     for m in msgs {
@@ -146,9 +93,7 @@ pub fn estimate(msgs: &[Message], schemas: &[Value]) -> u64 {
 /// A compacted request body together with its watermark.
 #[derive(Debug, Clone)]
 pub struct ViewCache {
-    /// Cache key: `(message count, fingerprint of the last message)`. Messages only append, so "the
-    /// count changed" means "there is new content"; the fingerprint covers the case of rolling back to
-    /// the same count with different content.
+    /// Cache key: `(message count, fingerprint of the last message)`. Messages only append, so "the count changed"...
     pub key: (usize, String),
     /// The compacted body (system prompt included).
     pub body: Vec<Message>,
@@ -158,7 +103,7 @@ pub struct ViewCache {
     pub summary: Option<String>,
 }
 
-/// Cache key: the count plus the last message's fingerprint.
+/// Cache key: the count plus the last message's fingerprint
 fn cache_key(msgs: &[Message]) -> (usize, String) {
     let last = msgs.last().map(|m| {
         let mut s = m.role.clone();
@@ -176,10 +121,6 @@ fn cache_key(msgs: &[Message]) -> (usize, String) {
 }
 
 /// Shape of the body: system prompt + (summary) + the kept tail.
-///
-/// The summary is a **user** message: the protocol lets no assistant / tool message open a
-/// conversation, and this is "the host talking to the model" — the same precedent as
-/// `Agent::push_ephemeral` injecting the restore note.
 fn assemble(msgs: &[Message], covered: usize, summary: &str) -> Vec<Message> {
     let mut out = Vec::with_capacity(msgs.len() - covered + 2);
     out.push(msgs[0].clone());
@@ -190,10 +131,8 @@ fn assemble(msgs: &[Message], covered: usize, summary: &str) -> Vec<Message> {
     out
 }
 
-/// Stub out old tool results. Returns how many were replaced.
-///
-/// Only what lies before `KEEP_RECENT`: the recent ones are exactly what the model needs right now,
-/// and stubbing them would just cost an extra round.
+/// Stub out old tool results.
+/// Only what lies before `KEEP_RECENT`: the recent ones are exactly what the model needs right now, and stubbing...
 fn elide_old_tool_results(body: &mut [Message]) -> usize {
     let end = body.len().saturating_sub(KEEP_RECENT);
     let mut n = 0;
@@ -217,12 +156,7 @@ fn elide_old_tool_results(body: &mut [Message]) -> usize {
     n
 }
 
-/// Pick one candidate cut: **the later the better** (less information lost), as long as the result
-/// fits the budget.
-///
-/// When none fits it returns `None` — that means "everything that could be folded still does not fit",
-/// and spending a model call on a summary at that point is pointless: a summary does not buy back the
-/// budget, it just burns one more call. The caller warns instead (see `prepare`).
+/// Pick one candidate cut: the later the better (less information lost), as long as the result fits the budget.
 fn pick_cut(msgs: &[Message], covered: usize, budget: u64, schemas: &[Value]) -> Option<usize> {
     let candidates: Vec<usize> = msgs
         .iter()
@@ -328,7 +262,7 @@ fn digest(msgs: &[Message], covered: usize, cut: usize, previous: Option<&str>) 
     out
 }
 
-/// The body of the summary message (model-facing, English).
+/// The body of the summary message (model-facing, English)
 fn summary_message(summary: &str) -> String {
     format!(
         "{} the earlier part of this conversation was compacted to save context. Everything before this point is \
@@ -340,17 +274,8 @@ fn summary_message(summary: &str) -> String {
 }
 
 /// Build this round's request body.
-///
-/// - `None` => no compaction needed; the caller sends `agent.messages()` as-is (**the request stays
-///   byte-identical**);
-/// - `Some(body)` => send this body.
-///
-/// Called once per round inside `AgentLoop` (tool results grow the context, so checking only at the
-/// start of a turn would be wrong).
 pub async fn prepare(agent: &mut Agent, ui: &mut dyn Ui, schemas: &[Value]) -> Option<Vec<Message>> {
-    // The budget follows the **live** provider: a model switch (smaller window, larger reply
-    // reservation) takes effect on the next round without restarting anything. Both halves are copied
-    // out in one scope, so no borrow of `agent` is held (the rest of this function takes `&mut`).
+    // The budget follows the live provider: a model switch (smaller window, larger reply reservation) takes effect...
     let policy = {
         let rt = agent.rt();
         Policy::from_parts(&rt.config.agent, &rt.provider.cfg())?
@@ -369,9 +294,7 @@ pub async fn prepare(agent: &mut Agent, ui: &mut dyn Ui, schemas: &[Value]) -> O
         return None;
     }
 
-    // Compaction only happens over budget, so one snapshot here is cheap: the model call later borrows
-    // `agent`, and holding a slice into `agent.messages` would collide with `&mut agent` sooner or
-    // later.
+    // Compaction only happens over budget, so one snapshot here is cheap: the model call later borrows `agent`...
     let msgs = agent.messages().to_vec();
 
     // Where to start from: continue from a usable watermark (the prefix no longer changes), or from
@@ -384,7 +307,7 @@ pub async fn prepare(agent: &mut Agent, ui: &mut dyn Ui, schemas: &[Value]) -> O
         _ => (msgs.clone(), 1, None),
     };
 
-    // ── L1: stub out old tool results ──
+    // L1: stub out old tool results
     let mut body = start_body;
     let elided = elide_old_tool_results(&mut body);
     let after_l1 = estimate(&body, schemas);
@@ -396,13 +319,9 @@ pub async fn prepare(agent: &mut Agent, ui: &mut dyn Ui, schemas: &[Value]) -> O
         return Some(body);
     }
 
-    // ── L2: fold the oldest complete user turns ──
+    // L2: fold the oldest complete user turns
     let Some(cut) = pick_cut(&msgs, covered, policy.budget, schemas) else {
-        // Either there is no legal cut (a single turn), or "everything folded is still over" (the
-        // system prompt + tool definitions + this turn already exceed it). A summary fixes neither, so
-        // **no model is called**: one call does not buy back the budget, it just burns money. The
-        // warning is emitted once — repeating it every round would be spam, and this is a config
-        // problem anyway.
+        // Either there is no legal cut (a single turn), or "everything folded is still over" (the system prompt + tool...
         if !agent.compact_warned() {
             ui.emit(AgentEvent::Warn(crate::tf!(
                 "the request cannot be brought under the context budget by folding history (~{} tokens vs budget {}): the system prompt, the tool definitions and the current turn already exceed it. Raise [agent] context_budget_tokens, or the model's context window in Settings → Model, or start a new conversation.",
@@ -614,7 +533,7 @@ mod tests {
         assert_ne!(cache_key(&a), cache_key(&c), "the same length with different content must not hit");
     }
 
-    // ───────── Wiring into `Agent` (real cache, real disk) ─────────
+    // Wiring into `Agent` (real cache, real disk)
 
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -668,9 +587,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aox-compact-{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         let mut c = crate::config::Config::dummy();
-        // The budget is passed in because it has to be comparable with the **real** system prompt
-        // (the built-in one alone is a few thousand tokens): "small" has to mean "bigger than any
-        // conversation this test builds", not "a small absolute number".
+        // The budget is passed in because it has to be comparable with the real system prompt (the built-in one alone...
         c.agent.context_budget_tokens = budget;
         c.workplace = crate::config::WorkplaceConfig { mode: "fixed".into(), root: Some(dir.to_string_lossy().into()) };
         let rt = Runtime::new(c, dir.clone(), dir.join("plugins")).unwrap();

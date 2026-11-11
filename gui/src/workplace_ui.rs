@@ -1,36 +1,6 @@
-//! Workspace button: the "Workspace · <tier>" chip at the **bottom-left** of the input box.
-//!
-//! The three tiers (default / choose workspace / full access) enter through **this UI layer** here. The
-//! `[workplace] mode` in config only fixes the tier **at launch** — the factory default is `default` (restricted;
-//! switched from `full` on 2026-10-05 because the user wants "default restricted every launch"); to change tiers at runtime you use this
-//! button. Switching only affects **the current conversation**: the tier and root travel with the conversation save, while `/new` always returns to "default".
-//!
-//! This module owns four things:
-//! - [`button`]: the button itself (hand-drawn folder icon + current tier name);
-//! - [`menu`]: the three-choice list that pops **upward** on click (current tier checked, "full access" shown red and bold);
-//! - [`confirm`]: the red second confirmation before switching to "full access" — the **only** toggle in the whole
-//!   program that **crosses every protection once clicked** (so only it uses [`P::danger`]);
-//! - [`picker`]: the built-in directory picker.
-//!
-//! # Three conventions
-//!
-//! **① State lives in [`WorkplaceUi`], held by `App`.** This module never touches any field of `App`.
-//!
-//! **② "Take parameters in, emit requests out."** Each function returning `Option<Mode>` means "the UI wants to send a request to
-//! the Agent thread, requesting that the tier be switched to this". Why the UI cannot switch tiers itself: `Workplace` lives inside
-//! `aox::runtime::Runtime`, and only the Agent thread can reach `Runtime` — the main thread holds only a
-//! channel (see `ToAgent::Workplace` in `gui/src/bridge.rs`).
-//!
-//! **③ The current state is "pushed in", not "asked for".** The tier name and checkmarks come from the `WorkplaceView` received by
-//! [`WorkplaceUi::set_view`] (the bridge re-sends it at startup / after each turn / after every tier switch). The UI keeping
-//! its own "which tier is selected now" is wrong: the authoritative state is on the Agent thread, and two copies will inevitably drift.
-//!
-//! # Why the directory picker is hand-drawn
-//!
-//! We do not call the system directory dialog (on Windows that is `IFileDialog`, which pulls in extra COM + a pile of
-//! `windows-sys` interfaces, and you would have to write another copy for macOS / Linux). This picker has a narrow purpose —
-//! pick a "workspace root" directory, no creation, no multi-select, no network locations — so a single egui-drawn screen
-//! suffices, and it stays **fully on-theme** instead of popping a white system dialog over the paper-and-ink UI.
+//! Workspace button: the "Workspace · <tier>" chip at the bottom-left of the input box.
+//! The three tiers (default / choose workspace / full access) enter through this UI layer here.
+//! This module owns four things: - button: the button itself (hand-drawn folder icon + current tier name); - menu...
 
 use std::path::{Path, PathBuf};
 
@@ -44,16 +14,13 @@ use crate::app::{danger_button, flat_button, primary_button};
 use crate::bridge::WorkplaceView;
 use crate::theme::{self, P};
 
-// ─────────────────────────── State ───────────────────────────
+// State
 
 /// All state for the workspace button plus the panels it pops up.
 pub struct WorkplaceUi {
     /// Current tier and root (pushed in from the bridge `FromAgent::Workplace`).
-    ///
-    /// `None` = no receipt received yet (the first frame or two after launch, or never managed to connect to the Agent thread).
-    /// In that case the button shows the plain "Workspace" and no list item is checked — we do not guess.
     view: Option<WorkplaceView>,
-    /// Whether the three-choice list is expanded.
+    /// Whether the three-choice list is expanded
     open: bool,
     /// The button rectangle. Pop-up panels anchor to it **upward** (see the coordinate math in [`menu`]).
     button_rect: Option<Rect>,
@@ -85,14 +52,7 @@ impl WorkplaceUi {
     }
 
     /// The text on the button.
-    ///
-    /// The "choose workspace" tier does not spell out its tier name (that would read "Workspace · Choose workspace", stuttering); instead it
-    /// shows **the selected directory name** — what the user cares about is "which patch of ground am I locked into right now",
-    /// and the full path lives in the pop-up list.
-    ///
-    /// The "default" tier also **carries the directory name once the ground is built** (`Workspace · Default · 20261005162915`): default is
-    /// **one fixed patch for the conversation** (switch away and back and it is still the same one; see `aox::workplace::State::own`),
-    /// and just writing "default" hides which patch it is, so you cannot confirm it is not quietly accumulating patch by patch (raised by the user on 2026-10-05).
+    /// The "choose workspace" tier does not spell out its tier name (that would read "Workspace · Choose workspace"...
     fn chip_text(&self) -> String {
         match &self.view {
             Some(v) => match &v.mode {
@@ -120,7 +80,7 @@ struct Picker {
     dir: PathBuf,
     /// Which drive letters exist on this machine (Windows only; empty elsewhere — just walk in from `/`).
     drives: Vec<char>,
-    /// The last directory-read error (permission denied, etc.).
+    /// The last directory-read error (permission denied, etc.)
     error: Option<String>,
     /// Subdirectories under the current directory. **Cached**, only re-read on open / directory switch —
     /// otherwise `read_dir` would run every frame and a 60fps UI would pointlessly hit the disk 60 times per second.
@@ -170,13 +130,9 @@ impl Picker {
     }
 }
 
-// ─────────────────────────── Button ───────────────────────────
+// Button
 
 /// Draw the button (at the bottom-left of the input box).
-///
-/// It does only two things: paint the current tier name, and record the hot-rect into `st.button_rect` (the pop-up panel uses it for positioning).
-/// The click flips `st.open` in place here — the panel itself is drawn by [`menu`] (it needs an independent `Area`
-/// and cannot be trapped inside the input card clip region).
 pub fn button(ui: &mut Ui, st: &mut WorkplaceUi, enabled: bool) -> bool {
     let text = st.chip_text();
     let font = egui::FontId::proportional(13.0);
@@ -228,7 +184,7 @@ pub fn button(ui: &mut Ui, st: &mut WorkplaceUi, enabled: bool) -> bool {
     clicked
 }
 
-// ─────────────────────────── Three-choice list ───────────────────────────
+// Three-choice list
 
 /// Draw the upward-popping three-choice list (does nothing when `st.open` is false).
 pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
@@ -240,15 +196,7 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
         return None;
     };
 
-    // Anchor at the button top-left corner, 6px further up; combined with `pivot(LEFT_BOTTOM)` that means "panel bottom edge sits on the button top edge"
-    // — so it grows upward and will not be clipped by the window bottom edge.
-    //
-    // WARNING: **do not apply any coordinate conversion.** The rects from `Area::fixed_pos` and `ui.allocate_*` live in
-    // **the same coordinate space** (client-area local, origin at the client area top-left) — egui itself uses `ctx.content_rect()` (= the client rect)
-    // as the default constraint rect inside `Area::begin`. Earlier here we added a "viewport origin" (`viewport().inner_rect.left_top()`)
-    // following the top-bar token-pill code, but that is
-    // **screen (monitor) coordinates**, and it is non-zero whenever the window is not at the monitor origin — on real hardware the panel ended up
-    // shifted by ~(154, 14) logical pixels.
+    // Anchor at the button top-left corner, 6px further up; combined with `pivot(LEFT_BOTTOM)` that means "panel...
     let anchor = btn.left_top() - Vec2::new(0.0, 6.0);
 
     let mut req = None;
@@ -264,13 +212,8 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
                 .show(ui, |ui| {
                     ui.set_width(276.0);
 
-                    // ① Default
-                    //
-                    // No hint line here either (it used to read "the app root; .aox/tmp/ for
-                    // scratch, workplace/ for projects"). Three one-line rows of the same height
-                    // read as one list of three choices; a single two-line row made "Default" look
-                    // like a different kind of item, and the sentence was explaining the folder
-                    // layout inside a menu whose job is to switch tiers.
+                    // Default.
+                    // No hint line here either (it used to read "the app root;.aox/tmp/ for scratch, workplace/ for projects").
                     if row(
                         ui,
                         aox::i18n::t("Default"),
@@ -283,11 +226,7 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
                         req = Some(Mode::Default);
                     }
 
-                    // ② Choose workspace… (opens the directory picker; not itself a tier switch)
-                    //
-                    // No hint line (user asked on 2026-10-04 to "keep only the default hint"): which directory is currently selected is already written on the button as "Workspace · <dir name>",
-                    // which directory is currently selected is already written on the button as "Workspace · <dir name>",
-                    // and repeating it in the menu would only inflate it.
+                    // Choose workspace… (opens the directory picker; not itself a tier switch).
                     let fixed_now = matches!(cur, Some(Mode::Fixed(_)));
                     if row(ui, aox::i18n::t("Choose workspace…"), "", fixed_now, false).clicked() {
                         st.open = false;
@@ -330,14 +269,9 @@ pub fn menu(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
 }
 
 /// One row in the list: a check slot on the left + a title + a small hint line.
-///
-/// The hand-drawn reason is the same as `text_button` in `app.rs`: **paint the base first, then the text**, so on hover color change we
-/// do not re-layout the text and we avoid the old problem of "the base color covering the text".
 fn row(ui: &mut Ui, label: &str, hint: &str, checked: bool, danger: bool) -> egui::Response {
     let width = ui.available_width();
-    // Two heights: two-line (title + hint) and one-line (title only). In the menu **only "default" still carries a hint**
-    // (user asked on 2026-10-04 to drop the hint text on the other two). A single-line row laid out at the old 46px height
-    // would leave its text floating in the top half, looking unfinished.
+    // Two heights: two-line (title + hint) and one-line (title only).
     let two_line = !hint.is_empty();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, if two_line { 46.0 } else { 32.0 }), Sense::click());
     if resp.hovered() {
@@ -376,9 +310,6 @@ fn row(ui: &mut Ui, label: &str, hint: &str, checked: bool, danger: bool) -> egu
 }
 
 /// One subdirectory row in the directory picker: hand-drawn folder icon + name, whole row clickable.
-///
-/// No emoji (glyphs like the folder emoji depend on whether the system font has them; missing, they render as tofu boxes),
-/// reusing the [`paint_folder`] from the button — the whole icon vocabulary has a single implementation.
 fn dir_row(ui: &mut Ui, name: &str) -> egui::Response {
     let width = ui.available_width();
     // 30 and radius 8 — the same row vocabulary as the workspace menu above it (32/8), one step
@@ -403,7 +334,7 @@ fn dir_row(ui: &mut Ui, name: &str) -> egui::Response {
     resp
 }
 
-// ─────────────────────────── Full access: second confirmation ───────────────────────────
+// Full access: second confirmation
 
 /// The red confirmation box shown before switching to "full access".
 pub fn confirm(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
@@ -436,9 +367,7 @@ pub fn confirm(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
                     .size(13.0),
             );
             ui.add_space(20.0);
-            // Same footer as every dialog in the main window (Cancel left, the affirmative on the
-            // right) -- `dialog_footer` owns that rule; this one passes a `danger_button` because
-            // switching to full access is the one toggle that crosses every protection.
+            // Same footer as every dialog in the main window (Cancel left, the affirmative on the right) -- `dialog_footer`...
             match crate::app::dialog_footer(ui, |ui| {
                 danger_button(ui, aox::i18n::t("Confirm switch")).clicked()
             }) {
@@ -458,13 +387,10 @@ pub fn confirm(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     req
 }
 
-// ─────────────────────────── Directory picker ───────────────────────────
+// Directory picker
 
-/// Built-in directory picker. On selection returns `Set(Mode::Fixed(<dir>))` — the same landing point as the CLI
-/// `/workplace <dir>` (both go through `Workplace::set_mode`).
-///
-/// Here we **do not pick files, do not create directories**: this entry has one purpose only — pick a "workspace root".
-/// Users who need a new directory can make it in the file manager first and then come back to pick it, which is cleaner than stuffing a "create" entry in here.
+/// Built-in directory picker.
+/// Here we do not pick files, do not create directories: this entry has one purpose only — pick a "workspace...
 pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     let Some(p) = st.picker.as_mut() else {
         return None;
@@ -598,7 +524,7 @@ pub fn picker(ctx: &egui::Context, st: &mut WorkplaceUi) -> Option<Mode> {
     None
 }
 
-// ─────────────────────────── Helpers ───────────────────────────
+// Helpers
 
 /// Display name of a directory (take the last segment; if none, fall back to the whole string minus the trailing separator).
 fn dir_name(p: &Path) -> String {
@@ -607,11 +533,7 @@ fn dir_name(p: &Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
-/// Middle-elide an over-long path: keep the head (drive letter) and tail (current dir name) — the middle part does not help identification.
-///
-/// `pub(crate)` because the "new workspace" dialog shows the path it is about to create the same way;
-/// one implementation means the two screens elide identically, which is what makes them read as the
-/// same kind of statement.
+/// Middle-elide an over-long path: keep the head (drive letter) and tail (current dir name) — the middle part does...
 pub(crate) fn elide_path(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -647,13 +569,6 @@ fn paint_check(painter: &egui::Painter, center: Pos2, s: f32, color: Color32) {
 }
 
 /// Folder icon: a "tab + body" solid silhouette.
-///
-/// Use **solid** rather than stroked: a stroked folder at 13px squares up into a mush on the tab inner horizontal line,
-/// while a solid silhouette stays clean under both themes.
-///
-/// Shared with the history overlay's group headers, which lead with this same glyph — hence
-/// `pub(crate)`. The 13x11 box the rows below use is the size to match; see `App`'s
-/// `history_group_header`.
 pub(crate) fn paint_folder(painter: &egui::Painter, rect: Rect, color: Color32) {
     let tab = Rect::from_min_max(
         Pos2::new(rect.left(), rect.top() + rect.height() * 0.10),

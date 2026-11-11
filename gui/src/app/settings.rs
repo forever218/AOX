@@ -1,24 +1,13 @@
-//! The settings dialog: one overlay, four columns, and the small rows they are built from.
-//!
-//! The columns are `App` methods on purpose -- every value they show comes from the window's own state
-//! (config path, model, runtimes, usage). What lives here as free functions is the vocabulary: a nav
-//! row, a choice row, and a `name / value` pair whose column width has to be measured from the widest
-//! name (see `kv_key_w`; a fixed width was the "英文排版混乱" bug).
+//! The settings dialog: one overlay, four columns, and the small rows built from them.
+//! Columns are App methods: shown values come from the window's own state (config path, model, runtimes, usage).
+//! Free functions are the vocabulary: nav/choice rows and name/value pairs with a measured key column (kv_key_w).
 
 use super::*;
 
-/// The settings dialog's **content area** size (padding 20/18 excluded).
-///
-/// A size up from the old 380px "about" card: it has to hold a two-column table, and the right
-/// column is a list of paths (`E:\rustapp\workplace\2026-10-05-...`, values that can't be short).
+/// The settings dialog's content area size (padding 20/18 excluded).
 pub(super) const SETTINGS_W: f32 = 700.0;
 
-/// Height hard-coded, the reason being "the card shouldn't grow and shrink when switching columns"
-/// -- see the comment on `settings_overlay`.
-///
-/// Raised from 470 on 2026-10-31: "Appearance" now carries the theme choice **and** the whole
-/// first-screen block (source, two colours, two switches, the folder link). The column scrolls
-/// anyway; this just lets the block be read without scrolling on the default window.
+/// Height hard-coded, the reason being "the card shouldn't grow and shrink when switching columns" -- see...
 pub(super) const SETTINGS_H: f32 = 540.0;
 
 /// Width of the left column (the list of columns).
@@ -31,25 +20,15 @@ pub(super) const SETTINGS_RIGHT_W: f32 = SETTINGS_W - SETTINGS_NAV_W - 24.0;
 pub(super) const SETTINGS_FOOT_H: f32 = 44.0;
 
 /// Floor for the name column in a "name + value" row.
-///
-/// The column is **measured**, not fixed — see `kv_key_w` for why. This is only the lower bound, so
-/// that a column of short names ("History", "App root") still looks deliberate instead of hugging
-/// the values. It is also what the Chinese column lands on, so the zh layout is unchanged.
 pub(super) const KV_KEY_MIN: f32 = 84.0;
 
 /// Air between a name and its value: the value's first glyph is what the eye lines up on.
 pub(super) const KV_KEY_GAP: f32 = 18.0;
 
-/// The open-source license text. **The repo's own `LICENSE`, embedded directly** -- not copied by
-/// hand: a hand copy will sooner or later drift from the file, and what "About" shows has to be the
-/// one actually in force.
+/// The open-source license text.
 pub(super) const LICENSE_TEXT: &str = include_str!("../../../LICENSE");
 
 /// One column row in the left column.
-///
-/// The selected state is stated in two ways: "backdrop up one step + text in the primary colour"
-/// plus a short vertical rule on the left. With the backdrop alone it would be nearly invisible in
-/// this monochrome scheme's narrow range (`surface_hi` and `surface` are one step apart).
 pub(super) fn tab_row(ui: &mut Ui, tab: SettingsTab, selected: bool) -> egui::Response {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::click());
@@ -59,9 +38,7 @@ pub(super) fn tab_row(ui: &mut Ui, tab: SettingsTab, selected: bool) -> egui::Re
     let fg = if selected { P::ink() } else { P::text_dim() };
 
     let painter = ui.painter();
-    // Selected and hovered share the **same** fill; only the marker on the left tells them apart.
-    // Two different greys for "you are here" and "the pointer is here" read as two different
-    // states of the same thing, which they are not.
+    // Selected and hovered share the same fill; only the marker on the left tells them apart.
     if selected || resp.hovered() {
         painter.rect_filled(rect, CornerRadius::same(theme::R1), P::surface_hi());
     }
@@ -81,11 +58,7 @@ pub(super) fn tab_row(ui: &mut Ui, tab: SettingsTab, selected: bool) -> egui::Re
     resp
 }
 
-/// 一张可点卡片的底座：1px 边框 + 12pt 圆角，hover / 选中时**底色和边框一起上一档**。
-///
-/// 这些行原来是"无边框、hover 时才铺一层灰"的极简写法。在 700pt 宽的对话框里，一列没有边界的
-/// 文字看着像清单、不像控件——点不点得动全靠猜；hover 也只是在字底下垫一层几乎看不出的灰。
-/// 卡片是主界面（模型列表、入口行）已经在用的语言，这里跟上它：高度 52，和模型列表的 56 一档。
+/// Card base: 1px border, 12pt radius; hover/select lifts fill and border, so rows read as controls (52pt).
 fn card_bg(p: &egui::Painter, rect: Rect, hot: bool, on: bool) {
     let fill = if hot || on { P::surface_hi() } else { P::surface() };
     let edge = if hot || on { P::border_strong() } else { P::border() };
@@ -104,10 +77,7 @@ fn card_h() -> f32 {
     52.0
 }
 
-/// 一行"选一个"的卡片（浅色 / 深色 / 跟随系统）：右边一个点，选中时实心。
-///
-/// 点而不是勾：勾这个形状在这个界面里已经是"当前生效的工作区层级"，再用一次会被当成同一件事。
-/// 实心 / 空心是"选中 / 没选中"最不需要解释的画法。
+/// Choice card (light/dark/system) with a dot that fills on select; a check would collide with the tier.
 fn choice_card(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), card_h()), Sense::click());
     if resp.hovered() {
@@ -131,14 +101,6 @@ fn choice_card(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
 }
 
 /// The "open activity stream" button: the flow line on the left + text on the right.
-///
-/// Why not a plain text button: that flow line is the activity stream's **only visual identity**
-/// (the old top-bar icon was exactly this), and dropping it would leave this column with just a few
-/// words, so you'd have to read them before knowing what opens.
-///
-/// When it is already open the whole button dims one step: a button labelled "open"
-/// **shouldn't close the window** when clicked again, so it isn't clickable then (which is what
-/// `activity::open` does too -- see its comment).
 pub(super) fn activity_open_button(ui: &mut Ui, on: bool) -> egui::Response {
     entry_row(ui, on, EntryMark::Flow, aox::i18n::t("Open activity stream"))
 }
@@ -153,12 +115,6 @@ pub(super) enum EntryMark {
 }
 
 /// One "opens a window" row on the settings page.
-///
-/// A row, not a bordered button. As a full-width filled block with an outline it read as a
-/// **disabled input field** — which is roughly what it looked like. The page is a column of
-/// settings, so the row obeys the same rules as every other row in the app: nothing at rest, one
-/// fill step on hover, full ink for the label. The chevron on the right says "this goes somewhere
-/// else" without a word of explanation under it.
 pub(super) fn entry_row(ui: &mut Ui, on: bool, mark: EntryMark, label: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 48.0), Sense::click());
     let hot = resp.hovered() && !on;
@@ -191,33 +147,17 @@ pub(super) fn entry_row(ui: &mut Ui, on: bool, mark: EntryMark, label: &str) -> 
     resp
 }
 
-/// The "open cache hit map" button: the same card as [`activity_open_button`], with the grid as its
-/// mark.
-///
-/// Sharing the card is the point, not a shortcut: both rows open "a window that observes the agent",
-/// and giving the second one a different height, radius or hover treatment would make the column
-/// look assembled from two different programs. What differs is the glyph — the flow line is the
-/// activity stream's identity, 4×4 cells are this one's.
-///
-/// The mark is a miniature of the window itself (hit cells filled, the rest outlined), so the two
-/// read as the same object at two scales.
+/// The "open cache hit map" button: the same card as activity_open_button, with the grid as its mark.
 pub(super) fn cache_open_button(ui: &mut Ui, on: bool) -> egui::Response {
     entry_row(ui, on, EntryMark::Grid, aox::i18n::t("Open cache hit map"))
 }
 
 /// The "open workspace view" button: the same card again, with a file tree as its mark.
-///
-/// Third of the trio, and deliberately the third: the flow line and the grid both observe the
-/// agent, whereas this one observes **the files it touched** — a different question, so a different
-/// glyph, but the same row, because all three open a window and the column should not start
-/// changing shape halfway down.
 pub(super) fn wsview_open_button(ui: &mut Ui, on: bool) -> egui::Response {
     entry_row(ui, on, EntryMark::Tree, aox::i18n::t("Open workspace view"))
 }
 
-/// The tree mark: a root, two branches, two leaves — the smallest shape that reads as "a directory
-/// of files" at 20 points. Drawn with the same 1.4px stroke as the other two marks so the three
-/// icons sit at the same weight.
+/// The tree mark: a root, two branches, two leaves — the smallest shape that reads as "a directory of files" at 20...
 pub(super) fn draw_tree_mark(p: &egui::Painter, r: Rect, fg: Color32) {
     let st = Stroke::new(1.4, fg);
     let x0 = r.left() + 2.5;
@@ -239,10 +179,6 @@ pub(super) fn draw_tree_mark(p: &egui::Painter, r: Rect, fg: Color32) {
 }
 
 /// The 4×4 mark for the cache-hit button: ten cells filled, the rest outlined.
-///
-/// The count is not decoration — ten of sixteen is the "mostly cached" reading the window exists to
-/// make visible, and an all-filled or half-filled square would say nothing. It is drawn at 18 points,
-/// so 4×4 is the largest grid that still resolves; a literal 16×16 would be a smudge.
 pub(super) fn draw_grid_mark(p: &egui::Painter, r: Rect, fg: Color32) {
     const N: i32 = 4;
     let gap = 2.0;
@@ -266,23 +202,11 @@ pub(super) fn draw_grid_mark(p: &egui::Painter, r: Rect, fg: Color32) {
 }
 
 /// The font every name in a "name + value" row is set in.
-///
-/// Shared with [`kv_key_w`] on purpose: the column is measured with the same font it is painted
-/// with, and a second literal here would let the two drift apart silently.
 pub(super) fn kv_key_font() -> egui::FontId {
     egui::FontId::proportional(13.5)
 }
 
-/// Width of the name column for a **whole** column of rows: the widest name actually drawn.
-///
-/// A fixed width was the wrong tool. `84` had been measured against the Chinese label ("运行时环境");
-/// English names run ~40% wider — "Runtime environment" is ~118 pt — and the name is painted
-/// straight onto the painter, which neither clips nor takes part in layout, so an overlong one does
-/// not push anything aside: it prints **on top of** the value. That was the whole of "英文排版混乱".
-///
-/// It has to be the width of the widest name in the column, not per row: a per-row width would let
-/// each value start wherever, and a column that lines up is the entire point of these rows. So the
-/// caller collects its rows first and measures once. The cost is one layout call per name.
+/// Name column width is the widest name, measured once; a fixed 84 let wider English names overlap values.
 pub(super) fn kv_key_w(ui: &Ui, keys: &[&str]) -> f32 {
     let mut w = KV_KEY_MIN;
     for k in keys {
@@ -299,10 +223,6 @@ pub(super) fn kv_key_w(ui: &Ui, keys: &[&str]) -> f32 {
 }
 
 /// A "name + value" row (the "System" column is all rows like this).
-///
-/// `key_w` comes from [`kv_key_w`] and must be the same for every row of a column. The colour is a
-/// parameter rather than a second function: the runtime rows use it to say "not found", and one
-/// entry point is one place to change.
 pub(super) fn kv_row(ui: &mut Ui, key_w: f32, key: &str, val: &str, color: Color32) {
     ui.horizontal_top(|ui| {
         let (r, _) = ui.allocate_exact_size(Vec2::new(key_w, 19.0), Sense::hover());
@@ -312,8 +232,6 @@ pub(super) fn kv_row(ui: &mut Ui, key_w: f32, key: &str, val: &str, color: Color
             p.galley(Pos2::new(r.left(), r.top() + 1.0), g, P::text_dim());
         }
         // Values are always monospace: they are paths, commands, version numbers, not prose.
-        // Selectable -- paths often need copying elsewhere (a terminal, a file manager), and a
-        // read-only display amounts to making people retype them.
         ui.add(
             Label::new(RichText::new(val).font(theme::mono_font(12.5)).color(color))
                 .selectable(true)
@@ -347,10 +265,6 @@ pub(super) fn link_row(ui: &mut Ui, key_w: f32, key: &str, url: &str) {
 }
 
 /// A hairline across the column.
-///
-/// Only one is used (between the theme choice and the first-screen block), and it exists because
-/// those two groups answer different questions — "what does the interface look like" versus "what
-/// does the first screen say". Without a line the switch row reads as one more theme option.
 fn rule(ui: &mut Ui) {
     let w = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), Sense::hover());
@@ -358,10 +272,6 @@ fn rule(ui: &mut Ui) {
 }
 
 /// A segmented control: one pill per option, the chosen one filled.
-///
-/// Hand-drawn rather than three `choice_row`s because this is a **one-of-three value on one row**,
-/// not a list of destinations: three stacked radio rows would take 90pt of a panel that already
-/// scrolls, and would read like a second theme selector.
 fn segmented(ui: &mut Ui, salt: &str, items: &[(&str, bool)]) -> Option<usize> {
     if items.is_empty() {
         return None;
@@ -383,7 +293,7 @@ fn segmented(ui: &mut Ui, salt: &str, items: &[(&str, bool)]) -> Option<usize> {
         if *on {
             ui.painter().rect_filled(inner, CornerRadius::same(theme::R2), P::surface());
         } else if resp.hovered() {
-            // 未选中的那一格 hover 时给一圈边，而不是填色：填色会和"已选中"撞成同一个样子。
+            // Unselected cells get a hover outline instead of a fill, which would look the same as selected.
             ui.painter().rect_stroke(
                 inner,
                 CornerRadius::same(theme::R2),
@@ -405,10 +315,7 @@ fn segmented(ui: &mut Ui, salt: &str, items: &[(&str, bool)]) -> Option<usize> {
     hit
 }
 
-/// 一个"做一件事"的卡片行（换一句 / 打开文件夹）：左边文字，右边一个 `›`。
-///
-/// 不用 `flat_button`：那个是对话框底部 34pt 的文本按钮，单独摆在 52pt 的卡片堆里像一个漏排的
-/// 控件。这里和别的卡片同高、同边框、同样的 hover。
+/// A single-action card row (label, chevron) matching other cards in height, border and hover, not flat_button.
 fn action_card(ui: &mut Ui, label: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), card_h()), Sense::click());
     if resp.hovered() {
@@ -424,7 +331,7 @@ fn action_card(ui: &mut Ui, label: &str) -> egui::Response {
     resp
 }
 
-/// 两行字的卡片："背景文件夹" + 路径，右边一个 `›`。整张卡都能点。
+/// A two-line card for the background folder (label + path) with a right chevron; the whole card is clickable.
 fn folder_card(ui: &mut Ui, label: &str, path: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 66.0), Sense::click());
     if resp.hovered() {
@@ -435,8 +342,7 @@ fn folder_card(ui: &mut Ui, label: &str, path: &str) -> egui::Response {
     let g = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(15.0), P::text());
     ui.painter().galley(Pos2::new(rect.left() + 16.0, rect.top() + 13.0), g, P::text());
 
-    // 路径用等宽字：它是一串要对照的字符，不是一句话。超长时截断——完整路径在悬停提示里，
-    // 而且点一下就是那个目录本身。
+    // Monospace path, truncated when long; full value in the hover tip and a click opens that directory.
     let avail = rect.width() - 48.0;
     let mut job = egui::text::LayoutJob::single_section(
         path.to_owned(),
@@ -457,7 +363,7 @@ fn folder_card(ui: &mut Ui, label: &str, path: &str) -> egui::Response {
     resp
 }
 
-/// 右边那个 `›`。三处卡片共用，粗细和 `entry_row` 的一致。
+/// The right chevron, shared by three cards, with the same stroke weight as entry_row.
 fn chevron(p: &egui::Painter, c: Pos2, hot: bool) {
     let s = 3.4;
     let st = Stroke::new(1.4, if hot { P::text() } else { P::text_faint() });
@@ -465,7 +371,7 @@ fn chevron(p: &egui::Painter, c: Pos2, hot: bool) {
     p.line_segment([c + Vec2::new(s * 0.65, 0.0), c + Vec2::new(-s * 0.45, s)], st);
 }
 
-/// 一行开关卡片：左边标签，右边开关，**整行**都是热区。
+/// A one-line toggle card: label on the left, switch on the right, and the whole row is the hit area.
 fn toggle_card(ui: &mut Ui, on: &mut bool, label: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), card_h()), Sense::click());
     if resp.hovered() {
@@ -525,20 +431,11 @@ fn switch_mark(p: &egui::Painter, r: Rect, on: bool, hover: bool) {
 }
 
 /// The presets offered behind the colour swatch.
-///
-/// Eight is what fits two rows of four at a comfortable size. They are a shortcut, not the limit:
-/// the hex field next to the swatch takes anything.
 const PRESETS: [&str; 8] = [
     "#000000", "#FFFFFF", "#F5F1E8", "#1C1C18", "#8A8A80", "#3E7B4F", "#B4543C", "#2F4B7C",
 ];
 
 /// One colour: `name | swatch | #RRGGBB | Default`.
-///
-/// Returns whether the colour changed (so the caller knows to restart the line and save).
-///
-/// The row is a card now (46pt) with the controls laid out inside it. When these two rows were bare
-/// 30pt lines they read as a legend under the switches rather than something you could interact
-/// with — the swatch was the only hint, and it is 20pt.
 fn color_row(
     ui: &mut Ui,
     key_w: f32,
@@ -642,10 +539,7 @@ fn link_label(ui: &mut Ui, text: &str, url: &str) {
     }
 }
 
-/// 上一次请求**失败**时的原因，只此一条。
-///
-/// 失败必须说出来：首屏会退回一句本地句子，不解释的话人只会觉得"模型不灵"。成功时不画任何
-/// 东西——"下一句正在路上"这种话对结果没有影响，只是又一行要读的小字。
+/// The last failure reason, shown only on error; success draws nothing (an extra line adds only small text).
 fn error_line(ui: &mut Ui, st: &crate::welcome::Stage) {
     if let Some(e) = st.note() {
         ui.label(RichText::new(e).color(P::warn()).size(12.5));
@@ -654,17 +548,6 @@ fn error_line(ui: &mut Ui, st: &crate::welcome::Stage) {
 
 impl App {
     /// Settings: one large centred card, pick on the left, read on the right.
-    ///
-    /// It replaces the three buttons that used to be at the top-right (activity stream / theme /
-    /// about) and that 380px "about" card -- "delete all three buttons and fold them into one
-    /// settings dialog" was the user's request on 2026-10-05.
-    /// So three of the four columns are **relocations**: "Extra" takes the activity-stream
-    /// entrance, "Appearance" takes the light/dark switch, "About" takes the version and the
-    /// license; only "System" is newly written (those paths used to be half-hidden in the about
-    /// card and are now listed properly).
-    ///
-    /// Clicking the background, pressing Esc, or clicking "Close" all dismiss it (the first two
-    /// come from `Modal`).
     pub(super) fn settings_overlay(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -677,24 +560,14 @@ impl App {
                     .inner_margin(Margin::symmetric(20, 18)),
             )
             .show(ctx, |ui| {
-                // Height hard-coded: switching columns shouldn't make the card grow and shrink with
-                // the content -- going from "System" (a long column of paths) to "Extra" (a single
-                // button) shrinking the whole block looks bad.
+                // Height hard-coded: switching columns shouldn't make the card grow and shrink with the content -- going...
                 ui.set_width(SETTINGS_W);
                 ui.set_height(SETTINGS_H);
                 ui.horizontal_top(|ui| {
-                    // The horizontal spacing in this row is **entirely hand-written by the
-                    // `add_space` calls below**.
-                    //
-                    // Without zeroing it, `item_spacing` (8 in this theme) stacks between every
-                    // allocate: 8 extra between the left column and the vertical rule, and another 8
-                    // between the rule and the content -- the total width quietly becomes 716, 16
-                    // more than `SETTINGS_W`. So the card is 16px wider than designed, and "how wide
-                    // is the right column really" goes from computable to guesswork (which is exactly
-                    // why the first version measured 758.7 instead of 740).
+                    // The horizontal spacing in this row is entirely hand-written by the `add_space` calls below.
                     ui.spacing_mut().item_spacing.x = 0.0;
 
-                    // ── left: the columns ──
+                    // left: the columns
                     ui.vertical(|ui| {
                         ui.set_width(SETTINGS_NAV_W);
                         ui.set_height(SETTINGS_H);
@@ -706,23 +579,12 @@ impl App {
                     });
 
                     // No vertical rule between the two columns.
-                    //
-                    // The rule was there to say "picking on the left, reading on the right". The
-                    // two columns are already told apart by their size, their colour and the
-                    // selected row's marker; a line on top of that is one more line to look at, and
-                    // the card reads calmer without it. The gap does the same job.
                     ui.add_space(SETTINGS_W - SETTINGS_NAV_W - SETTINGS_RIGHT_W);
 
-                    // ── right: the content ──
+                    // right: the content
                     ui.vertical(|ui| {
                         ui.set_width(SETTINGS_RIGHT_W);
-                        // The height is hard-coded too. The reason: `ScrollArea` takes "available
-                        // height ∩ max_height", and in this horizontal layout the available height is
-                        // affected by the other children on the same row (the vertical rule's allocate
-                        // ate into it once already). With it hard-coded, the heights of "content + gap
-                        // + bottom button" are all computable, so the card height can't vary with the
-                        // column's content -- and that was the source of "the card grows and shrinks
-                        // when you switch columns".
+                        // The height is hard-coded too.
                         ui.set_height(SETTINGS_H);
                         // The `SETTINGS_FOOT_H` at the bottom is reserved for "Close": without
                         // subtracting it, long content pushes the button out of the card
@@ -731,22 +593,7 @@ impl App {
                             .max_height(SETTINGS_H - SETTINGS_FOOT_H)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                // ⚠️ This line is **what makes the whole dialog stable**; don't delete
-                                // it.
-                                //
-                                // A `ScrollArea`'s inner width = outer width - the scrollbar's
-                                // reservation, and that reservation is **animated frame by frame**
-                                // (`animate_bool_responsive` x `spacing.scroll.allocated_width()`, 6px
-                                // in this project). As long as the content width still follows
-                                // `available_width()`, every time the scrollbar breathes the row width
-                                // changes and wrapped text re-wraps -- which shows up as "the whole panel
-                                // is jittering and the text looks blurry", and it **only happens when
-                                // there is a repaint** (moving the mouse repaints, so it looks like "it
-                                // jitters the moment I move the mouse").
-                                //
-                                // Pinned down: the content width is a constant, wrapping is stable, and
-                                // the scrollbar only affects its own floating 6px bar (which floats to
-                                // the right of the content and doesn't press on the text).
+                                // ️ This line is what makes the whole dialog stable; don't delete it.
                                 let content_w =
                                     SETTINGS_RIGHT_W - ui.spacing().scroll.allocated_width();
                                 ui.set_width(content_w);
@@ -775,18 +622,8 @@ impl App {
     }
 
     /// The "Extra" column: the activity-stream entrance.
-    ///
-    /// This column deliberately holds **one entrance and no settings** -- it comes first only
-    /// because the user asked for that, but it really does contain just the one thing, "open the
-    /// activity stream" (which used to occupy an icon in the top-right).
     pub(super) fn tab_extra(&mut self, ui: &mut Ui) {
-        // Drop the lock first, then test: `is_open()` takes the lock, and `open()` in the click
-        // branch takes it again -- two locks stacked in one statement is a self-deadlock (the
-        // top-bar version ran into this).
-        //
-        // No caption line under either button. "Open the activity stream" already says what it
-        // opens; a grey sentence underneath only repeats it in smaller type and adds a second
-        // thing to read on a screen that holds two buttons.
+        // Drop the lock first, then test: `is_open()` takes the lock, and `open()` in the click branch takes it again ...
         let on = activity::lock(&self.act).is_open();
         if activity_open_button(ui, on).clicked() {
             activity::open(ui.ctx(), &self.act);
@@ -805,28 +642,13 @@ impl App {
         }
     }
 
-    /// The "Model" column: the endpoint, the key, the scanned model list, and the two numbers that
-    /// decide how a conversation goes.
-    ///
-    /// This page has **no Save button** on purpose — see the module docs of `crate::model_ui`. A field
-    /// commits when it loses focus or on Enter, and the status line underneath says what happened. In
-    /// demo mode every control still draws (that is what demo mode is for); pressing one answers with
-    /// "there is no agent thread behind this window".
+    /// The "Model" column: the endpoint, the key, the scanned model list, and the two numbers that decide how...
     pub(super) fn tab_model(&mut self, ui: &mut Ui) {
         let req = crate::model_ui::panel(ui, &mut self.mdl);
         self.send_requests(req);
     }
 
     /// The "Appearance" column: the light/dark choice, then everything about the first screen.
-    ///
-    /// Picking a theme only changes `theme::Pref`; what "follow system" actually resolves to is
-    /// computed from the system theme by `theme::effective` and **rechecked every frame** (see
-    /// `theme::follow_system`) -- without the recheck, "follow system" would amount to "decide
-    /// once at startup by copying the system".
-    ///
-    /// The welcome line lives here rather than in its own column because it *is* an appearance
-    /// decision: a sentence, two colours, two switches. Its state is [`crate::welcome::Stage`];
-    /// this function only moves values around and says "something changed".
     pub(super) fn tab_appearance(&mut self, ui: &mut Ui) {
         let cur = theme::pref();
         for p in theme::Pref::ALL {
@@ -839,8 +661,7 @@ impl App {
         ui.add_space(14.0);
         rule(ui);
         ui.add_space(15.0);
-        // 一个小标题，不是说明文字：下面那三个选项（自定义 / 一言 / 模型）得有个名字，否则
-        // "自定义" 是在自定义什么没人知道。字号和卡片标签同档，它读起来是"这一段叫什么"。
+        // A small heading (not body text) naming the three options custom / hitokoto / model, at the card-label size.
         ui.label(
             RichText::new(aox::i18n::t("Welcome line"))
                 .color(P::text())
@@ -848,14 +669,11 @@ impl App {
         );
         ui.add_space(10.0);
 
-        // "Restart the line" vs "write the file": a colour or a switch changes what is on the first
-        // screen right now, while a **text** edit is still being typed — writing each keystroke is
-        // fine, restarting the typewriter on each one is not. So text edits save on every change and
-        // restart only when the field is left.
+        // "Restart the line" vs "write the file": a colour or a switch changes what is on the first screen right now...
         let mut restart = false;
         let mut save = false;
 
-        // ── the source ──
+        // the source
         let items: Vec<(&str, bool)> =
             crate::welcome::Source::ALL.iter().map(|s| (s.label(), self.welcome.prefs.source == *s)).collect();
         if let Some(hit) = segmented(ui, "aox-welcome-source", &items) {
@@ -884,9 +702,7 @@ impl App {
                                     .size(13.5),
                             ),
                     );
-                    // 40 characters is what still reads as **one line** at 26pt on a 1280 window;
-                    // cutting here is honest (the field refuses more) rather than silently eliding
-                    // the user's sentence on the first screen.
+                    // 40 characters is what still reads as one line at 26pt on a 1280 window; cutting here is honest (the field...
                     let n = self.welcome.prefs.custom.chars().count();
                     if n > 40 {
                         self.welcome.prefs.custom =
@@ -898,8 +714,7 @@ impl App {
                     if r.lost_focus() {
                         restart = true;
                     }
-                    // 计数只在快写满时出现：写到 34 个字以前，这个数字没有任何用处，只是多一行
-                    // 要读的小字。写到那儿了，它才变成"还剩几个字"这个真问题。
+                    // The counter shows only near the limit; before that it is useless, only then answering how many are left.
                     if n >= 34 {
                         ui.add_space(8.0);
                         ui.label(
@@ -939,8 +754,7 @@ impl App {
                 error_line(ui, &self.welcome);
             }
             crate::welcome::Source::Model => {
-                // 没有说明段落：三个选项的名字已经把这件事说全了，模型写的句子好不好，看一眼
-                // 首屏就知道，不需要一段小字先解释它好在哪。
+                // No help paragraph: the option names say it all, and the model line is judged from the first screen.
                 if action_card(ui, aox::i18n::t("Another one")).clicked() {
                     if let Some(ask) = self.welcome.refresh() {
                         self.request_hello(ask);
@@ -952,7 +766,7 @@ impl App {
 
         ui.add_space(16.0);
 
-        // ── the two colours ──
+        // the two colours
         let keys = [aox::i18n::t("Text colour · light"), aox::i18n::t("Text colour · dark")];
         let key_w = kv_key_w(ui, &keys);
         for (i, mode) in [theme::Mode::Light, theme::Mode::Dark].into_iter().enumerate() {
@@ -964,7 +778,7 @@ impl App {
         }
 
         ui.add_space(8.0);
-        // ── the two switches ──
+        // the two switches
         if toggle_card(ui, &mut self.welcome.prefs.typing, aox::i18n::t("Typewriter effect")) {
             restart = true;
             save = true;
@@ -978,7 +792,7 @@ impl App {
         }
 
         ui.add_space(14.0);
-        // ── where the pictures go ──
+        // where the pictures go
         let dir = aox::paths::app_root().join("assets");
         let hit = folder_card(
             ui,
@@ -995,8 +809,7 @@ impl App {
         hit.on_hover_text(aox::i18n::t("Open this folder"));
 
         ui.add_space(8.0);
-        // 这一段小字是**唯一**留下的一段：它说的是怎么摆放文件（light/、dark/、只收 PNG、
-        // 每次随机），这些从界面上看不出来，也不是点一下就能明白的事。
+        // The only kept small text explains file layout (light/, dark/, PNG only, random), invisible in the UI.
         ui.label(
             RichText::new(aox::i18n::t(
                 "light/ for the light theme, dark/ for the dark one. PNG only; one is picked at \
@@ -1015,9 +828,6 @@ impl App {
     }
 
     /// The "System" column: this machine, this config, these directories.
-    ///
-    /// The order follows the list the user asked for: system info -> runtime environment ->
-    /// model -> config -> workplace -> history -> plugins -> runtime directory.
     pub(super) fn tab_system(&self, ui: &mut Ui) {
         let p = self.boot.as_ref().map(|b| b.paths.clone()).unwrap_or_default();
 
@@ -1027,20 +837,12 @@ impl App {
 
         rows.push((aox::i18n::t("System info"), p.host.clone(), P::text_faint()));
 
-        // Which command-line tool the model reaches for first. Above the language runtimes on purpose:
-        // those are for *plugins*, this is for the model's own hands. The value names the flavour
-        // (`git-bash` vs `busybox`), because that is the difference between a full bash and an ash —
-        // and the exact executable, because "which one did it pick" is the next question.
+        // Which command-line tool the model reaches for first.
         if !p.command_line.is_empty() {
             rows.push((aox::i18n::t("Command line"), p.command_line.clone(), P::text_faint()));
         }
 
-        // Runtime environment: **bundled or system PATH** -- one row per language, with the
-        // source written straight into brackets. Only the first row carries the name; the rest are
-        // continuations and simply get the same (measured) column.
-        // No ✓/✗ drawn: those two glyphs aren't guaranteed to exist in the hand-picked font (the
-        // two in the call stream are hand-drawn), and the word "not found" already states the
-        // conclusion clearly.
+        // Runtime environment: bundled or system PATH -- one row per language, with the source written straight...
         for (i, it) in self.runtimes.items.iter().enumerate() {
             rows.push((
                 if i == 0 { aox::i18n::t("Runtime environment") } else { "" },
@@ -1056,11 +858,6 @@ impl App {
             rows.push((aox::i18n::t("Config file"), p.config.clone(), P::text_faint()));
         }
         // Which layers this config is merged from: `core -> patch -> config.toml`.
-        //
-        // Only the name chain is shown, not the full provenance tree (for the complete table use
-        // the CLI's `aox --dump-config`); **with only one layer nothing is shown** -- saying
-        // "there's just one layer" amounts to saying nothing. This rule was lifted from the old
-        // "about" card, not a word changed.
         let layers: Vec<String> = self
             .boot
             .as_ref()
@@ -1105,9 +902,7 @@ impl App {
             kv_row(ui, key_w, k, v, *c);
         }
 
-        // When there is no Python on this machine, offer a one-click install. It used to live in
-        // the "about" card, but "About" now only covers version and license -- installing a
-        // runtime is a system-level matter, so this is the right column for it.
+        // When there is no Python on this machine, offer a one-click install.
         if self.runtimes.python_missing {
             ui.add_space(14.0);
             ui.label(
@@ -1125,10 +920,6 @@ impl App {
     }
 
     /// The workplace row: "path + tier".
-    ///
-    /// The workplace **follows the conversation** (`/new` always goes back to the default tier),
-    /// so what is shown here is **this conversation's** plot of land -- which is also why it can
-    /// be shown without waiting for a disk scan: the bridge pushes the current state.
     pub(super) fn workplace_line(&self) -> String {
         use aox::workplace::Mode;
         let Some(v) = self.ws.view() else {
@@ -1149,12 +940,7 @@ impl App {
         }
     }
 
-    /// The "About" column: version, license, links.
-    ///
-    /// The license text is **the repo's own `LICENSE`, embedded directly**, not copied out by
-    /// hand -- a hand-copied version that drifts from the file means what "About" shows is no
-    /// longer the license actually in force, and nobody ever double-checks that kind of error.
-    /// 远程页：配对 / 启停 / 日志。桥跑在独立线程，这里只负责把状态画出来。
+    /// About column (version, repo LICENSE, links); the Remote tab only draws state from a bridge on its own thread.
     pub(super) fn tab_remote(&mut self, ui: &mut Ui) {
         self.remote.page(ui);
     }
@@ -1173,10 +959,7 @@ impl App {
             });
         });
         ui.add_space(12.0);
-        // No rule under the masthead, and no "Full ISC license text" label above the box: the
-        // masthead is already the only large type on the column, and the box below it is plainly
-        // the licence. A label saying "here is the licence" is the definition of a line of text
-        // that earns nothing.
+        // No rule under the masthead, and no "Full ISC license text" label above the box: the masthead is already...
         ui.label(
             RichText::new(aox::i18n::t("AOX GUI, written in Rust. Licensed under the open-source ISC license."))
                 .color(P::text_dim())
@@ -1246,18 +1029,7 @@ mod tests {
     const ABOUT_EN: [&str; 2] = ["Author's blog", "Project home"];
     const ABOUT_ZH: [&str; 2] = ["作者博客", "项目地址"];
 
-    /// The name column must be wide enough for **every** name it can show, in **every** language.
-    ///
-    /// This is "设置-系统界面英文排版混乱" as an executable statement. The column used to be a
-    /// constant (`84`) measured against the Chinese labels; English runs ~40% wider ("Runtime
-    /// environment" ≈ 118 pt) and the name is painted straight onto the painter — no clipping, no
-    /// participation in layout — so the overlong name printed **on top of** its value. The fix was
-    /// to measure the widest name in the column (`kv_key_w`); this states the property that fix has
-    /// to keep: `column >= widest name + gap`.
-    ///
-    /// The second assertion is the other half of the contract: the Chinese layout must not move.
-    /// `KV_KEY_MIN` exists so that a column of short names still looks deliberate — if this ever
-    /// fails, the minimum was changed and the zh dialog now has a gap where there wasn't one.
+    /// Name column must hold the widest label in any language; KV_KEY_MIN keeps the Chinese layout from moving.
     #[test]
     fn the_name_column_fits_every_name_it_can_show() {
         let ctx = egui::Context::default();
@@ -1265,7 +1037,7 @@ mod tests {
         // that lays out text installs its own, or it measures whatever a sibling test left behind.
         crate::theme::install_fonts(&ctx);
 
-        /// Widest of these names, painted the way `kv_row` paints them.
+        /// Widest of these names, painted the way `kv_row` paints them
         fn widest(ui: &Ui, keys: &[&str]) -> f32 {
             keys.iter()
                 .map(|k| {
@@ -1311,10 +1083,7 @@ mod tests {
                 "{col}: the column is {key_zh:.1} pt but the widest Chinese name needs {:.1}",
                 widest_zh + KV_KEY_GAP
             );
-            // Chinese is the language the old constant was tuned for. It may settle a hair above
-            // the floor — 67.5 + the 18 pt gap is 85.5, so it lands on 86 rather than 84 — but it
-            // must not *jump*: the floor is there precisely so the zh dialog keeps the column it
-            // has always had, and 2 pt is invisible while 60 would not be.
+            // Chinese is the language the old constant was tuned for.
             assert!(
                 key_zh <= KV_KEY_MIN + 4.0,
                 "{col}: the Chinese column jumped from {KV_KEY_MIN} to {key_zh:.1}"

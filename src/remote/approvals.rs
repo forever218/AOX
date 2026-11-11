@@ -1,7 +1,5 @@
 //! Pending approval requests, keyed by id.
-//!
-//! The read loop resolves them; `RemoteUi::authorize` waits on them. A `Mutex<HashMap>` is enough
-//! because a turn only ever waits on one approval at a time and the socket task never blocks on it.
+//! The read loop resolves them; `RemoteUi::authorize` waits on them.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -11,7 +9,7 @@ use tokio::sync::oneshot;
 #[derive(Clone, Copy, Debug)]
 pub struct Decision {
     pub allow: bool,
-    /// "本任务内都允许" — scoped to this turn only, never written into `Runtime::session_allowed`.
+    /// Allow for this task only: scoped to the current turn, never written into Runtime::session_allowed.
     pub for_task: bool,
 }
 

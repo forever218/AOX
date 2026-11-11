@@ -1,29 +1,6 @@
-//! Long-lived **shell jobs**: process trees that outlive the tool call that started them.
-//!
-//! # Why this is separate from one-shot `shell` / `bash`
-//!
-//! Every one-shot call runs inside a Job Object with `KILL_ON_JOB_CLOSE`, and that fence is dropped
-//! as soon as the shell returns. That is exactly right for a build or a `grep`, and exactly wrong
-//! for `npm run dev`: the shell exits immediately, the fence closes, and the server it just started
-//! is killed with it. Raising `timeout_secs` cannot help — the server never exits on its own, and
-//! the idle watchdog treats its silence as a wedge.
-//!
-//! A job here is the same kernel fence, only **owned by the runtime instead of the call**. It keeps
-//! the promise "nothing is left behind" while allowing the one thing a developer actually needs:
-//! a server that stays up across several tool calls.
-//!
-//! # What is retained
-//!
-//! - the [`crate::sandbox::Fence`] — dropping it kills the tree; the runtime keeps it alive;
-//! - the helper `Child` — used for exit status, never awaited by the UI;
-//! - a log file under `<workspace>/.aox/run/` — no pipes, because nobody may read for minutes and a
-//!   full pipe would block the server.
-//!
-//! # What is *not* here
-//!
-//! No shell parsing, no command policy, no environment construction: those stay in
-//! `tool::shell::prepare`, so a background command obeys the same cwd check and write guard as its
-//! one-shot twin. This module only manages lifetime.
+//! Long-lived shell jobs: process trees that outlive the tool call that started them.
+//! # Why this is separate from one-shot `shell` / `bash`.
+//! Every one-shot call runs inside a Job Object with `KILL_ON_JOB_CLOSE`, and that fence is dropped as soon...
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -80,7 +57,7 @@ impl JobInfo {
     }
 }
 
-/// The registry carried by [`crate::runtime::Runtime`].
+/// The registry carried by [`crate::runtime::Runtime`]
 #[derive(Default)]
 pub struct Jobs {
     items: HashMap<String, Job>,
@@ -93,9 +70,6 @@ impl Jobs {
     }
 
     /// Drop jobs whose total lifetime has passed. `max_hours == 0` disables expiry.
-    ///
-    /// Returns the ids that were stopped, so the caller can say so instead of silently making a
-    /// server vanish.
     pub fn expire(&mut self, max_hours: u64) -> Vec<String> {
         if max_hours == 0 {
             return Vec::new();
@@ -129,9 +103,6 @@ impl Jobs {
     }
 
     /// Reserve a slot and insert an already-started background process.
-    ///
-    /// The caller has spawned it with `runner::spawn_background`; on any error the `Background` is
-    /// dropped and its fence kills the child, so there is no half-registered process.
     pub fn insert(
         &mut self,
         name: &str,
@@ -305,9 +276,7 @@ pub fn read_log_tail(path: &Path, max_bytes: usize) -> Result<(String, bool, u64
     let mut buf = Vec::with_capacity((len - cut) as usize);
     f.read_to_end(&mut buf)
         .map_err(|e| crate::tf!("could not read the job log {}: {}", path.display(), e))?;
-    // Same decoder as a one-shot call: UTF-8 first, then the machine's ANSI code page. A dev server
-    // started from `cmd` often prints GBK on a Chinese Windows, and lossy UTF-8 would turn every
-    // error into U+FFFD — the model would then "fix" the wrong thing.
+    // Same decoder as a one-shot call: UTF-8 first, then the machine's ANSI code page.
     Ok((crate::shell::decode(&buf), cut > 0, len))
 }
 

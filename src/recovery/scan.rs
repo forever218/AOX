@@ -1,31 +1,6 @@
 //! Bounded, symmetric workspace scanning for shell commands (the "strict" half of `shell_guard`).
-//!
-//! # Why this exists
-//!
-//! `write_file` / `edit_file` / `remove` tell the host which path they touch, so their capture is
-//! exact and costs one read. A shell command tells the host nothing, so the only honest way to learn
-//! what it changed is to look before and look after. This module is that look.
-//!
-//! # The three rules that matter more than speed
-//!
-//! 1. **Symmetry.** The before walk and the after walk use the same exclusions, the same depth and
-//!    the same file-type rules. One side skipping what the other visits invents files that appeared
-//!    or vanished.
-//! 2. **Content, not metadata.** Strict mode hashes every regular file, because the case metadata
-//!    cannot see is exactly the interesting one: a same-size rewrite (`sed -i`, a formatter, an
-//!    in-place editor save that preserves mtime). Metadata is never allowed to *prove* "unchanged";
-//!    it only orders the work.
-//! 3. **Bounded.** Entry count, stored bytes and wall clock each have a ceiling. Reaching one stops
-//!    the walk and records why. The caller then decides what that means — refuse the command
-//!    (strict) or mark the recovery point partial (best effort). It is never silently ignored.
-//!
-//! # What "before image" means here
-//!
-//! A `Scan` records, per file, the content hash *and* whether the bytes are in the store. The
-//! second half is what makes rollback possible: a hash proves what changed, an object restores it.
-//! [`scan`] fills it by asking the store whether the object exists (a `stat`), and stores the file
-//! only when it does not and the scope asks for it — so the first strict command in a workspace pays
-//! a full copy, and every later one pays only for files it has never seen.
+//! # Why this exists.
+//! `write_file` / `edit_file` / `remove` tell the host which path they touch, so their capture is exact and costs...
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -35,10 +10,6 @@ use super::model::BlobRef;
 use super::store::RecoveryStore;
 
 /// Estimated in-memory cost of one index entry: the map node, the path `String` and the `BlobRef`.
-///
-/// Deliberately generous. `metadata_memory_mb` is a ceiling meant to keep a scan from OOM-ing the
-/// agent, not an accounting target, so over-estimating turns the budget into a *smaller* tree rather
-/// than a surprise allocation.
 pub const ENTRY_COST: u64 = 256;
 
 /// How much content a scan is allowed to put into the store.
@@ -57,7 +28,7 @@ pub struct Limits {
     pub max_entries: u64,
     /// Maximum bytes this scan may add to the store. `0` = unlimited.
     pub max_bytes: u64,
-    /// Wall-clock ceiling for one scan. `0` = unlimited.
+    /// Wall-clock ceiling for one scan. `0` = unlimited
     pub deadline: Duration,
 }
 
@@ -71,7 +42,7 @@ impl Limits {
 /// What the tree looked like at one instant.
 #[derive(Clone, Debug, Default)]
 pub struct Scan {
-    /// Workspace-relative path → content state. Only regular files appear here.
+    /// Workspace-relative path → content state. Only regular files appear here
     pub files: BTreeMap<String, BlobRef>,
     /// Relative paths of directories (no entries of their own; used to tell "empty dir" from "gone").
     pub dirs: BTreeSet<String>,
@@ -81,7 +52,7 @@ pub struct Scan {
     pub stored_bytes: u64,
     /// `Some(why)` when a ceiling stopped the walk early.
     pub stopped: Option<String>,
-    /// Symlinks / junctions / sockets: recorded, never followed.
+    /// Symlinks / junctions / sockets: recorded, never followed
     pub skipped: Vec<String>,
     /// Paths whose content could not be read (locked, vanished mid-walk, over `max_file_mb`).
     pub unreadable: Vec<String>,
@@ -100,9 +71,9 @@ impl Scan {
 #[derive(Clone, Debug)]
 pub struct Change {
     pub path: String,
-    /// `None` = the path did not exist before.
+    /// `None` = the path did not exist before
     pub before: Option<BlobRef>,
-    /// `None` = the path does not exist now.
+    /// `None` = the path does not exist now
     pub after: Option<BlobRef>,
 }
 
@@ -115,11 +86,6 @@ impl Change {
 }
 
 /// Walk `root`, hash every regular file, and store content according to `scope`.
-///
-/// Never returns `Err`: a path that cannot be read, a subtree that is a reparse point and a budget
-/// that ran out are all *facts about the scan*, and the caller needs them to decide whether the
-/// command may run at all. Turning them into an error here would throw away the partial knowledge
-/// that `best_effort` mode is allowed to work with.
 pub fn scan(
     store: &RecoveryStore,
     root: &Path,
@@ -230,9 +196,7 @@ fn observe(
         }
     };
 
-    // "The bytes are available for a rollback" is a fact about the store, not about this scan. Asking
-    // the store (a `stat`) is what lets a file that was stored by an earlier command — or by the
-    // baseline — be used as a before-image without reading it again.
+    // "The bytes are available for a rollback" is a fact about the store, not about this scan.
     blob.stored = store.has_object(&blob.hash);
 
     let changed = known_hash != Some(blob.hash.as_str());
@@ -293,14 +257,6 @@ fn rel_hint(root: &Path, path: &Path) -> String {
 }
 
 /// Paths whose content differs, as `(before, after)` pairs.
-///
-/// Comparison is by content hash only. A file whose mtime moved but whose bytes did not is **not** a
-/// change — otherwise every `touch`, every build-system timestamp probe and every editor save with no
-/// edit would produce a rollback entry, and the real changes would be lost in the noise.
-///
-/// A path that was a directory and is now a file (or the reverse) shows up as two entries, a delete of
-/// the subtree and a create of the file, which is exactly what restoring it requires. Nothing here
-/// needs a third "type changed" case.
 pub fn diff(before: &Scan, after: &Scan) -> Vec<Change> {
     let mut out = Vec::new();
     for (path, b) in &before.files {
@@ -523,10 +479,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Perf probe, not a test: `AOX_SCAN_PROBE=<dir> cargo test --release --lib a_scan_of_a_real_tree -- --ignored --nocapture`.
-    ///
-    /// It exists because "how much does a strict shell command cost" is a question with a number for
-    /// an answer, and the number depends on the machine. Print it instead of guessing in the docs.
+    /// Perf probe, not a test: `AOX_SCAN_PROBE=<dir> cargo test --release --lib a_scan_of_a_real_tree -- --ignored...
     #[test]
     #[ignore]
     fn a_scan_of_a_real_tree() {

@@ -1,41 +1,14 @@
-//! A minimal SVG renderer: the three shapes `<rect>` / `<line>` / `<text>`, plus `viewBox` and a
-//! couple of fill / stroke attributes.
-//!
-//! When the model writes a ```` ```svg ```` fence in its reply, this draws it **inside the chat**
-//! (see the matching branch in `markdown.rs`). Zero protocol change — markdown already has fenced
-//! code blocks, and the model is already good at writing SVG.
-//!
-//! # Why not HTML
-//!
-//! "Render HTML directly in the UI" sounds one step away, but what's actually missing is a **layout
-//! engine** (box model, inline flow, stacking, font metrics...). SVG is different: it is a pile of
-//! absolutely-positioned shapes that need no layout — and flowcharts, structure diagrams and
-//! sequence diagrams are exactly "a pile of absolutely-positioned shapes".
-//!
-//! # Why only three shapes
-//!
-//! This is the scope the user chose (2026-10-06): boxes, connectors, text — enough for
-//! flowchart-style diagrams. Rounded corners, curves, rotation, ellipses and gradients are all
-//! unsupported. Arrows are pieced together from two short lines (`<line>` can't draw a triangle).
-//!
-//! # Two deliberate deviations
-//!
-//! 1. **With no `fill` / `stroke` written, use the current theme's color**, not the black of the SVG
-//!    spec. Under a dark theme a black box is simply invisible, and "no color written" is exactly
-//!    what's most common in model-generated flowcharts.
-//! 2. **Skip unrecognized elements instead of erroring**: the model easily writes `<defs>` /
-//!    `<style>` / `<marker>` on the side (they're regular SVG parts anyway). Hiding the whole
-//!    diagram over that is not worth it.
+//! A minimal SVG renderer: the three shapes `<rect>` / `<line>` / `<text>`, plus `viewBox` and a couple of fill /...
+//! When the model writes a ```` ```svg ```` fence in its reply, this draws it inside the chat (see the matching...
+//! # Why not HTML.
 
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use crate::theme::P;
 
-// ─────────────────────────── Data ───────────────────────────
+// Data
 
-/// A paint value. Three variants rather than `Option<Color32>`: `none` (explicitly no fill) and
-/// "not written" (use the theme color) are two different things; merging them into one `None`
-/// makes them impossible to tell apart again.
+/// A paint value. Three variants rather than `Option<Color32>`: `none` (explicitly no fill) and "not written" (use...
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Paint {
     None,
@@ -75,7 +48,7 @@ pub struct Drawing {
     shapes: Vec<Shape>,
 }
 
-// ─────────────────────────── Parsing ───────────────────────────
+// Parsing
 
 /// Parse an SVG. On failure it returns **a human-readable sentence** (shown in the chat).
 pub fn parse(src: &str) -> Result<Drawing, String> {
@@ -84,9 +57,7 @@ pub fn parse(src: &str) -> Result<Drawing, String> {
 
     for (name, attrs, body) in tags(src) {
         match name.as_str() {
-            // Root: only these three sizes are read, in order viewBox → width/height. If none,
-            // fall back to the shapes' actual bounds at the end (see function tail) — models
-            // occasionally forget viewBox, and "draw nothing" is the worst reaction then.
+            // Fall back to the shapes' actual bounds at the end (see function tail) — models occasionally forget viewBox...
             "svg" => {
                 vb = parse_viewbox(&attrs).or_else(|| {
                     let w = num(&attrs, "width");
@@ -268,9 +239,6 @@ fn rgb_func(s: &str) -> Option<Color32> {
 }
 
 /// Only the most common names are recognized.
-///
-/// No 147-name table: that would eat half this module's bytes, while the colors models use for
-/// flowcharts are just these few over and over (everything else goes through `#rrggbb`).
 fn named(s: &str) -> Option<Color32> {
     let c = match s.to_ascii_lowercase().as_str() {
         "black" => (0, 0, 0),
@@ -288,16 +256,11 @@ fn named(s: &str) -> Option<Color32> {
     Some(Color32::from_rgb(c.0, c.1, c.2))
 }
 
-// ─────────────────────────── Minimal XML scan ───────────────────────────
+// Minimal XML scan
 
 type Attrs = std::collections::HashMap<String, String>;
 
 /// Scan a stretch of SVG into `(element name, attributes, text content)`.
-///
-/// Hand-written rather than pulling in `quick-xml`: what has to be recognized here is pitiably
-/// little (no namespaces, no entities, no CDATA, attribute values are only ever a quoted run of
-/// characters), so adding an XML library for a "draw a box" feature doesn't pay — the same
-/// trade-off as hand-writing `attach::b64_encode`.
 fn tags(src: &str) -> Vec<(String, Attrs, String)> {
     let b: Vec<char> = src.chars().collect();
     let mut out = Vec::new();
@@ -328,15 +291,7 @@ fn tags(src: &str) -> Vec<(String, Attrs, String)> {
         let (name, attrs) = split_tag(inner.trim().trim_end_matches('/'));
         let mut body = String::new();
         let mut next = gt + 1;
-        // ⚠️ **Only `<text>` collects body text**.
-        //
-        // For every other element (`<svg>` / `<g>` / `<defs>` ...) the content must keep being
-        // scanned for elements — treating them as "jump to the closing tag" would swallow the whole
-        // subtree and parse not a single shape. This mistake was made in the first version, and it
-        // showed up as "nothing gets drawn" while the code looked perfectly fine.
-        //
-        // The closing tag itself (`</svg>`) gets sliced by `split_tag` into a name `/svg`, which
-        // naturally falls into the "unrecognized element" arm and is harmless.
+        // ️ Only `<text>` collects body text.
         if !self_closing && name == "text" {
             if let Some(end) = find(&b, next, &format!("</{name}")) {
                 body = b[next..end].iter().collect();
@@ -365,7 +320,6 @@ fn find(b: &[char], from: usize, pat: &str) -> Option<usize> {
     (from..=b.len() - p.len()).find(|&i| b[i..i + p.len()] == p[..])
 }
 
-/// `rect x="1" y="2"` → `("rect", {x: 1, y: 2})`
 fn split_tag(s: &str) -> (String, Attrs) {
     let mut it = s.split_whitespace();
     let name = it.next().unwrap_or("").to_ascii_lowercase();
@@ -381,10 +335,6 @@ fn split_tag(s: &str) -> (String, Attrs) {
 }
 
 /// Split attributes by "don't cut inside quotes".
-///
-/// Can't just `split_whitespace` on whitespace: `text-anchor="middle"` is fine, but body text
-/// often has attribute values with spaces like `font-family="Microsoft YaHei"` — cutting there
-/// tears the attribute in half and shifts every following item.
 fn split_attrs(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -417,13 +367,9 @@ fn split_attrs(s: &str) -> Vec<String> {
     out
 }
 
-// ─────────────────────────── Drawing ───────────────────────────
+// Drawing
 
 /// Draw a stretch of SVG into `ui`. Returns the height it occupies (0 = nothing drawn).
-///
-/// The width is squeezed to `max_w` (never enlarged): stretching a 200-wide diagram to fill the
-/// column only blurs it, and "it's just this big" is more useful than a fuzzy large image — the
-/// same criterion as `images_block`.
 pub fn render(ui: &mut Ui, src: &str, max_w: f32) -> f32 {
     let d = match parse(src) {
         Ok(d) => d,
@@ -478,9 +424,7 @@ pub fn render(ui: &mut Ui, src: &str, max_w: f32) -> f32 {
             }
             Shape::Text { x, y, text, size, fill, anchor } => {
                 let a = match anchor {
-                    // SVG's `y` is the **baseline**, while egui only has bounding-box anchors —
-                    // approximate with BOTTOM. With descenders (gjpqy) it sits slightly high, which
-                    // is good enough for flowcharts.
+                    // SVG's `y` is the baseline, while egui only has bounding-box anchors — approximate with BOTTOM. With descenders...
                     Anchor::Start => Align2::LEFT_BOTTOM,
                     Anchor::Middle => Align2::CENTER_BOTTOM,
                     Anchor::End => Align2::RIGHT_BOTTOM,

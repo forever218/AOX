@@ -1,17 +1,6 @@
-//! `aox remote` — the host side of AOX Remote.
-//!
-//! Two verbs for the person, one long-running loop underneath:
-//!
-//! ```text
-//! aox remote pair     输服务端地址 + 手机上的配对码，换一张长期设备凭证
-//! aox remote serve    连上服务端，收到 @自己 的指令就在本机跑一轮
-//! aox remote status   看看现在配的是哪台服务器
-//! aox remote unpair   删掉凭证
-//! ```
-//!
-//! **No endpoint is compiled in.** The address is whatever the person typed at `pair` time and is
-//! stored in `.aox/remote.json`; this file only knows how to talk to "a server", not to a
-//! particular one.
+//! aox remote: the host side of AOX Remote; two verbs for the person, one long-running loop underneath.
+//! pair trades a server address + pairing code for a device credential; serve runs a local turn on @-mentions.
+//! status and unpair show/remove the config; no endpoint is compiled in (address is stored in .aox/remote.json).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -58,9 +47,7 @@ pub(crate) fn frame_id(prefix: &str) -> String {
     format!("{prefix}{}-{}", now_ms(), SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
-/// `interactive` 决定配对时**能不能追问**。`aox remote pair` 传 true（终端里一行行问）；
-/// REPL 里的 `/remote pair` 传 false——它跑在已经持有 stdin 的行编辑里，再开一个
-/// `read_line` 会把用户敲的内容抢走。
+/// interactive gates prompts: CLI pair true, REPL /remote pair false (its line editor owns stdin).
 pub async fn cli(rt: Arc<Runtime>, root: PathBuf, args: &[String], interactive: bool) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("pair") => pair(&root, args, interactive).await,
@@ -72,14 +59,14 @@ pub async fn cli(rt: Arc<Runtime>, root: PathBuf, args: &[String], interactive: 
                 let mut book = Book::load(&root)?;
                 if book.select(n) {
                     book.save(&root)?;
-                    println!("已选择：{}", book.active().map(|p| p.title().to_string()).unwrap_or_default());
+                    println!("Selected: {}", book.active().map(|p| p.title().to_string()).unwrap_or_default());
                 } else {
-                    println!("没有这一条配对：{n}");
+                    println!("No such pairing: {n}");
                 }
                 Ok(())
             }
             None => {
-                println!("用法：aox remote use <序号|id>");
+                println!("Usage: aox remote use <index|id>");
                 status(&root)
             }
         },
@@ -88,45 +75,45 @@ pub async fn cli(rt: Arc<Runtime>, root: PathBuf, args: &[String], interactive: 
                 let mut book = Book::load(&root)?;
                 if book.rename(n, label) {
                     book.save(&root)?;
-                    println!("已重命名。");
+                    println!("Renamed.");
                 } else {
-                    println!("没有这一条配对：{n}");
+                    println!("No such pairing: {n}");
                 }
                 Ok(())
             }
             _ => {
-                println!("用法：aox remote rename <序号|id> <名字>");
+                println!("Usage: aox remote rename <index|id> <name>");
                 Ok(())
             }
         },
         Some("policy") => match args.get(1) {
             Some(want) => {
                 let Some(p) = CallPolicy::parse(want) else {
-                    println!("用法：aox remote policy <ask|owner|open>");
+                    println!("Usage: aox remote policy <ask|owner|open>");
                     return Ok(());
                 };
                 let mut book = Book::load(&root)?;
                 {
                     let Some(active) = book.active_mut() else {
-                        println!("还没有配对（先 aox remote pair）");
+                        println!("No pairing yet (run aox remote pair first)");
                         return Ok(());
                     };
                     active.call_policy = p;
                 }
                 book.save(&root)?;
-                println!("已设置：{}（{}）", p.as_str(), policy_hint(p));
+                println!("Set: {} ({})", p.as_str(), policy_hint(p));
                 Ok(())
             }
             None => {
                 let book = Book::load(&root)?;
                 match book.active() {
                     Some(p) => {
-                        println!("当前策略：{}（{}）", p.call_policy.as_str(), policy_hint(p.call_policy));
-                        println!("  ask   别人 @ 时先问你（默认）");
-                        println!("  owner 只执行你自己的指令");
-                        println!("  open  谁都能用，不再询问");
+                        println!("Current policy: {} ({})", p.call_policy.as_str(), policy_hint(p.call_policy));
+                        println!("  ask   ask first when others @ (default)");
+                        println!("  owner only run your own instructions");
+                        println!("  open  anyone can use, no more asking");
                     }
-                    None => println!("还没有配对。"),
+                    None => println!("No pairing yet."),
                 }
                 Ok(())
             }
@@ -141,30 +128,30 @@ pub async fn cli(rt: Arc<Runtime>, root: PathBuf, args: &[String], interactive: 
 
 fn policy_hint(p: CallPolicy) -> &'static str {
     match p {
-        CallPolicy::Ask => "别人 @ 时先问你",
-        CallPolicy::Owner => "只执行你的指令",
-        CallPolicy::Open => "谁都能用",
+        CallPolicy::Ask => "ask first when others @",
+        CallPolicy::Owner => "only run your instructions",
+        CallPolicy::Open => "anyone can use",
     }
 }
 
 fn help() {
     println!(
         r#"
-AOX 远程（主机端）
+AOX Remote (host side)
 
-  aox remote list                列出本机保存的所有配对（* 为当前）
-  aox remote use <序号|id>        指定 serve 连接哪一条
-  aox remote rename <序号|id> <名字>   给这条配对起个本机叫法
-  aox remote remove [序号|id]     删除配对（不带参数 = 删当前那条）
-  aox remote status              当前配对与服务端
-  aox remote policy [ask|owner|open]   别人 @ 这台机器时怎么办（不带参数 = 查看）
+  aox remote list                list all pairings saved on this machine (* = active)
+  aox remote use <index|id>        choose which one serve connects to
+  aox remote rename <index|id> <name>   give this pairing a local name
+  aox remote remove [index|id]     delete a pairing (no argument = delete the current one)
+  aox remote status              current pairing and server
+  aox remote policy [ask|owner|open]   what to do when others @ this machine (no argument = view)
 
-  aox remote pair [服务端地址] [配对码] [Agent 名称]
-      新增一条配对。地址与配对码都可以不带参数、按提示输入。
-      配对码在手机 App 的「添加电脑」里生成，5 分钟内有效。
+  aox remote pair [server address] [pairing code] [Agent name]
+      Add a pairing. Address and pairing code can be omitted and entered at the prompts.
+      The pairing code is generated in the phone app's "Add Computer", valid for 5 minutes.
 
   aox remote serve
-      常驻运行当前配对：收到 @你的Agent 的指令，就在本机执行并把过程与结果发回房间。
+      Run the current pairing continuously: on an @-mention to your Agent, run it on this machine and post the process and result back to the room.
 "#
     );
 }
@@ -179,13 +166,13 @@ fn prompt(label: &str) -> Result<String> {
     std::io::stdout().flush()?;
     let mut s = String::new();
     if std::io::stdin().read_line(&mut s)? == 0 {
-        bail!("没有读到输入，已取消");
+        bail!("No input read, cancelled");
     }
     Ok(s.trim().to_string())
 }
 
 fn prompt_or(label: &str, default: &str) -> Result<String> {
-    let v = prompt(&format!("{label} [{default}]："))?;
+    let v = prompt(&format!("{label} [{default}]: "))?;
     Ok(if v.is_empty() { default.to_string() } else { v })
 }
 
@@ -231,7 +218,7 @@ struct PairAgent {
     handle: String,
 }
 
-/// 配对的纯逻辑：不读 stdin、不打印。CLI 与 GUI 共用。
+/// Pure pairing logic: no stdin, no printing, shared by CLI and GUI.
 pub async fn pair_with(
     raw_server: &str,
     raw_code: &str,
@@ -242,11 +229,11 @@ pub async fn pair_with(
     let server = normalize_server(raw_server)?;
     let code = raw_code.trim().to_ascii_uppercase();
     if code.is_empty() {
-        bail!("配对码不能为空");
+        bail!("Pairing code cannot be empty");
     }
     let handle = raw_handle.trim().to_ascii_lowercase();
     if handle.is_empty() {
-        bail!("Agent 名称不能为空");
+        bail!("Agent name cannot be empty");
     }
 
     let client = reqwest::Client::builder()
@@ -262,15 +249,15 @@ pub async fn pair_with(
         }))
         .send()
         .await
-        .with_context(|| format!("连不上 {server}"))?;
+        .with_context(|| format!("Cannot reach {server}"))?;
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("配对失败（HTTP {status}）：{body}");
+        bail!("Pairing failed (HTTP {status}): {body}");
     }
     let paired: PairResp =
-        serde_json::from_str(&body).context("服务端返回的不是预期的配对结果")?;
+        serde_json::from_str(&body).context("Server did not return the expected pairing result")?;
 
     let profile = RemoteProfile {
         id: format!("p{}", now_ms()),
@@ -294,52 +281,52 @@ pub async fn pair_with(
 }
 
 async fn pair(root: &Path, args: &[String], interactive: bool) -> Result<()> {
-    println!("\nAOX 远程 · 配对");
-    println!("服务端地址请填写你自己那台服务器的地址，本程序不内置任何服务器。\n");
+    println!("\nAOX Remote · Pairing");
+    println!("Enter the address of your own server; this program does not bundle any server.\n");
 
-    // 不能追问的场合（REPL）就要求参数给全：少一个就报用法，别去碰 stdin。
+    // Where prompting is impossible (REPL), require all args: a missing one reports usage instead of touching stdin.
     let ask = interactive && is_tty();
 
     let server = match args.get(1) {
         Some(s) => normalize_server(s)?,
-        None if !ask => bail!("缺少服务端地址：aox remote pair <服务端地址> <配对码> [Agent 名称]"),
-        None => normalize_server(&prompt("服务端地址（例如 https://chat.example.com）：")?)?,
+        None if !ask => bail!("Missing server address: aox remote pair <server address> <pairing code> [Agent name]"),
+        None => normalize_server(&prompt("Server address (e.g. https://chat.example.com): ")?)?,
     };
     let code = match args.get(2) {
         Some(c) => c.trim().to_ascii_uppercase(),
-        None if !ask => bail!("缺少配对码：aox remote pair <服务端地址> <配对码> [Agent 名称]"),
-        None => prompt("配对码（手机 App → 添加电脑）：")?.to_ascii_uppercase(),
+        None if !ask => bail!("Missing pairing code: aox remote pair <server address> <pairing code> [Agent name]"),
+        None => prompt("Pairing code (phone app → Add Computer): ")?.to_ascii_uppercase(),
     };
     if code.is_empty() {
-        bail!("配对码不能为空");
+        bail!("Pairing code cannot be empty");
     }
 
     let host = hostname();
     let handle = match args.get(3) {
         Some(h) => h.trim().to_ascii_lowercase(),
         None if !ask => default_handle(&host),
-        None => prompt_or("Agent 名称", &default_handle(&host))?.to_ascii_lowercase(),
+        None => prompt_or("Agent name", &default_handle(&host))?.to_ascii_lowercase(),
     };
-    let device_name = if ask { prompt_or("设备名称", &host)? } else { host.clone() };
+    let device_name = if ask { prompt_or("Device name", &host)? } else { host.clone() };
 
-    println!("\n正在向 {server} 配对…");
+    println!("\nPairing with {server}...");
     let profile = pair_with(&server, &code, &handle, &device_name, root).await?;
-    println!("\n配对成功。");
-    println!("  服务端  {}", profile.server);
+    println!("\nPairing succeeded.");
+    println!("  Server   {}", profile.server);
     println!("  Agent   @{}", profile.agent_handle);
-    println!("  凭证    {}", RemoteProfile::path(root).display());
-    println!("\n下一步：aox remote serve");
-    println!("在手机或群里发：@{} 你的指令", profile.agent_handle);
+    println!("  Credential  {}", RemoteProfile::path(root).display());
+    println!("\nNext: aox remote serve");
+    println!("Send from your phone or a group: @{} your instruction", profile.agent_handle);
     Ok(())
 }
 
 fn status(root: &Path) -> Result<()> {
     let book = Book::load(root)?;
     if book.pairings.is_empty() {
-        println!("尚未配对。运行：aox remote pair");
+        println!("Not paired yet. Run: aox remote pair");
         return Ok(());
     }
-    println!("共 {} 条配对（* 为当前）：", book.pairings.len());
+    println!("{} pairing(s) (* = active):", book.pairings.len());
     for (i, p) in book.pairings.iter().enumerate() {
         let mark = if Some(&p.id) == book.active.as_ref() { "*" } else { " " };
         let name = if p.label.trim().is_empty() { "" } else { p.label.as_str() };
@@ -352,38 +339,37 @@ fn status(root: &Path) -> Result<()> {
 fn remove_pairing(root: &Path, needle: Option<&str>) -> Result<()> {
     let mut book = Book::load(root)?;
     if book.pairings.is_empty() {
-        println!("本来就没有配对。");
+        println!("No pairings to begin with.");
         return Ok(());
     }
     let target = match needle {
         Some(n) => n.to_string(),
-        // 没给参数就删当前那条
+        // With no argument, delete the current entry.
         None => match book.active.clone() {
             Some(id) => id,
             None => {
-                println!("没有当前配对；用 aox remote remove <序号> 指定一条。");
+                println!("No active pairing; specify one with aox remote remove <index>.");
                 return Ok(());
             }
         },
     };
     if book.remove(&target) {
         book.save(root)?;
-        println!("已删除。剩下 {} 条。", book.pairings.len());
+        println!("Deleted. {} remaining.", book.pairings.len());
     } else {
-        println!("没有这一条配对：{target}");
+        println!("No such pairing: {target}");
     }
     Ok(())
 }
 
-/// 给前端（GUI 的远程页）看的事件。CLI 里这些同时打到 stdout。
+/// Events for the frontend (GUI remote page); in the CLI these also go to stdout.
 #[derive(Clone, Debug)]
 pub enum RemoteEvent {
     Status(String),
     Log(String),
 }
 
-/// 接管凭证：桥在运行时写一个心跳文件，GUI 盯着它决定要不要锁屏。
-/// 点「取回控制权」= 删掉这个文件；桥发现文件没了就自己退出。
+/// Bridge heartbeat file the GUI watches; Reclaim Control deletes it, and the bridge exits once it is gone.
 pub fn lock_path(root: &Path) -> PathBuf {
     root.join(".aox").join("remote.lock")
 }
@@ -403,7 +389,7 @@ fn write_lock(root: &Path, profile: &RemoteProfile, who: &str, since: i64) {
     let _ = std::fs::write(path, body.to_string());
 }
 
-/// 连接者是谁：手机账号的显示名。拿不到就退回"手机端"，不编造。
+/// Who is connected: the phone account's display name; fall back to a generic mobile label, never invent one.
 async fn owner_name(profile: &RemoteProfile) -> String {
     let url = format!("{}/api/me", profile.server.trim_end_matches('/'));
     match reqwest::Client::new()
@@ -417,10 +403,10 @@ async fn owner_name(profile: &RemoteProfile) -> String {
             v["user"]["display_name"]
                 .as_str()
                 .or_else(|| v["user"]["handle"].as_str())
-                .unwrap_or("手机端")
+                .unwrap_or("Mobile")
                 .to_string()
         }
-        _ => "手机端".to_string(),
+        _ => "Mobile".to_string(),
     }
 }
 
@@ -428,11 +414,7 @@ async fn serve(rt: Arc<Runtime>, root: PathBuf) -> Result<()> {
     serve_with(rt, root, None, Arc::new(std::sync::atomic::AtomicBool::new(false)), true).await
 }
 
-/// REPL 里的 `/remote start`：后台常驻，**不接管终端输入**。
-///
-/// `serve_with` 原本会起一个 stdin 读线程处理 `allow / deny`。在 REPL 里那是灾难：
-/// 它和 `read_user_input` 抢同一行，用户打的普通消息会被它吞掉。
-/// 授权的主路径本来就在手机上点，这里不需要终端控制。
+/// REPL /remote start is background, takes no stdin (avoids line-editor conflict); approvals are phone taps.
 pub async fn serve_headless(
     rt: Arc<Runtime>,
     root: PathBuf,
@@ -441,34 +423,29 @@ pub async fn serve_headless(
     serve_with(rt, root, None, stop, false).await
 }
 
-/// REPL 的 `/remote`：一屏状态。用户想知道的是"配了没、在跑没"，
-/// 不是一整页子命令手册（那仍然可以 `/remote list` 看到）。
+/// REPL /remote is one status screen (configured? running?), not a full manual (still in /remote list).
 pub fn brief(root: &Path, running: bool) -> String {
     let mut out = String::new();
     out.push_str(if running {
-        "远程服务：运行中\n"
+        "Remote service: running\n"
     } else {
-        "远程服务：未运行（/remote start 启动）\n"
+        "Remote service: not running (/remote start to launch)\n"
     });
     match Book::load(root) {
         Ok(book) if !book.pairings.is_empty() => {
-            out.push_str(&format!("共 {} 条配对（* 为当前）：\n", book.pairings.len()));
+            out.push_str(&format!("{} pairing(s) (* = active):\n", book.pairings.len()));
             for (i, p) in book.pairings.iter().enumerate() {
                 let mark = if Some(&p.id) == book.active.as_ref() { "*" } else { " " };
                 out.push_str(&format!("{mark} {}. {} @{}\n", i + 1, p.title(), p.agent_handle));
             }
         }
-        _ => out.push_str("还没有配对（/remote pair <服务端地址> <配对码>）\n"),
+        _ => out.push_str("No pairing yet (/remote pair <server address> <pairing code>)\n"),
     }
-    out.push_str("其余子命令同 aox remote：list / use / pair / policy / remove / rename");
+    out.push_str("Other subcommands same as aox remote: list / use / pair / policy / remove / rename");
     out
 }
 
-/// 常驻主体。`events` 给了就发事件（GUI），`stop` 置位后在一个心跳周期内退出。
-///
-/// 授权只在**手机**上决定：桌面端不弹框（用户 2026-11-03 要求），CLI 只在交互终端里打一行
-/// 提示，不打断任何东西。`control_stdin` 只给 `aox remote serve` 那种"整个终端交给远程"的
-/// 用法；REPL 后台启动时传 false，否则会和行编辑抢 stdin。
+/// Resident loop: events and stop within one heartbeat; approvals phone-only; control_stdin for aox remote serve.
 pub async fn serve_with(
     rt: Arc<Runtime>,
     root: PathBuf,
@@ -488,15 +465,14 @@ pub async fn serve_with(
     let profile = book
         .active()
         .cloned()
-        .context("还没有配对（或没有选中哪一条）。先运行：aox remote pair")?;
+        .context("No pairing yet (or none selected). Run first: aox remote pair")?;
 
-    // 连接者名字取一次就够：接管期间不会换人。
+    // Fetch the connected user's name once; it cannot change during a takeover.
     let who = owner_name(&profile).await;
     let since = now_ms();
     write_lock(&root, &profile, &who, since);
 
-    // 心跳 + 看门狗合一：每 5 秒写一次；如果文件被别人删了（GUI 点了"取回控制权"），
-    // 立刻置 stop 并**不再重建**——重建会让那个按钮失效。
+    // Heartbeat/watchdog writes every 5s; GUI deletion (reclaim) sets stop and is never rebuilt.
     let hb = {
         let stop_hb = stop.clone();
         let root_hb = root.clone();
@@ -519,13 +495,13 @@ pub async fn serve_with(
         })
     };
 
-    println!("AOX 远程 · 主机常驻");
-    println!("  服务端  {}", profile.server);
+    println!("AOX Remote · Host resident");
+    println!("  Server   {}", profile.server);
     println!("  Agent   @{}", profile.agent_handle);
-    println!("  策略    别人的 @ → {}", profile.call_policy.as_str());
-    println!("  （Ctrl+C 退出）\n");
+    println!("  Policy   others' @ → {}", profile.call_policy.as_str());
+    println!("  (Ctrl+C to quit)\n");
     emit(RemoteEvent::Status(format!(
-        "已配对：{} @{}",
+        "Paired: {} @{}",
         profile.server, profile.agent_handle
     )));
 
@@ -539,14 +515,13 @@ pub async fn serve_with(
         spawn_stdin_control(calls.clone());
     }
 
-    // `room_history` / `room_pull` 只在接了 aoxchat 的时候存在：本地 CLI / GUI 的对话里看不到。
-    // 先 unregister 再 register 是"替换"——服务被停掉再启一次时不会撞名字。
+    // room_history/room_pull need aoxchat; unregister then register replaces cleanly across service restarts.
     let room_now: tool::Slot = Arc::new(tokio::sync::RwLock::new(None));
     for t in tool::tools(room_now.clone(), profile.clone(), keys.clone()) {
         rt.unregister(t.name()).await;
         if let Err(e) = rt.register(t).await {
-            // 注册不上不是致命的：这一轮照跑，只是模型没有"往回翻"的入口。
-            println!("  ↑ 房间工具没注册上：{e:#}");
+            // Failing to register is non-fatal: the turn still runs, the model just lacks a history-lookup entry point.
+            println!("  ↑ room tools failed to register: {e:#}");
         }
     }
 
@@ -580,15 +555,15 @@ pub async fn serve_with(
         .await
         {
             Ok(()) => {
-                eprintln!("连接已关闭，{backoff}s 后重连");
-                emit(RemoteEvent::Status(format!("连接已关闭，{backoff}s 后重连")));
+                eprintln!("Connection closed, retrying in {backoff}s");
+                emit(RemoteEvent::Status(format!("Connection closed, retrying in {backoff}s")));
             }
             Err(e) => {
-                eprintln!("连接失败：{e:#}，{backoff}s 后重连");
-                emit(RemoteEvent::Status(format!("连接失败：{e:#}")));
+                eprintln!("Connection failed: {e:#}, retrying in {backoff}s");
+                emit(RemoteEvent::Status(format!("Connection failed: {e:#}")));
             }
         }
-        // 分段睡：否则 stop 要等满 30 秒才生效。
+        // Sleep in short slices, otherwise stop takes a full 30s to take effect.
         for _ in 0..backoff {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -599,33 +574,30 @@ pub async fn serve_with(
     }
     hb.abort();
     let _ = std::fs::remove_file(lock_path(&root));
-    emit(RemoteEvent::Status("已停止".into()));
+    emit(RemoteEvent::Status("Stopped".into()));
     Ok(())
 }
 
 struct Job {
     room: String,
-    /// 房间名（`hello_ok` 的 rooms 里带下来的）。只用来给会话起名：`远端 · 前端组`。
-    /// 拿不到就是空串——宁可用 `远端`，也不编一个房间 id 上去。
+    /// Room name (from hello_ok rooms), used only to title sessions; empty when missing, never an invented room id.
     room_name: String,
-    /// 触发这一轮的那条消息 id。手机靠它把"运行中"的呼吸条挂在原文下面。
+    /// Id of the message that triggered this turn; the phone hangs its running indicator under that original.
     msg_id: String,
     prompt: String,
-    /// 只有设备主人能改配置（模型、工作空间）。群里的协作者可以下指令，但不能改你的机器。
+    /// Only the owner can change config (model, workspace); collaborators may instruct but not reconfigure it.
     from_owner: bool,
-    /// 这条消息带的图。**不在 WS 循环里下载**：几百 KB 的图也能把心跳卡住，交给 worker。
+    /// Images on this message go to the worker, not the WS loop, since a few hundred KB can stall the heartbeat.
     media: Vec<aoxchat_proto::ArtifactView>,
-    /// 这条消息引用的是哪一条。取原文、解密、下载都在 worker 里做（见 `context.rs`）。
+    /// Which message this quotes; fetching, decrypting and downloads all happen in the worker (see context.rs).
     quote: Option<aoxchat_proto::ReplyView>,
-    /// 这个房间的存储上限（MB），0 = 不限。由房主在房间设置里定，服务端在 `Room` 里带下来。
-    /// 宿主的 inbox 只是服务端那份的副本，两边用同一个数字，否则"房间上限"管不住本机磁盘。
+    /// Room storage cap (MB, 0 = unlimited) set by the owner; the host inbox is a server copy using the same number.
     cap_mb: u32,
-    /// 触发这一轮的那条消息的 seq。`room_history` 从它往前翻（不含它自己）。
+    /// Seq of the triggering message; room_history reads backward from it, excluding itself.
     last_seq: i64,
 }
 
-/// 没见过这个房间时按服务端的默认值（200 MB）兜底。这不是宿主自己的策略，
-/// 只是"服务端没告诉我"时的保守取值——真正说了算的是房主设的那个数。
+/// Unseen rooms fall back to the server default (200MB), not host policy; the owner's cap really governs.
 const DEFAULT_ROOM_STORAGE_MB: u32 = 200;
 
 async fn run_once(
@@ -646,16 +618,15 @@ async fn run_once(
         }
     };
     let url = profile.ws_url();
-    // 房间 → 我在这个房间里的名字。同一个 Agent 可以在 A 群叫 `aox`、在 B 群叫 `aox-b`，
-    // 而 `@` 匹配必须用房间内的那个名字，不是配对时的全局 handle。
+    // Room -> my in-room name; @-matching uses it, not the global handle, since one Agent differs per room.
     let mut room_handles: HashMap<String, String> = HashMap::new();
-    // 房间 → 存储上限（MB）。和 room_handles 一起维护：都来自同一个 `Room` 快照。
+    // Room -> storage cap (MB), maintained with room_handles since both come from the same Room snapshot.
     let mut room_caps: HashMap<String, u32> = HashMap::new();
-    // 房间名，只给会话标题用。运行期新建的房间靠 `RoomUpdated` 补（见下），和 handle 同一条路。
+    // Room name, only for session titles; runtime-created rooms are added via RoomUpdated, like handles.
     let mut room_names: HashMap<String, String> = HashMap::new();
     let (ws, _) = tokio_tungstenite::connect_async(&url)
         .await
-        .with_context(|| format!("无法连接 {url}"))?;
+        .with_context(|| format!("Cannot connect to {url}"))?;
     let (mut tx, mut rx) = ws.split();
 
     let hello = Frame::new(
@@ -683,10 +654,10 @@ async fn run_once(
     loop {
         let msg = tokio::time::timeout(deadline, rx.next())
             .await
-            .context("等待 hello_ok 超时")?
-            .context("连接在握手阶段断开")?;
+            .context("Timed out waiting for hello_ok")?
+            .context("Connection dropped during handshake")?;
         let WsMessage::Text(t) = msg? else { continue };
-        let frame: Frame = serde_json::from_str(&t).context("服务端发来无法解析的帧")?;
+        let frame: Frame = serde_json::from_str(&t).context("Server sent an unparsable frame")?;
         match frame.body {
             Body::HelloOk(ok) => {
                 room_handles.extend(ok.rooms.iter().filter_map(|r| {
@@ -698,18 +669,18 @@ async fn run_once(
                 room_caps.extend(ok.rooms.iter().map(|r| (r.id.clone(), r.max_storage_mb)));
                 room_names.extend(ok.rooms.iter().map(|r| (r.id.clone(), r.name.clone())));
                 println!(
-                    "已连接，{} 个房间。等待 @{} 的指令…",
+                    "Connected, {} rooms. Waiting for @{} instructions...",
                     ok.rooms.len(),
                     profile.agent_handle
                 );
                 emit(RemoteEvent::Status(format!(
-                    "已连接 · {} 个房间 · @{}",
+                    "Connected · {} rooms · @{}",
                     ok.rooms.len(),
                     profile.agent_handle
                 )));
                 break;
             }
-            Body::Error(e) => bail!("服务端拒绝：{:?} {}", e.code, e.message),
+            Body::Error(e) => bail!("Server rejected: {:?} {}", e.code, e.message),
             _ => {}
         }
     }
@@ -724,7 +695,7 @@ async fn run_once(
                 tx.send(WsMessage::Text(serde_json::to_string(&ping)?.into())).await?;
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                // 每秒看一眼"取回控制权"：长连接可能挂几小时，不能只在重连时才检查。
+                // Check reclaim-control every second: a connection can last hours, so checking only on reconnect is not enough.
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     return Ok(());
                 }
@@ -740,17 +711,17 @@ async fn run_once(
                         match frame.body {
                             Body::TaskCancel(c) => {
                                 if cancels.cancel(&c.task_id) {
-                                    println!("收到停止请求：{}", c.task_id);
+                                    println!("Stop request received: {}", c.task_id);
                                 } else {
-                                    eprintln!("停止请求已过期：{}", c.task_id);
+                                    eprintln!("Stop request expired: {}", c.task_id);
                                 }
                             }
                             Body::ApprovalDecide(d) => {
                                 if approvals.resolve(&d.approval_id, d.allow, d.for_task) {
                                     println!(
-                                        "审批 {} → {}",
+                                        "Approval {} → {}",
                                         d.approval_id,
-                                        if d.allow { "允许" } else { "拒绝" }
+                                        if d.allow { "allowed" } else { "denied" }
                                     );
                                 }
                             }
@@ -759,24 +730,23 @@ async fn run_once(
                                     d.remember_secs.map(|s| Duration::from_secs(s as u64));
                                 if calls.resolve(&d.call_id, d.allow, remember) {
                                     println!(
-                                        "授权 {}：{}",
+                                        "Authorization {}: {}",
                                         d.call_id,
-                                        if d.allow { "允许" } else { "拒绝" }
+                                        if d.allow { "allowed" } else { "denied" }
                                     );
                                 } else {
-                                    eprintln!("授权决定已过期：{}", d.call_id);
+                                    eprintln!("Authorization decision expired: {}", d.call_id);
                                 }
                             }
                             Body::MsgNew(MsgNew { msg }) => {
                                 let msg = match decrypt_incoming(keys, msg) {
                                     Ok(m) => m,
                                     Err(reason) => {
-                                        eprintln!("跳过一条消息：{reason}");
+                                        eprintln!("Skipping a message: {reason}");
                                         continue;
                                     }
                                 };
-                                // 用这个房间里生效的名字匹配。新房间（运行期建/被拉进去）靠
-                                // RoomUpdated 补进表里；表里没有才退回配对时的全局名。
+                                // Match using the room-effective name; RoomUpdated adds new rooms; only a miss falls back to the global one.
                                 let handle = room_handles
                                     .get(&msg.room)
                                     .map(String::as_str)
@@ -785,7 +755,7 @@ async fn run_once(
                                     continue;
                                 };
 
-                                println!("收到指令（{}）：{}", msg.room, mention.prompt);
+                                println!("Instruction received ({}): {}", msg.room, mention.prompt);
                                 let from_owner = msg.sender_id == profile.owner_id;
                                 let job = Job {
                                     room: msg.room.clone(),
@@ -794,8 +764,7 @@ async fn run_once(
                                     prompt: mention.prompt,
                                     from_owner,
                                     media: mention.media,
-                                    // 引用只记下"引的是哪一条"，取原文与文件交给 worker：那一步要发
-                                    // HTTP，在这条读循环里 await 会把心跳、取消、审批一起卡住。
+                                    // A quote only records its target; the worker fetches, since HTTP in the WS loop stalls the heartbeat.
                                     quote: msg.reply_to.clone(),
                                     cap_mb: room_caps
                                         .get(&msg.room)
@@ -804,9 +773,9 @@ async fn run_once(
                                     last_seq: msg.seq,
                                 };
 
-                                // 斜杠命令先拦：这是配置操作，批了也会被 worker 拒，白问一次。
+                                // Intercept slash commands first: they are config ops the worker rejects anyway, so approving is wasted.
                                 if !from_owner && job.prompt.trim_start().starts_with('/') {
-                                    send_text(out_tx, &msg.room, "只有设备主人能执行配置命令");
+                                    send_text(out_tx, &msg.room, "Only the device owner can run config commands");
                                     continue;
                                 }
 
@@ -816,21 +785,21 @@ async fn run_once(
                                     send_text(
                                         out_tx,
                                         &msg.room,
-                                        &format!("{}，我只听主人的。", msg.sender_name),
+                                        &format!("{}, I only take orders from my owner.", msg.sender_name),
                                     );
                                 } else if calls.is_remembered(&msg.room, &msg.sender_id) {
-                                    // 一小时内已经允许过这个人。
+                                    // This person was already allowed within the hour.
                                     let _ = jobs.send(job);
                                 } else {
                                     request_call(out_tx, jobs, calls, profile, &msg, handle, job);
                                 }
                             }
                             Body::RoomUpdated(u) => {
-                                // 房主刚把上限调了，下一条消息就该按新数清 inbox。
+                                // The owner just changed the cap, so the next message clears the inbox by the new number.
                                 room_caps.insert(u.room.id.clone(), u.room.max_storage_mb);
-                                // 房间名可能刚改过，也可能这是个新建的房间。
+                                // The room name may have just changed, or this is a newly created room.
                                 room_names.insert(u.room.id.clone(), u.room.name.clone());
-                                // 房间里我的别名可能被改了，也可能刚被拉进一个新房间。
+                                // My alias in the room may have changed, or I was just added to a new room.
                                 match u.room.agents.iter().find(|a| {
                                     a.owner_id == profile.owner_id && a.id == profile.agent_id
                                 }) {
@@ -840,7 +809,7 @@ async fn run_once(
                                             .is_none();
                                         if is_new {
                                             println!(
-                                                "新房间「{}」，我在里面的名字是 @{}",
+                                                "New room '{}', my name there is @{}",
                                                 u.room.name, a.handle
                                             );
                                         }
@@ -853,10 +822,10 @@ async fn run_once(
                             Body::RoomRemoved(r) => {
                                 room_handles.remove(&r.room);
                                 room_caps.remove(&r.room);
-                                println!("房间 {} 对我已不可用（{:?}）", r.room, r.reason);
+                                println!("Room {} is no longer available to me ({:?})", r.room, r.reason);
                             }
                             Body::Error(e) => {
-                                eprintln!("服务端错误：{:?} {}", e.code, e.message);
+                                eprintln!("Server error: {:?} {}", e.code, e.message);
                             }
                             _ => {}
                         }
@@ -869,8 +838,7 @@ async fn run_once(
     }
 }
 
-/// 一条消息里可能同时点名多个 Agent。**所有** `@handle` 都要从句子里剔除，
-/// 只剩"这台机器该做什么"；否则 `@a @b 一起看下` 会让 b 收到一句带 `@a` 的指令。
+/// Strip all @handles so only this machine's task remains; a message can name several agents at once.
 fn split_mentions(text: &str) -> (Vec<String>, String) {
     let chars: Vec<char> = text.chars().collect();
     let mut mentions = Vec::new();
@@ -897,20 +865,15 @@ fn split_mentions(text: &str) -> (Vec<String>, String) {
     (mentions, rest.trim().to_string())
 }
 
-/// 一条消息要不要这台机器干活，要的话做什么。
+/// Whether this message asks this machine to work, and if so what to do.
 struct Mention {
-    /// 剔掉所有 `@handle` 之后剩下的那句——这才是"这台机器该做什么"。
+    /// What remains after stripping all @handles: the actual instruction for this machine.
     prompt: String,
-    /// 这条消息自己带的图（`media` 消息）。引用里的那些是另一条消息的，不在这里。
+    /// Images carried by this message itself (media); those inside a quote belong to another message.
     media: Vec<aoxchat_proto::ArtifactView>,
 }
 
-/// Only human messages addressed to this agent count. Two exclusions matter:
-/// agents never obey agents (that is how a loop starts), and this host never obeys itself.
-///
-/// 带图的消息同样能点名：`media` 是"一句话 + 最多 9 张图"，而 `@` 就写在那句话里。早先这里
-/// 只认 `MessageBody::Text`，于是"@aox 看看这张图"什么都不发生——`Job.media` 也因此一直
-/// 是个只有一处赋值、而那处永远走不到的死字段。
+/// Only addressed human messages count; no agent-to-agent (loops) or self-obey; media can also mention.
 fn mention_of(msg: &aoxchat_proto::Message, handle: &str) -> Option<Mention> {
     if msg.sender_kind != aoxchat_proto::SenderKind::User {
         return None;
@@ -924,7 +887,7 @@ fn mention_of(msg: &aoxchat_proto::Message, handle: &str) -> Option<Mention> {
     if !mentions.iter().any(|m| m == handle) {
         return None;
     }
-    // 只点名不写字 = 没有指令。光有图也一样：图是宾语，动词还是得人说。
+    // A mention with no text is no instruction; images alone are the same (an image is the object, not the verb).
     if rest.is_empty() {
         None
     } else {
@@ -932,7 +895,7 @@ fn mention_of(msg: &aoxchat_proto::Message, handle: &str) -> Option<Mention> {
     }
 }
 
-/// 按**字符**截断，不是按字节：中文按字节切会切出半个字。
+/// Truncate by characters, not bytes, so multibyte text is never split in half.
 fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max).collect();
     if s.chars().count() > max {
@@ -941,10 +904,7 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// 别人要调用这台机器：发一张授权卡给主人的手机，然后在**独立任务**里等结果。
-///
-/// 不能在这里 `await`：这条分支跑在 WS 读循环里，等两分钟不读 socket，心跳、取消、审批全部
-/// 停摆，连接会被服务端判死。所以这里只登记 + 发包，等待交给 `tokio::spawn`。
+/// Send an approval card, then wait in a tokio::spawn task; awaiting in the WS read loop would stall it.
 fn request_call(
     out: &mpsc::UnboundedSender<Frame>,
     jobs: &mpsc::UnboundedSender<Job>,
@@ -973,11 +933,11 @@ fn request_call(
     );
     let _ = out.send(frame);
 
-    // 终端里也要看得见、点得动：GUI 和手机会弹卡，CLI 用户只有这一行字。
+    // Make it visible and clickable in a terminal too: GUI/phone show a card, a CLI user has only this line.
     let short: String = id.chars().take(6).collect();
-    println!("\n[授权] {} 想调用 @{}", msg.sender_name, handle);
-    println!("       内容：{}", truncate(&job.prompt, 60));
-    println!("       允许 allow {short} ｜ 本小时 allow1h {short} ｜ 拒绝 deny {short}");
+    println!("\n[auth] {} wants to call @{}", msg.sender_name, handle);
+    println!("       content: {}", truncate(&job.prompt, 60));
+    println!("       allow {short} | allow1h {short} (this hour) | deny {short}");
 
     let out2 = out.clone();
     let jobs2 = jobs.clone();
@@ -986,9 +946,7 @@ fn request_call(
     tokio::spawn(async move {
         match tokio::time::timeout(calls::TIMEOUT, rx).await {
             Ok(Ok(true)) => {
-                // 把结论也发回服务端：GUI 在本地点的"允许"服务端并不知道，登记项得清掉，
-                // 否则手机上的卡片会一直挂到超时。手机点的则由服务端先处理，这里会收到
-                // not_found，无害。
+                // Also report local approval to the server so the phone's pending call card clears instead of timing out.
                 let decided = Frame::in_room(
                     Frame::new(
                         frame_id("f"),
@@ -1002,27 +960,24 @@ fn request_call(
                     room.clone(),
                 );
                 let _ = out2.send(decided);
-                // 主人同意了，这才真正进队列。
+                // Enqueue the job only after the owner has actually approved it.
                 let _ = jobs2.send(job);
             }
-            Ok(Ok(false)) => send_text(&out2, &room, "主人没有同意这次调用。"),
-            Ok(Err(_)) => send_text(&out2, &room, "授权请求已失效。"),
-            Err(_) => send_text(&out2, &room, "等了两分钟没有回应，已取消。"),
+            Ok(Ok(false)) => send_text(&out2, &room, "The owner did not approve this call."),
+            Ok(Err(_)) => send_text(&out2, &room, "The authorization request has expired."),
+            Err(_) => send_text(&out2, &room, "No response after two minutes, cancelled."),
         }
         gate.forget(&id);
     });
 }
 
-/// CLI 里的授权入口：`serve` 跑在前台，stdin 一直空着，正好用来敲 allow / deny。
-///
-/// GUI 和后台进程没有交互终端（`is_terminal()` 为假），直接不启动。这一点很关键：读不到
-/// stdin 时绝不能把一个阻塞循环挂在那里，否则整个授权流程会被它拖死。
+/// CLI approval loop over stdin; started only with a real terminal so a blocking read never stalls authorization.
 fn spawn_stdin_control(calls: Arc<CallGate>) {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return;
     }
-    println!("（别人要调用这台机器时，会打印一行 [授权]；输入 allow / allow1h / deny + 前 6 位 id 即可）\n");
+    println!("(When someone wants to call this machine, an [auth] line is printed; enter allow / allow1h / deny + the first 6 chars of the id)\n");
     tokio::task::spawn_blocking(move || {
         use std::io::BufRead;
         let stdin = std::io::stdin();
@@ -1043,19 +998,19 @@ fn spawn_stdin_control(calls: Arc<CallGate>) {
                 _ => continue,
             };
             match calls.resolve_prefix(prefix, allow, remember) {
-                Ok(id) => println!("  已处理 {id}"),
+                Ok(id) => println!("  handled {id}"),
                 Err(calls::PrefixErr::Ambiguous) => {
-                    println!("  前缀 {prefix} 不唯一，请多输几位")
+                    println!("  prefix {prefix} is ambiguous, enter more characters")
                 }
                 Err(calls::PrefixErr::NotFound) => {
-                    println!("  没有这条待批请求（可能已经超时）")
+                    println!("  no such pending request (it may have timed out)")
                 }
             }
         }
     });
 }
 
-/// 告诉服务端这台机器是不是在干活。服务端据此向所有相关房间推 presence。
+/// Tell the server whether this machine is busy so it can push presence to all relevant rooms.
 fn send_agent_busy(out: &mpsc::UnboundedSender<Frame>, agent_id: &str, room: &str, busy: bool) {
     let frame = Frame::in_room(
         Frame::new(
@@ -1071,8 +1026,7 @@ fn send_agent_busy(out: &mpsc::UnboundedSender<Frame>, agent_id: &str, room: &st
     let _ = out.send(frame);
 }
 
-/// 任务结束时把"占用中"撤掉。用 Drop 而不是在每个出口手写，是因为 run_turn 的返回路径太多
-/// （完成、报错、取消、panic），漏一条就会永远显示占用。
+/// Clear the busy flag on turn end via Drop, covering done, error, cancel, and panic paths.
 struct BusyGuard {
     out: mpsc::UnboundedSender<Frame>,
     agent_id: String,
@@ -1085,14 +1039,7 @@ impl Drop for BusyGuard {
     }
 }
 
-/// 把一条消息里的附件拉到本地，分成两组：能直接喂给模型的，和只落盘的。
-///
-/// 落在 `.aox/remote/inbox/<room>/`：一次会话一个目录，整目录清理即可，也不会和产物目录混。
-/// 下载走能力链接、不带 Authorization——链接本身就是凭证，和服务端 `download` 的约定一致。
-///
-/// **只有图片进附件通道**。非图片走 `to_content` 会被 base64 成 `{"type":"file"}` 塞进请求体，
-/// 而多数端点根本不认这个块，整轮直接 400——"发个 zip 让它跑一下"本来也不需要它看见字节，
-/// 给它路径就够了。顺带解决了大小：附件上限 36 MiB（48 MiB 请求体倒推），落盘没有这个限制。
+/// Stage attachments in a per-room inbox; only images go to the model, others are given by path to avoid 400s.
 async fn download_media(
     http: &reqwest::Client,
     profile: &RemoteProfile,
@@ -1108,30 +1055,30 @@ async fn download_media(
 
     let mut out = Vec::new();
     let mut loose = Vec::new();
-    // 服务端已经限过 9 个，这里再兜一次：真收到 100 条也不会把机器拖死。
+    // Re-check the attachment count locally as a backstop to the server's cap, so a flood cannot stall the machine.
     for a in items.iter().take(9) {
         let url = format!("{}{}", profile.server.trim_end_matches('/'), a.url);
         let resp = match http.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                eprintln!("拉取「{}」失败：HTTP {}", a.name, r.status());
+                eprintln!("Failed to fetch '{}': HTTP {}", a.name, r.status());
                 continue;
             }
             Err(e) => {
-                eprintln!("拉取「{}」失败：{e}", a.name);
+                eprintln!("Failed to fetch '{}': {e}", a.name);
                 continue;
             }
         };
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("读取「{}」失败：{e}", a.name);
+                eprintln!("Failed to read '{}': {e}", a.name);
                 continue;
             }
         };
         let path = dir.join(format!("{}_{}", short_id(&a.id), safe_file_name(&a.name)));
         if let Err(e) = tokio::fs::write(&path, &bytes).await {
-            eprintln!("写入「{}」失败：{e}", a.name);
+            eprintln!("Failed to write '{}': {e}", a.name);
             continue;
         }
         if !a.mime.starts_with("image/") {
@@ -1139,12 +1086,11 @@ async fn download_media(
             continue;
         }
         match Attachment::probe(&path) {
-            // probe 只是校验（大小上限、是不是目录），真正的解析由 run_turn 自己做；
-            // 这里提前拦一次，日志能落到具体文件名上，而不是一行"附件加载失败"。
+            // Pre-probe attachments so failures log a filename; parsing still happens in run_turn.
             Ok(_) => out.push(path),
-            // 图片但太大：降级成只落盘，比悄悄丢掉强——模型至少知道有这张图、在哪。
+            // Oversized images are saved to disk instead of dropped, so the model still knows the image exists and where.
             Err(reason) => {
-                eprintln!("「{}」不能作为附件，改为只落盘：{reason}", a.name);
+                eprintln!("'{}' cannot be used as an attachment, saved to disk only: {reason}", a.name);
                 loose.push(Loose { name: a.name.clone(), path, size: bytes.len() as u64 });
             }
         }
@@ -1154,23 +1100,20 @@ async fn download_media(
     (out, loose)
 }
 
-/// 一个只落了盘、没进附件通道的文件。路径要写进 prompt 交给模型。
+/// A file saved to disk but not attached to the model; its path is written into the prompt.
 struct Loose {
     name: String,
     path: std::path::PathBuf,
     size: u64,
 }
 
-/// 只落盘的那些文件，写进 prompt 的一段。
-///
-/// 措辞和 `context::prompt_block` 的文件清单对齐：先说清"这是别人发来的"，再给路径。
-/// 不写"请阅读"——读不读是模型自己的判断，我们只负责让它知道东西在哪、多大。
+/// Prompt block listing disk-only files: note they were sent by others and give paths, without ordering a read.
 fn media_block(files: &[Loose]) -> String {
-    let mut s = String::from("\n\n[随消息发来的文件]\n");
-    s.push_str("已拉到本机，路径可以直接用：\n");
+    let mut s = String::from("\n\n[Files sent with the message]\n");
+    s.push_str("Downloaded to this machine, paths can be used directly:\n");
     for f in files {
         s.push_str(&format!(
-            "  {}（{}，{}）\n",
+            "  {} ({}, {})\n",
             f.path.display(),
             context::size_text(f.size),
             f.name
@@ -1183,7 +1126,7 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-/// 文件名里只留安全字符。服务端已经清洗过一遍，这里是第二道：`..` 之类不能跨出目录。
+/// Keep only safe characters in filenames as a second pass, so .. cannot escape the inbox directory.
 fn safe_file_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("file");
     let cleaned: String = base
@@ -1204,10 +1147,7 @@ fn safe_file_name(name: &str) -> String {
     }
 }
 
-/// inbox 只增不减会吃满磁盘。超过这个房间的上限就按修改时间从旧到新删。
-///
-/// `cap_mb` 来自房主在房间设置里设的数（0 = 不限），不是宿主自己的常量。这里删的是**本机
-/// 的副本**，不影响服务端：手机再要这张图会重新下，代价是流量而不是数据丢失。
+/// Delete oldest inbox files by mtime at the room's size cap; only local copies go, server data stays.
 async fn prune_inbox(dir: &std::path::Path, cap_mb: u32) {
     if cap_mb == 0 {
         return;
@@ -1244,8 +1184,7 @@ async fn prune_inbox(dir: &std::path::Path, cap_mb: u32) {
     }
 }
 
-/// 一个房间的执行上下文。`/cwd` 会把它整体换掉（新的 Runtime + 新的 Agent），
-/// 所以运行时不能是 worker 的一个参数，而要是每个房间自己的东西。
+/// A room's own Runtime and Agent, swapped by /cwd; kept per room, not passed as a worker argument.
 struct RoomCtx {
     rt: Arc<Runtime>,
     agent: Agent,
@@ -1274,14 +1213,12 @@ async fn worker(
         }
 
         if !rooms.contains_key(&job.room) {
-            // 一个群一条会话：登记表里有、文件还在就接上（消息、token 账本、workplace 全恢复）；
-            // 没有就开新的一段。以前每次重启都从零开始，列表里还多一排看不出是谁的文件。
+            // One conversation per group: resume the registered session if its file still exists, else start a new one.
             let agent = room_agent(&base, &profile, &job.room, &job.room_name);
             rooms.insert(job.room.clone(), RoomCtx { rt: base.clone(), agent });
         }
 
-        // 从这一刻起这台机器是"占用中"：别的群再发 `@` 要看得见，不然只会以为没响应。
-        // guard 在离开作用域时自动发 false，取消/报错/提前 return 都不会漏。
+        // Mark the machine busy so other groups see it; a guard clears it on scope exit even on cancel or error.
         send_agent_busy(&out, &profile.agent_id, &job.room, true);
         let _busy = BusyGuard {
             out: out.clone(),
@@ -1289,11 +1226,10 @@ async fn worker(
             room: job.room.clone(),
         };
 
-        // 取出再放回：run_turn 要 &mut，而 await 期间不能一直借着 map。
+        // Take the room context out of the map for run_turn (&mut); the borrow cannot cross an await.
         let mut ctx = rooms.remove(&job.room).expect("just inserted");
 
-        // 图先落到本地：模型只能读路径，读不了 url。放在 worker 里做而不是 WS 循环，
-        // 是为了不让下载把心跳和取消卡住。
+        // Save images locally in the worker, not the WS loop, so downloads never block heartbeat or cancellation.
         let meta = TaskMeta {
             agent_id: profile.agent_id.clone(),
             agent_handle: profile.agent_handle.clone(),
@@ -1301,8 +1237,7 @@ async fn worker(
             prompt: job.prompt.clone(),
             msg_id: job.msg_id.clone(),
         };
-        // 先建 ui 再取物：取的过程要能推到手机上（"正在取引用的内容…"），否则一个大文件要等
-        // 下载完，手机才知道这一轮已经开始了。
+        // Build the UI before fetching so the phone shows progress during a long download, not only once it finishes.
         let mut ui = RemoteUi::new(out.clone(), job.room.clone(), approvals.clone(), meta);
 
         let (mut attachments, loose) = if job.media.is_empty() {
@@ -1311,16 +1246,15 @@ async fn worker(
             download_media(&http, &profile, &root, &job.room, &job.media, job.cap_mb).await
         };
 
-        // 引用取物：一次 HTTP 取原文，再按类型把文件搬下来（见 `context.rs`）。
+        // Fetch quoted content with one HTTP request, then download its files by type.
         let mut prompt = job.prompt.clone();
-        // 只落盘的文件挂在 prompt 末尾：指令在前、清单在后，模型读完要干什么再看到有什么可用。
+        // Append disk-only files at the end of the prompt so the model reads the instruction before the file list.
         if !loose.is_empty() {
             prompt.push_str(&media_block(&loose));
         }
         if let Some(reply) = &job.quote {
-            ui.note("正在取引用的内容…");
-            // 要跑的东西必须落在**工作区**里：边界只放行区内的写与执行。`/cwd` 之后工作区
-            // 可能不在 app root 下，所以两个目录要分开算。
+            ui.note("Fetching quoted content...");
+            // Executables must sit in the workspace (only in-zone writes/runs); compute it separately from app root.
             let ws = ctx
                 .rt
                 .config
@@ -1342,32 +1276,31 @@ async fn worker(
             for n in &quote.notes {
                 ui.note(n.clone());
             }
-            // 一样都没取到就在房间里说一声：否则"发了没反应"和"它根本没看到"分不出来。
+            // Say so in the room when nothing was fetched, otherwise silence and not-seen look identical to the user.
             if quote.is_empty() {
                 let why = quote
                     .notes
                     .first()
                     .cloned()
-                    .unwrap_or_else(|| "引用里没有可取的内容".to_string());
-                let text = format!("引用的内容没取到：{why}");
+                    .unwrap_or_else(|| "Nothing to fetch from the quote".to_string());
+                let text = format!("Could not fetch quoted content: {why}");
                 send_text(&out, &job.room, &outbound(&keys, &job.room, &text));
             }
             ui.set_digest(context::digest(&quote));
             attachments.extend(quote.attachments());
-            // 引用块拼在指令**前面**：模型先知道"这是什么"，再知道"要干什么"。
+            // Prepend the quote block before the instruction so the model first learns what it is, then what to do.
             prompt.insert_str(0, &context::prompt_block(&quote));
         }
 
         if !attachments.is_empty() {
-            println!("附件 {} 个", attachments.len());
+            println!("{} attachment(s)", attachments.len());
         }
 
         let started = std::time::Instant::now();
-        println!("开始执行…");
-        // 取消 = drop 掉这个 future + 关掉恢复轮次（和 GUI 的停止按钮同一条路径）。
+        println!("Starting...");
+        // Cancellation drops this future and closes the recovery turn, the same path as the GUI stop button.
         let mut cancel_rx = cancels.register(ui.task_id());
-        // `room_history` 只在这一轮里有效：设进去、跑完清掉。**清掉是必要的**——本地 GUI 的
-        // 对话和远程 worker 共用同一个 Runtime，不清的话那边也能翻到这个房间。
+        // Set room_history for this turn and clear it afterward, since local GUI and remote worker share one Runtime.
         *room_now.write().await =
             Some(tool::Current::new(job.room.clone(), job.last_seq));
         let outcome = tokio::select! {
@@ -1378,41 +1311,32 @@ async fn worker(
         match outcome {
             None => {
                 let _ = ctx.rt.recovery.abort_turn();
-                println!("已停止（{:.1}s）：手机点了停止", started.elapsed().as_secs_f32());
-                send_text(&out, &job.room, &outbound(&keys, &job.room, "已停止。"));
+                println!("Stopped ({:.1}s): the phone tapped stop", started.elapsed().as_secs_f32());
+                send_text(&out, &job.room, &outbound(&keys, &job.room, "Stopped."));
                 let task = ui.snapshot(aoxchat_proto::TaskStatus::Cancelled, None);
                 if let Err(e) = upload_task(&profile, &job.room, &task).await {
-                    println!("  ↑ 任务记录写入失败：{e:#}");
+                    println!("  ↑ failed to write task record: {e:#}");
                 }
             }
             Some(Ok(())) => {
                 let text = ui.take_final_text();
-                println!("执行结束（{:.1}s），回复 {} 字", started.elapsed().as_secs_f32(), text.chars().count());
+                println!("Finished ({:.1}s), replied with {} chars", started.elapsed().as_secs_f32(), text.chars().count());
                 if !text.trim().is_empty() {
                     send_text(&out, &job.room, &outbound(&keys, &job.room, &text));
                 }
-                // 产物在回复之后上传：先让人看到结论，再传文件。文件此刻是**暂存副本**，
-                // 原件可能已经被这一轮删掉了。
-                //
-                // **一轮只发一条消息**（最多 9 个附件，超出分条）。以前是一个文件一条消息，
-                // 产出 5 个文件就是 5 张卡竖着排满一屏，而且"引用这一轮的全部产物"无从谈起
-                // ——`reply_to` 是单值。归组之后，折叠、引用、取物三件事同时成立。
-                //
-                // 顺序是"先传文件、再写任务快照"：快照里要带这一轮的产物清单，引用任务卡
-                // 才能取回整轮文件。快照本身是一条 HTTP 请求，落库顺序仍在文件之前。
+                // After the reply, upload staged artifacts as one grouped message per turn, then write a snapshot listing them.
                 let files = ui.take_artifacts();
                 let mut views = Vec::new();
                 for file in files {
                     match defer_artifact(&profile, &job.room, &file.name, &file.path).await {
                         Ok(view) => {
-                            println!("  ↑ 已上传产物 {}", view.name);
+                            println!("  ↑ uploaded artifact {}", view.name);
                             views.push(view);
                         }
                         Err(e) => {
-                            println!("  ↑ 产物上传失败 {}：{e:#}", file.path.display());
-                            // 手机上看不到宿主的标准输出。文件没送到就得说出来，
-                            // 否则模型那句"已经发到房间里了"就是唯一的说法，而它是错的。
-                            let msg = format!("产物「{}」没传上去：{e}", file.name);
+                            println!("  ↑ artifact upload failed {}: {e:#}", file.path.display());
+                            // Report failed uploads to the phone (no host stdout visible), correcting a false 'sent to room' claim.
+                            let msg = format!("Artifact '{}' was not uploaded: {e}", file.name);
                             send_text(&out, &job.room, &outbound(&keys, &job.room, &msg));
                         }
                     }
@@ -1420,7 +1344,7 @@ async fn worker(
                 ui.set_artifacts(views.clone());
                 let task = ui.snapshot(aoxchat_proto::TaskStatus::Done, None);
                 if let Err(e) = upload_task(&profile, &job.room, &task).await {
-                    println!("  ↑ 任务记录写入失败：{e:#}");
+                    println!("  ↑ failed to write task record: {e:#}");
                 }
                 for chunk in views.chunks(9) {
                     send_media(&out, &job.room, "", chunk.to_vec());
@@ -1428,24 +1352,23 @@ async fn worker(
             }
             Some(Err(e)) => {
                 let msg = format!("{e:#}");
-                println!("执行失败（{:.1}s）：{msg}", started.elapsed().as_secs_f32());
-                send_text(&out, &job.room, &outbound(&keys, &job.room, &format!("执行失败：{msg}")));
+                println!("Execution failed ({:.1}s): {msg}", started.elapsed().as_secs_f32());
+                send_text(&out, &job.room, &outbound(&keys, &job.room, &format!("Execution failed: {msg}")));
                 let task = ui.snapshot(aoxchat_proto::TaskStatus::Failed, Some(msg));
                 if let Err(e) = upload_task(&profile, &job.room, &task).await {
-                    println!("  ↑ 任务记录写入失败：{e:#}");
+                    println!("  ↑ failed to write task record: {e:#}");
                 }
             }
         }
 
         cancels.finish(ui.task_id());
 
-        // 这一轮之后把"这个群对应哪条会话"记下来，下次启动才接得上。
-        // 只在 id 变了时写盘：一条会话聊一百轮也只落一次，`remote.json` 不会被每轮刷一遍。
+        // Persist the group-to-session id for restart resume, writing only on change to avoid per-turn rewrites.
         let conv_id = ctx.agent.history_id().map(str::to_string);
         if let Some(id) = conv_id {
             let known = profile.rooms.get(&job.room).map(|r| r.conversation.as_str());
             if known != Some(id.as_str()) {
-                // 标题只在第一次（或换了一段之后）写一次：`远端 · 前端组`。
+                // Write the display title (Remote plus group name) only once, on the first turn of a session.
                 let name = room_title(&job.room_name);
                 let _ = ctx.agent.rename_conversation(&id, Some(&name));
                 profile.rooms.insert(
@@ -1458,7 +1381,7 @@ async fn worker(
                 );
                 if let Err(e) = remember_room(&root, &profile.id, &job.room, &profile.rooms[&job.room])
                 {
-                    println!("  ↑ 房间会话登记失败：{e:#}");
+                    println!("  ↑ failed to register room session: {e:#}");
                 }
             }
         }
@@ -1468,10 +1391,7 @@ async fn worker(
 
 
 
-/// 给一个房间建 Agent：带上出生标记（远端 · 房间名），并尽量接上这个群上一段会话。
-///
-/// 两处调用（worker 首次遇到某个群、`/cwd` 换了工作空间重建运行时）。**必须都走这里**：
-/// 漏掉 `set_birth` 的那条路会以 `local` 出生，会话就落进「本机」组，列表里再也认不出它是谁。
+/// Create a room Agent with a remote birth marker and resume its session; all call sites must use this helper.
 fn room_agent(
     base: &Arc<Runtime>,
     profile: &RemoteProfile,
@@ -1482,14 +1402,14 @@ fn room_agent(
     agent.set_birth(crate::store::Birth::remote(room, room_name));
     if let Some(rc) = profile.rooms.get(room) {
         if agent.resume(&rc.conversation).is_err() {
-            // 文件被删了（手机上清过、或换了台机器）：当新的一段，别让这一轮卡住。
+            // If the session file is gone (cleared on phone or another machine), start a new segment instead of stalling.
             agent.new_conversation();
         }
     }
     agent
 }
 
-/// 一个群在会话列表里叫什么：`远端 · 前端组`。没有房间名就只写 `远端`。
+/// Display name for a group in the session list, falling back to just Remote when no room name exists.
 fn room_title(room_name: &str) -> String {
     let tag = crate::i18n::t("Remote");
     if room_name.trim().is_empty() {
@@ -1499,10 +1419,7 @@ fn room_title(room_name: &str) -> String {
     }
 }
 
-/// 把"这个群 → 这条会话"写回 `remote.json`。
-///
-/// 整表 load-modify-save：`Book` 是这份文件唯一的结构化视图，直接改内存里那份 `profile` 不落盘，
-/// 重启就白记。配对/改名是人在设置页偶尔做的事，和这里撞车的概率远低于维护两套写法的成本。
+/// Save the group-to-session mapping to remote.json via load-modify-save, since Book is its only structured view.
 fn remember_room(
     root: &Path,
     profile_id: &str,
@@ -1517,8 +1434,7 @@ fn remember_room(
     Ok(())
 }
 
-/// 斜杠命令：改模型、换工作空间。只有设备主人能执行——群里的协作者可以下指令，
-/// 但不能替你改这台机器的执行环境。
+/// Slash commands to change model/workspace; only the device owner may run them, not group collaborators.
 async fn handle_command(
     job: &Job,
     rooms: &mut HashMap<String, RoomCtx>,
@@ -1535,7 +1451,7 @@ async fn handle_command(
     let arg = it.next().unwrap_or("").trim();
 
     if !job.from_owner {
-        send_text(out, &job.room, "只有设备主人能执行配置命令");
+        send_text(out, &job.room, "Only the device owner can run config commands");
         return;
     }
 
@@ -1546,11 +1462,11 @@ async fn handle_command(
                 let active = book.active.clone().unwrap_or_default();
                 let cur = book
                     .active_record()
-                    .map(|r| format!("{}（{}）", r.model, r.id))
-                    .unwrap_or_else(|| "未设置".into());
-                let mut text = format!("当前模型：{cur}");
+                    .map(|r| format!("{} ({})", r.model, r.id))
+                    .unwrap_or_else(|| "not set".into());
+                let mut text = format!("Current model: {cur}");
                 if !book.models.is_empty() {
-                    text.push_str("\n可用：");
+                    text.push_str("\nAvailable:");
                     for m in &book.models {
                         text.push_str(&format!(
                             "\n{} {}",
@@ -1562,7 +1478,7 @@ async fn handle_command(
                 send_text(out, &job.room, &text);
             } else if book.set_active(arg) {
                 if let Err(e) = book.save(root) {
-                    send_text(out, &job.room, &format!("保存失败：{e:#}"));
+                    send_text(out, &job.room, &format!("Save failed: {e:#}"));
                     return;
                 }
                 if let Some(cfg) = book.active_config() {
@@ -1571,27 +1487,27 @@ async fn handle_command(
                     for ctx in rooms.values() {
                         let _ = ctx.rt.provider.apply(cfg.clone());
                     }
-                    send_text(out, &job.room, &format!("已切换到 {model}（{arg}）"));
+                    send_text(out, &job.room, &format!("Switched to {model} ({arg})"));
                 }
             } else {
-                send_text(out, &job.room, &format!("没有这个模型：{arg}"));
+                send_text(out, &job.room, &format!("No such model: {arg}"));
             }
         }
         "/key" => {
             if arg.is_empty() || arg.eq_ignore_ascii_case("off") {
                 match keys.clear(&job.room) {
-                    Ok(true) => send_text(out, &job.room, "本房间已关闭加密（历史密文将无法再解）。"),
-                    Ok(false) => send_text(out, &job.room, "本房间本来就没有设置口令。"),
-                    Err(e) => send_text(out, &job.room, &format!("清除失败：{e:#}")),
+                    Ok(true) => send_text(out, &job.room, "Encryption is off for this room (past ciphertext can no longer be decrypted)."),
+                    Ok(false) => send_text(out, &job.room, "No passphrase was set for this room anyway."),
+                    Err(e) => send_text(out, &job.room, &format!("Clear failed: {e:#}")),
                 }
             } else {
                 match keys.set(&job.room, arg) {
                     Ok(()) => send_text(
                         out,
                         &job.room,
-                        "本房间已启用加密。\n⚠ 手机端还没做口令输入：启用后手机上只会看到一串 enc:v1: 开头的密文。\n口令不上网，忘了我这边也解不开。",
+                        "Encryption is on for this room.\n⚠ The phone has no passphrase input yet: after enabling, the phone will only see ciphertext starting with enc:v1:.\nThe passphrase never goes online; if you forget it, I cannot decrypt it either.",
                     ),
-                    Err(e) => send_text(out, &job.room, &format!("保存失败：{e:#}")),
+                    Err(e) => send_text(out, &job.room, &format!("Save failed: {e:#}")),
                 }
             }
         }
@@ -1606,13 +1522,13 @@ async fn handle_command(
                 send_text(
                     out,
                     &job.room,
-                    &format!("当前工作空间：{cur}\n用法：/cwd D:\\work\\proj"),
+                    &format!("Current workspace: {cur}\nUsage: /cwd D:\\work\\proj"),
                 );
                 return;
             }
             let path = PathBuf::from(arg);
             if !path.is_dir() {
-                send_text(out, &job.room, &format!("目录不存在：{}", path.display()));
+                send_text(out, &job.room, &format!("Directory does not exist: {}", path.display()));
                 return;
             }
             let mut cfg = base.config.clone();
@@ -1620,29 +1536,28 @@ async fn handle_command(
             cfg.workplace.root = Some(path.to_string_lossy().to_string());
             match crate::bootstrap::build(cfg, root.to_path_buf(), plugins_dir.to_path_buf()).await {
                 Ok(new_rt) => {
-                    // 换了工作目录不等于换了话题：接着这个群上一段会话聊。
+                    // Changing the working directory does not change the topic: keep talking in the group's existing session.
                     let agent = room_agent(&new_rt, profile, &job.room, &job.room_name);
                     rooms.insert(job.room.clone(), RoomCtx { rt: new_rt, agent });
                     send_text(
                         out,
                         &job.room,
                         &format!(
-                            "工作空间已切到 {}\n本房间的下一轮从新目录开始（模型沿用当前设置）",
+                            "Workspace switched to {}\nThis room's next turn starts from the new directory (model keeps the current setting)",
                             path.display()
                         ),
                     );
                 }
-                Err(e) => send_text(out, &job.room, &format!("切换失败：{e:#}")),
+                Err(e) => send_text(out, &job.room, &format!("Switch failed: {e:#}")),
             }
         }
         "/new" => {
-            // 一段对话聊满了、或者换了话题：手机上说一声，下一句从新的一段开始。
-            // 同时把登记表里这条删掉——否则下一次重启会又 resume 回刚才那段。
+            // On a full or changed segment, start fresh on the phone and drop its entry so restarts do not resume it.
             rooms.remove(&job.room);
             let mut book = match Book::load(root) {
                 Ok(b) => b,
                 Err(e) => {
-                    send_text(out, &job.room, &format!("会话登记读取失败：{e:#}"));
+                    send_text(out, &job.room, &format!("Failed to read session registry: {e:#}"));
                     return;
                 }
             };
@@ -1650,7 +1565,7 @@ async fn handle_command(
             if let Some(p) = book.pairings.iter_mut().find(|p| p.id == profile.id) {
                 cleared = p.rooms.remove(&job.room).is_some();
                 if let Err(e) = book.save(root) {
-                    send_text(out, &job.room, &format!("保存失败：{e:#}"));
+                    send_text(out, &job.room, &format!("Save failed: {e:#}"));
                     return;
                 }
             }
@@ -1658,22 +1573,22 @@ async fn handle_command(
                 out,
                 &job.room,
                 if cleared {
-                    "好，下一句开新的一段（上一段还在本地历史里）"
+                    "OK, the next message starts a new segment (the previous one is still in local history)"
                 } else {
-                    "好，下一句开新的一段"
+                    "OK, the next message starts a new segment"
                 },
             );
         }
         _ => send_text(
             out,
             &job.room,
-            "可用命令：\n/model [id]  查看或切换模型\n/cwd [路径]   查看或切换工作空间\n/new          下一句开新的一段",
+            "Available commands:\n/model [id]  view or switch model\n/cwd [path]   view or switch workspace\n/new          start a new segment with the next message",
         ),
     }
     let _ = profile; // 目前命令只用得到 owner 判定，保留参数便于后续加 /status
 }
 
-/// 出站：本房间有口令就加密，否则原样发。加密只是字符串变换，服务端不需要知道。
+/// Outbound: encrypt text if the room has a passphrase, else send plain; a transform the server ignores.
 fn outbound(keys: &RoomKeys, room: &str, text: &str) -> String {
     match keys.get(room) {
         Some(k) => crypto::encrypt(&k, text),
@@ -1681,11 +1596,7 @@ fn outbound(keys: &RoomKeys, room: &str, text: &str) -> String {
     }
 }
 
-/// inbound：密文必须能解开才处理。解不开就跳过并说明原因——
-/// 把密文当普通文本喂给模型，等于让它对着一串 base64 编故事。
-///
-/// `media` 消息里的那句话同样会被加密（加密只作用于 `text` 字段，图片是字节）。早先这里只
-/// 看 `Text`，加密房间里的图片消息带着一句密文进上下文。
+/// Inbound: process only decryptable text, skip the rest with a reason; decrypt media captions, not just Text.
 fn decrypt_incoming(
     keys: &RoomKeys,
     mut msg: aoxchat_proto::Message,
@@ -1704,15 +1615,15 @@ fn decrypt_incoming(
     Ok(msg)
 }
 
-/// 一段正文的解密。明文原样返回——房间里可能只有一半人设了口令。
+/// Decrypt one text body; return plaintext unchanged since only some members may have set the passphrase.
 fn open_text(keys: &RoomKeys, room: &str, text: &str) -> std::result::Result<String, String> {
     if !crypto::is_encrypted(text) {
         return Ok(text.to_string());
     }
     let Some(key) = keys.get(room) else {
-        return Err("收到密文，但本机未设置口令（先发 /key <口令>）".to_string());
+        return Err("Received ciphertext, but no passphrase is set on this machine (send /key <passphrase> first)".to_string());
     };
-    crypto::decrypt(&key, text).ok_or_else(|| "口令不对，解不开这条消息".to_string())
+    crypto::decrypt(&key, text).ok_or_else(|| "Wrong passphrase, cannot decrypt this message".to_string())
 }
 
 fn send_text(out: &mpsc::UnboundedSender<Frame>, room: &str, text: &str) {
@@ -1723,8 +1634,7 @@ fn send_text(out: &mpsc::UnboundedSender<Frame>, room: &str, text: &str) {
             Body::MsgSend(MsgSend {
                 client_msg_id: frame_id("c"),
                 body: MessageBody::Text { text: text.to_string() },
-                // 宿主发的是机器人的话，不引用任何人的消息。字段在协议里是
-                // `Option` + `skip_serializing_if`，这里显式写 None 只是为了跟着 crate 走。
+                // Host messages quote nobody; reply_to is None to follow the protocol's Option and skip_serializing_if.
                 reply_to: None,
                 reply_artifact_ids: Vec::new(),
             }),
@@ -1734,7 +1644,7 @@ fn send_text(out: &mpsc::UnboundedSender<Frame>, room: &str, text: &str) {
     let _ = out.send(frame);
 }
 
-/// 与服务端 `MAX_ARTIFACT_BYTES` 对齐。本地先挡一次，省得把 128MB 传上去再被拒。
+/// Match the server's artifact size cap locally to reject oversized files before a wasted upload.
 const MAX_UPLOAD: u64 = 128 * 1024 * 1024;
 
 fn mime_of(name: &str) -> &'static str {
@@ -1757,7 +1667,7 @@ fn mime_of(name: &str) -> &'static str {
     }
 }
 
-/// 一轮结束时的任务快照：写进历史，重开 App 还能看到这次执行做过什么。
+/// A task snapshot written at turn end into history, so reopening the app still shows what the turn did.
 async fn upload_task(
     profile: &RemoteProfile,
     room: &str,
@@ -1776,10 +1686,7 @@ async fn upload_task(
     Ok(())
 }
 
-/// 上传一个文件，但**不发消息**（`?defer=1`），只把产物视图拿回来。
-///
-/// 一轮的产物要归到同一条 `media` 消息里：以前一次请求完成"存 + 发消息"，于是一个文件一条
-/// 消息，五张卡竖着排满一屏；引用也没法覆盖"这一轮的全部产物"。
+/// Upload a file without posting, returning just its artifact view, so a turn's files share one grouped message.
 async fn defer_artifact(
     profile: &RemoteProfile,
     room: &str,
@@ -1788,17 +1695,17 @@ async fn defer_artifact(
 ) -> Result<aoxchat_proto::ArtifactView> {
     let meta = tokio::fs::metadata(path).await?;
     if meta.len() > MAX_UPLOAD {
-        anyhow::bail!("超过 {} MB", MAX_UPLOAD / 1024 / 1024);
+        anyhow::bail!("Exceeds {} MB", MAX_UPLOAD / 1024 / 1024);
     }
     let mut url = reqwest::Url::parse(&format!(
         "{}/api/rooms/{room}/artifacts",
         profile.server.trim_end_matches('/')
     ))?;
-    // 用 Url 的 query_pairs_mut 而不是手拼字符串：中文文件名必须被正确编码。
+    // Use Url query_pairs_mut instead of manual string building so non-ASCII filenames are encoded correctly.
     url.query_pairs_mut()
         .append_pair("name", name)
         .append_pair("mime", mime_of(name))
-        // 服务端按字符串收（`?defer=1` 也行）；这里写 `true` 是它最直白的形态。
+        // Send the defer flag as true, its most direct form even though the server accepts the string too.
         .append_pair("defer", "true");
 
     let bytes = tokio::fs::read(path).await?;
@@ -1817,7 +1724,7 @@ async fn defer_artifact(
     Ok(serde_json::from_str(&text)?)
 }
 
-/// 发一条附件消息。服务端只认 id，其余字段按库里的数据补全。
+/// Send an attachment message; the server only needs the id and fills the rest from its database.
 fn send_media(
     out: &mpsc::UnboundedSender<Frame>,
     room: &str,
@@ -1877,20 +1784,19 @@ mod tests {
         }
     }
 
-    /// 带图的消息同样能点名。早先这里只认 `Text`，"@aox 看看这张图"什么都不发生，
-    /// `Job.media` 也因此一直是个走不到的死字段。
+    /// Media messages can @-mention an Agent too; only Text was checked before, so the media mention never fired.
     #[test]
     fn a_photo_with_a_mention_still_reaches_the_agent() {
         let m = msg(
             SenderKind::User,
-            MessageBody::Media { text: "@aox 看看这张图".into(), artifacts: vec![art()] },
+            MessageBody::Media { text: "@aox look at this picture".into(), artifacts: vec![art()] },
         );
-        let got = mention_of(&m, "aox").expect("带图的消息也该能点名");
-        assert_eq!(got.prompt, "看看这张图");
+        let got = mention_of(&m, "aox").expect("a message with an image should also be able to mention");
+        assert_eq!(got.prompt, "look at this picture");
         assert_eq!(got.media.len(), 1);
     }
 
-    /// 只点名不写字 = 没有指令。光有图也一样：图是宾语，动词还得人说。
+    /// A textless mention, even with an image, is no instruction: the image is the object, a person gives the verb.
     #[test]
     fn a_bare_mention_is_not_an_instruction() {
         assert!(mention_of(&msg(SenderKind::User, MessageBody::Text { text: "@aox".into() }), "aox")
@@ -1902,10 +1808,7 @@ mod tests {
         .is_none());
     }
 
-    /// 只落盘的文件必须出现在 prompt 里。
-    ///
-    /// 原来 `probe` 失败只打一行日志，于是"发了个 100 MB 的包让它跑一下"在模型那边等于
-    /// 没发过——用户看到的是"发了没反应"。
+    /// Ensure disk-only files appear in the prompt; silent probe failures made large files look like no response.
     #[test]
     fn files_that_are_only_saved_on_disk_still_reach_the_prompt() {
         let block = media_block(&[Loose {
@@ -1915,30 +1818,27 @@ mod tests {
         }]);
         assert!(block.contains("/tmp/inbox/build.zip"), "{block}");
         assert!(block.contains("build.zip"), "{block}");
-        // 大小要跟着走：模型得知道该不该整个读进来。
+        // Include the file size in the listing so the model can judge whether to read the whole thing.
         assert!(block.contains("2 KB"), "{block}");
     }
 
-    /// Agent 不听 Agent 的——这是死循环的起点。自己的消息也不算。
+    /// Ignore messages from other Agents (and our own) to avoid feedback loops.
     #[test]
     fn agents_never_obey_agents() {
-        let m = msg(SenderKind::Agent, MessageBody::Text { text: "@aox 去改一下".into() });
+        let m = msg(SenderKind::Agent, MessageBody::Text { text: "@aox go change it".into() });
         assert!(mention_of(&m, "aox").is_none());
     }
 
-    /// 一条消息点名多个 Agent 时，所有 `@` 都要剔掉，只剩"这台机器该做什么"。
+    /// Strip every @ mention when one message names multiple Agents, leaving only the instruction for this machine.
     #[test]
     fn every_mention_is_stripped_from_the_prompt() {
-        let m = msg(SenderKind::User, MessageBody::Text { text: "@aox @other 一起看下".into() });
-        assert_eq!(mention_of(&m, "aox").unwrap().prompt, "一起看下");
-        // 没点到我就不归我管
+        let m = msg(SenderKind::User, MessageBody::Text { text: "@aox @other take a look together".into() });
+        assert_eq!(mention_of(&m, "aox").unwrap().prompt, "take a look together");
+        // If the message does not mention me, it is not my job.
         assert!(mention_of(&m, "aox-b").is_none());
     }
 
-    /// `/remote` 不带参数时看到的那一屏：**先说在不在跑，再说配了没**。
-    ///
-    /// 值得钉住的是"没有 remote.json 时不能说成出错"——新用户第一次打 `/remote`
-    /// 就是这个路径，一个 `Book::load` 的错误弹出来会让人以为程序坏了。
+    /// The /remote screen shows running state, then config status; a missing remote.json is first-run, not an error.
     #[test]
     fn brief_survives_a_missing_booking_file() {
         let dir = std::env::temp_dir().join(format!("aox-remote-brief-{}", std::process::id()));
@@ -1946,12 +1846,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let idle = brief(&dir, false);
-        assert!(idle.contains("未运行"), "{idle}");
-        assert!(idle.contains("还没有配对"), "{idle}");
-        assert!(idle.contains("/remote pair"), "要告诉用户怎么开始：{idle}");
+        assert!(idle.contains("not running"), "{idle}");
+        assert!(idle.contains("No pairing yet"), "{idle}");
+        assert!(idle.contains("/remote pair"), "Should tell the user how to start: {idle}");
 
         let running = brief(&dir, true);
-        assert!(running.contains("运行中"), "{running}");
+        assert!(running.contains("running"), "{running}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

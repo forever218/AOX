@@ -1,27 +1,6 @@
-//! One shell call: from a [`Spec`] to captured output — spawn, fence, timeout, decode, cap.
-//!
-//! Everything a *dialect* decides is "which program, with which arguments"; everything else here is
-//! identical for every dialect, which is the whole point of this module: `cmd`, PowerShell, Git Bash
-//! and a future `bash` all go through one spawn path, one Job, one timeout, one output format. A
-//! second implementation would be a second boundary to keep correct.
-//!
-//! # The two processes
-//!
-//! ```text
-//! host ──spawn──▶ helper (same exe, --aox-shell-exec) ──spawn──▶ the real command
-//!   │                    │ lowers its own token to Low (when the kernel boundary is on)
-//!   └── Job Object ──────┴─ the command and every descendant inherit the Job and the token
-//! ```
-//!
-//! The helper exists because a Medium process cannot simply *ask* for a Low child on Windows without
-//! possibly needing privileges it does not have — see [`crate::shell`]'s module docs.
-//!
-//! # Two failure classes, kept apart
-//!
-//! [`Failure`] means "the call never produced a command outcome": the boundary could not be applied
-//! ([`Failure::NoBoundary`]) or the process could not start ([`Failure::Spawn`]). A command that ran
-//! and exited non-zero is **not** a failure — it is an [`Outcome`] with `code = Some(1)`, because the
-//! model needs to see the compiler's own error text, not our summary of it.
+//! One shell call: from a Spec to captured output — spawn, fence, timeout, decode, cap.
+//! Everything a *dialect* decides is "which program, with which arguments"; everything else here is identical...
+//! # The two processes.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -38,10 +17,6 @@ use crate::plugin::ProcessFlags;
 use crate::runtime::Runtime;
 
 /// Test-only override for "which executable re-enters as the shell helper".
-///
-/// Unit tests run inside a harness binary that does not understand `--aox-shell-exec`. The tests
-/// point this at a freshly built `aox.exe`; production never sets it and always re-enters the actual
-/// host binary.
 #[cfg(test)]
 static TEST_HOST: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
@@ -89,9 +64,7 @@ impl Dialect {
         }
     }
 
-    /// The default when the model does not say. `cmd` on Windows (always present), `bash` on other
-    /// platforms — but this build only ships the Windows dialects, so non-Windows callers must pass
-    /// one explicitly.
+    /// The default when the model does not say. `cmd` on Windows (always present), `bash` on other platforms —...
     pub fn default_for_platform() -> Self {
         Dialect::Cmd
     }
@@ -108,21 +81,9 @@ impl Dialect {
     }
 
     /// The program and arguments this dialect runs for `command`.
-    ///
-    /// The quoting rules are the interesting part:
-    /// - `cmd /D /S /C` strips exactly one pair of outer quotes, which is what makes a whole command
-    ///   line with its own quotes survive being passed as a single argument.
-    /// - PowerShell takes the command as one argument; Rust's argument quoting already produces the
-    ///   right thing, so no manual wrapping.
-    /// - `git` is not a shell: its "command" is split into arguments (see [`split_args`]).
     fn command_line(&self, command: &str, bash: Option<&super::bash::Bash>) -> CmdLine {
         match self {
-            // ⚠️ `cmd` is the one dialect whose command must **not** be passed as an ordinary
-            // argument: Rust quotes arguments with the MSVC rules (`"` becomes `\"`) and `cmd` does
-            // not understand that escape — it sees a literal backslash-quote and answers "the syntax
-            // of the command is incorrect". Measured: `type "C:\a b\c.txt"` failed exactly that way.
-            // Handing the tail over verbatim inside one pair of quotes — which `/S` then strips — is
-            // the form `cmd` actually parses.
+            // ️ `cmd` is the one dialect whose command must not be passed as an ordinary argument: Rust quotes arguments...
             Dialect::Cmd => CmdLine {
                 program: "cmd.exe".to_string(),
                 args: vec!["/D".into(), "/S".into(), "/C".into()],
@@ -157,9 +118,7 @@ impl Dialect {
                 args: split_args(command),
                 raw_tail: None,
             },
-            // `command` is a **script** here (the tool has already prepended the prologue). It goes in as
-            // one ordinary argument: MSYS parses argv the same way the C runtime does, so Rust's quoting
-            // produces exactly what bash expects — unlike `cmd`, which needs the verbatim tail.
+            // `command` is a script here (the tool has already prepended the prologue).
             Dialect::Bash => match bash {
                 Some(b) => {
                     let (program, args) = b.command_line(command);
@@ -187,10 +146,6 @@ pub struct CmdLine {
 }
 
 /// Split a command line into arguments, honouring double quotes.
-///
-/// Hand-rolled rather than `CommandLineToArgvW` so the behaviour is the same on every platform and
-/// can be unit-tested without a Windows process. The one thing it does *not* implement is the
-/// `\"` escape (rare in `git` commands, and a wrong guess would be worse than a documented limit).
 pub fn split_args(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -262,11 +217,6 @@ pub struct Outcome {
     /// The call was **stopped by us** (the whole tree was killed), and why.
     pub stopped: Option<Stop>,
     /// Processes still alive in the Job when the shell finished, before the fence was dropped.
-    ///
-    /// A normal one-shot command leaves 0. A positive number means the command detached something
-    /// (`&`, `nohup`, `start /b`) and the host is about to terminate it with the Job. The model
-    /// cannot see the difference from stdout — the shell exits successfully either way — so this
-    /// count is what turns a puzzling "output was empty and the port is closed" into a fact.
     pub left_behind: Option<u32>,
 }
 
@@ -291,10 +241,6 @@ pub enum Failure {
 }
 
 /// Build the host-side helper command: program, helper argv, env and cwd.
-///
-/// Shared by the one-shot runner and the managed background runner. Both **must** take the same
-/// path here: a background command that skipped the bash `PATH` rewrite or the environment
-/// redirection would fail on the exact projects it was meant to serve.
 fn command_for(rt: &Arc<Runtime>, spec: &Spec) -> Result<Command, Failure> {
     // A bash has to be found *before* the command line is built (its path is the program), and its
     // `PATH` must be rewritten: MSYS would otherwise treat every `C:\…` entry as a relative POSIX path.
@@ -330,10 +276,6 @@ fn command_for(rt: &Arc<Runtime>, spec: &Spec) -> Result<Command, Failure> {
 }
 
 /// A shell process that is deliberately allowed to outlive its call.
-///
-/// The `Fence` is **not** a local of this function's caller: it is moved into the job registry, so
-/// `KILL_ON_JOB_CLOSE` fires when the registry drops the record (explicit stop, lifetime expiry, or
-/// host exit) rather than when the launching tool call returns.
 pub struct Background {
     pub child: Child,
     pub fence: crate::sandbox::Fence,
@@ -341,14 +283,6 @@ pub struct Background {
 }
 
 /// Start a command and keep its process tree alive under a caller-owned Job.
-///
-/// Output goes to `log` instead of pipes: nobody may be reading for minutes, and a full pipe would
-/// block the server. `spec.timeout` / `spec.idle` are deliberately ignored — a long-lived server has
-/// no meaningful total budget, and its silence is normal.
-///
-/// A background job **requires** a working Job Object. If the fence cannot be fitted, the child is
-/// killed and the call fails: letting it run unwrapped would create exactly the untracked daemon
-/// this feature exists to prevent.
 pub fn spawn_background(
     rt: &Arc<Runtime>,
     spec: &Spec,
@@ -415,17 +349,12 @@ pub async fn run(rt: &Arc<Runtime>, spec: &Spec) -> Result<Outcome, Failure> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let cap = rt.config.shell.max_output_bytes;
-    // Milliseconds since `started` at which the last byte arrived, **one shared stamp for both
-    // streams**: a command that only writes to stderr is making progress just as much as one that
-    // writes to stdout, and a wedged one writes to neither.
+    // Milliseconds since `started` at which the last byte arrived, one shared stamp for both streams: a command...
     let activity = Arc::new(AtomicU64::new(0));
     let out_task = tokio::spawn(read_capped(stdout, cap, activity.clone(), started));
     let err_task = tokio::spawn(read_capped(stderr, cap, activity.clone(), started));
 
-    // Poll rather than `timeout(child.wait())`: **two** conditions can end the call (the total
-    // budget, and "no output for a while"), and re-arming a `wait()` future every tick would make
-    // the cancel-safety of `Child::wait` load-bearing for a correctness rule. Polling at 100 ms
-    // costs 10 cheap `try_wait` calls a second and answers "is it still there" without ambiguity.
+    // Poll rather than `timeout(child.wait())`: two conditions can end the call (the total budget, and "no output...
     let deadline = started + spec.timeout;
     let mut stopped: Option<Stop> = None;
     let code = loop {
@@ -458,9 +387,7 @@ pub async fn run(rt: &Arc<Runtime>, spec: &Spec) -> Result<Outcome, Failure> {
     let out = join_capture(out_task).await;
     let err = join_capture(err_task).await;
 
-    // The helper's own signals travel on stderr, marked with a `\x01` prefix that a normal program
-    // will not produce. Strip them from what the model reads, and turn them into a `Failure` — the
-    // model must not be told "the command failed" when the truth is "the boundary did not apply".
+    // The helper's own signals travel on stderr, marked with a `\x01` prefix that a normal program will not produce.
     let (err_text, signal) = helper::strip_signals(&err.text);
     let err = Capture { text: err_text, total: err.total };
 
@@ -479,11 +406,7 @@ pub async fn run(rt: &Arc<Runtime>, spec: &Spec) -> Result<Outcome, Failure> {
         return Err(Failure::Spawn(why));
     }
 
-    // Read the tree's size **after** the shell itself has been reaped and before this function
-    // returns. Anything still in the Job at this point was detached by the command and is about to
-    // be terminated. Terminate it now rather than waiting for `Fence::drop`: a detached child may be
-    // holding the stdout pipe open, and the capture join would otherwise sit out its 3 s grace for a
-    // command that already finished.
+    // Read the tree's size after the shell itself has been reaped and before this function returns.
     let left_behind = if stopped.is_some() { Some(0) } else { fence.active_processes() };
     if left_behind.unwrap_or(0) > 0 {
         fence.terminate();
@@ -497,12 +420,6 @@ pub async fn run(rt: &Arc<Runtime>, spec: &Spec) -> Result<Outcome, Failure> {
 const TICK: Duration = Duration::from_millis(100);
 
 /// Which budget, if any, has run out — the whole policy of the wait loop, in one testable place.
-///
-/// Split out because the alternative is a test that waits 30 seconds: the rule is "the total budget,
-/// or `idle` without a single byte arriving", and both are arithmetic on clocks.
-///
-/// `last_activity_ms` is measured from `started`, not from now: a command that has printed nothing
-/// has its last activity at 0, which is exactly "quiet since it started".
 fn budget_spent(
     now: Instant,
     deadline: Instant,
@@ -525,21 +442,13 @@ const GRACE: Duration = Duration::from_secs(5);
 /// How long the process we hold gets after a direct `kill`, before the call gives up on it.
 const GRACE_HARD: Duration = Duration::from_secs(2);
 
-/// Stop the whole tree, and **bound how long we wait for it to die**.
-///
-/// `terminate()` is a no-op when there is no Job (`Fence.job == 0`: not Windows, `CreateJobObjectW`
-/// failed, or the helper had already exited so `contain` had nothing to put in it). The previous
-/// version called `child.wait()` unconditionally right after it, so in exactly those cases the call
-/// waited **forever** — which is the one outcome a timeout must never produce. Measured complaint
-/// behind this: a `bash` call sitting at 471 s with no way out.
+/// Stop the whole tree, and bound how long we wait for it to die.
 async fn kill_tree(fence: &crate::sandbox::Fence, child: &mut Child) {
     fence.terminate();
     if died_within(child, GRACE).await {
         return;
     }
-    // The fence did not take it (no Job, or the helper escaped one). Kill what we hold: its own
-    // children may survive — that is exactly what the Job was for — but the call returns, which is
-    // the part the user can act on.
+    // The fence did not take it (no Job, or the helper escaped one).
     let _ = child.start_kill();
     let _ = died_within(child, GRACE_HARD).await;
 }
@@ -571,10 +480,6 @@ async fn join_capture(
 }
 
 /// Read one stream to EOF, keeping the head and the tail and counting everything.
-///
-/// Keeping both ends is deliberate: a build log puts the *reason* at the top ("error: linking with
-/// `cc` failed") and the *list of failures* at the bottom. A plain "first N bytes" would show a
-/// screen of `Compiling …` and none of the answer.
 async fn read_capped<R>(
     reader: Option<R>,
     cap: usize,
@@ -682,10 +587,6 @@ mod tests {
     }
 
     /// The two deadlines, without waiting for either.
-    ///
-    /// This is the rule the user's complaint was about: an eight-minute hang is either "the total
-    /// budget has not run out yet" or "it has not said anything for a while", and until now neither
-    /// could be checked without sitting through the wall clock.
     #[test]
     fn the_budget_is_spent_on_time_or_on_silence() {
         let start = Instant::now();
@@ -694,26 +595,21 @@ mod tests {
         let deadline = at(120);
         let idle = Some(Duration::from_secs(30));
 
-        // Running, printing: nothing to do.
+        // Running, printing: nothing to do
         assert_eq!(budget_spent(at(10), deadline, start, 9_000, idle), None);
         // Silent since the start, 30 s in ⇒ idle.
         assert_eq!(budget_spent(at(30), deadline, start, 0, idle), Some(Stop::Idle(Duration::from_secs(30))));
-        // Printed at 25 s, now 40 s: only 15 s of silence, still fine.
+        // Printed at 25 s, now 40 s: only 15 s of silence, still fine
         assert_eq!(budget_spent(at(40), deadline, start, 25_000, idle), None);
         // ...and at 56 s the same print is 31 s old ⇒ idle fires.
         assert_eq!(budget_spent(at(56), deadline, start, 25_000, idle), Some(Stop::Idle(Duration::from_secs(30))));
         // The total budget wins over a call that kept printing (a build that never ends).
         assert_eq!(budget_spent(at(120), deadline, start, 119_000, idle), Some(Stop::Timeout(timeout)));
-        // Watchdog off: silence is not a reason to kill anything.
+        // Watchdog off: silence is not a reason to kill anything
         assert_eq!(budget_spent(at(119), deadline, start, 0, None), None);
     }
 
-    /// The wait after a kill **must** be bounded. A wedged `child.wait()` with no deadline was the
-    /// one path that could outlive every timeout in the program (the `471 s and still counting`
-    /// report): `terminate()` is a no-op when there is no Job, and the old code waited forever.
-    ///
-    /// Uses a real process but not the shell *helper* — that path needs the built binary, and the
-    /// helper handshake is not what is under test here.
+    /// The wait after a kill must be bounded.
     #[tokio::test]
     async fn waiting_for_a_killed_child_gives_up_instead_of_hanging() {
         let mut child = Command::new("cmd.exe")

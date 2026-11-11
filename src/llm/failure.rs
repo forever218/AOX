@@ -1,26 +1,12 @@
 //! Why a model request failed, and whether trying again is worth it.
-//!
-//! Before this module every request failure was a formatted string ([`anyhow::bail!`]), so the loop
-//! could not tell `429 Too Many Requests` from `401 invalid api key` — both arrived as "some error"
-//! and both were handled the same way (fail the turn, or retry blindly). The two need opposite
-//! treatment: one is a queue with a clock on it, the other will fail identically every time.
-//!
-//! So the transport layer now attaches a **cause** to the error it returns:
-//!
-//! - [`HttpFailure`] — a non-2xx response, carrying the status and the `Retry-After` the server sent;
-//! - [`StreamCut`] — 200 OK, but the stream stopped before the model finished. This used to be
-//!   silently accepted as a half-sentence reply (see `openai::chat_stream`);
-//! - [`Stalled`] — accepted, then no bytes at all for [`STREAM_IDLE_SECS`];
-//! - a bare [`reqwest::Error`] — connection refused, reset, read timeout.
-//!
-//! The public surface is deliberately three functions ([`retryable`], [`retry_after`], [`delay`]) so
-//! the *policy* lives in one file and the loop stays a loop.
+//! Before this module every request failure was a formatted string (anyhow::bail!), so the loop could not tell...
+//! So the transport layer now attaches a cause to the error it returns.
 
 use std::time::Duration;
 
 use crate::config::RetryConfig;
 
-/// A non-2xx response from the endpoint.
+/// A non-2xx response from the endpoint
 #[derive(Debug)]
 pub struct HttpFailure {
     pub status: u16,
@@ -40,11 +26,7 @@ impl std::fmt::Display for HttpFailure {
 
 impl std::error::Error for HttpFailure {}
 
-/// The response stopped before the model finished — no `finish_reason` chunk and no `data: [DONE]`.
-///
-/// This is not an edge case: it is what a dropped connection, a proxy cutting a long body, or a
-/// server that gives up halfway looks like. Treating it as success wrote a half-sentence into the
-/// conversation file and ended the turn as if the model had answered.
+/// The response stopped before the model finished — no `finish_reason` chunk and no `data: DONE`.
 #[derive(Debug)]
 pub struct StreamCut {
     /// What had arrived by then, for the error message ("312 chars, 41 chunks").
@@ -73,11 +55,7 @@ impl std::fmt::Display for Stalled {
 
 impl std::error::Error for Stalled {}
 
-/// How long a stream may stay **silent** before it counts as dead.
-///
-/// A **stall** watchdog, not a total timeout: a thinking model writing 32k tokens legitimately takes
-/// minutes, and the 180 s total timeout this replaces would kill it mid-answer (and then, with
-/// retries on, pay for it twice). Silence is the only thing that means "this is not coming".
+/// How long a stream may stay silent before it counts as dead.
 pub const STREAM_IDLE_SECS: u64 = 120;
 
 /// Cap on the whole **non-streaming** request. Same number the client used to apply to everything.
@@ -88,11 +66,6 @@ pub const BLOCKING_TOTAL_SECS: u64 = 180;
 pub const CONNECT_SECS: u64 = 15;
 
 /// Is this status worth another attempt?
-///
-/// The split is "would the identical request plausibly succeed a second later?" — rate limits,
-/// upstream overload and gateway hiccups yes; a bad key, a bad model name, a context that is too
-/// long, or a malformed tool schema no. Retrying the second group only delays the error the user has
-/// to see anyway (and, for `429`-style billing endpoints, costs money).
 pub fn retryable_status(status: u16) -> bool {
     matches!(
         status,
@@ -110,15 +83,11 @@ pub fn retryable(e: &anyhow::Error) -> bool {
     if let Some(h) = e.downcast_ref::<HttpFailure>() {
         return retryable_status(h.status);
     }
-    // A cut or stalled stream is by definition transient: the next attempt starts from a new
-    // connection. A `StreamCut` caused by *the server refusing to stream* would burn one extra
-    // attempt and then fail with the same message, which is the right price.
+    // A cut or stalled stream is by definition transient: the next attempt starts from a new connection.
     if e.downcast_ref::<StreamCut>().is_some() || e.downcast_ref::<Stalled>().is_some() {
         return true;
     }
-    // Transport: refused / reset / TLS / read timeout. `reqwest::Error` is the only source of these
-    // (everything we generate ourselves is one of the types above or a parse error, which is not
-    // retryable: the same bytes would parse the same way).
+    // Transport: refused / reset / TLS / read timeout. `reqwest::Error` is the only source of these (everything we...
     e.downcast_ref::<reqwest::Error>().is_some()
 }
 
@@ -127,12 +96,7 @@ pub fn retry_after(e: &anyhow::Error) -> Option<Duration> {
     e.downcast_ref::<HttpFailure>().and_then(|h| h.retry_after)
 }
 
-/// The wait before attempt `n` (1-based): `base * 2^(n-1)`, never shorter than the server's hint,
-/// never longer than `max_ms`.
-///
-/// The cap applies to the hint **as well**: a `Retry-After: 3600` is a real answer from the server,
-/// but honouring it means the turn sits silent for an hour. Better to give up after a bounded wait
-/// and say so than to hang — see the caller, which reports the failure with the delay it used.
+/// The wait before attempt `n` (1-based): `base * 2^(n-1)`, never shorter than the server's hint, never longer...
 pub fn delay(attempt: usize, cfg: &RetryConfig, hint: Option<Duration>) -> Duration {
     let shift = attempt.saturating_sub(1).min(16) as u32;
     let backoff = cfg.base_ms.saturating_mul(1u64 << shift);
@@ -140,11 +104,7 @@ pub fn delay(attempt: usize, cfg: &RetryConfig, hint: Option<Duration>) -> Durat
     Duration::from_millis(backoff.max(hinted).min(cfg.max_ms))
 }
 
-/// `Retry-After` → duration. Only the `delta-seconds` form is honoured.
-///
-/// The header may also be an HTTP-date, which would need a date parser (and the machine's own
-/// clock, which can be wrong) to turn into a delay. None of the OpenAI-compatible endpoints AOX
-/// talks to use it, so an unparseable value means "no hint" rather than "guess".
+/// The header may also be an HTTP-date, which would need a date parser (and the machine's own clock, which can...
 pub fn parse_retry_after(v: &str) -> Option<Duration> {
     v.trim().parse::<u64>().ok().map(Duration::from_secs)
 }

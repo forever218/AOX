@@ -1,12 +1,6 @@
-//! 本机保存的所有配对。
-//!
-//! **v2 是一个列表**（v1 是单条）。理由很实际：换服务器、家里公司各一台，都需要"留着旧的不删"，
-//! 而每次重配都要重新找手机要配对码。列表里用 `active` 指定 `serve` 连哪一条。
-//!
-//! 服务端地址是**只读**的：token 与端点绑定，改地址等于凭证失效。想换服务器就删了重配，
-//! 只留一条路径，用户不会在"改了地址却连不上"里打转。
-//!
-//! 令牌不进 `config.toml`——那个文件是给人看和贴进 issue 的；这里是机器状态，Unix 下 0600。
+//! All pairings saved locally on this machine.
+//! v2 is a list: old pairings survive server switches; active picks which one serve uses.
+//! Address is read-only (token-bound); switch by re-pairing. Tokens stay out of config.toml and are 0600 on Unix.
 
 use std::path::{Path, PathBuf};
 
@@ -15,16 +9,16 @@ use serde::{Deserialize, Serialize};
 
 pub const VERSION: u32 = 2;
 
-/// 别人 `@` 我的机器时怎么办。存在配对项里——不同服务器/房间的信任程度不一样。
+/// How to handle @-mentions from others, stored per pairing since trust varies by server/room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CallPolicy {
-    /// 只执行主人的指令，别人的 `@` 直接回绝。
+    /// Only execute the owner's instructions; reject @-mentions from anyone else.
     Owner,
-    /// 每次都要主人点同意（默认）。
+    /// Ask the owner to approve every request (the default).
     #[default]
     Ask,
-    /// 谁都能用，不再询问。只适合完全信任的房间。
+    /// Let anyone use it without asking; only for fully trusted rooms.
     Open,
 }
 
@@ -50,7 +44,7 @@ impl CallPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteProfile {
     pub id: String,
-    /// 服务端地址，用户配对时输入。**不硬编码**：分发版不属于任何一台服务器。
+    /// Server address entered at pairing time; never hard-coded since the distro belongs to no single server.
     pub server: String,
     pub device_id: String,
     pub token: String,
@@ -59,23 +53,23 @@ pub struct RemoteProfile {
     pub device_name: String,
     #[serde(default)]
     pub owner_id: String,
-    /// 本机给这条配对起的名字（"公司服务器"）。只在本地，不上传。
+    /// Local nickname for this pairing, kept on the device and never uploaded.
     #[serde(default)]
     pub label: String,
-    /// 别人 `@` 我的机器时怎么办。缺省 ask：每次都问。
+    /// How to handle others' @-mentions; defaults to ask every time.
     #[serde(default)]
     pub call_policy: CallPolicy,
     #[serde(default)]
     pub created_at: i64,
     #[serde(default)]
     pub last_connected_at: i64,
-    /// 群 → 会话。每个群一条，跨重启接上；`/new` 清掉一条。
+    /// Group-to-session map, one per group, resumed across restarts; /new clears one entry.
     #[serde(default)]
     pub rooms: std::collections::HashMap<String, RoomConv>,
 }
 
 impl RemoteProfile {
-    /// 列表里显示的那一行标题。
+    /// The one-line title shown in the pairings list.
     pub fn title(&self) -> &str {
         if self.label.trim().is_empty() {
             &self.server
@@ -88,7 +82,7 @@ impl RemoteProfile {
         Book::path(root)
     }
 
-    /// `https://host` → `wss://host/ws`；`http://` → `ws://`（只用于局域网/开发服务器）。
+    /// Map https to wss and http to ws for LAN/dev servers, appending the /ws path.
     pub fn ws_url(&self) -> String {
         let base = self.server.trim_end_matches('/');
         let ws = if let Some(rest) = base.strip_prefix("https://") {
@@ -106,17 +100,14 @@ impl RemoteProfile {
     }
 }
 
-/// 一个群对应哪条会话。
-///
-/// 存下来的唯一目的是**跨重启接上上下文**：`conversation` 是会话 id（也就是文件名），
-/// 下一轮先 `resume` 它；文件没了就当新的一段。手机上发 `/new` 会把这条删掉。
+/// Maps a group to a session id for resume across restarts; /new deletes the entry, a missing file starts fresh.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomConv {
     pub conversation: String,
-    /// 房间名（可能为空：老配对或服务端没给）。只用来显示。
+    /// Room name, possibly empty for old pairings; used only for display.
     #[serde(default)]
     pub name: String,
-    /// 最后说上话的时间（毫秒）。现在只用于排查，不参与任何清理。
+    /// Timestamp of the last exchange in ms; currently only for diagnostics, not used for cleanup.
     #[serde(default)]
     pub updated_at: i64,
 }
@@ -154,21 +145,21 @@ impl Book {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self { version: VERSION, active: None, pairings: Vec::new() })
             }
-            Err(e) => return Err(e).with_context(|| format!("读取 {}", path.display())),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
 
         let value: serde_json::Value = serde_json::from_str(&text)
-            .with_context(|| format!("{} 不是有效的 JSON", path.display()))?;
+            .with_context(|| format!("{} is not valid JSON", path.display()))?;
 
         if value.get("pairings").is_some() {
             let book: Self = serde_json::from_value(value)
-                .with_context(|| format!("{} 不是有效的 remote.json", path.display()))?;
+                .with_context(|| format!("{} is not a valid remote.json", path.display()))?;
             return Ok(book);
         }
 
-        // v1：单条对象 → 迁移成一条列表项，不丢凭证、不需要重新配对。
+        // Migrate the v1 single-object file into one list entry without losing credentials or re-pairing.
         let old: V1 = serde_json::from_value(value)
-            .with_context(|| format!("{} 既不是 v2 也不是可识别的 v1", path.display()))?;
+            .with_context(|| format!("{} is neither v2 nor a recognizable v1", path.display()))?;
         let id = format!("p{}", aoxchat_proto::now_ms());
         let profile = RemoteProfile {
             id: id.clone(),
@@ -216,7 +207,7 @@ impl Book {
         self.pairings.iter_mut().find(|p| p.id == id)
     }
 
-    /// 按 id 或 1 起始的序号找一条。序号是为了让人少打字。
+    /// Find a pairing by id or by 1-based index, the latter to save typing.
     pub fn find(&self, needle: &str) -> Option<usize> {
         let needle = needle.trim();
         if let Ok(n) = needle.parse::<usize>() {
@@ -256,7 +247,7 @@ impl Book {
         }
     }
 
-    /// 同 id 覆盖，否则追加，并设为当前。
+    /// Overwrite the entry with the same id or append it, then make it active.
     pub fn upsert(&mut self, profile: RemoteProfile) {
         if let Some(slot) = self.pairings.iter_mut().find(|p| p.id == profile.id) {
             *slot = profile.clone();
@@ -272,16 +263,16 @@ impl Book {
 pub fn normalize_server(input: &str) -> Result<String> {
     let s = input.trim().trim_end_matches('/');
     if s.is_empty() {
-        anyhow::bail!("服务端地址不能为空");
+        anyhow::bail!("the server address cannot be empty");
     }
     let s = if s.starts_with("http://") || s.starts_with("https://") {
         s.to_string()
     } else {
         format!("https://{s}")
     };
-    let url: reqwest::Url = s.parse().with_context(|| format!("{s} 不是有效地址"))?;
+    let url: reqwest::Url = s.parse().with_context(|| format!("{s} is not a valid address"))?;
     if !matches!(url.scheme(), "http" | "https") {
-        anyhow::bail!("只支持 http/https");
+        anyhow::bail!("only http/https is supported");
     }
     Ok(s)
 }

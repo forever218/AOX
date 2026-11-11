@@ -1,26 +1,6 @@
-//! `ask_user` — lets the model hand a "multiple-choice question" to the interface, instead of
-//! writing it into the body text and waiting for the user to type.
-//!
-//! # Why it is needed
-//!
-//! When the model wants the user to make a decision, it naturally writes a line like "do you pick 1
-//! or 2?" into the body. That line is **completely invisible** to the host — it's just ordinary
-//! text, and the host has no mechanism to catch it. The consequence: the user has to type the answer
-//! themselves, and whether their typing lines up with the model's numbering is pure luck ("1" is the
-//! first one above or the first one below?), and nobody notices if it's wrong.
-//!
-//! So the model is given a **structured** outlet here: `ask_user(question, options[])`. The host
-//! takes it and draws it as a row of clickable options above the input box, waits for the user to
-//! click (or type), and hands the result back as a tool result.
-//!
-//! # Why it isn't implemented in `Tool::call`
-//!
-//! "Asking the user" needs a `Ui`, and `Tool::call(args, rt)`'s signature doesn't have one — the
-//! whole tool-call path (including the plugin RPC) carries no interface. The authorisation path
-//! (`Ui::authorize`) goes through the Agent for exactly this reason. So this tool is **special-cased**
-//! by [`crate::agent::Agent::authorize_and_execute`]: when the name matches [`ASK_TOOL`] the `Ui` is
-//! passed into [`interact`], and `call` is never reached (a fallback implementation is kept only so
-//! that "if someone bypasses the Agent and executes directly" there is a comprehensible sentence).
+//! `ask_user` — lets the model hand a "multiple-choice question" to the interface, instead of writing...
+//! # Why it is needed.
+//! When the model wants the user to make a decision, it naturally writes a line like "do you pick 1 or 2?"...
 
 use std::sync::Arc;
 
@@ -31,16 +11,10 @@ use super::{Tool, ToolKind, ToolOutput};
 use crate::runtime::Runtime;
 use crate::ui::{ChoiceReply, Ui};
 
-/// The tool name. The Agent's special case and this spot **reference the same constant** — so a
-/// rename cannot produce the silent misalignment of "the special case stops matching and the tool
-/// runs as an ordinary one" (same reasoning as `HOST_FILE_TOOLS`).
+/// The tool name. The Agent's special case and this spot reference the same constant — so a rename cannot produce...
 pub const ASK_TOOL: &str = "ask_user";
 
 /// The maximum number of options at once.
-///
-/// The limit isn't arbitrary: the option slot is **a single horizontal row** above the input box,
-/// and more than 6 would have to wrap — yet its entire point is "glance once, click once". Beyond
-/// that it should be asked in two rounds.
 pub const MAX_OPTIONS: usize = 6;
 
 pub fn ask_tools() -> Vec<Arc<dyn Tool>> {
@@ -54,9 +28,7 @@ impl Tool for AskUser {
     fn name(&self) -> &str {
         ASK_TOOL
     }
-    /// Report `Host`: it is a capability built into the host (the same class as the file tools), not a
-    /// plugin, and it doesn't touch the host itself. The `workplace_reject` path does it no harm —
-    /// there is no `path` in its arguments, so the first check returns.
+    /// Report `Host`: it is a capability built into the host (the same class as the file tools), not a plugin...
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
@@ -67,9 +39,7 @@ impl Tool for AskUser {
         parameters()
     }
     async fn call(&self, _args: Value, _rt: &Arc<Runtime>) -> ToolOutput {
-        // Under normal circumstances this is unreachable (see the module docs). If it really is
-        // reached, the caller has bypassed the Agent, and the sentence has to make it immediately
-        // clear to whoever reads the log what's missing.
+        // Under normal circumstances this is unreachable (see the module docs).
         ToolOutput::err(crate::tf!(
             "{} must be handled by the host's main loop (it needs the UI handed in) and cannot be executed directly",
             ASK_TOOL
@@ -97,10 +67,7 @@ fn parameters() -> Value {
     })
 }
 
-/// Split `ask_user`'s arguments into `(question, options)`. Errors are phrased **for the model to read**.
-///
-/// Extracted as a pure function so it's unit-testable: the easiest mistake here is "silently swallowing an
-/// empty option", after which the model receives an option slot missing one entry, and neither side knows what's gone.
+/// Split `ask_user`'s arguments into `(question, options)`. Errors are phrased for the model to read.
 pub fn parse(args: &Value) -> Result<(String, Vec<String>), String> {
     let question = args
         .get("question")
@@ -141,25 +108,12 @@ pub fn parse(args: &Value) -> Result<(String, Vec<String>), String> {
     Ok((question, options))
 }
 
-/// The labelling character for an option: 0 → `A`, 1 → `B` …
-///
-/// Letters rather than digits: the model often writes its own numbers in the body ("1. 2. 3."), and
-/// when the user echoes back "I picked A" there is no ambiguity. More than 26 can't happen (the limit
-/// is 6).
+/// Letters rather than digits: the model often writes its own numbers in the body ("1. 2. 3."), and when the user...
 pub fn letter(i: usize) -> char {
     (b'A' + (i % 26) as u8) as char
 }
 
 /// Read a line the user typed as "which option". Returns `None` when it can't be recognised.
-///
-/// It accepts these forms: `A` / `a` / `A.` / `a)` / `1` / `1.` — the interface gives letters, but a
-/// user looking at a list of options typing a digit is only natural too (the model often numbers its
-/// body text). Both are accepted.
-///
-/// It deliberately **accepts only a single character** (optionally with one trailing punctuation):
-/// `ab` is not an option, nor is `A4 paper` — such input should be handed to the model verbatim as a
-/// free-form answer, rather than guessed as A. The cost of guessing wrong is the model carrying on
-/// with a choice the user never made, and the user having no chance to notice.
 pub fn as_choice(s: &str, n: usize) -> Option<usize> {
     let t = s.trim().trim_end_matches(['.', '。', ')', '）', '、', ':']);
     if t.chars().count() != 1 {
@@ -194,9 +148,7 @@ pub async fn interact(args: Value, ui: &mut dyn Ui) -> ToolOutput {
             None => ToolOutput::err(crate::i18n::t("the UI returned a non-existent option index (internal error); ask again")),
         },
         ChoiceReply::Text(t) => {
-            // It deliberately spells out "this is a valid answer too": the model easily reads "the
-            // user didn't click an option" as "the user didn't answer", and then asks the same
-            // question all over again — which is the most infuriating kind of loop.
+            // It deliberately spells out "this is a valid answer too": the model easily reads "the user didn't click...
             ToolOutput::ok(crate::tf!("the user did not click an option and answered directly: {}", t))
         }
         ChoiceReply::Cancelled => ToolOutput::err(
@@ -217,9 +169,7 @@ mod tests {
         assert_eq!(o, vec!["left".to_string(), "right".to_string()]);
     }
 
-    /// An empty option **must be an error**, never silently swallowed: after swallowing, the model
-    /// receives an option slot missing one entry, neither side knows what's gone, and the index the
-    /// user clicks is misaligned with the one the model believes in from then on.
+    /// An empty option must be an error, never silently swallowed: after swallowing, the model receives an option slot...
     #[test]
     fn empty_or_non_string_options_are_rejected_not_swallowed() {
         let e = parse(&json!({"question": "q", "options": ["a", "  "]})).unwrap_err();

@@ -1,30 +1,6 @@
 //! `web_fetch` — one URL in, text out.
-//!
-//! # Why this is a host tool
-//!
-//! A plugin could open a socket, but it could not promise the things that make the result *usable*:
-//! one charset decision, one byte cap, one envelope, the same behaviour in the CLI and the GUI. The
-//! engine lives in [`crate::web`]; this file owns the contract the model sees.
-//!
-//! # What is here, and what is not
-//!
-//! Reading works: `readable` extraction, `links`, cursor paging, `save` for binaries. There is
-//! deliberately **no cache** (owner decision, 2026-10-29): every call goes to the network, so a
-//! cursor slice re-fetches the page — the offset still lands on the same text, the cost is one
-//! request. JavaScript rendering was built and then removed (2026-10-29, D10): on the one real
-//! pristine page it was measured against it changed three characters for ten seconds, and it handed
-//! the fetch to a browser that follows its own redirects, which is a hole in the egress rule.
-//! `web_search` was dropped before it started (D11): a results page is just HTML, and `web_fetch`
-//! already reads it. The schema only advertises what exists, so the model never asks for a mode
-//! that cannot answer.
-//!
-//! # The budget, and the trap it avoids
-//!
-//! `agent_loop::cap_chars` truncates every tool result at `[agent] max_result_chars` (20,000 by
-//! default) **from the end**, which is exactly where a "there is more" marker would live. So the
-//! budget here is clamped to `max_result_chars − 1,200`, leaving room for the envelope and the
-//! trailer. Without this, a 20,000-character page silently loses the line that says how to read the
-//! rest of it.
+//! # Why this is a host tool.
+//! A plugin could open a socket, but it could not promise the things that make the result *usable*: one charset...
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -78,9 +54,7 @@ impl Tool for WebFetch {
     }
 
     fn access(&self) -> crate::workplace::Access {
-        // No parameter names a path, and the only thing this writes is its own download directory
-        // under `.aox/web/`. Declaring `Write` would say "this tool writes the user's files", which
-        // is false — see docs/WEB.md D9.
+        // No parameter names a path, and the only thing this writes is its own download directory under `.aox/web/`....
         crate::workplace::Access::Read
     }
 
@@ -373,9 +347,7 @@ pub(crate) async fn run(args: &Value, rt: &Arc<Runtime>) -> Result<ToolOutput, W
             bad
         ));
     }
-    // The most common dead end: a single-page app returns a shell, the extractor honestly finds
-    // almost no text, and the model retries the same URL. Say what to do instead — extraction only
-    // ever sees the bytes the server sent, so a client-rendered page is a limit, not a bug.
+    // The most common dead end: a single-page app returns a shell, the extractor honestly finds almost no text...
     if is_html && mode == "readable" && total < 200 && got.body.len() > 20_000 {
         tails.push(
             crate::i18n::t(
@@ -543,9 +515,7 @@ fn envelope(got: &Fetched, requested: &Url, detail: &str, title: Option<&str>) -
     out
 }
 
-/// The cursor is `<key>:<offset>`, where the key is derived from **the URL the caller passed** and
-/// the mode. That is what makes a cursor from page A rejected on page B instead of silently slicing
-/// the wrong text — and keeps the token cheap (about six).
+/// The cursor is `<key>:<offset>`, where the key is derived from the URL the caller passed and the mode.
 fn cursor_key(url: &Url, mode: &str) -> String {
     let digest = blake3::hash(format!("{}\u{0}{}", url.as_str(), mode).as_bytes()).to_hex();
     digest[..8].to_string()
@@ -741,7 +711,7 @@ fn seconds(d: std::time::Duration) -> String {
     }
 }
 
-/// `dir` exists and is a directory — used by the tests below.
+/// `dir` exists and is a directory — used by the tests below
 #[cfg(test)]
 fn expect_dir(dir: &std::path::Path) {
     assert!(dir.is_dir(), "{} should be a directory", dir.display());
@@ -889,10 +859,7 @@ mod tests {
         assert_eq!(human_bytes(3 * 1024 * 1024), "3.0 MB");
     }
 
-    // ── a real request against a loopback server ─────────────────────────────
-    //
-    // The same approach as `src/llm/models.rs`: no external network, no mocking of reqwest, the
-    // bytes come off a socket.
+    // ── a real request against a loopback server ─────────────────────────────.
 
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1152,9 +1119,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The one test that needs the real internet. `cargo test --lib web -- --ignored`.    ///
-    /// Kept separate from everything else so CI (and a `cargo test` on a plane) never depends on a
-    /// network. `example.com` is the IANA's own "this is a page" fixture: stable, tiny, UTF-8.
+    /// The one test that needs the real internet. `cargo test --lib web -- --ignored`. /// Kept separate...
     #[tokio::test]
     #[ignore = "needs the real network; run explicitly with --ignored"]
     async fn live_fetch_example_com() {
@@ -1165,14 +1130,12 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("Example Domain"), "{}", out.content);
         assert!(out.content.contains("web_fetch  200"), "{}", out.content);
-        // `--nocapture` shows the exact envelope the model would read.
+        // `--nocapture` shows the exact envelope the model would read
         println!("{}", out.content);
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The stand-in for a search tool (D11): a results page is an ordinary HTML page, so `web_fetch`
-    /// already reads it. `cn.bing.com` answers from here, DuckDuckGo does not (all three of its
-    /// endpoints time out), which is half the reason no `web_search` was built.
+    /// The stand-in for a search tool (D11): a results page is an ordinary HTML page, so `web_fetch` already reads...
     #[tokio::test]
     #[ignore = "needs the real network; run explicitly with --ignored"]
     async fn live_a_search_results_page_is_readable() {

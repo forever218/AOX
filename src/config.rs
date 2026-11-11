@@ -4,21 +4,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Layered composition manifest (stage 5): turn "read one config" into "compose a layer stack".
-///
-/// What comes out is still an ordinary TOML tree — not a single field of the `Config` shape in
-/// this file changed, so "the config model" and "the config source" stay two independent things
-/// (design principle P1).
 pub mod layer;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// The **fallback** model configuration, from the layer stack (bundle / patch / `config.toml`).
-    ///
-    /// Since 2026-10-28 this is no longer where the model lives: `.aox/models.json` is (see
-    /// `crate::modelbook`), and every front end reads the book first. The layered `[provider]` is
-    /// what a fresh install starts from before anything has been chosen, and what a `[provider]` in
-    /// an older `config.toml` is imported from, once. Hence `default`: a config file without the
-    /// section is not an error, it is the normal case now.
+    /// The fallback model configuration, from the layer stack (bundle / patch / `config.toml`).
     #[serde(default)]
     pub provider: ProviderConfig,
     #[serde(default)]
@@ -35,70 +25,28 @@ pub struct Config {
     pub prompt: PromptConfig,
     #[serde(default)]
     pub hook: HookConfig,
-    /// The `[retry]` section of `config.toml` (what to do when a model request fails, see
-    /// [`RetryConfig`] and `src/llm/failure.rs`).
-    ///
-    /// It lives next to `[hook]` on purpose: until 2026-10-23 the retry budget was
-    /// `[hook] max_llm_retries`, a key that only existed because a *hook* was the first thing able
-    /// to ask for a retry. The budget never belonged to the hook seam — it belongs to the loop — and
-    /// it now travels with the delay curve it has to agree with.
+    /// The `retry` section of `config.toml` (what to do when a model request fails, see RetryConfig...
     #[serde(default)]
     pub retry: RetryConfig,
-    /// The `[loop]` section of `config.toml` (the loop seam's second form, see `src/agent_loop.rs`).
-    ///
-    /// The Rust field name carries an underscore because `loop` is a keyword — **the TOML key is
-    /// still `loop`** (matched via `rename`), so what you see in the config file is `[loop]`.
+    /// The `loop` section of `config.toml` (the loop seam's second form, see `src/agent_loop.rs`).
     #[serde(default, rename = "loop")]
     pub loop_config: LoopConfig,
     /// The `[sandbox]` section of `config.toml` (the plugin child-process fence, see `src/sandbox.rs`).
     #[serde(default)]
     pub sandbox: SandboxConfig,
-    /// The `[shell]` section of `config.toml` (the built-in command line, see `src/tool/shell.rs`).
-    ///
-    /// A fifth, again distinct, "how much": `[sandbox]` limits how a plugin process runs,
-    /// `[workplace]` limits which files may be touched, `[plugins]` limits how long a process lives,
-    /// `[tools]` limits what the model is told exists, and **this one grants a capability the model
-    /// did not have before** — a command line, confined to the workspace by the host's command check.
+    /// The `shell` section of `config.toml` (the built-in command line, see `src/tool/shell.rs`).
     #[serde(default)]
     pub shell: ShellConfig,
-    /// The `[web]` section of `config.toml` (the built-in fetch tool, see `src/tool/web.rs`).
-    ///
-    /// The sixth distinct "how much", and the only one that points **outward**: `[sandbox]` limits
-    /// how a plugin process runs, `[workplace]` which files may be touched, `[plugins]` how long a
-    /// process lives, `[tools]` what the model is told exists, `[shell]` grants a command line, and
-    /// **this one grants one HTTP request** — with the reach limited by `[web] egress`.
+    /// The `web` section of `config.toml` (the built-in fetch tool, see `src/tool/web.rs`).
     #[serde(default)]
     pub web: WebConfig,
-    /// The `[plugins]` section of `config.toml` (lazy loading of plugin subprocesses, see
-    /// `src/plugin/mod.rs`).
-    ///
-    /// It governs a third thing, again distinct from both of the above: `[sandbox]` limits how a
-    /// plugin process runs, `[workplace]` limits which files may be touched, and **this one limits
-    /// how long a plugin process exists at all**.
+    /// The `plugins` section of `config.toml` (lazy loading of plugin subprocesses, see `src/plugin/mod.rs`).
     #[serde(default)]
     pub plugins: PluginsConfig,
-    /// The `[tools]` section of `config.toml` (which tool schemas are advertised, see
-    /// [`ToolsConfig`]).
-    ///
-    /// A fourth, again distinct, "how much": `[sandbox]` limits how a plugin process runs,
-    /// `[workplace]` limits which files may be touched, `[plugins]` limits how long a process lives,
-    /// and **this one limits what the model is told exists**.
+    /// The `tools` section of `config.toml` (which tool schemas are advertised, see ToolsConfig).
     #[serde(default)]
     pub tools: ToolsConfig,
-    /// The `[workplace]` section of `config.toml` (the model's file boundary, see `src/workplace.rs`).
-    ///
-    /// Two layers apart from `[sandbox]`: this one governs "which files may be touched", not
-    /// "how child processes run".
-    ///
-    /// ⚠️ **The TOML section name is `[workplace]`; the old name `[workspace]` is still accepted**
-    /// (`alias`). Naming was unified once on 2026-10-04: **the word is always `workplace`** — the
-    /// directory name `<app root>/workplace/`, the CLI command `/workplace`, the config section
-    /// `[workplace]`; the second pass also renamed the Rust-side module and types
-    /// (`src/workplace.rs` / `Workplace` / `WorkplaceConfig`), so there is no second spelling left.
-    ///
-    /// **Do not delete that `alias`**: without it, an already-written `config.toml` **silently**
-    /// falls back to `full` (serde ignores sections it doesn't recognize without erroring) — exactly
-    /// the "written but not in effect" class of problem that is hardest to track down.
+    /// The `workplace` section of `config.toml` (the model's file boundary, see `src/workplace.rs`).
     #[serde(default, rename = "workplace", alias = "workspace")]
     pub workplace: WorkplaceConfig,
     /// The `[recovery]` section: task-level file checkpoints and rollback (see `src/recovery`).
@@ -112,68 +60,34 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConfig {
-    /// Empty = not configured yet. Since the section became optional (2026-10-28) an empty
-    /// `[provider]` — or one carrying only a default like `stream` — has to be a *state*, not a
-    /// parse error: "nothing chosen" is exactly what a fresh install starts in, and the GUI's job is
-    /// to fill it in.
+    /// Empty = not configured yet.
     #[serde(default)]
     pub base_url: String,
     #[serde(default)]
     pub model: String,
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
-    /// Cap on the reply's tokens. Omitted ⇒ [`DEFAULT_MAX_TOKENS`].
-    ///
-    /// It is also the amount **reserved** inside the context budget (`compact::Policy`), so the reply
-    /// does not get cut off by the input having filled the window: raising it lowers the input budget
-    /// by the same number.
+    /// Cap on the reply's tokens.
+    /// It is also the amount reserved inside the context budget (`compact::Policy`), so the reply does not get cut off...
     #[serde(default = "default_max_tokens")]
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     /// Whether to request via SSE streaming (default true).
-    /// With it on, a thinking model's reasoning can be echoed in real time; if some endpoint does
-    /// not accept stream / stream_options, set it false to fall back to waiting for the full response.
     #[serde(default = "default_true")]
     pub stream: bool,
-    /// The model's context window, in tokens. Omitted ⇒ [`DEFAULT_CONTEXT_WINDOW`].
-    ///
-    /// **Two readers, and the second one is not cosmetic** (this doc said otherwise until
-    /// 2026-10-23, and the stale half was the important one):
-    ///
-    /// 1. the GUI's context ring — "how full is the window" needs to know what full means;
-    /// 2. **`compact::Policy`**, which derives the compaction budget as
-    ///    `context_window × compact_ratio − max_tokens`. Set it too high and compaction never
-    ///    triggers, so an over-long conversation goes to the endpoint and comes back as a 400; set it
-    ///    too low and context that would still fit gets folded away.
-    ///
-    /// So this must be the **model's real window**, not an aspiration. `[agent]
-    /// context_budget_tokens` overrides the derivation outright if a single number is easier to
-    /// reason about.
+    /// The model's context window, in tokens.
     #[serde(default = "default_context_window")]
     pub context_window: Option<u32>,
     /// How hard the model should think before answering (the Model tab's "thinking strength").
-    ///
-    /// Omitted ⇒ [`Thinking::Default`], which means **not a single thinking-related field is sent**:
-    /// the decision stays with the endpoint. That is the only value that can never earn a 400 from an
-    /// endpoint that does not know the field, which is why it, and not "high", is the default.
-    ///
-    /// ⚠️ An unrecognized name **errors at startup** (serde lists the accepted words) rather than
-    /// quietly meaning "default" — the same call as `[store] backend` / `[loop] impl`.
     #[serde(default)]
     pub thinking: Thinking,
-    /// Which wire format the thinking fields are written in. See [`ThinkingWire`].
-    ///
-    /// `auto` infers it from the endpoint's host; an unknown host resolves to [`ThinkingWire::None`],
-    /// i.e. "send nothing" — guessing that a stranger's gateway accepts OpenAI's `reasoning_effort`
-    /// is exactly how the first message of a session ends up as a 400.
+    /// Which wire format the thinking fields are written in.
     #[serde(default)]
     pub thinking_wire: ThinkingWire,
 }
 
 impl Default for ProviderConfig {
-    /// Mirrors the serde defaults exactly (a `[provider]` with no keys at all and a
-    /// `ProviderConfig::default()` have to mean the same thing — otherwise "not configured" would
-    /// differ depending on which path produced it).
+    /// Mirrors the serde defaults exactly (a `provider` with no keys at all and a `ProviderConfig::default()` have...
     fn default() -> Self {
         Self {
             base_url: String::new(),
@@ -190,12 +104,7 @@ impl Default for ProviderConfig {
     }
 }
 
-/// Thinking strength, as the **user** states it (not as any one endpoint spells it).
-///
-/// The mapping to actual request fields lives in [`ThinkingWire::apply`]; this enum only says how
-/// much thinking is wanted. Keeping the two apart is what lets one setting drive DeepSeek's
-/// `reasoning_effort`, OpenAI's `reasoning_effort`, and Qwen's `enable_thinking` without the config
-/// file having to name a vendor.
+/// Thinking strength, as the user states it (not as any one endpoint spells it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Thinking {
@@ -241,7 +150,7 @@ impl Thinking {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingWire {
-    /// Infer from the host (see [`ThinkingWire::resolve`]).
+    /// Infer from the host (see [`ThinkingWire::resolve`])
     #[default]
     Auto,
     /// `thinking: {type: "enabled"|"disabled"}` + `reasoning_effort` (DeepSeek, and the many
@@ -249,7 +158,7 @@ pub enum ThinkingWire {
     Deepseek,
     /// `reasoning_effort` only; there is no way to switch thinking off.
     Openai,
-    /// `enable_thinking: true|false` (DashScope / Qwen).
+    /// `enable_thinking: true|false` (DashScope / Qwen)
     Qwen,
     /// Send nothing at all.
     None,
@@ -275,10 +184,6 @@ impl ThinkingWire {
     }
 
     /// Turn `auto` into a concrete wire, from the endpoint's host alone.
-    ///
-    /// An unrecognized host resolves to [`ThinkingWire::None`] **on purpose**: a gateway nobody has
-    /// heard of may reject unknown fields outright, and "the first message of the session 400s" is a
-    /// far worse outcome than "thinking strength had no effect, and the panel says so".
     pub fn resolve(self, base_url: &str) -> ThinkingWire {
         if self != ThinkingWire::Auto {
             return self;
@@ -296,10 +201,6 @@ impl ThinkingWire {
     }
 
     /// Write this level's fields into a request body.
-    ///
-    /// One entry point for every wire, so "which field did this endpoint get" has exactly one answer
-    /// to read. Levels a wire cannot express are **omitted rather than approximated**: OpenAI has no
-    /// "off", so `off` there sends nothing (the panel already greys it out).
     pub fn apply(self, level: Thinking, body: &mut serde_json::Value) {
         use serde_json::json;
         if level == Thinking::Default || self == ThinkingWire::None {
@@ -315,7 +216,7 @@ impl ThinkingWire {
                     body["reasoning_effort"] = json!(e);
                 }
             }
-            // No way to disable it on this wire → `off` sends nothing, and the GUI says so.
+            // No way to disable it on this wire → `off` sends nothing, and the GUI says so
             (ThinkingWire::Openai, Thinking::Off) => {}
             (ThinkingWire::Openai, l) => {
                 // `max` has no OpenAI equivalent; `high` is its ceiling.
@@ -344,10 +245,6 @@ fn host_of(base_url: &str) -> String {
 pub const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
 /// Default context window assumed when the config says nothing.
-///
-/// ⚠️ It feeds the compaction budget (see [`ProviderConfig::context_window`]), so it has to match the
-/// model actually in use. When a model is smaller than this, **set the real number**: an oversized
-/// assumption is not "extra headroom", it is "compaction never runs".
 pub const DEFAULT_CONTEXT_WINDOW: u32 = 600_000;
 
 fn default_max_tokens() -> Option<u32> {
@@ -362,13 +259,7 @@ fn default_true() -> bool {
     true
 }
 
-/// The shipped configuration template, embedded **once**.
-///
-/// It is the file a first run needs (`config.toml` is deliberately not packaged, so no personal key
-/// is ever baked into an installer) and it is also, byte for byte, the documentation of every key.
-/// Both front ends take it from here: the CLI writes it when no config exists, and the GUI does the
-/// same on its first launch — a second `include_str!` in `gui/` would put a second copy of 30 KB of
-/// comments into the binary and could drift from this one.
+/// The shipped configuration template, embedded once.
 pub const TEMPLATE: &str = include_str!("../config.example.toml");
 
 impl ProviderConfig {
@@ -399,17 +290,7 @@ impl ProviderConfig {
         }
     }
 
-    /// The `…/models` URLs to try when scanning, **in order**.
-    ///
-    /// OpenAI-compatible endpoints disagree about where the list lives, and there is no way to know
-    /// from the URL alone:
-    ///
-    /// * a base that already names a version (`/v1`, `/compatible-mode/v1`, `/api/v3`) means the list
-    ///   hangs directly off it — that is the only candidate worth trying;
-    /// * a bare host (`https://api.deepseek.com`, `http://localhost:11434`) is ambiguous, so both
-    ///   shapes are tried, `/v1/models` first (the OpenAI convention, far more common).
-    ///
-    /// The GUI remembers which one answered, so the second scan asks once.
+    /// The `…/models` URLs to try when scanning, in order.
     pub fn models_urls(&self) -> Vec<String> {
         let mut base = self.base_url.trim().trim_end_matches('/').to_string();
         if let Some(b) = base.strip_suffix("/chat/completions") {
@@ -434,11 +315,7 @@ impl ProviderConfig {
         self.thinking_wire.resolve(&self.base_url)
     }
 
-    /// Whether this config looks **filled in**.
-    ///
-    /// Not "is the key non-empty": the shipped template carries the literal placeholder `sk-...`,
-    /// which is non-empty and would sail through, turning "not configured yet" into a 401 on the
-    /// user's first message. The placeholder is treated as "still empty" instead.
+    /// Whether this config looks filled in.
     pub fn is_configured(&self) -> bool {
         if !self.base_url.trim().is_empty() && is_placeholder(self.base_url.trim()) {
             return false;
@@ -480,10 +357,6 @@ pub enum KeyState {
 }
 
 /// Values that mean "nobody has filled this in yet".
-///
-/// `sk-...` and friends ship inside `config.example.toml`; `your-key` / `changeme` / `<...>` are what
-/// people type when they mean "later". Treating them as real is worse than useless: everything looks
-/// configured until the first request 401s.
 fn is_placeholder(s: &str) -> bool {
     let l = s.trim().to_ascii_lowercase();
     l.is_empty()
@@ -493,31 +366,16 @@ fn is_placeholder(s: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-// The whole table is optional: when `[auth]` only sets `meta_tools`, `plugin_tools` takes its
-// code default. This matches the long-standing behavior of `[prompt]` / `[history]` / `[store]` /
-// `[theme.metrics]`. Stage-5 layered composition can produce "a slice of one table" (a single
-// layer changing just one key); requiring the whole table would make that layer fail to parse, and
-// the error (missing field) would point at the composed result, leaving the user completely lost.
+// The whole table is optional: when `auth` only sets `meta_tools`, `plugin_tools` takes its code default.
 #[serde(default)]
 pub struct AuthConfig {
     /// One of: ask | auto | deny
     pub meta_tools: String,
     /// ask | auto | deny
     pub plugin_tools: String,
-    /// ask | auto | deny — the **shell tools** (`shell`, and `bash` once it lands) only.
-    ///
-    /// Its own key rather than riding `plugin_tools`, because it is a different kind of capability:
-    /// a plugin tool does one designed job, whereas a command line runs arbitrary programs (and can
-    /// read every file the user can read). Default `auto` (since 2026-11-10): the dialog is a
-    /// checkpoint for users who want one, not a default gate. Set `"ask"` to put it back.
+    /// Ask | auto | deny — the shell tools (`shell`, and `bash` once it lands) only.
     pub shell: String,
-    /// ask | auto | deny — the **web tools** (`web_fetch`, and anything else in `NET_TOOLS`).
-    ///
-    /// A tier of its own rather than riding `plugin_tools`, for the same reason as `shell`: it is
-    /// the only capability that leaves the machine, so a user who wants to watch it should be able
-    /// to say so once. Default `auto` — `[web] egress` already keeps it narrower than the shell
-    /// (public internet only, no loopback), so a prompt on every page would buy little and cost a
-    /// click each time.
+    /// Ask | auto | deny — the web tools (`web_fetch`, and anything else in `NET_TOOLS`).
     pub web: String,
     #[serde(default)]
     pub overrides: HashMap<String, String>,
@@ -526,10 +384,7 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            // Everything is allowed unless the user says otherwise: a tool call that stops to ask
-            // is a tool call the model cannot use. The four tiers are the same permissive value on
-            // purpose — nothing is special-cased into a prompt — and each one can still be
-            // tightened to `ask` (a nod per call, remembered for the session) or `deny`.
+            // Everything is allowed unless the user says otherwise: a tool call that stops to ask is a tool call the model...
             meta_tools: "auto".into(),
             plugin_tools: "auto".into(),
             shell: "auto".into(),
@@ -540,21 +395,13 @@ impl Default for AuthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-// Same as above: `[agent]` is written in parts by two bundles (tools writes the timeout and
-// truncation, prompt-core writes the rules file); requiring the whole table would make that
-// composition fail outright.
+// Same as above: `agent` is written in parts by two bundles (tools writes the timeout and truncation, prompt-core...
 #[serde(default)]
 pub struct AgentConfig {
     pub rules_file: Option<String>,
     pub tool_timeout_secs: u64,
     pub max_result_chars: usize,
-    /// The **input** token budget for one request; `> 0` turns compaction on and overrides everything
-    /// else. Use it when the window is known to be smaller than `context_window` says (or when only
-    /// part of the window is usable).
-    ///
-    /// 0 = "derive it from `[provider] context_window × compact_ratio`". Since 2026-10-23 both of
-    /// those have defaults (600k / 0.8), so **0 means "compact at ~448k input tokens"**, not "off".
-    /// Set this explicitly when a single number is easier to reason about than the product.
+    /// The input token budget for one request; `> 0` turns compaction on and overrides everything else.
     pub context_budget_tokens: u64,
     /// How much of the model's context window may be used for input, before the reply's reserve is
     /// taken off. Only read when `context_budget_tokens == 0` and `context_window` is set.
@@ -573,39 +420,14 @@ impl Default for AgentConfig {
     }
 }
 
-/// The `[tools]` section: **how much of the tool registry is advertised to the model**.
-///
-/// Two different questions live here, and they are deliberately kept apart instead of being merged
-/// into one "on/off":
-///
-/// - `inline_max` answers "is the list still small enough to send whole?" A registry at or under it
-///   is sent **exactly as before** — every tool, every round, byte-identical request. That is the
-///   zero-drift default: a light install sees no change at all.
-/// - `enabled` answers "which tools must be visible no matter what", for the case where the user runs
-///   a plugin they always want at hand.
-///
-/// The line for "may be held back" is **not a name list** but the tool's own
-/// [`crate::tool::ToolKind`]: the host's own tools (`Meta` / `Host`) are always advertised, and only
-/// `Plugin(_)` tools can be hidden. A model-built plugin therefore can never displace the host's own
-/// vocabulary — see [`crate::tool::scope`] for the rule and the reasoning.
-///
-/// ⚠️ Hiding is **advertising only**, not execution: `Runtime::execute` (and `Agent`'s
-/// `authorize_and_execute`) resolve a name against the registry, not against this list, so a tool
-/// the model remembers but cannot see still runs. Hidden ≠ unavailable.
+/// The `tools` section: how much of the tool registry is advertised to the model.
 #[derive(Debug, Clone, Deserialize)]
 // Same as above: a section that sets only one key leaves the other at its default.
 #[serde(default)]
 pub struct ToolsConfig {
-    /// Registry size at or below which the whole list is sent (old behaviour). `0` = never hide
-    /// plugin tools, ever — the permanent escape hatch.
-    ///
-    /// The default (24) is picked so that the 18 host tools plus a handful of plugins stay fully
-    /// inline: discovery costs a round trip, and paying it to save a few hundred tokens is a bad
-    /// trade. It starts paying when a registry holds dozens of tools.
+    /// Registry size at or below which the whole list is sent (old behaviour). `0` = never hide plugin tools, ever —...
     pub inline_max: usize,
-    /// Tools that stay visible regardless of `inline_max` (plugin tools included). Names must match
-    /// the registry exactly; unknown names are ignored, so deleting a plugin does not leave a broken
-    /// config behind.
+    /// Tools that stay visible regardless of `inline_max` (plugin tools included).
     pub enabled: Vec<String>,
 }
 
@@ -621,24 +443,11 @@ impl Default for ToolsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RuntimesConfig {
-    /// When the value is a **bare command** (`python` / `node` / `rustc`), the host tries in order:
-    /// **`PATH`** → "runtime bundled in the app directory `<app_root>/runtime/<lang>/<exe>`";
-    /// when it is a **full path** it is used directly, with no substitution.
-    ///
-    /// `PATH` comes first because a complete interpreter (with pip, venv, headers and the full stdlib) is
-    /// better than the embeddable runtime this project can ship — see [`prefer`](RuntimesConfig::prefer)
-    /// for the way out. A `PATH` candidate is only accepted when it is a real file: the Windows "app
-    /// execution alias" (`%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe`, 0 bytes, a reparse point
-    /// that opens the Microsoft Store) is skipped.
+    /// When the value is a bare command (`python` / `node` / `rustc`), the host tries in order.
     pub python: String,
     pub node: String,
     pub rustc: String,
     /// Which side wins when both exist: `system` (default) or `builtin`.
-    ///
-    /// `system` = `PATH` first, bundled runtime as the fallback. `builtin` = ignore `PATH` for bare
-    /// commands and use `<app_root>/runtime/<lang>/` whenever it is installed — the escape hatch for
-    /// machines whose `PATH` python is broken in a way that is not detectable by looking at the file.
-    /// An explicit path in `python` / `node` / `rustc` always wins over both.
     #[serde(default = "default_prefer")]
     pub prefer: String,
     /// Override the Python runtime download source (default: the official CPython embeddable package, see `runtimes::DEFAULT_PYTHON_URL`).
@@ -690,12 +499,7 @@ impl Default for HistoryConfig {
     }
 }
 
-/// The **storage backend** for conversation history (the storage seam extracted in stage 3, see `src/store.rs`).
-///
-/// This cycle has only one implementation, `"jsonl"`: one file per conversation, under
-/// `<app root>/history/`. **An unrecognized value errors out at startup**, rather than silently
-/// falling back to jsonl — a mistyped config that still starts shows up as "I clearly set another
-/// backend, why is it still writing jsonl?", and that class of problem is the hardest to track down.
+/// The storage backend for conversation history (the storage seam extracted in stage 3, see `src/store.rs`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct StoreConfig {
     #[serde(default = "default_store_backend")]
@@ -714,16 +518,9 @@ impl Default for StoreConfig {
 }
 
 /// How the system prompt is assembled (reordering / disabling / appending segments).
-///
-/// The segments themselves and the assembly logic live in `src/prompt.rs`; this is just the user's
-/// override in `config.toml`. All fields empty by default = follow the built-in order exactly,
-/// **byte-identical** to the historical hard-coded prompt.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PromptConfig {
-    /// Explicit order: the listed segment ids are sorted to the front in this order, and the
-    /// unlisted ones keep their default order after them.
-    ///
-    /// So "move only env to the front" needs just `order = ["env"]`, no need to list all four.
+    /// Explicit order: the listed segment ids are sorted to the front in this order, and the unlisted ones keep...
     #[serde(default)]
     pub order: Vec<String>,
     /// Segment ids to disable (built-in segments may use `core` / `protocol` / `env` / `rules`).
@@ -749,47 +546,17 @@ pub struct PromptSegmentConfig {
 }
 
 /// Loop hooks (the stage-4 Loop seam, implemented in `src/hook.rs`).
-///
-/// **This whole section empty = not a single hook registered**, and `run_loop` takes exactly the
-/// same path as before the Loop seam.
-///
-/// Note the division of labour: this governs "whether to change things **after releasing**", not
-/// "whether to release at all" — blocking a tool is an authorization concern and belongs to
-/// `[auth]` (whose override keys support wildcards like `fs_*`).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct HookConfig {
-    /// Auto-fill arguments for the given tools, written like:
-    ///
-    /// ```toml
-    /// [hook.tool_args_default.fs_read_file]
-    /// encoding = "utf-8"
-    /// ```
-    ///
-    /// **Only fills keys the model did not give**; values the model passed explicitly are never
-    /// touched — overriding the model's explicit intent creates the hardest-to-track failure mode
-    /// of "the model said A, the tool received B".
+    /// Auto-fill arguments for the given tools, written like.
     #[serde(default)]
     pub tool_args_default: HashMap<String, HashMap<String, toml::Value>>,
 }
 
-/// The `[retry]` section: how many times a failed **model request** is sent again, and how long to
-/// wait between attempts.
-///
-/// Scope is exactly "the request that never produced a reply". Tool calls are not retried here and
-/// never will be — a tool can have side effects, so the host may report a failure but must never
-/// run it a second time on its own. Requests, by contrast, are safe to repeat: `agent.messages()` is
-/// only ever mutated by a *successful* reply, so a retry sends a byte-identical body.
-///
-/// **Defaults are on** (`attempts = 2`): a rate limit or a dropped stream used to throw away the
-/// whole turn, which with a 600k window is the most expensive failure the program has. The cost of
-/// being wrong in the other direction is one second of waiting before the same error appears.
+/// The `retry` section: how many times a failed model request is sent again, and how long to wait between attempts.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetryConfig {
-    /// Extra attempts **after** the first one (`0` = never retry). Total requests ≤ `attempts + 1`.
-    ///
-    /// Only failures that could plausibly succeed on the next try are retried at all — `429`, `5xx`,
-    /// connection errors, a stream that stopped mid-answer. A `401`, a bad model name or a context
-    /// that is too long fails on the first attempt (see `llm::failure::retryable`).
+    /// Extra attempts after the first one (`0` = never retry).
     #[serde(default = "default_retry_attempts")]
     pub attempts: usize,
     /// The first wait, in milliseconds. It doubles per attempt: `base`, `2×base`, `4×base` …
@@ -824,45 +591,15 @@ impl Default for RetryConfig {
 }
 
 /// The main loop (the loop seam's second form from stage 6 · 6a, implemented in `src/agent_loop.rs`).
-///
-/// The stage-4 hooks could only insert five points **inside the loop**, the skeleton was still
-/// welded shut; this section decides **which loop skeleton to use**, and along the way provides the
-/// "context trimming" capability that only the loop layer can offer (it has to touch both memory and
-/// the conversation file, and rebuild the request after trimming).
-///
-/// Default (whole section unwritten) = `standard` + no trimming, **byte-identical** to stage 5.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LoopConfig {
-    /// Which loop implementation to use. **This cycle only recognizes `standard`** — any other value
-    /// **errors out at startup** in `Runtime::new`, no silent fallback (the same principle as
-    /// `[store] backend`: a setting written but never taking effect is the hardest class of bug).
+    /// Which loop implementation to use.
     #[serde(rename = "impl")]
     pub implementor: String,
     /// How many "user turns" to keep at most in the context; `0` (default) = no trimming.
-    ///
-    /// A turn is delimited by one `role == "user"` message (tips injected by the host hook are also
-    /// user messages, so each occupies a turn too). Trimming always drops from the **oldest whole
-    /// turn**, and always keeps the system-prompt message — so the trimmed context is itself a legal
-    /// request body, and never leaves the half-message "a tool result remains while its assistant was
-    /// already dropped", which the endpoint would reject outright.
     pub max_rounds: usize,
-    /// How many model requests **one turn** may make before the host stops and hands control back.
-    /// `0` (default) = no limit, exactly as before this existed.
-    ///
-    /// A turn makes one request per round (a round = one model reply + the tools it asked for), so
-    /// this is the only hard ceiling on what a confused model can spend in one go: without it, a
-    /// model that keeps calling tools can run until the user notices and interrupts. The count is
-    /// per turn and resets with every user message.
-    ///
-    /// When it fires, the turn ends **normally** (the checkpoint is persisted, the front end closes
-    /// the card) and the user is told which limit fired — "the task died silently" is the failure
-    /// this is trying to prevent, so it must not create that impression.
-    ///
-    /// Not the same thing as `max_rounds`: that one trims the **context** (how much history is kept),
-    /// this one caps the **work** (how many requests a single instruction may cost). A turn can hit
-    /// this ceiling at 50 with a perfectly small context, and can run 200 rounds with
-    /// `max_rounds = 3`.
+    /// How many model requests one turn may make before the host stops and hands control back. `0` (default) =...
     #[serde(default)]
     pub max_iters_per_turn: usize,
 }
@@ -878,48 +615,15 @@ fn default_loop_impl() -> String {
     crate::agent_loop::default_impl().to_string()
 }
 
-/// The plugin child-process **fence** (Job Object, see `src/sandbox.rs`).
-///
-/// **On** by default, and the default values are exactly the set that has "zero impact on legitimate
-/// plugins": allow a plugin to open 8 more child processes, kill everything when it closes, isolate
-/// the USER object. Together they remove the fork bomb, orphan processes, and a plugin reaching for
-/// the host's windows/clipboard.
-///
-/// ⚠️ The defaults of this section are **not** "zero drift" — it is a deliberate hardening, and
-/// `enabled = false` reverts it. Note however that it **cannot govern files and the network**: those
-/// two need AppContainer (see the options comparison in docs).
+/// The plugin child-process fence (Job Object, see `src/sandbox.rs`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SandboxConfig {
     /// Master switch. Once off, no Job is built and no `CREATE_SUSPENDED` is added, byte-identical to before the fence.
     pub enabled: bool,
-    /// How many child processes **each plugin may open at most** (**not counting the plugin itself**).
-    ///
-    /// `0` = forbid the plugin from opening child processes (the only tier that locks this path shut); default `8`.
-    ///
-    /// Why the default is no longer `1`: that number used to be "the total process count **including
-    /// the plugin itself**", written straight into the Job, so a default of 1 meant "only 1 process
-    /// allowed in the Job" — the plugin itself filled it, and any plugin that does work via a child
-    /// process (calling `curl` / `git` / an interpreter) got `WinError 1816` (quota exceeded), showing
-    /// up as "the plugin inexplicably cannot do its job". The platform's "including self" convention
-    /// now lives in one place, [`SandboxConfig::job_process_limit`], and this config layer speaks
-    /// only of what the user cares about.
-    ///
-    /// Why keep a **finite small allowance** (rather than unlimited): a fork bomb relies on concurrent
-    /// doubling, and capping concurrency stops it (child processes also inherit this Job automatically,
-    /// so they cannot escape the fence). To loosen it, write a large number, **not 0** — a 0 here means
-    /// "not a single one allowed", the opposite direction from `max_memory_mb = 0` (unlimited): when
-    /// asking "how many are allowed", 0 means 0, whereas that memory 0 is just shorthand for "no cap".
-    ///
-    /// Note this is an allowance **per plugin** (one Job per plugin), not a global budget — otherwise
-    /// one plugin could eat the whole allowance and the others could not even start.
+    /// How many child processes each plugin may open at most (not counting the plugin itself).
     pub max_processes: u32,
     /// Commit-memory cap for each plugin process, in MB. `0` (default) = unlimited.
-    ///
-    /// ⚠️ Why off by default: exceeding it **kills the whole process in the kernel**, rather than
-    /// being one failed allocation — a tight cap would simply kill a "legitimate but memory-hungry"
-    /// plugin, with no visible reason from the plugin side, showing up as "the plugin keeps
-    /// inexplicably restarting". Turn it on deliberately if you want it.
     pub max_memory_mb: usize,
     /// Forbid the plugin from using the host process's USER object (windows / clipboard / desktop / global atoms).
     /// A plugin process doesn't need these anyway — all its communication goes through the stdin/stdout pipes.
@@ -928,16 +632,6 @@ pub struct SandboxConfig {
 
 impl SandboxConfig {
     /// The `ActiveProcessLimit` actually written into the Job.
-    ///
-    /// The `+1` is **platform semantics**, not config semantics: `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`
-    /// counts processes in the **whole Job**, and the plugin itself takes one slot. Keeping this layer
-    /// here (the one place) is what makes [`max_processes`](SandboxConfig::max_processes) in the config
-    /// really mean "how many more child processes the plugin may open" — otherwise the user would have
-    /// to +1 in their head, and the consequence of missing that step is exactly "the plugin cannot do
-    /// its job under the default config".
-    ///
-    /// `saturating_add`: a config of `u32::MAX` will not wrap to 0 (0 in a Job means "unlimited", which
-    /// is a different meaning, and must not be hit by one careless extreme value).
     pub fn job_process_limit(&self) -> u32 {
         self.max_processes.saturating_add(1)
     }
@@ -949,120 +643,43 @@ impl Default for SandboxConfig {
     }
 }
 
-/// The built-in **shell tools** (`config.toml`'s `[shell]`, see `src/tool/shell.rs`).
-///
-/// This section governs a capability none of the others do: `[sandbox]` limits how a *plugin*
-/// process runs, `[workplace]` says which files may be touched, and **this one hands the model a
-/// command line** — together with the one boundary that makes doing so defensible.
-///
-/// # The boundary, in one paragraph
-///
-/// The command runs at **Low integrity** (Mandatory Integrity Control, `src/shell/lowil.rs`) and the
-/// workspace is labelled Low, so `no-write-up` turns "write outside the workspace" into a **kernel
-/// refusal** instead of a convention the model has to respect. Reads are deliberately untouched —
-/// the same read/write asymmetry as [`crate::workplace::Access`]. The command scan in
-/// `tool::shell` is a **guard rail** (it produces a readable refusal before a command half-runs),
-/// never the boundary itself.
+/// The built-in shell tools (`config.toml`'s `shell`, see `src/tool/shell.rs`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ShellConfig {
     /// Master switch. `false` = the tools are never registered, so the model never sees them.
     pub enabled: bool,
-    /// Which command line the model should reach for **first**: `bash` (default) or `cmd`.
-    ///
-    /// This is an **instruction, not a fallback**. The host can never "try bash, then cmd": a command
-    /// has side effects, so running one twice to find out which shell accepts it would be a disaster
-    /// (`del`, `git commit`, `cargo build`). What the key changes is the wording the model reads —
-    /// [`crate::prompt`] orders its paragraph around it, and `/shell` plus the settings row report it.
-    ///
-    /// `cmd` needs no new tool name: it is already `shell`'s default dialect
-    /// (`Dialect::default_for_platform`), so `prefer = "cmd"` is honest about a door that already
-    /// exists. Measured on Windows 11 26200: `cmd /D /S /C exit` ≈ 87 ms, `git-bash -c exit` ≈ 270 ms,
-    /// busybox `sh -c exit` ≈ 28 ms. `bash` stays the default anyway: a shell with `$(…)`, `&&` and
-    /// sed/grep/find/awk is worth the ~180 ms on anything longer than a one-word command, and a wrong
-    /// guess costs a whole model round trip — far more than 180 ms.
+    /// Which command line the model should reach for first: `bash` (default) or `cmd`.
     #[serde(default = "default_shell_prefer")]
     pub prefer: String,
-    // NOTE: there is deliberately **no** `boundary` switch. A kernel-enforced boundary (low-integrity
-    // child + labelled workspace) was implemented three ways and measured not to hold on Windows 11
-    // 26200 — see `docs/SHELL.md`. The only layer is the host's command scan, and pretending otherwise
-    // through a config key would be the worst kind of option: one that reads as protection.
-    /// Where the `bash` tool's shell comes from: `auto` (default) | `off` | an absolute path.
-    ///
-    /// `auto` looks, in order, at `<app root>\runtime\bash\` (see `bash_pack`), the usual Git for
-    /// Windows install locations, and finally `bash.exe` on PATH — skipping anything under
-    /// `\Microsoft\WindowsApps\`, which is the WSL launcher and a different file system. Detection only
-    /// stats files; a candidate is validated with `uname -s` on the first call.
+    // NOTE: there is deliberately no `boundary` switch.
     pub bash: String,
     /// Whether `<app root>\runtime\bash\bash.exe` (or `busybox.exe`) is considered by `auto`.
-    ///
-    /// A sidecar rather than something embedded in the exe: the binary stays small, and the pack can be
-    /// shipped or skipped independently. `off` ignores it.
     pub bash_pack: String,
-    /// Default per-call timeout, in seconds. A call may ask for more via its own `timeout_secs`.
-    ///
-    /// 60 rather than the old 120 (user decision, 2026-10-23): a normal command finishes in
-    /// milliseconds, a build in a couple of minutes, and anything already running for a minute with
-    /// no result is far more often wedged than working. A call that really needs longer says so —
-    /// `timeout_secs` is right there in the schema, and running out of budget is a *readable*
-    /// outcome (`TIMED OUT … the whole tree was terminated`), not a silent hang.
+    /// Default per-call timeout, in seconds.
     pub timeout_secs: u64,
     /// Hard ceiling for `timeout_secs`. A model that asks for an hour waits an hour otherwise,
     /// while holding one tool slot the whole time.
     pub max_timeout_secs: u64,
-    /// Kill a call that has written **nothing** to either stream for this many seconds.
-    ///
-    /// This is the answer to "it has been running for eight minutes, is it working or wedged?". A
-    /// total timeout cannot tell the two apart — a build legitimately runs for minutes — but the
-    /// *stream* can: a build prints constantly, a wedged process prints nothing. Measured from the
-    /// last byte that arrived, not from the start, so `cargo build` is never killed for being slow.
-    ///
-    /// `0` = off (only `timeout_secs` applies). A call may override it with its own `idle_secs`.
+    /// Kill a call that has written nothing to either stream for this many seconds.
     pub idle_timeout_secs: u64,
     /// How much of a command's output to keep (stdout and stderr counted separately), in bytes.
-    ///
-    /// Beyond it the **head and the tail** are kept and the elided middle is reported with its
-    /// size: build logs put the failure at the end and often the reason at the start, so keeping one
-    /// end only would throw away half the answer.
     pub max_output_bytes: usize,
-    /// Process allowance for **one call** (a Job Object per call, the same mechanism as plugins).
-    ///
-    /// This one is a correctness need rather than hardening: a timeout has to kill the whole tree
-    /// (`cargo` → `rustc` × N), so the fence is created regardless of `[sandbox] enabled`.
-    /// `0` = the command may not spawn anything at all.
+    /// Process allowance for one call (a Job Object per call, the same mechanism as plugins).
     pub max_processes: u32,
-    /// How many **long-lived** `shell_job` trees may exist at once. `0` disables the tool.
-    ///
-    /// Separate from `max_processes`: that one is the process allowance *inside one Job*, this one
-    /// is how many Jobs are allowed to stay alive across calls. A dev server, a watcher and a
-    /// preview process all have legitimate reasons to coexist, but an unbounded set of them is just
-    /// the orphan-process problem with better bookkeeping.
+    /// How many long-lived `shell_job` trees may exist at once. `0` disables the tool.
     pub background_max_jobs: usize,
-    /// Process allowance **inside one background Job**.
-    ///
-    /// Browser-driven checks are the reason this is larger than [`Self::max_processes`]: a single
-    /// Chromium launch can occupy a dozen processes before the site has even rendered. `0` means
-    /// the helper may not start a command at all and is rejected by the tool.
+    /// Process allowance inside one background Job.
     pub background_max_processes: u32,
     /// Maximum lifetime of one background job, in hours. `0` = no expiry (stop explicitly instead).
-    ///
-    /// Expiry is checked when `shell_job` is used and before every agent request; a job cannot slip
-    /// past it just because the model stopped asking. The hard guarantee remains host exit: the
-    /// registry owns every fence, so closing it kills all trees at once.
     pub background_max_hours: u64,
-    /// Point build caches at the workspace (`CARGO_HOME`, `NPM_CONFIG_CACHE`, `PIP_CACHE_DIR`,
-    /// `TMP`/`TEMP`) instead of the user profile.
-    ///
-    /// Not a nicety: a Low-integrity process **cannot write** `%USERPROFILE%\.cargo` (Medium), so
-    /// with this off `cargo build` inside the workspace fails with "access denied" on its own cache
-    /// — a failure that looks like the boundary being broken. The price is one cold cache per
-    /// workspace.
+    /// Point build caches at the workspace (`CARGO_HOME`, `NPM_CONFIG_CACHE`, `PIP_CACHE_DIR`, `TMP`/`TEMP`) instead...
     pub env_cache: bool,
     /// Report which workspace files changed during the call (a bounded mtime scan afterwards).
     pub track_changes: bool,
 }
 
-/// `prefer` defaults to bash; see [`ShellConfig::prefer`].
+/// `prefer` defaults to bash; see [`ShellConfig::prefer`]
 fn default_shell_prefer() -> String {
     "bash".to_string()
 }
@@ -1088,51 +705,27 @@ impl Default for ShellConfig {
     }
 }
 
-/// The built-in **web tool** (`config.toml`'s `[web]`, see `src/tool/web.rs` + `src/web/`).
-///
-/// # What this section is, and is not
-///
-/// It governs the first capability the host hands the model that points **outward**: one URL in, some
-/// text out. It is deliberately not called a boundary. The shell tool can already reach every host
-/// this machine can reach; `web_fetch` narrows the *easy* path (a prompt-free GET to
-/// `http://127.0.0.1:<port>/admin` is exactly what the shell's `ask` tier exists to prevent), which
-/// is why [`egress`](WebConfig::egress) defaults to `public` rather than `any`.
-///
-/// # Why so many keys
-///
-/// Every one of them answers a failure that has a *readable* fix: a GB18030 page that came back as
-/// mojibake, an intranet CA rustls does not know, a 40 MB PDF behind `save`, a page that needs a
-/// browser. The tool's error text names the key, so the config is part of the interface.
+/// The built-in web tool (`config.toml`'s `web`, see `src/tool/web.rs` + `src/web/`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
     /// Master switch. `false` = the tool is never registered, so the model never sees it.
     pub enabled: bool,
     /// Which hosts may be reached: `public` (default) | `any` | `allowlist`.
-    ///
-    /// - `public` refuses loopback, RFC1918, link-local, CGNAT, multicast and unspecified addresses;
-    /// - `any` refuses nothing (the shell's effective reach, minus non-http schemes);
-    /// - `allowlist` refuses everything except [`hosts`](WebConfig::hosts).
-    ///
-    /// `hosts` doubles as the exception list for `public`: a local dev server needs its host there.
     pub egress: String,
     /// Exceptions (`public`) or the whole list (`allowlist`).
-    ///
-    /// Matching is on label boundaries: `example.com` also matches `www.example.com`;
-    /// `*.example.com` matches subdomains only; `127.0.0.1` matches the literal address only.
-    /// Ports are not part of the match.
     pub hosts: Vec<String>,
-    /// Default per-result character budget.
+    /// Default per-result character budget
     pub max_chars: usize,
-    /// Ceiling for an explicit `max_chars` in the call.
+    /// Ceiling for an explicit `max_chars` in the call
     pub hard_max_chars: usize,
     /// Body cap for text-ish responses, counted **after** decompression.
     pub max_bytes: usize,
-    /// Body cap for `save = true` (PDFs, images, archives).
+    /// Body cap for `save = true` (PDFs, images, archives)
     pub max_save_bytes: usize,
     /// Default total deadline for one call, in seconds.
     pub timeout_secs: u64,
-    /// Ceiling for the call's own `timeout_secs`.
+    /// Ceiling for the call's own `timeout_secs`
     pub max_timeout_secs: u64,
     /// How many redirect hops are followed before giving up.
     pub max_redirects: u32,
@@ -1168,63 +761,17 @@ impl Default for WebConfig {
     }
 }
 
-/// **Lazy loading of plugin subprocesses** (`config.toml`'s `[plugins]`, see `src/plugin/mod.rs`).
-///
-/// # What problem it solves
-///
-/// A plugin is one interpreter process. Under the old behaviour **every** plugin under `plugins/`
-/// was started at boot and stayed resident for as long as the program lived — a shelf of idle
-/// `python.exe` processes (roughly 10-15 MB each) that nobody was calling, which is exactly the
-/// "checked the task manager and found a row of mysterious processes" complaint.
-///
-/// # How
-///
-/// A plugin slot has only two states: **dormant** (no process; only metadata in memory, a few
-/// hundred bytes) and **active** (child process + Job fence). Startup reads the manifest plus
-/// `plugins/<name>/plugin.cache.json` and registers the plugin's tools, hooks and prompt segments
-/// **without starting anything**; the process is started by the first real use (`tools/call` or a
-/// hook), and the reaper takes it away again once it has been idle past `idle_timeout_secs`.
-///
-/// Dormant is not "disabled": the plugin's tools are still in the model's tool list and still
-/// callable — they just cost a process start (tens of milliseconds) the first time.
-///
-/// ⚠️ The one thing worth knowing: the tool list comes from a cache, so a plugin whose source was
-/// edited since its last run may briefly advertise a stale tool table. It self-heals — every real
-/// start re-reads the tools, re-registers them if they differ, and rewrites the cache — so the
-/// worst case is one wasted call. To force a rebuild by hand, delete that plugin's
-/// `plugin.cache.json`.
+/// Lazy loading of plugin subprocesses (`config.toml`'s `plugins`, see `src/plugin/mod.rs`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PluginsConfig {
     /// Master switch. `true` (default) = metadata-only at boot, start on demand, reap when idle.
-    ///
-    /// `false` restores the previous behaviour **item by item**: every plugin is started at boot
-    /// and stays resident until the program exits. This is the escape hatch, the same idea as
-    /// `[sandbox] enabled = false` — anything that turns out to misbehave under lazy loading can be
-    /// taken back to the old model without downgrading the program.
     pub lazy: bool,
     /// How many seconds a plugin process may sit unused before it is shut down.
-    ///
-    /// `0` = never reap (processes persist once started, i.e. lazy *start* but no lazy *stop*).
-    ///
-    /// Why there is a threshold at all rather than "close it the moment the call returns": every
-    /// start costs a process spawn (tens of milliseconds for `python.exe`), and a task usually calls
-    /// the same plugin several times in a row. A minute of grace is invisible to the user while
-    /// still leaving the machine clean by the time they look at the task manager.
     pub idle_timeout_secs: u64,
-    /// Upper bound on **simultaneously live** plugin processes. `0` (default) = unlimited.
-    ///
-    /// Over the cap, the longest-idle process is closed first to make room. Leave it at 0 unless
-    /// memory is genuinely tight: a turn that alternates between a hook component and a tool plugin
-    /// can otherwise be forced to start a process on every single round, which is slower than just
-    /// keeping both alive for the idle window.
+    /// Upper bound on simultaneously live plugin processes. `0` (default) = unlimited.
     pub max_resident: usize,
-    /// Plugin names that **always stay resident** even when idle.
-    ///
-    /// For components that fire on every turn (`[contributes] hooks`): they count as "in use" at the
-    /// start of every request, so under lazy loading they would be started, reaped and started again
-    /// on each round. Put those names here and they are started at boot like before — the right
-    /// shape for "always on, always cheap".
+    /// Plugin names that always stay resident even when idle.
     pub eager: Vec<String>,
 }
 
@@ -1234,34 +781,11 @@ impl Default for PluginsConfig {
     }
 }
 
-/// The workspace boundary (the config surface of sandbox option ③ "take the file capability back to
-/// the host", see `src/workplace.rs`).
-///
-/// It and `[sandbox]` are **two different things**, don't conflate them:
-/// - `[sandbox]` governs whether a **plugin child process** can open child processes / eat memory /
-///   touch host windows (a process fence);
-/// - `[workplace]` governs **which files the model may touch this time** (the path boundary for writes
-///   and deletes; reads are unrestricted).
-///
-/// Default `mode = "default"` (the workspace **is the app root**; `temp/` for scratch, `workplace/`
-/// for durable deliverables). **Changed from `"full"` to this on 2026-10-05** — honoring the user's
-/// original "**confined by default** on every start"; the per-conversation `<timestamp>/` plot was
-/// dropped on 2026-10-08 in favour of a single app-root workspace.
-///
-/// ⚠️ The cost: "no `[workplace]` config = byte-identical to before this layer" **no longer holds**.
-/// Writing nothing now means the confined tier (writes and deletes may only land **under the app
-/// root**, reads remain unrestricted); to be unrestricted you must explicitly write
-/// `mode = "full"`, or switch to "full access" in the UI (that is a runtime choice, valid only for the
-/// current conversation).
+/// The workspace boundary (the config surface of sandbox option "take the file capability back to the host", see...
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct WorkplaceConfig {
-    /// `"default"` (**default**: confined to the app root — the workspace itself) /
-    /// `"full"` (unrestricted) / `"fixed"` (with `root` naming a fixed directory).
-    ///
-    /// **An unrecognized value errors out at startup**, no silent fallback to the default tier — the
-    /// same principle as `[store] backend` / `[loop] impl`: a setting written but never taking effect
-    /// is the hardest class of bug to track down.
+    /// `"default"` (default: confined to the app root — the workspace itself) / `"full"` (unrestricted) / `"fixed"`...
     pub mode: String,
     /// The fixed workspace directory when `mode = "fixed"`. A relative path is interpreted relative to the **app root**.
     pub root: Option<String>,
@@ -1274,7 +798,7 @@ impl Default for WorkplaceConfig {
     }
 }
 
-// ─────────────────────────── Task recovery (checkpoints / rollback) ───────────────────────────
+// Task recovery (checkpoints / rollback)
 
 /// How thoroughly an opaque tool call (`shell`, a writing plugin) is guarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1289,9 +813,6 @@ pub enum ShellGuard {
 }
 
 /// Task-level file checkpoints under `<workspace>/.aox/backup`.
-///
-/// The defaults are deliberately conservative but cheap for read-only turns: no store is opened
-/// until the first file write.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RecoveryConfig {
@@ -1336,9 +857,7 @@ fn default_recovery_exclude() -> Vec<String> {
         "venv/",
         "__pycache__/",
         ".pytest_cache/",
-        // Downloaded toolchains and vendored runtimes: generated, large, and never the thing a
-        // rollback is for. This one came from a real report — a single-page HTML file ended up
-        // costing 45 MiB of baseline because the workspace also held an embedded Python runtime.
+        // Downloaded toolchains and vendored runtimes: generated, large, and never the thing a rollback is for.
         "runtime/",
         // Agent housekeeping (this program's sibling tooling, session logs, blobs). Not the user's
         // source, and it grows on its own.
@@ -1346,12 +865,7 @@ fn default_recovery_exclude() -> Vec<String> {
         "dist/",
         "build/",
         "out/",
-        // Executable images and their symbols. Not source, and the one category a rollback can
-        // never honour: the running process keeps its mapped image, and the next build overwrites
-        // the file anyway. It is also the largest thing an app directory holds — a single
-        // `aox-gui.exe` is ~9 MiB of object per build, which a workspace that *is* the install
-        // directory would otherwise pay for on every rebuild (measured: 48 MiB of objects for a
-        // task whose only file was a 3.8 KB report).
+        // Executable images and their symbols.
         "*.exe",
         "*.dll",
         "*.pdb",
@@ -1366,22 +880,10 @@ fn default_recovery_exclude() -> Vec<String> {
     .collect()
 }
 
-// ─────────────────────────── Appearance (GUI theme) ───────────────────────────
-//
-// This section describes **data** only and does not know about egui. Two reasons:
-//   ① `gui::theme::Palette` holds `egui::Color32`, and `Color32` does not implement `Deserialize`;
-//   ② the core library `aox` should not depend on egui (the GUI is an optional frontend, the CLI doesn't use it).
-// So this holds "plain colour data + per-field overrides", which the GUI side converts into `Color32` and layers onto the built-in palette.
+// ─────────────────────────── Appearance (GUI theme) ───────────────────────────.
 
 /// A colour value.
-///
-/// Accepts these forms (usable in both `config.toml` and theme files):
-/// - `"#RRGGBB"` opaque
-/// - `"#RRGGBBAA"` with alpha (`AA` is **opacity**, `FF` = fully opaque)
-/// - `"#RGB"` three-digit shorthand
-/// - `[r, g, b]` / `[r, g, b, a]` array form
-///
-/// The leading `#` may be omitted.
+/// Accepts these forms (usable in both `config.toml` and theme files): - `"#RRGGBB"` opaque - `"#RRGGBBAA"`...
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RgbColor {
     pub r: u8,
@@ -1399,7 +901,6 @@ impl RgbColor {
             6 => Some(Self { r: byte(0)?, g: byte(2)?, b: byte(4)?, a: 255 }),
             8 => Some(Self { r: byte(0)?, g: byte(2)?, b: byte(4)?, a: byte(6)? }),
             3 => {
-                // Three-digit shorthand: each nibble duplicated (`#abc` → `#aabbcc`)
                 let nib =
                     |i: usize| -> Option<u8> { Some(u8::from_str_radix(t.get(i..i + 1)?, 16).ok()? * 17) };
                 Some(Self { r: nib(0)?, g: nib(1)?, b: nib(2)?, a: 255 })
@@ -1455,10 +956,7 @@ impl<'de> Deserialize<'de> for RgbColor {
     }
 }
 
-/// A **per-field override** of one palette. Write only the fields you want to change; the rest inherit the built-in (paper / ink).
-///
-/// The fields correspond one-to-one and in the same order as `gui/src/theme.rs`'s `Palette`, for easy comparison.
-/// All empty = **pixel-identical** to the built-in palette.
+/// A per-field override of one palette.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct PaletteConfig {
@@ -1484,14 +982,7 @@ pub struct PaletteConfig {
     pub on_reverse: Option<RgbColor>,
     /// Shadow colour of floating cards
     pub shadow: Option<RgbColor>,
-    /// **The only hue in the whole palette**: dangerous actions (currently used only for "full access").
-    ///
-    /// The other fields deliberately express semantics with lightness alone, but "after crossing the
-    /// line there is no boundary at all" deserves one exception — it is the only switch that, once
-    /// clicked, bypasses every protection, and a lightness scale cannot express "this is not an
-    /// ordinary option". It is still an ordinary, overridable palette field (kept in step with
-    /// `gen_themes.py`'s fields): if a theme author really wants to remove this bit of red, that is
-    /// their choice, and it must not be silently ignored in the merge layer.
+    /// The only hue in the whole palette: dangerous actions (currently used only for "full access").
     pub danger: Option<RgbColor>,
 }
 
@@ -1538,7 +1029,7 @@ impl Default for MetricsConfig {
     }
 }
 
-/// Font file paths. When empty, continue auto-searching in the order "environment variable → built-in candidate table".
+/// Font file paths. When empty, continue auto-searching in the order "environment variable → built-in candidate table"
 #[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct FontsConfig {
@@ -1554,17 +1045,11 @@ pub struct FontsConfig {
     pub mono: Option<String>,
 }
 
-/// GUI appearance config: `config.toml`'s `[theme]`, or a whole theme file given with `--theme <file>`.
-///
-/// A `--theme` file **wholly replaces** `config.toml`'s `[theme]` (not a field-by-field layering),
-/// so a theme file is either complete or expected to be filled in with built-in values.
+/// GUI appearance config: `config.toml`'s `theme`, or a whole theme file given with `--theme <file>`.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct ThemeConfig {
     /// Initial light/dark: `"light"` / `"dark"`.
-    ///
-    /// **Lowest priority**: if the user manually switched theme before, that record wins (see the GUI's
-    /// `.aox-gui-theme`); this value is used only if it was never switched, and if neither exists, "ink" (dark) is used.
     pub mode: Option<String>,
     /// Overrides for the "paper" (light) set
     #[serde(default)]
@@ -1580,19 +1065,10 @@ pub struct ThemeConfig {
 
 #[allow(dead_code)] // Only the GUI calls it (`--theme <file>`); the CLI doesn't accept this argument, but the bin target compiles this file too
 impl ThemeConfig {
-    /// Parse a theme from a TOML text. **Both forms are accepted**:
-    ///
-    /// - **bare theme**: `mode` / `[metrics]` / `[dark]` … written directly at the top level;
-    /// - **with a `[theme]` table**: exactly as written in `config.toml`.
-    ///
-    /// Both are accepted so it is "usable and pasteable": `themes/*.toml` uses the latter, so the whole
-    /// block can be pasted as-is into `config.toml`'s `[theme]`; conversely, the `[theme]` block from
-    /// `config.toml` can be lifted out whole and saved as a standalone theme file.
+    /// Parse a theme from a TOML text.
     fn from_toml_text(text: &str) -> Result<Self> {
         let value: toml::Value = toml::from_str(text)?;
-        // Writing `mode` at the top of the file (i.e. outside `[theme]`) is very natural, and TOML puts
-        // it on the document root. Pull it out first as a fallback for when the table below lacks it —
-        // avoiding "I clearly wrote mode but it doesn't take effect".
+        // Writing `mode` at the top of the file (i.e. outside `theme`) is very natural, and TOML puts it on the document...
         let root_mode = value.get("mode").and_then(|v| v.as_str()).map(str::to_string);
         // Use `[theme]` if present, otherwise treat the whole file as the theme
         let node = value.get("theme").cloned().unwrap_or(value);
@@ -1603,7 +1079,7 @@ impl ThemeConfig {
         Ok(cfg)
     }
 
-    /// Load a standalone theme file (`--theme <path>`).
+    /// Load a standalone theme file (`--theme <path>`)
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| crate::tf!("theme file not found: {}", path.display()))?;
@@ -1613,11 +1089,7 @@ impl ThemeConfig {
 }
 
 impl Config {
-    /// Read a **single** TOML into `Config` (no layered composition done to it).
-    ///
-    /// After stage 5, the repo's main path is `config::layer::resolve` (profile → bundle → patch →
-    /// config.toml composition). This function stays as-is for callers that "have one TOML in hand and
-    /// need no composition".
+    /// Read a single TOML into `Config` (no layered composition done to it).
     #[allow(dead_code)] // No caller in the bin target; in the lib target it is a public API
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| {
@@ -1733,9 +1205,7 @@ mod tests {
         }
     }
 
-    /// The default ThemeConfig must be a **zero override**, and the metric defaults must equal the
-    /// constants hard-coded in `gui/src/theme.rs` before stage 2. This test is the data-layer
-    /// guarantee that "the default appearance is pixel-for-pixel unchanged".
+    /// The default ThemeConfig must be a zero override, and the metric defaults must equal the constants hard-coded...
     #[test]
     fn default_theme_is_zero_override() {
         let t = ThemeConfig::default();
@@ -1921,7 +1391,7 @@ mod tests {
         assert_eq!(c.theme.metrics.body_size, 16.0);
     }
 
-    /// The nested form `[hook.tool_args_default.<tool name>]` must parse into "tool → which keys to fill".
+    /// The nested form `[hook.tool_args_default.<tool name>]` must parse into "tool → which keys to fill"
     #[test]
     fn hook_section_parses_nested_tool_args_default() {
         let c: Config = toml::from_str(
@@ -1946,11 +1416,7 @@ mod tests {
         assert_eq!(d["fs_write_file"]["create_dirs"].as_bool(), Some(true));
     }
 
-    /// `[retry]` — the retry budget lives here since 2026-10-23 (it used to be
-    /// `[hook] max_llm_retries`, which was only ever the hook seam's address of convenience).
-    ///
-    /// Two things are pinned: the defaults are **on** (a rate limit or a dropped stream must not
-    /// throw the turn away), and a whole table may omit fields like every other section.
+    /// `retry` — the retry budget lives here since 2026-10-23 (it used to be `hook max_llm_retries`, which was only...
     #[test]
     fn retry_section_defaults_to_two_attempts_and_parses_overrides() {
         let p = "[provider]\nbase_url = \"https://example.com/v1\"\nmodel = \"m\"\napi_key = \"k\"\n";
@@ -1970,12 +1436,7 @@ mod tests {
         assert_eq!((c.retry.attempts, c.retry.base_ms, c.retry.max_ms), (5, 200, 900));
     }
 
-    /// `[workplace]` is the official section name, `[workspace]` is the **old name** (unified on 2026-10-04).
-    ///
-    /// This is a hard requirement: without the `alias`, a config.toml already written with `[workspace]`
-    /// would be **silently ignored** by serde (unrecognized sections are skipped without error) ⇒ the user
-    /// thinks the boundary is still on while it actually fell back to `full` — exactly the "written but
-    /// not in effect" class of problem. So both names must be pinned.
+    /// `workplace` is the official section name, `workspace` is the old name.
     #[test]
     fn workplace_section_accepts_the_legacy_name() {
         const BASE: &str = r#"
@@ -1991,22 +1452,13 @@ api_key = "k"
         assert_eq!(old.workplace, new.workplace, "the old section name must read back exactly like the new one");
         assert_eq!(new.workplace.mode, "default", "the value must really be read in, not fall back to the default");
 
-        // Both names written (which theoretically should not happen): better to **error** than silently
-        // pick one — picking wrong shows up as the self-diagnosis-proof phenomenon "I clearly wrote full,
-        // yet it still blocks me".
+        // Both names written (which theoretically should not happen): better to error than silently pick one — picking...
         let both =
             format!("{BASE}\n[workplace]\nmode = \"default\"\n[workspace]\nmode = \"full\"\n");
         assert!(toml::from_str::<Config>(&both).is_err(), "writing both names for the same section should error");
     }
 
-    /// An old config (with no `[hook]` at all) must still parse, and the hook table must be empty —
-    /// stage 4, like stage 2, must not break any existing config.toml.
-    /// The factory default is the **confined tier** (`default`) — changed from `full` on 2026-10-05.
-    ///
-    /// This pins a **product decision**: a user who writes no `[workplace]` should start confined
-    /// (writes and deletes may only land under the app root). Reverting to `full` would
-    /// **silently** open everyone's write boundary — a regression in the safety direction, so a test
-    /// must speak up rather than relying on review to remember.
+    /// An old config (with no `hook` at all) must still parse, and the hook table must be empty — stage 4, like stage...
     #[test]
     fn factory_default_is_the_confined_mode() {
         assert_eq!(WorkplaceConfig::default().mode, "default");
@@ -2075,11 +1527,7 @@ api_key = "k"
         assert_eq!(c.loop_config.max_rounds, 6);
     }
 
-    /// `[loop] max_iters_per_turn` — the work ceiling, added 2026-10-23 next to the context ceiling.
-    ///
-    /// Two things matter: it is **off by default** (no written config = the behaviour every earlier
-    /// version had), and it is a separate key from `max_rounds` (that one caps context, this one caps
-    /// requests — conflating them would either trim memory or stop turns for the wrong reason).
+    /// `loop max_iters_per_turn` — the work ceiling, added 2026-10-23 next to the context ceiling.
     #[test]
     fn the_per_turn_request_ceiling_is_separate_from_the_context_cap() {
         let p = "[provider]\nbase_url = \"https://example.com/v1\"\nmodel = \"m\"\napi_key = \"k\"\n";
@@ -2117,11 +1565,7 @@ api_key = "k"
         assert_eq!(c.loop_config.max_rounds, 3);
     }
 
-    /// The defaults of `[sandbox]`: **on**, and exactly the set with "zero impact on legitimate plugins".
-    ///
-    /// This is **deliberately different** from the "default = no effect" of the other sections: the fence's
-    /// default value is itself behaviour, so it must be pinned even harder — should someone casually change
-    /// the default, this test should go red immediately.
+    /// The defaults of `sandbox`: on, and exactly the set with "zero impact on legitimate plugins".
     #[test]
     fn sandbox_defaults_are_on_and_conservative() {
         let c: Config = toml::from_str(
@@ -2156,10 +1600,7 @@ api_key = "k"
         );
     }
 
-    /// `[plugins]` defaults: lazy on, 60s idle, uncapped resident count, no eager list — and an old
-    /// config that has never heard of the section has to parse into exactly that. This is the
-    /// "written but not in effect" guard: if the default ever silently flipped back to eager, the
-    /// symptom would be a shelf of idle processes, not an error message.
+    /// `plugins` defaults: lazy on, 60s idle, uncapped resident count, no eager list — and an old config that has...
     #[test]
     fn plugins_default_to_lazy_loading() {
         let c: Config = toml::from_str(
@@ -2219,8 +1660,6 @@ api_key = "k"
     }
 
     /// Background jobs are on by default, but bounded: four trees, 64 processes each, two hours.
-    /// These are not arbitrary — a browser check can exceed the one-shot process allowance, and an
-    /// unbounded lifetime is the orphan-process problem this feature is meant to avoid.
     #[test]
     fn background_job_defaults_are_bounded() {
         let d = ShellConfig::default();
@@ -2247,13 +1686,7 @@ api_key = "k"
         assert!(!c.sandbox.enabled);
     }
 
-    /// The two provider defaults, checked through **serde** rather than by reading the struct: the
-    /// defaults live in `#[serde(default = ...)]` attributes, so a test that sets the fields directly
-    /// would prove nothing about what a config file actually gets.
-    ///
-    /// Pinned because both numbers have a second job beyond "a sensible value": `context_window` and
-    /// `max_tokens` are the compaction budget (`window x ratio - max_tokens`). A silent change here
-    /// moves the point where long conversations start being folded, and nothing would fail.
+    /// The two provider defaults, checked through serde rather than by reading the struct: the defaults live...
     #[test]
     fn a_minimal_config_gets_the_documented_provider_defaults() {
         let c: Config = toml::from_str(

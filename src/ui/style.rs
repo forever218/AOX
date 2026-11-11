@@ -60,10 +60,6 @@ pub fn bold_white(s: &str) -> String {
 pub const PROJECT_URL: &str = "https://github.com/forever218/AOX";
 
 /// Whether the current terminal supports OSC 8 hyperlinks.
-///
-/// Legacy conhost doesn't recognize this sequence and would spew the escape bytes onto the screen
-/// as plain characters, so we must probe before using it; when probing is uncertain we fall back to
-/// the plain-text URL.
 fn osc8_supported() -> bool {
     if !enabled() {
         return false; // redirected to a file / NO_COLOR set
@@ -76,9 +72,7 @@ fn osc8_supported() -> bool {
     }
     #[cfg(windows)]
     {
-        // Windows Terminal injects WT_SESSION; VS Code / WezTerm etc. inject TERM_PROGRAM.
-        // Neither present = legacy conhost (double-clicking the exe, or Git Bash in a classic
-        // console) → degrade.
+        // Windows Terminal injects WT_SESSION; VS Code / WezTerm etc. inject TERM_PROGRAM. Neither present = legacy...
         std::env::var_os("WT_SESSION").is_some() || std::env::var_os("TERM_PROGRAM").is_some()
     }
     #[cfg(not(windows))]

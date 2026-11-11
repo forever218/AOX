@@ -1,7 +1,5 @@
 //! Recovery store: content-addressed blobs plus immutable task nodes and an atomic cursor.
-//!
-//! No database and no refcounts. `objects/` and `nodes/` are append-only; `cursor.json` is the one
-//! mutable pointer and is always published last.
+//! No database and no refcounts. `objects/` and `nodes/` are append-only; `cursor.json` is the one mutable pointer...
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -51,12 +49,6 @@ pub struct RecoveryStore {
     cfg: RecoveryConfig,
     used: Mutex<u64>,
     /// The running executable, workspace-relative and case-folded, when it lives inside `root`.
-    ///
-    /// `None` whenever the workspace is anywhere but the app directory, which is the normal case.
-    /// It exists for the case that is not normal but does happen — the app run from, and therefore
-    /// working in, its own install directory — where the first strict scan would copy
-    /// `aox-gui.exe` into `objects/` and the baseline would keep it there: ~9 MiB of executable
-    /// image per build, for a file no rollback can put back into a running process.
     self_rel: Option<String>,
 }
 
@@ -179,9 +171,7 @@ impl RecoveryStore {
         if parts.is_empty() {
             return Err(RecoveryError::OutsideWorkspace("the workspace root itself".into()));
         }
-        // Reject a path reached through a junction/symlink inside the workspace. Canonicalising
-        // only the final component is not enough: a link at any parent can redirect the write
-        // outside the tree while the relative path still looks harmless.
+        // Reject a path reached through a junction/symlink inside the workspace.
         let mut cur = self.root.clone();
         for part in &parts {
             cur.push(part);
@@ -228,9 +218,7 @@ impl RecoveryStore {
     pub fn is_excluded(&self, rel: &str) -> bool {
         let r = rel.replace('\\', "/");
         let lower = r.to_ascii_lowercase();
-        // Not configurable on purpose: the file this process is running from is never rollback
-        // material, whatever `[recovery] exclude` says. Restoring it could not affect the live
-        // process, and the next build replaces it.
+        // Not configurable on purpose: the file this process is running from is never rollback material, whatever...
         if self.self_rel.as_deref() == Some(lower.as_str()) {
             return true;
         }
@@ -564,17 +552,9 @@ impl RecoveryStore {
         write_json_atomic(&self.dir.join(CURSOR), cursor)
     }
 
-    // ─────────── the strict-shell baseline ───────────
-    //
-    // One manifest per workspace (not one per task): it answers "what did the tree look like when the
-    // last shell command finished", so a command's before-images can reuse objects that already
-    // exist. It is a GC root but **not** a checkpoint: rollback never restores from it.
+    // ─────────── the strict-shell baseline ───────────.
 
     /// Load the baseline, or an empty map when there is none.
-    ///
-    /// A corrupt or foreign manifest is treated as absent on purpose: the next strict shell call
-    /// rebuilds it, which costs one full pass — far better than refusing every command in the
-    /// workspace until the user deletes a file by hand.
     pub fn load_baseline(&self) -> BTreeMap<String, BlobRef> {
         let path = self.dir.join(BASELINE);
         let Ok(text) = std::fs::read_to_string(&path) else { return BTreeMap::new() };
@@ -855,12 +835,7 @@ fn new_workspace_id(root: &Path) -> String {
         .to_string()
 }
 
-/// The running executable's path relative to `root`, `/`-separated and case-folded, or `None` when
-/// it is outside the workspace.
-///
-/// Both sides are canonicalised as a fallback before stripping, so a workspace spelled differently
-/// from what the loader reports (`E:\app` vs `\\?\E:\app`, a relative `root`, a linked parent)
-/// still matches. Returning `None` is the common answer and costs one `strip_prefix`.
+/// The running executable's path relative to `root`, `/`-separated and case-folded, or `None` when it is outside...
 fn self_executable_rel(root: &Path) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let rel = match exe.strip_prefix(root) {

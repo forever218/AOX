@@ -1,75 +1,6 @@
-//! Workspace: **where the model's file capabilities may be confined**.
-//!
-//! This is the host side of sandbox approach ③ "take file capability back to the host".
-//! It answers one question: "is this path allowed under the current tier?"
-//!
-//! # Three tiers
-//!
-//! | Tier | Meaning | Decision |
-//! |------|------|------|
-//! | `default` (**config default**) | the workspace **is the app root itself** — no per-conversation subfolder (see the layout below) | write·delete only allowed under the app root; **read unrestricted** |
-//! | `full` | full access, byte-for-byte identical to before the workspace layer was added | everything allowed |
-//! | `fixed` (`root = "..."`) | a fixed root (the GUI's "choose workspace" is equivalent to it) | same as `default` |
-//!
-//! # The default workspace's layout
-//!
-//! Until 2026-10-08 the `default` tier opened a **fresh timestamped plot per conversation**
-//! (`<app root>/workplace/<YYYYMMDDHHMMSS>/`). The user asked for that to go: the workspace is now
-//! simply the **app root** —— every conversation works in the same place, and the tree is kept tidy
-//! by convention rather than by a new folder each time:
-//!
-//! - `<app root>/temp/` —— scratch: screenshots, caches, anything throwaway. Pre-created by
-//!   [`Workplace::ensure_started`] so a plugin can `open()` a file there without a separate mkdir.
-//! - `<app root>/workplace/<project>/` —— a durable deliverable (a document, a code project), one
-//!   folder per project, named after the project in a few words.
-//! - `<root>/.aox/memory/<YYYY-MM-DD>.md` —— the AI's own dated notes (what it did, pitfalls hit,
-//!   how it got past them). Created at the **workspace root** on first use; inside a project the AI
-//!   keeps them in that project's own `.aox/memory/`.
-//!
-//! These conventions are spelled out to the model too, in the prompt's "Run environment" segment
-//! (`src/prompt.rs`). The boundary is the whole app root: writes and deletes are allowed anywhere
-//! under it, and nowhere else.
-//!
-//! **The config default is `default` (confined)**, changed from `full` on 2026-10-05: what the
-//! user wants is "**confined by default on every launch**". So the rule "omit `[workplace]` = behavior
-//! identical to before this layer" no longer holds — omitting it means the confined tier; to be
-//! unrestricted you must explicitly write `mode = "full"`.
-//! Also `/new` always returns to the `default` tier (see [`Workplace::reset_for_new_conversation`]).
-//!
-//! # Read/write asymmetry (the single most important rule of this module)
-//!
-//! Under the confined tier **only writes to disk are blocked, not reads**:
-//!
-//! - `read_file` / `list_dir` ([`Access::Read`]): the whole device can be read, **not limited by the workspace**,
-//!   even while "the plot isn't opened yet" ([`Active::Pending`]) reads go through fine.
-//! - `write_file` / `remove` ([`Access::Write`]): must land inside the workspace; relative paths are always rejected.
-//!
-//! The reason is asymmetric consequence: reading is **taking information**, writing/deleting is **changing the
-//! device**. Wanting to read a piece of material scattered elsewhere (logs, config, another project) is a very
-//! common legitimate need; forcing an escalation flow for it would only push the user to keep "full access" on —
-//! the boundary ends up looser; whereas "only allowed to write within the delimited plot" is the thing this
-//! feature truly must protect. See [`Access`] for the details.
-//!
-//! # Two semantics that must be made clear
-//!
-//! **① Absolute paths only.** Under the confined tier **relative paths are always rejected**. The reason is that
-//! the host and the plugin subprocess do not share the same working directory (the plugin's cwd is still the app
-//! root, see `plugin::spawn_command`), so the same string `config.toml` points to two different files on the two
-//! sides — that "host thinks it's inside, plugin actually went outside" inconsistency is far more dangerous than
-//! writing a few extra characters. The rejection message tells the model the root directly.
-//!
-//! **② Out-of-bounds is not silently blocked.** See [`Reject::model_text`]: it is a **contract shown to the model**,
-//! and its three parts are hard requirements — what happened / this is a permission boundary, not a broken tool,
-//! don't retry / please relay to the user and tell them how to escalate. If any part is missing, the model will
-//! keep retrying the same out-of-bounds call, wasting turns for nothing.
-//!
-//! # Where the boundary is
-//!
-//! This layer governs "**capabilities provided by the host**": the host's built-in file tools, and the path
-//! parameters declared by plugin tools (the host can only guess by parameter name — see [`scan_paths`], which is
-//! a coarse net).
-//! **It cannot govern a misbehaving plugin that `open()`s files on its own** — that needs OS-level AppContainer,
-//! which is outside this module's scope. Don't treat it as a sandbox.
+//! Workspace: where the model's file capabilities may be confined.
+//! This is the host side of sandbox approach "take file capability back to the host". It answers one question: "is...
+//! # Three tiers.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -84,29 +15,13 @@ use crate::tf;
 /// (`<app root>/workplace/<project>/`).
 pub const WORKPLACE_DIR: &str = "workplace";
 
-/// Scratch subdirectory of [`AOX_DIR`] (`<workspace>/.aox/tmp/`) —— screenshots, caches, one-off
-/// output. Pre-created when a tier starts (see [`Workplace::ensure_started`]).
-///
-/// Moved under `.aox/` on 2026-10-14 at the user's request, together with history: everything AOX
-/// produces inside a workspace now sits in one folder, so that folder is self-contained (copy it and
-/// you take the project's conversations, notes and scratch files along), and a project directory
-/// gains **one** AOX entry instead of two visible ones. The trade is that scratch files are hidden
-/// now; the prompt tells the model where to put them (see the `# Workspace layout` segment).
+/// Scratch subdirectory of AOX_DIR (`<workspace>/.aox/tmp/`) —— screenshots, caches, one-off output.
 pub const TMP_DIR: &str = "tmp";
 
-/// How old a scratch file has to be before a **turn-end** sweep removes it.
-///
-/// Ten minutes, not zero, because a task often spans several turns: a script written in one turn and
-/// re-run two turns later is a legitimate pattern, and a zero grace would delete it between them (a
-/// wasted rebuild, occasionally a wasted round trip). Ten minutes is longer than any healthy gap
-/// inside one task and shorter than any gap between tasks.
+/// How old a scratch file has to be before a turn-end sweep removes it.
 pub const SCRATCH_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// How old a scratch file has to be before a **turn-start** sweep removes it.
-///
-/// This one exists for the case a turn-end sweep cannot cover: the process was killed, or the turn
-/// never ended. A day is long enough that nothing a live session cares about is touched, and short
-/// enough that a crashed session does not leave gigabytes behind for a week.
+/// How old a scratch file has to be before a turn-start sweep removes it.
 pub const SCRATCH_STALE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// What a scratch sweep removed.
@@ -124,21 +39,6 @@ impl Swept {
 }
 
 /// Empty the workspace's scratch directory of everything older than `min_age`.
-///
-/// The host points `TMP`/`TEMP`/`TMPDIR` at `<ws>/.aox/tmp` for every shell call (see
-/// `shell::child_env`), so that is where a model puts its throwaway scripts ("fix1.py", a screenshot,
-/// a `__pycache__`) — and until now **nothing ever removed them**. Measured in this repo on
-/// 2026-10-23: 122 files, 4.5 MB, accumulated over two days, none of it asked for. The directory is
-/// pre-created and named by the host, so emptying it is maintenance of the host's own state, not a
-/// judgment about the user's files.
-///
-/// Scoped **strictly** to `TMP_DIR`: a file elsewhere in the workspace is indistinguishable from a
-/// deliverable, and the host has no business guessing. The prompt asks the model to tidy those
-/// itself; this function is the part the model cannot forget.
-///
-/// Errors are swallowed per entry on purpose — a file held open by a build that outlived its turn (or
-/// by a plugin) cannot be deleted on Windows, and that is not a reason to stop the sweep or to tell
-/// the user. The next sweep gets it.
 pub fn sweep_scratch(ws: &Path, min_age: std::time::Duration) -> Swept {
     let dir = ws.join(AOX_DIR).join(TMP_DIR);
     let mut out = Swept::default();
@@ -171,48 +71,17 @@ pub fn sweep_scratch(ws: &Path, min_age: std::time::Duration) -> Swept {
     out
 }
 
-/// Subdirectory of [`AOX_DIR`] holding conversations (`<workspace>/.aox/history/`).
-///
-/// Hidden marker directory created at a workspace root on first use (`<root>/.aox/`). It holds the
-/// AI's own dated notes under [`MEMORY_DIR`] and its scratch files under [`TMP_DIR`] — the
-/// per-workspace state that should travel with the project.
-///
-/// **Conversations are not here any more** (2026-11-05): one store, `<app root>/.aox/conversations`,
-/// whatever the working directory is. A workspace used to grow its own `.aox/history` the moment a
-/// conversation picked it, which is what scattered history into `workplace/<project>/`.
+/// Subdirectory of AOX_DIR holding conversations (`<workspace>/.aox/history/`).
 pub const AOX_DIR: &str = ".aox";
 
 /// Subdirectory of [`AOX_DIR`] holding the AI's own dated markdown notes
 /// (`<root>/.aox/memory/<YYYY-MM-DD>.md`). Created alongside [`AOX_DIR`] on first use.
 pub const MEMORY_DIR: &str = "memory";
 
-/// The key in the **parameters** of the host's built-in file tools that denotes "path".
-///
-/// Pulled out on its own because the check needs to read it precisely: these tools' schema is
-/// defined by the host itself, so no guessing is needed (contrast with [`scan_paths`] on the
-/// plugin-tools side).
+/// The key in the parameters of the host's built-in file tools that denotes "path".
 pub const PATH_ARG: &str = "path";
 
-/// When a parameter name hits one of these words, its value is treated as a path (only used for
-/// the **coarse scan** of plugin tools).
-///
-/// Deliberately conservative: a miss only means "one less coarse net", but a false positive would
-/// directly reject a legitimate call, which is more annoying.
-///
-/// This net **only decides "which values are paths"**; "use it for reading or writing" is declared
-/// by the tool itself ([`crate::tool::Tool::access`], on the plugin side it is `"access": "read"`
-/// inside `initialize`): declared-read is judged as read (`check_access(Read)` is always `Ok`, so
-/// the net is a no-op for it), undeclared is judged as write-to-disk. So a plugin author has two
-/// duties —— **(optionally) declare the path parameter, (as needed) declare read-only**; doing
-/// neither means it can only be blocked as a write.
-///
-/// There is **no** mechanism to inject a "workspace root" into plugins (e.g. an
-/// `AOX_WORKSPACE_ROOT` env var): the `default` tier's root is only created at **the first
-/// message**, but the plugin process is already spun up at the moment it starts / gets created —
-/// at that moment there is no value to inject, and injecting would only yield a stale or empty
-/// thing. So for a plugin to respect the boundary, the correct approach is to **declare**, letting
-/// the host's coarse net do the judging (even if it misjudges, it only rejects one extra time, it
-/// never lets something through).
+/// When a parameter name hits one of these words, its value is treated as a path (only used for the coarse scan...
 const PATH_KEYS: &[&str] = &[
     "path", "paths", "file", "files", "filename", "filepath", "file_path", "dir", "dirs", "directory",
     "folder", "root", "src", "dst", "dest", "destination", "target", "cwd", "workdir", "working_dir",
@@ -241,20 +110,7 @@ impl Mode {
     }
 }
 
-/// The **intent** of a path access —— decides whether the workspace boundary governs it under the
-/// confined tier.
-///
-/// Semantics (set on 2026-10-04): **reads are unrestricted; writes and deletes are confined to the
-/// workspace**.
-///
-/// Why not also govern "reads": the two have asymmetric consequences for the device ——
-/// reading is **taking information**; a misread at worst reveals something you shouldn't have seen,
-/// whereas writing/deleting is **changing the device**, and a single out-of-bounds action can
-/// destroy something outside the workspace (and irreversibly). Wanting to read a piece of material
-/// scattered elsewhere (logs, config, another project) is a very common legitimate need; opening an
-/// escalation flow for it would only push the user to keep "full access" on, making the boundary a
-/// facade; whereas "AOX can only write within the delimited plot" is the thing this feature truly
-/// must protect.
+/// The intent of a path access —— decides whether the workspace boundary governs it under the confined tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     /// Read-only (`read_file` / `list_dir`): **the whole device can be read**, not limited by the
@@ -266,37 +122,17 @@ pub enum Access {
 }
 
 /// The currently effective state.
-///
-/// `Clone` is carried so that [`Workplace::report`] can format "take a snapshot first, then release
-/// the lock" —— see the comment there (calling a method that re-locks while holding the lock = deadlock).
 #[derive(Debug, Clone)]
 enum Active {
     /// Unrestricted (config is `full`).
     Full,
-    /// Confined, but the **root is not yet decided**: `default` tier, this conversation hasn't
-    /// sent a message yet.
-    ///
-    /// Kept as a separate state rather than folding "unrestricted" and "not yet decided" into one
-    /// `Option`: the two have **opposite** judgments (the former allows everything, the latter
-    /// rejects everything). Folding them into one `None` would yield "under the confined tier,
-    /// silent full allowance because the directory isn't built yet" —— the worst kind of failure.
+    /// Confined, but the root is not yet decided: `default` tier, this conversation hasn't sent a message yet.
     Pending,
     /// Confined, root already decided.
     At(PathBuf),
 }
 
-/// A conversation's **workspace record** (the `kind:"workplace"` line in `.jsonl`).
-///
-/// The three fields each answer a question:
-/// - `mode` / `root`: the **current** tier and the root it is bound to (`fixed` is the named one;
-///   `default` is the app root);
-/// - `own`: this conversation's own root under the "default" tier —— **must be kept even under the
-///   `full` / `fixed` tiers**, otherwise "switch away then switch back to default" has nothing to
-///   return to.
-///
-/// Why store it in the conversation file rather than a separate side file: it belongs to this
-/// conversation. When the conversation is deleted, trimmed, or has its backend swapped, this
-/// record naturally travels with it and leaves no orphans.
+/// A conversation's workspace record (the `kind:"workplace"` line in `.jsonl`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Record {
     /// `"default"` / `"fixed"` / `"full"`. Empty string = unrecognized (caller should treat as no
@@ -309,11 +145,7 @@ pub struct Record {
 }
 
 impl Record {
-    /// Serialize into one `.jsonl` line (`kind` is filled in by the storage layer, see
-    /// `store::jsonl`).
-    ///
-    /// Same rule as the usage records: **don't write fields that are absent**, don't fake them
-    /// with an empty string or `null`.
+    /// Serialize into one `.jsonl` line (`kind` is filled in by the storage layer, see `store::jsonl`).
     pub fn to_value(&self) -> serde_json::Value {
         let mut v = serde_json::json!({ "mode": self.mode });
         let mut put = |key: &str, p: &Option<PathBuf>| {
@@ -343,14 +175,8 @@ impl Record {
     }
 }
 
-/// The runtime tier and root. Travels with `Runtime`; CLI / GUI / selftest share one
-/// implementation.
-///
-/// **Does not store config** (once stored a `cfg`): the tier's criterion is `picked` in the
-/// state, not config —— config only sets the tier **at the moment of startup** (see `new`), after
-/// which everything follows the runtime state. Keeping that config would only tempt people to
-/// "derive the tier from config" again, and that is a pit already fallen into (see
-/// `State::picked`).
+/// The runtime tier and root.
+/// Does not store config (once stored a `cfg`): the tier's criterion is `picked` in the state, not config ——...
 pub struct Workplace {
     /// `std::sync::Mutex`: only read/written in synchronous context, **never held across an
     /// `await`** (the check runs on the tool-call path, and that future must stay `Send`).
@@ -361,38 +187,15 @@ pub struct Workplace {
 struct State {
     active: Active,
     /// Whether this conversation has "started" (= has already decided a root).
-    /// The `default` tier relies on it to guarantee "a conversation decides its root only once",
-    /// rather than once per turn.
     started: bool,
-    /// **This conversation's own root under the "default" tier** (fixed on the first message —
-    /// the app root, since 2026-10-08); `None` = not yet established.
-    ///
-    /// Must be recorded separately from `active`: `active` gets overwritten by tier switches. When
-    /// you switch to "full access" and back to "default", looking only at `active` you no longer
-    /// know which root was the original one, and can only re-decide —— the historical symptom was
-    /// one extra empty directory per round trip, piling up a bunch of `workplace/<timestamp>/`
-    /// (reported by a user on 2026-10-05; that timestamped scheme is gone now, but the field still
-    /// keeps "switch away and back → the same root" true).
-    ///
-    /// Cleared when a new conversation is created / another conversation is opened.
+    /// This conversation's own root under the "default" tier; `None` = not yet established.
     own: Option<PathBuf>,
-    /// Is the root in `active` **one the user explicitly picked** (`fixed`, or a runtime tier
-    /// switch), or one handed out by the `default` tier?
-    ///
-    /// This can only live in the state, **it cannot be derived from `cfg.mode`**: a user whose
-    /// config says `default` can still pick a fixed plot at runtime (`/workplace <dir>`, or the
-    /// GUI selector), in which case the tier is "choose workspace" not "default". Previously it
-    /// was derived from config, so the same action was described as two tiers: `set_mode` reported
-    /// "switched to 'choose workspace': X", then `snapshot()` reported "tier: default" —— on the
-    /// GUI the button reads "default" and the check is on "default", yet writes actually went to X
-    /// (hit in production, fixed 2026-10-04).
+    /// Is the root in `active` one the user explicitly picked (`fixed`, or a runtime tier switch), or one handed out...
     picked: bool,
 }
 
 impl Workplace {
-    /// Construct from config. **An unrecognized `mode` errors at startup**, it does not silently
-    /// fall back to `full` —— same principle as `[store] backend` / `[loop] impl`: writing
-    /// something that has no effect is the hardest class of problem to debug.
+    /// Construct from config. An unrecognized `mode` errors at startup, it does not silently fall back to `full` ——...
     pub fn new(cfg: WorkplaceConfig, app_root: &Path) -> anyhow::Result<Self> {
         let mode = cfg.mode.trim().to_ascii_lowercase();
         let active = match mode.as_str() {
@@ -408,10 +211,7 @@ impl Workplace {
                 }
                 let p = PathBuf::from(raw);
                 let p = if p.is_absolute() { p } else { app_root.join(p) };
-                // A fixed workspace is built **right now**: the user named a plot in config, so
-                // that plot should exist.
-                // Different from the `default` tier —— that one waits for the first message
-                // (otherwise clicking the button without speaking would also leave an empty dir).
+                // A fixed workspace is built right now: the user named a plot in config, so that plot should exist.
                 let p = normalize(&p);
                 std::fs::create_dir_all(&p)
                     .map_err(|e| anyhow::anyhow!("{}", tf!("[workplace] failed to create root = {}: {}", p.display(), e)))?;
@@ -437,7 +237,7 @@ impl Workplace {
         })
     }
 
-    /// The currently effective root; `None` = unrestricted.
+    /// The currently effective root; `None` = unrestricted
     pub fn active_root(&self) -> Option<PathBuf> {
         match &self.lock().active {
             Active::At(p) => Some(p.clone()),
@@ -445,20 +245,7 @@ impl Workplace {
         }
     }
 
-    /// Snapshot for the UI: **lock once** while grabbing both the "tier" and the "currently
-    /// effective root".
-    ///
-    /// Why not let the caller call [`Workplace::mode`] and [`Workplace::active_root`]
-    /// separately: that would lock twice, and the state could be mutated between the two calls
-    /// (the classic case is the first message happening to be building the plot), so the UI's
-    /// tier and directory would disagree. **The tier↔root mapping is written only here** ——
-    /// `mode()` also goes through it, so they can't drift apart later: `/workplace` says
-    /// "default" while the UI has the check on "choose workspace".
-    ///
-    /// ⚠️ **Do not call it while holding the lock** —— it also locks `state`, and
-    /// `std::sync::Mutex` is not reentrant, so a nested call would **deadlock the whole
-    /// process** (a previous version of [`Workplace::report`] died exactly this way).
-    /// Either call it before acquiring the lock, or grab the snapshot first.
+    /// Snapshot for the UI: lock once while grabbing both the "tier" and the "currently effective root".
     pub fn snapshot(&self) -> (Mode, Option<PathBuf>) {
         Self::snapshot_of(&self.lock())
     }
@@ -469,12 +256,7 @@ impl Workplace {
         let mode = match &st.active {
             Active::Full => Mode::Full,
             Active::Pending => Mode::Default,
-            // ⚠️ The criterion is **`picked` in the state**, not `cfg.mode` in config. A user
-            // whose config says `default` can still pick a fixed plot at runtime
-            // (`/workplace <dir>`, or the GUI selector), in which case the tier is "choose
-            // workspace"; deriving from config would describe the same action as two tiers.
-            // Conversely, a plot built on the fly by the `default` tier reports "default" not
-            // "choose workspace" —— it was just built at that moment, not a plot the user named.
+            // ️ The criterion is `picked` in the state, not `cfg.mode` in config.
             Active::At(_) if !st.picked => Mode::Default,
             Active::At(p) => Mode::Fixed(p.clone()),
         };
@@ -490,11 +272,7 @@ impl Workplace {
         self.snapshot().0
     }
 
-    /// Compress the current state into a **persistable** form (see [`Record`]).
-    ///
-    /// **Lock once** to grab all three together: grabbing them in two passes would yield a
-    /// half snapshot like "tier is post-switch, `own` is pre-switch", which once persisted can
-    /// never be reconstructed.
+    /// Compress the current state into a persistable form (see Record).
     pub fn persisted(&self) -> Record {
         let st = self.lock();
         let (mode, root) = Self::snapshot_of(&st);
@@ -507,14 +285,6 @@ impl Workplace {
     }
 
     /// Restore the workspace from a conversation record (used when opening an old conversation).
-    /// An unrecognized tier name falls back to "default", no guessing.
-    ///
-    /// Both points are critical:
-    /// - **If the `default` tier's root was saved, reuse it** (`At` + `picked = false`), don't
-    ///   wait for the first message to re-decide it —— that is the cause of "every time I
-    ///   enter the same conversation it's a different workspace";
-    /// - **`own` must also be restored** —— without it, "reopen this conversation → switch to
-    ///   full access → switch back to default" would have nothing to return to.
     pub fn restore(&self, rec: &Record) {
         let mut st = self.lock();
         st.own = rec.own.clone();
@@ -552,22 +322,7 @@ impl Workplace {
         }
     }
 
-    /// Start a new conversation: **always return to the "default" tier**, and clear "started".
-    ///
-    /// Semantics set by the user on 2026-10-04: "for a new conversation, the default workspace
-    /// should be default" —— tiers temporarily switched in the previous conversation
-    /// (`fixed` / `full`) are **no longer inherited**. Originally it only reset when
-    /// `cfg.mode == "default"`, so "the previous conversation picked some directory, click +
-    /// and the new conversation is still in that directory" looked like the new conversation
-    /// never changed its plot.
-    ///
-    /// ⚠️ **The cost** (the user has accepted it): for a user who writes `mode = "fixed"` in
-    /// config, only the **first conversation of this launch** lands in the config-named plot;
-    /// every subsequent new conversation is "default" and works in the app root.
-    /// To keep a fixed plot always in effect, you must switch per conversation.
-    ///
-    /// **Nothing is built here** —— the `default` tier's root is fixed on the **first message**
-    /// (when the user clicks "+" but says nothing, nothing is touched on disk).
+    /// Start a new conversation: always return to the "default" tier, and clear "started".
     pub fn reset_for_new_conversation(&self) {
         let mut st = self.lock();
         st.started = false;
@@ -578,30 +333,15 @@ impl Workplace {
         st.own = None;
     }
 
-    /// Ensure the root is decided before this conversation starts. Returning `Some(dir)` means
-    /// **this call is exactly the one that established it** (or first decided it for this
-    /// conversation), and the caller should notify the user with an `Info`.
-    ///
-    /// The "establish once per conversation" semantics land here: `started` guarantees a
-    /// conversation decides its root only once.
+    /// Ensure the root is decided before this conversation starts.
     pub fn ensure_started(&self, app_root: &Path) -> anyhow::Result<Option<PathBuf>> {
         let mut st = self.lock();
         if st.started {
             return Ok(None);
         }
-        // `Pending`: the **only** branch that does real work; pulled out on its own —— so we don't
-        // write `st.active` while borrowing it (the borrow checker won't allow it, and separating
-        // "read state" from "write state" also reads more clearly).
+        // `Pending`: the only branch that does real work; pulled out on its own —— so we don't write `st.active`...
         if matches!(st.active, Active::Pending) {
-            // The default workspace **is the app root** (changed 2026-10-08 by user request): no
-            // per-conversation `<timestamp>/` plot any more. Conventional subdirectories are made
-            // up front so the model (and its plugins, which call `open()` directly) can drop files
-            // straight in without a separate mkdir step:
-            //   .aox/tmp/      scratch —— screenshots, caches, one-off output
-            //   .aox/memory/   the AI's own dated notes (see the prompt's "# Memory" segment)
-            //   workplace/     durable deliverables, one folder per project
-            // Conversations are **not** created here: they all live in the app root's store.
-            // The prompt's "Run environment" segment teaches the model this same layout.
+            // The default workspace is the app root: no per-conversation `<timestamp>/` plot any more.
             let dir = normalize(app_root);
             std::fs::create_dir_all(&dir)
                 .map_err(|e| anyhow::anyhow!("{}", tf!("failed to create the workspace ({}): {}", dir.display(), e)))?;
@@ -621,9 +361,7 @@ impl Workplace {
             st.started = true;
             return Ok(Some(dir));
         }
-        // `Full` / `At`: first time this conversation decides its root, just record it. The
-        // `At` root must be reported back to the caller, so it can tell the user with an `Info`
-        // "this is this conversation's workspace".
+        // `Full` / `At`: first time this conversation decides its root, just record it.
         let root = match &st.active {
             Active::At(p) => Some(p.clone()),
             _ => None,
@@ -635,11 +373,7 @@ impl Workplace {
     /// Switch tier at runtime (CLI's `/workplace`, GUI's button). Returns a message for the
     /// user.
     pub fn set_mode(&self, mode: Mode, app_root: &Path) -> anyhow::Result<String> {
-        // When switching to "choose workspace", build **immediately**: the user explicitly
-        // picked a plot, so that plot should exist (same semantics as the `fixed` tier in
-        // config). A relative path is resolved against the **app root** —— kept consistent with
-        // the `fixed` tier handling in `new()`, so the same relative path doesn't land in two
-        // places between config and CLI.
+        // When switching to "choose workspace", build immediately: the user explicitly picked a plot, so that plot should...
         let dir = match mode {
             Mode::Fixed(ref p) => {
                 // A relative path is resolved against the **app root** (same set as the `fixed`
@@ -655,10 +389,7 @@ impl Workplace {
             if !d.is_dir() {
                 anyhow::bail!("{}", tf!("{} is not a directory", d.display()));
             }
-            // First use of a user-picked workspace: lay down the same `.aox/` layout the `default`
-            // tier sets up (best-effort), so a picked workspace is immediately as usable as the app
-            // root. A relative pick resolves under the app root (above), so all of it stays inside the
-            // workspace.
+            // First use of a user-picked workspace: lay down the same `.aox/` layout the `default` tier sets up...
             for sub in [TMP_DIR, MEMORY_DIR] {
                 let _ = std::fs::create_dir_all(d.join(AOX_DIR).join(sub));
             }
@@ -681,13 +412,7 @@ impl Workplace {
             Mode::Default => {
                 st.picked = false;
                 let _ = app_root;
-                // **This conversation has already decided its "default" root ⇒ go back to that
-                // one, don't decide another.**
-                // See `State::own`: the historical failure was that switching to "full access" and
-                // back built a new directory, filling `workplace/` with empty dirs (reported by a
-                // user on 2026-10-05).
-                // Only if this conversation hasn't decided yet do we go back to "not yet
-                // decided" and wait for the first message.
+                // This conversation has already decided its "default" root ⇒ go back to that one, don't decide another.
                 match st.own.clone() {
                     Some(p) => {
                         st.active = Active::At(p.clone());
@@ -706,62 +431,26 @@ impl Workplace {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        // The check happens on the tool-call path; the lock is held for one path comparison ——
-        // it can't be poisoned. Even if it were poisoned, it shouldn't panic and kill the whole
-        // agent: falling back to "unrestricted" is better than crashing the program, but it
-        // must make noise.
+        // The check happens on the tool-call path; the lock is held for one path comparison —— it can't be poisoned.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Whether the current state is **unrestricted** (`full` tier = everything allowed).
-    ///
-    /// Used as a short-circuit for the check point. Under this tier, what `check` computes is
-    /// **entirely discarded** (the caller only wants `.err()`), yet it pays for one to several
-    /// real `canonicalize` calls —— measured at 65~224 µs, going through the filesystem. The
-    /// check runs on **every tool call**, and under the `full` tier (`mode = "full"`, or the
-    /// user switched to "full access" in the UI) this cost is pure waste; if the caller asks
-    /// this first, the whole path (including the `scan_paths` coarse net) is skipped.
-    ///
-    /// ⚠️ Since 2026-10-05 the **config default** is `default` (confined), no longer `full` ——
-    /// so this short-circuit now only applies to users who explicitly chose full access; don't
-    /// reason as if "most users go through this".
-    ///
-    /// ⚠️ Same rule as [`Workplace::mode`]: **don't call it while holding the lock**.
+    /// Whether the current state is unrestricted (`full` tier = everything allowed).
     pub fn is_unrestricted(&self) -> bool {
         matches!(self.lock().active, Active::Full)
     }
 
-    /// Judge a **write-to-disk** path (write / delete). `Ok` = the normalized absolute path,
-    /// ready to hand to the file API.
-    ///
-    /// Equivalent to [`Workplace::check_access`]`(raw, Access::Write)`. The name is kept
-    /// because it is the default meaning of "confined" —— when the caller doesn't specify, it
-    /// is judged under the strictest tier.
+    /// Judge a write-to-disk path (write / delete). `Ok` = the normalized absolute path, ready to hand to the file API.
     pub fn check(&self, raw: &str) -> Result<PathBuf, Reject> {
         self.check_access(raw, Access::Write)
     }
 
-    /// Judge a **read-only** path (read file / list directory).
-    ///
-    /// By the semantics of [`Access::Read`], it is **not limited by the workspace**, so it
-    /// **never returns `Err`** —— it still returns a `Result` only to share the shape with
-    /// [`Workplace::check`]: the two check points (agent and tool) use the same call code,
-    /// differing only by one `Access`; if reads are tightened later, the change lands only
-    /// here.
+    /// Judge a read-only path (read file / list directory).
     pub fn check_read(&self, raw: &str) -> Result<PathBuf, Reject> {
         self.check_access(raw, Access::Read)
     }
 
-    /// The **single** implementation for both intents.
-    ///
-    /// - `Access::Read`: all three states (`Full` / `Pending` / `At`) are **always allowed**,
-    ///   only normalization is done. Deliberately, even `Pending` is not rejected —— under the
-    ///   confined tier "plot not opened yet" blocks writes to disk, it shouldn't incidentally
-    ///   also ban "reading any file on the device" (that is exactly the path the new semantics
-    ///   opens up).
-    /// - `Access::Write`: `Full` is allowed; `Pending` is fully rejected (see
-    ///   [`Active::Pending`]); `At` only accepts **in-plot absolute paths** (relative paths are
-    ///   always rejected, see module doc "① absolute paths only").
+    /// The single implementation for both intents.
     pub fn check_access(&self, raw: &str, access: Access) -> Result<PathBuf, Reject> {
         if access == Access::Read {
             return Ok(normalize(Path::new(raw)));
@@ -783,15 +472,9 @@ impl Workplace {
         Ok(resolved)
     }
 
-    /// The body of `/workplace`.
+    /// The body of `/workplace`
     pub fn report(&self, app_root: &Path) -> String {
-        // ⚠️ **The order is deliberately reversed; don't casually "optimize" it into "lock
-        // first, then compute the tier name".**
-        // `std::sync::Mutex` is not reentrant: first `self.mode()` (which locks state once
-        // itself) to get the tier name, **then** take the state snapshot — that is correct;
-        // the reverse, calling `self.mode()` while holding the lock, would **deadlock the whole
-        // process** —— the symptom is "after switching to a fixed workspace, viewing
-        // /workplace once more freezes". A previous version did exactly this.
+        // ️ The order is deliberately reversed; don't casually "optimize" it into "lock first, then compute the tier...
         let label = self.mode().label();
         let active = self.lock().active.clone();
         let mut out = String::from(t("Workspace\n\n"));
@@ -828,37 +511,17 @@ impl Workplace {
     }
 }
 
-// ─────────────────────────── The /workplace command ───────────────────────────
+// The /workplace command
 
-/// The command's two names: **the first is the canonical name, the rest are legacy aliases.**
-///
-/// Naming was unified once on 2026-10-04 —— the word is uniformly `workplace` (the directory
-/// name `<app root>/workplace/`, the config section `[workplace]`, the CLI command
-/// `/workplace`, and even the Rust module and types were changed in a second pass). The old
-/// name "/workspace" predates the unification and is **kept**: users have muscle memory, and if
-/// this command stops working they'd see "tier won't switch" rather than "command renamed",
-/// which they'd almost never figure out on their own. Not listed in `/help`, treated as an
-/// implicit alias.
+/// The command's two names: the first is the canonical name, the rest are legacy aliases.
 const CMD_NAMES: [&str; 2] = ["/workplace", "/workspace"];
 
-/// The predicate for the `/workplace` command family (used by the CLI router, see the
-/// `_ if ...::is_cmd(line)` chain in `main.rs`).
-///
-/// **Both judgment and execution live here** rather than in the CLI, so that "switch tier" has
-/// only one implementation and one message —— if the GUI later also wants a `/workplace` input
-/// path, it can reuse directly, without the mismatch of "CLI says switched, GUI didn't" that
-/// two code paths would cause.
+/// The predicate for the `/workplace` command family (used by the CLI router, see the `_ if...::is_cmd(line)`...
 pub fn is_cmd(line: &str) -> bool {
     cmd_arg(line).is_some()
 }
 
 /// Strip the argument after the command; `None` = this line is not the command at all.
-///
-/// Uses "match by name + strip one prefix" rather than `trim_start_matches`: the latter would
-/// strip the prefix **repeatedly**, so when the directory name is `/workplace` (or the old
-/// name "/workspace"), a perfectly legal `/workplace /workplace` would be stripped to an empty
-/// string —— which is exactly "no argument", and the user gets the current state instead of a
-/// switch result.
 fn cmd_arg(line: &str) -> Option<&str> {
     for name in CMD_NAMES {
         if line == name {
@@ -876,13 +539,6 @@ fn cmd_arg(line: &str) -> Option<&str> {
 }
 
 /// Execute the `/workplace` command.
-///
-/// - `/workplace` (no argument) → print the current tier and root
-/// - `/workplace full` → full access (unrestricted)
-/// - `/workplace default` → confined to the app root (takes effect on the **next
-///   message**)
-/// - `/workplace <dir>` → pin to that directory (a relative path is resolved against the **app
-///   root**)
 pub fn command(rt: &std::sync::Arc<crate::runtime::Runtime>, line: &str) -> anyhow::Result<String> {
     // `is_cmd` already guarantees this line is the command, so `None` won't happen; if it
     // somehow does, treat it as "no argument".
@@ -900,11 +556,9 @@ pub fn command(rt: &std::sync::Arc<crate::runtime::Runtime>, line: &str) -> anyh
     rt.workplace.set_mode(mode, &rt.root)
 }
 
-// ─────────────────────────── The out-of-bounds contract ───────────────────────────
+// The out-of-bounds contract
 
-/// A single out-of-bounds event. The message is a **contract**, not a log —— split into
-/// [`model_text`](Reject::model_text) and [`user_text`](Reject::user_text) because the
-/// readers differ and want different things.
+/// A single out-of-bounds event.
 #[derive(Debug, Clone)]
 pub enum Reject {
     /// A relative path was given under the confined tier.
@@ -916,15 +570,7 @@ pub enum Reject {
 }
 
 impl Reject {
-    /// Text shown to the **model**. Its three parts are hard requirements:
-    ///
-    /// ① what happened (which path, where the root is) ② this is a permission boundary, not a
-    /// broken tool, **don't retry** ③ please relay to the user and tell them how to escalate.
-    ///
-    /// Why "don't retry" must be written: a model's instinct on a tool failure is to rewrite and
-    /// try again (`./x` → `x` → `../x`), but out-of-bounds is **un-rewritable** —— without
-    /// stating it, it burns turns all the way, and it will also think its own arguments were
-    /// wrong.
+    /// Text shown to the model. Its three parts are hard requirements.
     pub fn model_text(&self) -> String {
         // Every branch must **carry the root itself**: this text is all the model gets, and it has
         // nowhere else to look it up.
@@ -949,16 +595,7 @@ impl Reject {
                     .to_string()
             }
         };
-        // ⚠️ What follows is **operating instructions for the model**, and it will be relayed to
-        // the user verbatim —— so it may only mention entry points that **really exist**. Both
-        // frontend entry points must be written out: the CLI's `/workplace`, and the "workspace"
-        // button at the bottom-left of the GUI input box (three tiers + a directory picker, landed
-        // 2026-10-04). Miss one and users of that frontend get "advice they can't act on".
-        //
-        // There is one more easily-missed point (the new semantics): **reads are not restricted by
-        // the workspace**. Without saying so, a model that reads "blocked by a permission boundary"
-        // will give up on "reading outside the boundary" too, and may even ask for an escalation —
-        // when that path needs no escalation at all.
+        // ️ What follows is operating instructions for the model, and it will be relayed to the user verbatim ——...
         tf!(
             "[Permission boundary] {}\n\n\
              This is not a broken tool or a wrong argument — it is the current workspace's permission boundary.\
@@ -977,11 +614,7 @@ impl Reject {
         )
     }
 
-    /// The one line for the **user** (the caller sends it with a `Warn` event).
-    ///
-    /// Written separately from `model_text`: the model wants "don't retry + how to escalate", the
-    /// user wants "what AOX just tried to do, and what blocked it". Cramming the same text into
-    /// both serves neither.
+    /// The one line for the user (the caller sends it with a `Warn` event).
     pub fn user_text(&self) -> String {
         match self {
             Reject::Relative { root, raw } => tf!(
@@ -1005,14 +638,9 @@ impl Reject {
     }
 }
 
-// ─────────────────────────── Argument scanning (the coarse net) ───────────────────────────
+// Argument scanning (the coarse net)
 
 /// Pick the "path-like" strings out of one call's arguments, returning `(parameter name, value)`.
-///
-/// **This is a coarse net, only for plugin tools**: a plugin is a black box, and the host can only
-/// guess by parameter name. The host's own file tools don't come through here —— their schema is
-/// one we define, so `path` is read directly (see [`PATH_ARG`]). A misjudgement would reject a
-/// legitimate call, so the list is deliberately conservative.
 pub fn scan_paths(args: &Value) -> Vec<(String, String)> {
     let mut out = Vec::new();
     walk(args, "", &mut out);
@@ -1030,9 +658,7 @@ fn walk(v: &Value, prefix: &str, out: &mut Vec<(String, String)>) {
                             out.push((key, s.clone()));
                         }
                     }
-                    // Arrays of strings: a form like `paths = ["a", "b"]` is very common, so judge
-                    // each item. Item names reuse the array name (positional info like `paths[0]`
-                    // is useless to the model).
+                    // Arrays of strings: a form like `paths = ["a", "b"]` is very common, so judge each item.
                     Value::Array(items) => {
                         for item in items {
                             if let Value::String(s) = item {
@@ -1057,35 +683,18 @@ fn walk(v: &Value, prefix: &str, out: &mut Vec<(String, String)>) {
     }
 }
 
-/// Once a value exceeds this length, or contains a newline, it is **no longer treated as a path**
-/// (see [`looks_like_path`]).
-///
-/// 260 = Windows' traditional path limit (`MAX_PATH`). It is chosen over any other number because a
-/// **parameter value** longer than this is almost never a path — only source code / body text /
-/// logs.
+/// Once a value exceeds this length, or contains a newline, it is no longer treated as a path (see...
 const MAX_PATH_CHARS: usize = 260;
 
 fn looks_like_path(key: &str, val: &str) -> bool {
     if val.trim().is_empty() {
         return false;
     }
-    // ① The parameter name looks like a path —— the most reliable rule. The key name is declared
-    //    by the plugin **itself**: if it says this is a path, it is one, however long the value
-    //    (`path` really can hold a 300-character long path).
+    // The parameter name looks like a path —— the most reliable rule.
     if PATH_KEYS.contains(&key.to_ascii_lowercase().as_str()) {
         return true;
     }
-    // ② When the key name says nothing, we can only guess from the shape of the value —— and that
-    //    starts by ruling out values that are "obviously not paths":
-    //    containing a newline, or longer than a path limit.
-    //    **This rule is necessary, not fastidiousness**: a plugin tool's arguments routinely carry
-    //    a whole block of source code / body text (`create_plugin`'s `source` is one), and such a
-    //    string is almost bound to contain `/`, `\` or `..` —— judging by value shape alone would
-    //    take a 2 KB source block for a single path, whose consequence is that under the confined
-    //    tier `create_plugin` is rejected outright (**a broken feature, not a slow one**), and
-    //    under the full tier every call wastes a scan.
-    //    Use `chars().count()` rather than `len()`: non-ASCII in source code would trip the gate
-    //    early when counted in bytes, whereas path length is counted in characters.
+    // When the key name says nothing, we can only guess from the shape of the value —— and that starts by ruling out...
     if val.contains('\n') || val.contains('\r') || val.chars().count() > MAX_PATH_CHARS {
         return false;
     }
@@ -1102,28 +711,16 @@ fn looks_like_path(key: &str, val: &str) -> bool {
     val.split(['/', '\\']).any(|seg| seg == "..")
 }
 
-// ─────────────────────────── Path normalization and containment ───────────────────────────
+// Path normalization and containment
 
 /// Normalize: resolve symlinks / 8.3 short names / case, and cancel `.` and cancellable `..`.
-///
-/// For a path that **doesn't exist yet** (most common when writing a file) `canonicalize` can't be
-/// called directly, so it degrades to "canonicalize the deepest existing ancestor, then append the
-/// remaining tail back". This step is necessary: without it, `<workspace>/../..` or a symlink
-/// pointing elsewhere could make the prefix comparison reach a wrong conclusion.
 fn normalize(p: &Path) -> PathBuf {
     let lex = lexical(p);
     let mut tail: Vec<OsString> = Vec::new();
     let mut cur = lex.clone();
     loop {
         if let Ok(c) = cur.canonicalize() {
-            // On Windows `canonicalize` returns a **verbatim path** (`\\?\C:\…`) —— that is the
-            // one after "resolving symlinks / 8.3 short names", and the judgement must use it; but
-            // **showing** it (in `/workplace`, the out-of-bounds text, the contract given to the
-            // model) would make users think something went wrong, and a model copying it into a
-            // tool call is awkward too. So the prefix is stripped at **the single exit of
-            // normalization**: all of this module's paths come out of `normalize`, so judgement and
-            // display see the same shape, and there's no mismatch of "compare with one, display
-            // with another" (`inside` gets the same shape on both sides).
+            // On Windows `canonicalize` returns a verbatim path (`\\?\C:\…`) —— that is the one after "resolving symlinks /...
             let mut out = strip_verbatim(c);
             for seg in tail.iter().rev() {
                 out.push(seg);
@@ -1144,12 +741,7 @@ fn normalize(p: &Path) -> PathBuf {
     lex
 }
 
-/// Strip Windows' verbatim prefix: `\\?\C:\x` → `C:\x`, `\\?\UNC\s\share` → `\\s\share`.
-///
-/// Called only once, at [`normalize`]'s exit. The cost is that paths beyond `MAX_PATH` (260 chars)
-/// lose that verbatim exemption —— this project's scenarios (workspace, history, plugins all sit
-/// near the app root) never reach that length, whereas "every boundary message carrying a string of
-/// `\\?\`" is something you'd see every day.
+/// Called only once, at normalize's exit.
 fn strip_verbatim(p: PathBuf) -> PathBuf {
     let s = p.to_string_lossy().into_owned();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
@@ -1168,9 +760,7 @@ fn lexical(p: &Path) -> PathBuf {
     let mut stack: Vec<OsString> = Vec::new();
     for c in p.components() {
         match c {
-            // A drive letter and the root land at the head of the result, and **cannot be popped
-            // by `..`** —— otherwise `C:\..\..\x` would become `x` (a relative path) and the
-            // judgement would fail outright.
+            // A drive letter and the root land at the head of the result, and cannot be popped by `..` —— otherwise...
             Component::Prefix(_) | Component::RootDir => prefix.push(c.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
@@ -1189,10 +779,6 @@ fn lexical(p: &Path) -> PathBuf {
 }
 
 /// Is `p` inside `root` (including being equal to root)?
-///
-/// On Windows, compared segment by segment **case-insensitively** (`C:` and `c:`, `Users` and
-/// `users` are the same place). Non-ASCII case folding is not done —— such directory names almost
-/// never appear in a path prefix, and doing it properly would need the Unicode tables.
 fn inside(root: &Path, p: &Path) -> bool {
     let mut r = root.components();
     let mut q = p.components();
@@ -1211,10 +797,7 @@ fn inside(root: &Path, p: &Path) -> bool {
     }
 }
 
-// ─────────────────────────── (no timestamped plots any more) ───────────────────────────
-// Until 2026-10-08 the `default` tier named its plot with an `<YYYYMMDDHHMMSS>` stamp and needed a
-// collision-unique variant (`stamp()` + `unique_dir()`). The workspace is now the app root itself,
-// so no name is generated and both helpers are gone.
+// ─────────────────────────── (no timestamped plots any more) ─────────────────────────── Until 2026-10-08...
 
 #[cfg(test)]
 mod tests {
@@ -1231,14 +814,7 @@ mod tests {
         ws("fixed", Some(dir))
     }
 
-    /// The command's two names: `/workplace` is the canonical name, `/workspace` is the **legacy
-    /// name** (naming unified on 2026-10-04).
-    ///
-    /// Pinning three things: ① both names are recognised; ② the argument is stripped properly
-    /// (`/workplace default` → `default`); ③ when the directory happens to be named `/workplace`,
-    /// `/workplace /workplace` must **not** be stripped to an empty string —— that is the mistake
-    /// the old `trim_start_matches("/workplace")` would make (it strips the prefix repeatedly),
-    /// handing the user "the current state" instead of "the switch result", with no hint at all.
+    /// The command's two names: `/workplace` is the canonical name, `/workspace` is the legacy name.
     #[test]
     fn command_answers_to_both_names_and_parses_args() {
         for name in ["/workplace", "/workspace"] {
@@ -1425,9 +1001,7 @@ mod tests {
         assert!(hits.contains(&"/etc/passwd".to_string()), "an absolute path must be caught");
         assert!(hits.contains(&"D:\\data\\x.csv".to_string()), "a Windows absolute path must be caught");
         assert!(hits.contains(&"plugins".to_string()), "a nested dir must be caught");
-        // A relative name inside an array is caught by the **key name** (`paths`) —— if the key
-        // name weren't on the list, `b/c.txt` couldn't be recognised by its value alone, and
-        // missing it is exactly the price of this coarse net's "rather miss than misfire".
+        // A relative name inside an array is caught by the key name (`paths`) —— if the key name weren't on the list...
         assert!(hits.contains(&"a.txt".to_string()), "items in a paths array must be caught");
         assert!(hits.contains(&"b/c.txt".to_string()), "same as above");
         assert!(!hits.contains(&"*.rs".to_string()), "a glob is not a path");
@@ -1452,14 +1026,7 @@ mod tests {
         assert!(m.len() > u.len(), "the model contract should be longer and more complete than the user line");
     }
 
-    /// Regression: `report()` once called `self.mode()` **while holding the state lock** (it locks
-    /// the same `std::sync::Mutex`) —— `Mutex` is not reentrant, so "switch to a fixed workspace
-    /// then run `/workplace` once more" **pinned the whole process** (exit=124 on the real machine,
-    /// killed on timeout).
-    ///
-    /// Pinned with "spawn a thread + receive with a timeout": on a real deadlock this is a **test
-    /// failure**, rather than hanging `cargo test` along with it —— a hung test is harder to track
-    /// down than a failing one.
+    /// Regression: `report()` once called `self.mode()` while holding the state lock (it locks...
     #[test]
     fn report_after_switching_does_not_deadlock() {
         let base = std::env::temp_dir().join("aox-ws-report");
@@ -1494,12 +1061,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&app2);
     }
 
-    /// Regression: **a whole block of source code must not be taken for a path**. A real defect
-    /// measured in 7a —— in `create_plugin(source = "<2.2 KB of plugin source>")`, because `a/../b`
-    /// appeared, the whole source block was judged "a path containing a `..` component". The
-    /// consequence is bad on both sides: under the confined tier `create_plugin` is rejected
-    /// outright (**a broken feature**), and under the full tier every call burns about 1 ms for
-    /// nothing (a `canonicalize` at every level).
+    /// Regression: a whole block of source code must not be taken for a path.
     #[test]
     fn multiline_source_is_not_treated_as_a_path() {
         let src = "import os\nsys.path.insert(0, os.path.join(d, \"..\"))\n# a/b/c\n".repeat(30);
@@ -1516,19 +1078,13 @@ mod tests {
         );
         assert!(hits.is_empty(), "neither of these two arguments should be caught: {hits:?}");
 
-        // But the **key name is authoritative**: the same value hung under the `path` key is judged
-        // however long it is (it really can be a long path) —— pinning "the gate is only installed
-        // on the paths that guess by value shape", so that one day nobody gates the key-name path
-        // too.
+        // But the key name is authoritative: the same value hung under the `path` key is judged however long it is (it...
         let long_path = format!("C:\\{}", "x".repeat(300));
         let hits = scan_paths(&serde_json::json!({ "path": long_path }));
         assert_eq!(hits.len(), 1, "a long value under the path key is a path; length must not excuse it");
     }
 
-    /// `is_unrestricted()` is the **only** basis for the check point's short-circuit (under the
-    /// `full` tier the whole check is skipped), so it must agree strictly with "will `check`
-    /// reject": whenever it says `true`, every path must pass. Conversely, the day someone marks
-    /// `Pending` as `true` too, that's "the confined tier silently allowing everything".
+    /// `is_unrestricted()` is the only basis for the check point's short-circuit (under the `full` tier the whole...
     #[test]
     fn is_unrestricted_agrees_with_check() {
         let full = ws("full", None);
@@ -1549,11 +1105,7 @@ mod tests {
         assert!(!ws("default", None).is_unrestricted(), "Pending rejects everything and must never report unrestricted");
     }
 
-    /// The new semantics (2026-10-04): **reads unrestricted / writes and deletes confined**.
-    ///
-    /// Compared side by side, so that one day a "convenient unification" doesn't merge the two back
-    /// into one tier. All four states × both intents must be pinned: for the same out-of-bounds
-    /// path, `check` (write) must reject and `check_read` (read) must pass.
+    /// The new semantics: reads unrestricted / writes and deletes confined.
     #[test]
     fn read_is_never_restricted_but_write_is() {
         let base = std::env::temp_dir().join("aox-ws-rw");
@@ -1573,9 +1125,7 @@ mod tests {
         assert!(w.check(&inside).is_ok());
         assert!(w.check_read(&inside).is_ok());
 
-        // ② Relative path: write rejects (the host and plugin have different cwds, and that
-        //    ambiguity is a risk only writes carry); read passes —— the consequence of reading is
-        //    only "read a same-named file elsewhere", not worth rejecting a normal read for
+        // Relative path: write rejects (the host and plugin have different cwds, and that ambiguity is a risk only writes...
         assert!(matches!(w.check("config.toml"), Err(Reject::Relative { .. })));
         assert!(w.check_read("config.toml").is_ok(), "a read must not be rejected for being relative");
 
@@ -1592,19 +1142,7 @@ mod tests {
         assert!(f.check_read(&outside).is_ok());
     }
 
-    /// `snapshot()` is the **UI's** only state-fetching entry point: one lock acquisition grabs both
-    /// the "tier" and the "root".
-    ///
-    /// Pinning two things:
-    /// ① It says the same thing as `mode()` / `active_root()` —— otherwise you'd get a
-    ///    self-contradictory UI of "the button says default, while the list has the tick on 'choose
-    ///    workspace'";
-    /// ② It does not itself **re-enter the state lock** (re-entering would mean that line never
-    ///    comes back —— the same pit as `report_after_switching_does_not_deadlock`).
-    ///
-    /// Especially after the `default` tier decides its root: the tier must **still be `Default`**,
-    /// just with the root going from `None` to that directory —— which is precisely the point of
-    /// `snapshot()` writing the "tier-to-root mapping" only once.
+    /// `snapshot()` is the UI's only state-fetching entry point: one lock acquisition grabs both the "tier"...
     #[test]
     fn snapshot_agrees_with_mode_and_root() {
         // full: tier Full, root None (not "not yet decided" but "unrestricted")
@@ -1637,13 +1175,7 @@ mod tests {
         assert_eq!(f.active_root(), r);
     }
 
-    /// The tier's criterion is **how it came about at runtime**, not what the config says (a bug
-    /// fixed on 2026-10-04).
-    ///
-    /// Real-machine symptom: the config says `mode = "default"`, then at runtime a fixed plot is
-    /// picked —— `set_mode` reports "switched to 'choose workspace': X", and immediately afterwards
-    /// `snapshot()` reports "tier: default". One action, two descriptions; on the GUI that's "the
-    /// button says default, the tick is on default, yet writes go to X".
+    /// The tier's criterion is how it came about at runtime, not what the config says.
     #[test]
     fn snapshot_follows_the_runtime_origin_not_the_config() {
         let base = std::env::temp_dir().join("aox-ws-origin");
@@ -1668,14 +1200,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A new conversation **always returns to the "default" tier** (decided by the user on
-    /// 2026-10-04).
-    ///
-    /// The old implementation only reset when `cfg.mode == "default"`, so "the previous
-    /// conversation picked some directory, and after clicking + the new conversation is still in
-    /// that directory". Now, whatever the config says and whichever tier the previous one switched
-    /// to, after turning the page it is always "default" with the root **not yet decided** (fixed
-    /// on the first message).
+    /// A new conversation always returns to the "default" tier.
     #[test]
     fn new_conversation_always_returns_to_default() {
         let base = std::env::temp_dir().join("aox-ws-newconv");
@@ -1706,13 +1231,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// `persisted()` and `restore()` must be inverses of each other —— opening an old conversation
-    /// is just putting the saved one back.
-    ///
-    /// Key points: the `default`-tier-with-a-root branch **must reuse the root** (otherwise "every
-    /// time I enter the same conversation it's a different workspace"); `own` must also go into the
-    /// archive, and **stay** under the `full` / `fixed` tiers (otherwise "switch away and back to
-    /// default" builds another plot).
+    /// `persisted()` and `restore()` must be inverses of each other —— opening an old conversation is just putting...
     #[test]
     fn persisted_and_restore_round_trip() {
         let base = std::env::temp_dir().join("aox-ws-persist");
@@ -1744,9 +1263,7 @@ mod tests {
         assert!(matches!(m, Mode::Fixed(_)), "{m:?}");
         assert_eq!(r, saved.root);
 
-        // ③ full: the current tier has no root, but **the own root must stay** —— switching back
-        //    to default relies on it. (`own` here emulates an old record left by the pre-2026-10-08
-        //    timestamped scheme.)
+        // Full: the current tier has no root, but the own root must stay —— switching back to default relies on it.
         let own = normalize(&app.join(WORKPLACE_DIR).join("20260101000000"));
         let saved = Record { mode: "full".into(), root: None, own: Some(own.clone()) };
         let fresh = fixed(&base.join("picked").to_string_lossy());
@@ -1766,13 +1283,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// **Switching away and back to "default" must return to this conversation's original root, not
-    /// pick a different one.**
-    ///
-    /// Reported by the user on 2026-10-05: "new conversation → say the first thing → switch to full
-    /// access → switch back to default" opened another directory, so `workplace/` got piled up with
-    /// empty directories ("endless workspace accumulation"). Under the app-root model there is
-    /// nothing per-conversation to pile up, but the invariant still holds: `own` is remembered.
+    /// Switching away and back to "default" must return to this conversation's original root, not pick a different one.
     #[test]
     fn switching_back_to_default_reuses_the_conversation_own_root() {
         let app = std::env::temp_dir().join("aox-ws-own");
@@ -1813,11 +1324,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The scratch sweep removes what the model left, and **only** that.
-    ///
-    /// The age filter is exercised at both ends (`0` = everything, an hour = nothing) rather than by
-    /// back-dating a file, which `std` cannot do: the two extremes are the whole rule, and the middle
-    /// is the same comparison.
+    /// The scratch sweep removes what the model left, and only that.
     #[test]
     fn the_scratch_sweep_empties_tmp_and_nothing_else() {
         let root = std::env::temp_dir().join(format!("aox-sweep-{}", std::process::id()));
@@ -1837,7 +1344,7 @@ mod tests {
         assert_eq!(none, Swept::default());
         assert!(tmp.join("fix1.py").is_file());
 
-        // No window: the scratch directory is emptied, recursively...
+        // No window: the scratch directory is emptied, recursively
         let all = sweep_scratch(&root, std::time::Duration::ZERO);
         assert_eq!(all.files, 1, "{all:?}");
         assert_eq!(all.dirs, 1, "the __pycache__ directory counts as one, not one per file");

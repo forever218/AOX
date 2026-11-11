@@ -1,21 +1,6 @@
 //! The storage seam (the `Store` seam).
-//!
-//! It takes "where conversation history lives, in what format it is written, and how it is
-//! read back" out of the caller's hands. Callers (`Agent` / CLI / GUI) deal with only two
-//! traits and no longer build paths themselves:
-//!
-//! - [`Store`]: backend-level (one directory / one database). `Runtime` holds an `Arc<dyn Store>`.
-//! - [`Session`]: one **open conversation** (the write side), produced by [`Store::create`] /
-//!   [`Store::open`].
-//!
-//! **Paths are deliberately absent from the interface**: mappings like `dir` / `file_of`
-//! ("id ↔ filename") are implementation details of the jsonl backend (see [`jsonl`]). The moment a
-//! path parameter appears on a trait, switching backends later (e.g. sqlite holding all
-//! conversations in one database) becomes impossible — that is the easiest way for a "seam" to go
-//! wrong. So callers always speak in terms of **id**.
-//!
-//! Only the jsonl backend exists for now, but the `config.toml [store] backend` entry is set up
-//! early so that "switching backends" later means changing config, not code.
+//! It takes "where conversation history lives, in what format it is written, and how it is read back" out...
+//! Store: backend-level (one directory / one database). `Runtime` holds an `Arc<dyn Store>`. - Session: one open...
 
 pub mod jsonl;
 
@@ -29,84 +14,42 @@ use crate::history::{Loaded, Summary, UsageRecord};
 use crate::message::Message;
 
 /// One open conversation (the write side).
-///
-/// Its methods correspond one-to-one with the old `history::Log` and have exactly
-/// the same semantics: a failed append does not error (history must not break a
-/// running conversation), and `rewrite` must preserve the activity stream and
-/// usage lines.
 pub trait Session: Send {
-    /// The conversation id (== the filename stem).
+    /// The conversation id (== the filename stem)
     fn id(&self) -> &str;
-    /// Where it lands on disk. **For display only** — callers must not use it to
-    /// build other paths.
-    ///
-    /// `allow(dead_code)`: `src/main.rs` and `src/lib.rs` each compile the same set
-    /// of modules (see the top of lib.rs); the CLI build unit speaks only in ids
-    /// and has no use for it. It is kept for "show where this conversation lands"
-    /// and for test assertions (the same situation as `Runtime::add_prompt_segment`).
+    /// Where it lands on disk. For display only — callers must not use it to build other paths.
     #[allow(dead_code)]
     fn path(&self) -> &Path;
     /// Append a message (`role == "system"` is skipped; the system prompt changes every round).
     fn append(&mut self, msg: &Message, is_error: Option<bool>);
-    /// Append an activity-stream record.
+    /// Append an activity-stream record
     fn append_act(&mut self, act: &Value);
     /// Append one round's token ledger.
     fn append_usage(&mut self, rec: &UsageRecord);
-    /// Append a "this conversation's workplace" record (the current mode + bound
-    /// root + the plot this conversation's default tier created for itself).
-    ///
-    /// One record is written for the first message of each conversation and
-    /// another on every mode switch; when reading, **take the last one**. It is
-    /// stored for two reasons: ① restore that plot when reopening an old
-    /// conversation; ② so that "switch to full access and back to default" need
-    /// not create another plot (see [`crate::workplace::Record`]).
+    /// Append a "this conversation's workplace" record (the current mode + bound root + the plot this conversation's...
     fn append_workplace(&mut self, rec: &crate::workplace::Record);
-    /// Append "this conversation is called X now" (`None` = drop the user's name and go back to the
-    /// automatic one, the first user message).
-    ///
-    /// Appended rather than patched into the header record: the file is only ever appended to, the
-    /// newest record wins on read, and clearing the name is then just one more row rather than a
-    /// rewrite of the one line that anchors the whole file.
-    ///
-    /// ⚠️ Only the GUI renames conversations, so the CLI target reports this as never used (it compiles
-    /// these files as its own modules, with its own dead-code pass). Silenced on the item, as `mod space`
-    /// is silenced in `src/main.rs`, so the reason sits next to the thing it is about.
+    /// Append "this conversation is called X now" (`None` = drop the user's name and go back to the automatic...
     #[allow(dead_code)]
     fn append_title(&mut self, title: Option<&str>);
-    /// Append a **task checkpoint** (`kind:"task"`), the long-running task's goal / constraints /
-    /// progress / next steps (see `crate::task`).
-    ///
-    /// It travels with the conversation for the same reason the workplace record does: it belongs to
-    /// this conversation, so deleting or pruning the conversation takes it along and leaves no orphan
-    /// file. Written as an **append** rather than patching an earlier row — the file only ever grows,
-    /// and a reader takes the last one.
-    ///
-    /// The payload is a plain JSON value: the store writes what it is given and does not know the
-    /// task schema, exactly like [`Session::append_act`]. That keeps "how a checkpoint is shaped" in
-    /// one module (`crate::task`) instead of two.
+    /// Append a task checkpoint (`kind:"task"`), the long-running task's goal / constraints / progress / next steps...
     fn append_task(&mut self, task: &Value);
     /// Rewrite the whole file with the given message list (interrupt rollback);
     /// the activity stream and usage are preserved as-is.
     fn rewrite(&mut self, msgs: &[Message]);
 }
 
-/// 一段新会话的"出生信息"。
-///
-/// 只写进首行 meta，**不参与定位**：从 2026-11-05 起所有会话都落在同一个目录
-/// （`<app root>/.aox/conversations`），"这个会话是谁开的、算哪个空间"只是拿来分组的元数据。
-/// 默认值 = 本机、无空间、无房间，也就是桌面和 CLI 的常态。
+/// Birth metadata of a new session: grouping info in first-line meta only, not location; defaults to local.
 #[derive(Debug, Clone, Default)]
 pub struct Birth {
     pub origin: crate::history::Origin,
-    /// 出厂归属的空间 id。远端固定 `builtin:remote`；本机留空——它的分组仍由
-    /// `workplace` 记录推出来（见 `space::group`）。
+    /// Id of the originating space; remote is builtin:remote, local is empty and grouped via workplace.
     pub space: Option<String>,
-    /// 远端房间 `(id, name)`。
+    /// The remote room (id, name).
     pub room: Option<(String, String)>,
 }
 
 impl Birth {
-    /// 手机那一轮发起的新会话：固定落在「远端」空间，并带上房间名。
+    /// A new session started from the phone: fixed to the Remote space and carries the room name.
     pub fn remote(room_id: &str, room_name: &str) -> Self {
         Self {
             origin: crate::history::Origin::Remote,
@@ -116,60 +59,34 @@ impl Birth {
     }
 }
 
-/// The storage backend (directory-level).
+/// The storage backend (directory-level)
 pub trait Store: Send + Sync {
     /// The backend name, i.e. the value of `config.toml [store] backend`.
     fn backend(&self) -> &'static str;
-    /// Where conversations are kept — what the UI shows under "history lives here", and what the
-    /// CLI's `/history dir` prints.
-    ///
-    /// Since 2026-11-05 this is **the only** location: one store, one directory, no per-workspace
-    /// scanning. A conversation's workspace is recorded *inside* the file, not by where it sits.
+    /// Where conversations are kept — what the UI shows under "history lives here", and what the CLI's `/history dir`...
     fn location(&self) -> &Path;
     /// Create a new conversation and write the header record.
-    ///
-    /// No path parameter: where a conversation lives is the backend's business (see the module docs
-    /// on why paths stay off this interface). `birth` only says what to write into the header.
     fn create(&self, model: Option<&str>, birth: &Birth) -> Result<Box<dyn Session>>;
     /// Continue an existing conversation (keep writing by id).
     fn open(&self, id: &str) -> Result<Box<dyn Session>>;
-    /// List conversations, **most recently used first**.
+    /// List conversations, **most recently used first
     fn list(&self, limit: usize) -> Vec<Summary>;
     /// Resolve "the index in the list" or "id / id prefix" into one entry.
     fn resolve(&self, key: &str) -> Result<Summary>;
     /// Read the whole conversation's messages (bad lines skipped).
     fn load(&self, id: &str) -> Result<Vec<Loaded>>;
     /// Read the activity-stream records (payload returned as-is).
-    ///
-    /// `allow(dead_code)`: the timeline is read by the GUI (a consumer of the lib); the CLI build
-    /// unit has no caller for it (see the top of lib.rs for the two-build explanation).
     #[allow(dead_code)]
     fn load_acts(&self, id: &str) -> Vec<Value>;
-    /// Read the per-round token usage.
+    /// Read the per-round token usage
     fn load_usage(&self, id: &str) -> Vec<UsageRecord>;
-    /// Read this conversation's **last** workplace record; `None` if one was
-    /// never written (old conversation files have none).
-    ///
-    /// What `None` means is up to the caller: `Agent::resume` chooses to **leave**
-    /// the current state alone — if we don't know which plot that conversation
-    /// used, we should not guess on the user's behalf.
+    /// Read this conversation's last workplace record; `None` if one was never written (old conversation files have...
     fn load_workplace(&self, id: &str) -> Option<crate::workplace::Record>;
-    /// Read this conversation's **last** task checkpoint (`kind:"task"`), as the raw payload.
-    ///
-    /// `None` covers both "this conversation never had one" (a one-off question, or a file written
-    /// before checkpoints existed) and "the row is unreadable" — the caller parses it and degrades to
-    /// "no checkpoint" either way, because a broken checkpoint must never block a conversation.
+    /// Read this conversation's last task checkpoint (`kind:"task"`), as the raw payload.
     fn load_task(&self, id: &str) -> Option<Value>;
     /// Delete a conversation and return the entry that was removed.
     fn remove(&self, key: &str) -> Result<Summary>;
-    /// Keep only the newest `keep` conversations (`0` = no limit) and return the
-    /// number deleted.
-    ///
-    /// The everyday path does not need a caller to invoke it — creating a new
-    /// conversation makes the backend trim automatically per `config.toml
-    /// [history] keep`. It stays on the trait as a slot reserved for entries like
-    /// "manual cleanup", and as a guarantee that "switching backends preserves the
-    /// same semantics". `allow(dead_code)`: there really is no caller right now.
+    /// Keep only the newest `keep` conversations (`0` = no limit) and return the number deleted.
     #[allow(dead_code)]
     fn prune(&self, keep: usize) -> usize;
 }
@@ -177,13 +94,7 @@ pub trait Store: Send + Sync {
 /// The known backend names. When adding a backend, update here and [`backend`] together.
 pub const BACKENDS: [&str; 1] = ["jsonl"];
 
-/// How long a conversation title may be, in **characters** (not bytes, so CJK is never cut in half).
-///
-/// It lives on the seam rather than inside the jsonl backend because it is a contract between two
-/// sides: the backend clamps a stored title to this length on the way out (a hand-edited file, or one
-/// written before the rule existed, must not be able to break the one-line row), and the dialog that
-/// asks for a title refuses anything longer. Two copies of the number would drift, and the symptom
-/// would be a title quietly shorter than the one the user typed.
+/// How long a conversation title may be, in characters (not bytes, so CJK is never cut in half).
 pub const TITLE_MAX_CHARS: usize = 46;
 
 /// The default backend name — used when `config.toml` does not set `[store] backend`.
@@ -191,24 +102,13 @@ pub fn default_backend() -> &'static str {
     BACKENDS[0]
 }
 
-/// Build a default backend instance — **cannot fail** (the backend name is hard-coded to
-/// [`default_backend`]).
-///
-/// For the cases "config not yet read" and "just want to read history": the GUI must still show
-/// history in the sidebar even when config reading fails, and at that point it has no `Runtime`
-/// and thus no backend name from config — reading history must never disappear just because
-/// something else broke.
+/// Build a default backend instance — cannot fail (the backend name is hard-coded to default_backend).
 pub fn default_store(root: &Path, keep: usize) -> Arc<dyn Store> {
     Arc::new(jsonl::JsonlStore::new(root, keep))
 }
 
 /// Build a backend by name.
-///
-/// **An unrecognized name errors outright** rather than silently falling back to
-/// jsonl: starting up as usual despite a wrong config shows up as "I clearly
-/// configured a different backend, why is it still writing jsonl" — the hardest
-/// class of problem to diagnose. (Phase 2 already got burned once by "the file
-/// was written but didn't take effect"; see the `--theme` entry.)
+/// An unrecognized name errors outright rather than silently falling back to jsonl: starting up as usual despite...
 pub fn backend(name: &str, root: &Path, keep: usize) -> Result<Arc<dyn Store>> {
     let name = name.trim();
     // Empty = not configured = use the default backend; it's not "written wrong",
@@ -229,11 +129,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// An unrecognized backend name must **error**, not silently fall back to jsonl.
-    ///
-    /// This guards the hardest-to-diagnose trap of "config set but not taking effect": once it
-    /// silently falls back, the user sees "I clearly configured a different backend, why is it
-    /// still writing jsonl", with not a single hint in the startup log.
+    /// An unrecognized backend name must error, not silently fall back to jsonl.
     #[test]
     fn unknown_backend_is_an_error() {
         let root = std::env::temp_dir();

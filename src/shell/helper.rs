@@ -1,28 +1,6 @@
 //! The hidden entry point that actually starts the command.
-//!
-//! # Why this is a second process
-//!
-//! Windows refuses to let a Medium process *raise* an integrity level but has no objection to it
-//! *lowering its own*: dropping to Low needs no privilege (only `TOKEN_ADJUST_DEFAULT` on your own
-//! token), whereas going up needs `SeRelabelPrivilege`. So instead of asking the kernel to build a
-//! Low child from the outside — which may need `SE_INCREASE_QUOTA` that an ordinary account does not
-//! hold — the host spawns **itself** with [`FLAG`], and this file lowers the token from the inside
-//! and then starts the real command. Everything it spawns inherits the lowered token, which is
-//! exactly what [`crate::shell`] needs and what the S0 spike verified end to end.
-//!
-//! # The contract with the host
-//!
-//! | Channel | Meaning |
-//! |---------|---------|
-//! | `AOX_SHELL_SPEC` (env, JSON) | the [`HelperSpec`] — program, args, cwd, extra env, `lowil` |
-//! | stdin | null (a shell command must not block on a prompt nobody can answer) |
-//! | stdout / stderr | the command's own, inherited straight through |
-//! | exit code | the command's own, except for the two signals below |
-//!
-//! The two signals ride on **stderr** with a `\u{1}` prefix and a dedicated exit code, because "the
-//! command failed" and "the boundary could not be applied" must never be confused: the first is
-//! reported to the model as output, the second is a `Failure` the tool turns into a policy decision
-//! (`auto` retries without the kernel boundary, `kernel` refuses the call).
+//! # Why this is a second process.
+//! Windows refuses to let a Medium process *raise* an integrity level but has no objection to it *lowering...
 
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +10,7 @@ pub const FLAG: &str = "--aox-shell-exec";
 pub const SPEC_ENV: &str = "AOX_SHELL_SPEC";
 /// Exit code: the integrity boundary could not be applied (nothing was run).
 pub const EXIT_LOWIL_FAIL: i32 = 97;
-/// Exit code: the command could not be started at all.
+/// Exit code: the command could not be started at all
 pub const EXIT_SPAWN_FAIL: i32 = 98;
 /// Prefix no ordinary program produces, so a command that happens to print "AOX-…" cannot forge a
 /// signal.
@@ -46,9 +24,7 @@ const SPAWN_FAIL: &str = "\u{1}AOX-SPAWN-FAIL: ";
 pub struct HelperSpec {
     pub program: String,
     pub args: Vec<String>,
-    /// Appended to the command line **verbatim** (no quoting). Only `cmd` uses it: its command must
-    /// arrive inside one pair of quotes that `/S` strips, because Rust's MSVC-style argument quoting
-    /// (`"` → `\"`) is not something `cmd` parses.
+    /// Appended to the command line verbatim (no quoting).
     #[serde(default)]
     pub raw_tail: Option<String>,
     pub cwd: String,
@@ -67,9 +43,6 @@ pub enum Signal {
 }
 
 /// If this process was started as the helper, run the command and return the exit code.
-///
-/// Called first thing by both binaries (`src/main.rs`, `gui/src/main.rs`). `None` = an ordinary
-/// start, so the caller carries on with its own argument parsing.
 pub fn run_if_requested() -> Option<i32> {
     let mut args = std::env::args();
     let _ = args.next();
@@ -141,15 +114,12 @@ fn exec() -> i32 {
 }
 
 fn fail(code: i32, prefix: &str, why: &str) -> i32 {
-    // Written as one line so `strip_signals` can drop exactly it.
+    // Written as one line so `strip_signals` can drop exactly it
     eprintln!("{prefix}{}", why.replace(['\r', '\n'], " "));
     code
 }
 
 /// Remove signal lines from captured stderr and hand back the first one found.
-///
-/// A command's own stderr is passed to the model as-is; the helper's private markers must not leak
-/// into it, and if one is present the caller has to act on it (see [`Signal`]).
 pub fn strip_signals(text: &str) -> (String, Option<Signal>) {
     let mut found = None;
     let mut kept = String::with_capacity(text.len());

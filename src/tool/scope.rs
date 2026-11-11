@@ -1,42 +1,6 @@
-//! The **advertising boundary** of the tool list: which schemas go into a given request.
-//!
-//! # Why it exists
-//!
-//! The registry and "what the model should see" are two different things. The registry grows with
-//! plugins (a single `fs` plugin is 10 tools), and **every request sends all of those schemas
-//! verbatim**: tokens are the visible cost, but the real one is picking the wrong tool — the longer
-//! the list, the lower the chance each tool is chosen correctly. So "advertising" is split from
-//! "capability": every capability stays, advertising happens on demand.
-//!
-//! # The line is `ToolKind`, not a list of names
-//!
-//! The host's own tools (`Meta` / `Host`) are **always** listed; only `Plugin(_)` may be held back.
-//! Writing that as a structural check instead of a name table has two reasons:
-//!
-//! ① A name table drifts. Add a host tool, forget to register it there, and the new tool is
-//!    "invisible to the model" — the hardest kind of failure to find (the tool works; nobody knows
-//!    it exists).
-//! ② Host tools are **exactly 17**, plugin tools are **unbounded**. Keeping the list stable — and
-//!    the prefix cache warm — is about the former. However many plugins the model builds, they can
-//!    never push the host's own vocabulary out.
-//!
-//! # Hidden != unavailable
-//!
-//! `Runtime::execute` / `Agent::authorize_and_execute` resolve names against the **registry**, not
-//! against this list, so a model that remembers a hidden tool **still succeeds** when it calls it.
-//! What is switched off here is the advertising slot, not the capability — hiding must never create
-//! a new failure mode, or it becomes a breeding ground for bugs instead of an optimisation.
-//!
-//! # The three tiers
-//!
-//! - **core**: `ToolKind::Meta | Host`, always visible (18 tools).
-//! - **enabled**: names pinned in `[tools] enabled`, always visible (plugin tools included).
-//! - **discovered**: added by a `find_tools` hit, or automatically after a successful
-//!   `create_plugin` / `update_plugin`. Visible for the rest of this conversation; **never
-//!   persisted** — a new conversation or a resume clears it (it is a projection, the same kind of
-//!   thing as `compact::ViewCache`).
-//!
-//! A name outside those three tiers appears in no request at all, yet can still be called.
+//! The advertising boundary of the tool list: which schemas go into a given request.
+//! # Why it exists.
+//! The registry and "what the model should see" are two different things.
 
 use std::collections::BTreeSet;
 
@@ -71,11 +35,6 @@ impl Scope {
     }
 
     /// Whether this request is in "on demand" mode.
-    ///
-    /// Decided by the **live registry size**, not by a one-off switch: install a plugin and the
-    /// registry crosses the threshold, so the very next round starts hiding; remove it and the list
-    /// falls back to full on its own. No state to keep in sync means no "forgot to flip the flag"
-    /// class of bug.
     pub fn hides(&self, registered: usize) -> bool {
         self.inline_max > 0 && registered > self.inline_max
     }
@@ -118,7 +77,7 @@ mod tests {
     fn host_tools_are_never_hidden() {
         let s = scope(4, &[]);
         assert!(s.hides(12), "12 tools cross the threshold of 4 => on-demand mode");
-        // Once on-demand, host tools are still all there.
+        // Once on-demand, host tools are still all there
         for n in ["read_file", "task_state", "create_plugin"] {
             assert!(s.advertises(n, false), "{n} is a host tool and must always be visible");
         }

@@ -1,28 +1,6 @@
 //! `shell_job` — the host-managed form of "a command that must stay running".
-//!
-//! # Why not just `bash … &`
-//!
-//! Every one-shot shell call owns a Job Object and drops it when the call returns. That is the
-//! feature, not a bug: it guarantees a build, a test run or a `grep` cannot leave anything behind.
-//! It also means a detached server dies exactly when the shell that started it exits. `nohup`,
-//! `start /b` and `disown` only change the process's relationship to the *shell*; Job membership is
-//! inherited and cannot be talked out of.
-//!
-//! A `shell_job` is the same fence, owned by the **runtime** instead. It survives calls, is visible
-//! through `status`, writes to a log file, and dies on `stop`, on the lifetime cap, or when AOX
-//! exits.
-//!
-//! # Actions
-//!
-//! | action | meaning |
-//! |---|---|
-//! | `start` | launch one command under a managed Job; returns an id and a log path |
-//! | `status` | one job (with `id`) or all of them |
-//! | `logs` | tail of the job's combined stdout/stderr |
-//! | `stop` | terminate the whole tree now |
-//!
-//! There is deliberately no `restart`: a restart is "stop then start", and hiding those two facts
-//! behind one word would make a port conflict impossible to see.
+//! # Why not just `bash … &`.
+//! Every one-shot shell call owns a Job Object and drops it when the call returns.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -173,9 +151,7 @@ async fn start(args: &Value, rt: &Arc<Runtime>) -> Result<String, String> {
         .unwrap_or(0);
     let log = dir.join(format!("{}-{}.log", name, stamp));
 
-    // Fast pre-check (and a chance to free slots) before doing the expensive parts. Because the
-    // startup probe awaits, the registry is **not** held across the spawn; capacity is checked
-    // again under the lock below, and a late arrival is killed rather than silently overfilling.
+    // Fast pre-check (and a chance to free slots) before doing the expensive parts.
     let mut jobs = rt.jobs.lock().await;
     let expired = jobs.expire(cfg.background_max_hours);
     jobs.make_room();
@@ -201,14 +177,7 @@ async fn start(args: &Value, rt: &Arc<Runtime>) -> Result<String, String> {
         | crate::shell::runner::Failure::NoBoundary(s) => s,
     })?;
 
-    // A very short startup probe catches the common failures (missing binary, bad cwd, port already
-    // in use) while the log is still small and the model can act on the message immediately. A
-    // server that is still running after this is reported as started.
-    //
-    // 600 ms, not 300: this window is the only thing that distinguishes "it exited" from "it is a
-    // server", so too small a number turns a busy machine into a wrong answer ("started" for a
-    // command that had already died). The cost of the wider window is paid once per `start`, and a
-    // real server start is dominated by the model turn around it.
+    // A very short startup probe catches the common failures (missing binary, bad cwd, port already in use)...
     tokio::time::sleep(Duration::from_millis(600)).await;
     let early_exit = bg.child.try_wait().ok().flatten();
     if let Some(status) = early_exit {
@@ -231,8 +200,6 @@ async fn start(args: &Value, rt: &Arc<Runtime>) -> Result<String, String> {
     }
 
     // Re-lock for the insert; the startup probe must not hold the registry lock across an await.
-    // Another `start` may have taken the last slot in the meantime — kill this one instead of
-    // exceeding the configured cap.
     let mut jobs = rt.jobs.lock().await;
     let expired = jobs.expire(cfg.background_max_hours);
     jobs.make_room();

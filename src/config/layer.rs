@@ -1,31 +1,6 @@
-//! The layered composition manifest (phase 5's **composition layer**).
-//!
-//! Reading config goes from "open a file" to "synthesise a layer stack":
-//!
-//! ```text
-//! profile → bundle (aggregatable, overridable by a file) → patch (listed in the manifest) → config.toml (always the last layer)
-//! ```
-//!
-//! **Only the source changes, not the model**: what comes out is still an ordinary TOML tree,
-//! handed to `toml::from_str::<Config>` for parsing — not one field of `Config`'s shape changed.
-//! This is how design principle P1 "a single normalised config tree" is delivered, and why this
-//! route can be incremental without rework.
-//!
-//! Precedence: **later layers win**, and the merge rule is "if both sides are tables, merge deep;
-//! otherwise replace wholesale".
-//!
-//! Two semantics to hold on to:
-//!
-//! - `config.toml` **is always the last layer**. So not one key landed in phases 1–4 stops
-//!   working, and existing configs cost nothing to migrate (decision A: long-term compatibility).
-//! - Without `<app root>/aox.toml`, the layer stack degenerates to a single `[config.toml]` layer —
-//!   the composition result is **field-for-field identical** to before phase 5
-//!   (`no_manifest_is_single_layer` pins this).
-//!
-//! Every failure path is **an error at startup, never a silent skip**: an unrecognised bundle, a
-//! missing patch, a bundle cycle, a profile absent from the manifest — all fail outright. The
-//! consequence of skipping silently is "I clearly wrote this layer, why didn't it take effect",
-//! and that class of problem is the hardest to track down.
+//! The layered composition manifest (phase 5's composition layer).
+//! Reading config goes from "open a file" to "synthesise a layer stack".
+//! Only the source changes, not the model: what comes out is still an ordinary TOML tree, handed...
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
@@ -33,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use super::Config;
 
-// ─────────────────────────────── Layers ───────────────────────────────
+// Layers
 
 /// Where a layer comes from. Decides how the source is labelled in dump / `/config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +20,7 @@ pub enum LayerKind {
     BundleFile,
     /// A patch file listed in the manifest (relative to the app root)
     Patch,
-    /// The one given by `--config`. **Always the last layer.**
+    /// The one given by `--config`. **Always the last layer
     Config,
 }
 
@@ -64,7 +39,7 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// The source label shown in dump and `/config`.
+    /// The source label shown in dump and `/config`
     pub fn label(&self) -> String {
         let head = match self.kind {
             LayerKind::Bundle | LayerKind::BundleFile => format!("bundle:{}", self.name),
@@ -84,14 +59,9 @@ impl Layer {
     }
 }
 
-// ──────────────────────────── The provenance table ────────────────────────────
+// The provenance table
 
-/// Leaf path → the label of the last layer to write it.
-///
-/// Paths are dot-separated (`provider.base_url` / `auth.overrides.fs_*`). **Only leaves are
-/// recorded** — the "source" of an intermediate table is meaningless: one table is often written
-/// key by key by several layers, e.g. `[agent]` sets the tool timeout in tools.toml and the rules
-/// file in prompt-core.toml.
+/// Paths are dot-separated (`provider.base_url` / `auth.overrides.fs_*`).
 #[derive(Debug, Clone, Default)]
 pub struct Provenance {
     map: BTreeMap<String, String>,
@@ -121,14 +91,9 @@ impl Provenance {
     }
 }
 
-// ──────────────────────────── Composition ────────────────────────────
+// Composition
 
 /// The composed result: layer stack + composed tree + provenance table.
-///
-/// Deliberately **decoupled from `Config`**: `compose` does not parse `Config`, so even if the
-/// config itself is faulty (a required item missing, a type written wrong), `--dump-config` can
-/// still print the composed tree — a diagnostic tool that only works when the config is fine is
-/// half a useless tool.
 #[derive(Debug)]
 pub struct Composed {
     pub layers: Vec<Layer>,
@@ -223,13 +188,7 @@ pub struct Resolved {
     pub composed: Composed,
 }
 
-/// Compose the layer stack and parse it into `Config`. The only config entry point for both
-/// frontends (CLI / GUI).
-///
-/// `manifest`: an explicit override from `--manifest <path>`; `None` means look at `aox.toml` under
-/// the app root.
-/// `profile`: a temporary override from `--profile <name>`; `None` means use the manifest's
-/// `profile = "…"`, and failing that `"default"`.
+/// Compose the layer stack and parse it into `Config`. The only config entry point for both frontends (CLI / GUI).
 pub fn resolve(
     app_root: &Path,
     config_path: &Path,
@@ -308,7 +267,7 @@ pub fn compose(
         }
     }
 
-    // ── config.toml: always the last layer ──
+    // config.toml: always the last layer
     let text = std::fs::read_to_string(config_path).with_context(|| {
         crate::tf!(
             "config file not found: {}. Copy config.example.toml to config.toml and fill in the API settings.",
@@ -323,7 +282,7 @@ pub fn compose(
         .unwrap_or_else(|| config_path.display().to_string());
     layers.push(Layer { name, kind: LayerKind::Config, note: None, doc });
 
-    // ── Compose: later layers override earlier ones ──
+    // Compose: later layers override earlier ones
     let mut merged = toml::Value::Table(toml::Table::new());
     let mut provenance = Provenance::default();
     for l in &layers {
@@ -334,13 +293,7 @@ pub fn compose(
     Ok(Composed { layers, merged, provenance })
 }
 
-/// Expand bundles by name only (without reading the manifest). Both `compose` and the unit tests
-/// take this path.
-///
-/// The expansion order is **post-order**: all child bundles first, oneself last. So an aggregator
-/// (`core`), if it writes values, can override its child bundles — which also makes "a bundle
-/// listed later in the profile" reliably beat one listed earlier (that is how `strict` overrides
-/// the factory choice).
+/// Expand bundles by name only (without reading the manifest).
 pub fn expand_bundles(app_root: &Path, names: &[String]) -> Result<Vec<Layer>> {
     let mut ex = Expander { app_root, out: Vec::new() };
     let mut stack: Vec<String> = Vec::new();
@@ -350,7 +303,7 @@ pub fn expand_bundles(app_root: &Path, names: &[String]) -> Result<Vec<Layer>> {
     Ok(ex.out)
 }
 
-// ──────────────────────────── Expansion ────────────────────────────
+// Expansion
 
 struct Expander<'a> {
     app_root: &'a Path,
@@ -397,11 +350,7 @@ impl Expander<'_> {
         Ok(())
     }
 
-    /// Find one bundle layer's content: **a file under the app root wins**, then the built-in.
-    ///
-    /// If the file exists it **replaces the built-in layer wholesale** (not a key-by-key deep
-    /// merge) — "swap out the whole set of factory choices" is the useful semantic; if you only
-    /// want to change a few keys, that's what a patch is for.
+    /// Find one bundle layer's content: a file under the app root wins, then the built-in.
     fn load(&self, name: &str) -> Result<(String, LayerKind, Option<String>, String)> {
         let file = self.app_root.join("bundles").join(format!("{name}.toml"));
         if file.is_file() {
@@ -422,9 +371,7 @@ impl Expander<'_> {
     }
 }
 
-/// The built-in bundle table. `include_str!` needs a **literal** path, so they can only be listed
-/// one by one; adding a bundle means adding a line here (miss it and startup reports an
-/// "unrecognised bundle", never silently).
+/// The built-in bundle table. `include_str!` needs a literal path, so they can only be listed one by one; adding...
 fn builtin(name: &str) -> Option<&'static str> {
     Some(match name {
         "core" => include_str!("../../bundles/core.toml"),
@@ -440,13 +387,9 @@ fn builtin(name: &str) -> Option<&'static str> {
     })
 }
 
-// ──────────────────────────── Merging ────────────────────────────
+// Merging
 
-/// Merge `src` into `dst`: **if both sides are tables, merge deep; otherwise replace wholesale**
-/// (later layers override earlier ones).
-///
-/// `path` is the current node's dot-separated path in the config tree — conveniently recording,
-/// for each leaf, who last wrote it into `prov`.
+/// Merge `src` into `dst`: if both sides are tables, merge deep; otherwise replace wholesale (later layers...
 fn merge_at(dst: &mut toml::Value, src: &toml::Value, label: &str, path: &str, prov: &mut Provenance) {
     if let (toml::Value::Table(dt), toml::Value::Table(st)) = (&mut *dst, src) {
         for (k, v) in st {
@@ -489,7 +432,7 @@ fn count_leaves(v: &toml::Value) -> usize {
     }
 }
 
-/// Flatten the composed tree into a stream of "leaf path → value".
+/// Flatten the composed tree into a stream of "leaf path → value"
 fn collect_rows(v: &toml::Value, path: &str, out: &mut dyn FnMut(&str, &toml::Value)) {
     match v {
         // An empty table also counts as a leaf (otherwise an empty `[foo]` would vanish from the
@@ -538,7 +481,7 @@ fn inline(v: &toml::Value) -> String {
     }
 }
 
-// ──────────────────────────── The manifest ────────────────────────────
+// The manifest
 
 /// One profile in `aox.toml`.
 struct ProfileDecl {
@@ -604,23 +547,13 @@ fn relative_to(app_root: &Path, p: &str) -> PathBuf {
     }
 }
 
-// ──────────────────────────── Unit tests ────────────────────────────
-//
-// Every one of these tests builds its own "isolated root": a separate directory plus its own
-// config.toml / aox.toml / patch / bundles/*.toml. It never touches the repo's real config.toml,
-// so it is unaffected by the developer's machine-local config.
+// ──────────────────────────── Unit tests ────────────────────────────.
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// One separate directory per case, created under the system temp directory.
-    ///
-    /// The project's only deletion action lives here, and its scope is bounded by three things at
-    /// once: it must be a directory **we named ourselves**, it must sit under the system temp
-    /// directory, and its name must carry the `aox-layer-test-` prefix.
-    /// (The project's "no directory-level deletion" rule guards precisely against runaway
-    /// recursive deletes.)
     fn tmpdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("aox-layer-test-{tag}"));
         assert!(dir.starts_with(std::env::temp_dir()), "refuses to clean up outside the temp directory");
@@ -641,10 +574,7 @@ mod tests {
         std::fs::write(&p, text).unwrap();
     }
 
-    /// A config with only the required fields filled in. Comparing via `format!("{:#?}")` is to
-    /// compare **field by field** — `PartialEq` isn't implemented on `Config` (the roadmap says
-    /// explicitly not to touch `Config` itself), while every field implements `Debug`, and equal
-    /// Debug strings ⇔ equal fields.
+    /// A config with only the required fields filled in.
     const MINIMAL: &str = r#"
 [provider]
 base_url = "https://example.com/v1"
@@ -660,9 +590,7 @@ api_key = "k"
         );
     }
 
-    /// Without `aox.toml`, the layer stack is a single `[config.toml]` layer —
-    /// the composition result is field-for-field identical to "parsing config.toml directly"
-    /// (phase 5's zero-drift guarantee).
+    /// Without `aox.toml`, the layer stack is a single `[config.toml]` layer — the composition result...
     #[test]
     fn no_manifest_is_single_layer() {
         let dir = tmpdir("single");
@@ -683,9 +611,7 @@ api_key = "k"
         );
     }
 
-    /// **This test carries the cost of decision B**: the factory values written in the leaf
-    /// bundles must be field-for-field identical to the code defaults (the `#[serde(default)]`
-    /// side). Change either one without syncing and this goes red.
+    /// This test carries the cost of decision B: the factory values written in the leaf bundles must...
     #[test]
     fn core_equals_code_defaults() {
         let dir = tmpdir("core-defaults");
@@ -828,9 +754,7 @@ api_key = "k"
         assert_eq!(c.provenance.get("prompt.order"), Some("patch:p2.toml"));
     }
 
-    /// An override key containing `*` must be quoted to be valid (`*` isn't in TOML's bare-key
-    /// character set). This test also verifies that "composition goes through a
-    /// serialise → re-parse" won't break such a key.
+    /// An override key containing `*` must be quoted to be valid (`*` isn't in TOML's bare-key character set).
     #[test]
     fn wildcard_override_key_survives_roundtrip() {
         assert!(
@@ -930,14 +854,7 @@ api_key = "k"
         assert!(format!("{e:#}").contains("config file not found"), "{e:#}");
     }
 
-    /// The two examples shipped with the package (`config.example.toml` / `aox.example.toml`) must
-    /// really work.
-    ///
-    /// This test is aimed at "the example looks nice but the user copies it and can't start" —
-    /// phase 2's theme example tripped over exactly this once (the example used nested `[theme]`
-    /// while the loader at the time only understood bare themes).
-    /// The test runs under the repo root, where the **files** `bundles/*.toml` override the
-    /// built-in copies, so the source-label assertions match on name only, not on the suffix.
+    /// The two examples shipped with the package (`config.example.toml` / `aox.example.toml`) must really work.
     #[test]
     fn shipped_examples_compose_and_parse() {
         let root = Path::new(".");
@@ -956,10 +873,7 @@ api_key = "k"
         assert_eq!(cfg.provider.max_tokens, base.provider.max_tokens);
         assert_eq!(composed.layers.last().unwrap().kind, LayerKind::Config);
 
-        // The factory choices really did enter the composed tree, and config.toml is on top.
-        // `prompt.order` is chosen because the example config **doesn't write** [prompt] (the whole
-        // section is commented out), so it can only come from a bundle — use it to verify "the
-        // bundle really took part in composition".
+        // The factory choices really did enter the composed tree, and config.toml is on top. `prompt.order` is chosen...
         let prompt_order = composed.provenance.get("prompt.order").unwrap_or("");
         assert!(
             prompt_order.contains("prompt-core"),
@@ -971,11 +885,7 @@ api_key = "k"
             "the 120 seconds written in the example config must beat the factory bundle"
         );
 
-        // ③ The second profile in the example manifest must compose too.
-        //    Note we must **not** assert that strict's values win — the example config writes
-        //    [auth] itself, and config.toml is always the strongest layer, so those strict keys
-        //    are bound to be overridden by it. What can be verified is "the strict layer really
-        //    entered the stack".
+        // The second profile in the example manifest must compose too.
         let strict = compose(root, &cfg_path, Some(&manifest), Some("strict")).unwrap();
         assert!(
             strict.layer_labels().iter().any(|l| l.contains("strict")),

@@ -1,28 +1,6 @@
-//! The **live** model provider: one cell that the whole program reads, and that the GUI can swap.
-//!
-//! Before this existed, the provider was built once at startup (`OpenAiProvider::new(&config.provider)`)
-//! and then moved into `Agent` as an `Arc<dyn LlmProvider>`. That was fine while the only way to change
-//! the model was to edit `config.toml` and restart — which is the very friction the Model tab removes.
-//! Swapping it needs two things at once, and both live here:
-//!
-//! * a **config snapshot** the request-building code reads (window, max_tokens, thinking, wire);
-//! * a **provider handle** the loop calls.
-//!
-//! Two separate cells would allow "the new window with the old model"， a state nobody can debug. One
-//! struct with one `apply` keeps them in step: either both are the new values, or neither is.
-//!
-//! Rules this type exists to enforce:
-//!
-//! 1. **Never leave the program without a working provider.** [`LiveProvider::apply`] builds the new
-//!    one first and only then swaps; a bad key or an empty base URL leaves the previous handle in
-//!    place and returns the reason.
-//! 2. **A missing key is not a crash.** Construction can fail (that is how "not configured yet"
-//!    looks), so the cell starts out holding an [`UnavailableProvider`] that explains itself. The CLI
-//!    and the GUI both run fine in that state — local commands, history, plugins, settings — and the
-//!    panel is what fixes it.
-//! 3. **Reads are cheap and lock-scoped.** `llm()` clones an `Arc` under a read lock that is never
-//!    held across an `await`; `cfg()` clones a small struct. No `tokio` locks: the same rule as
-//!    `Runtime::runtimes`.
+//! One live provider cell all code reads and the GUI can swap; before it, changing models meant a restart.
+//! One apply keeps config and provider handle in step: build the new one first, keep the old on failure.
+//! Missing keys are no crash (UnavailableProvider); reads clone an Arc under a lock never held across an await.
 
 use std::sync::{Arc, RwLock};
 
@@ -37,9 +15,6 @@ pub struct LiveProvider {
     cfg: RwLock<ProviderConfig>,
     llm: RwLock<Arc<dyn LlmProvider>>,
     /// Why the current handle is a placeholder. `None` = the handle is real.
-    ///
-    /// Kept beside the handle rather than derived from its type: `dyn LlmProvider` cannot be
-    /// downcast here, and "is it usable" is asked on every frame by the GUI's status line.
     error: RwLock<Option<String>>,
 }
 
@@ -55,10 +30,7 @@ impl LiveProvider {
         })
     }
 
-    /// A cell that starts with a **given** handle, bypassing construction.
-    ///
-    /// For tests and the selftest: they need a provider that answers without a network, and the loop
-    /// must still go through the same `llm()` call as in production.
+    /// A cell that starts with a given handle, bypassing construction.
     pub fn with_handle(cfg: ProviderConfig, llm: Arc<dyn LlmProvider>) -> Arc<Self> {
         Arc::new(Self {
             cfg: RwLock::new(cfg),
@@ -68,22 +40,14 @@ impl LiveProvider {
     }
 
     /// Take a new configuration into force.
-    ///
-    /// Order matters and is the whole point: **construct, then swap.** A failure returns before either
-    /// cell is touched, so the caller can show the error and carry on with the previous model instead
-    /// of leaving the session unable to make a request at all.
     pub fn apply(&self, cfg: ProviderConfig) -> Result<()> {
         if let Some(reason) = missing_piece(&cfg) {
-            // Not `OpenAiProvider::new`'s error: a placeholder key would *succeed* there and only fail
-            // on the first request, which is the whole "everything looks configured until it isn't"
-            // problem this check exists to close.
+            // Not `OpenAiProvider::new`'s error: a placeholder key would *succeed* there and only fail on the first request...
             return Err(anyhow::anyhow!(reason));
         }
         let provider = OpenAiProvider::new(&cfg)?;
         let handle: Arc<dyn LlmProvider> = Arc::new(provider);
-        // Two short writes back to back; no reader can observe "new handle, old config" in a way that
-        // matters, because every reader that cares takes both in one call (`info`) or takes only the
-        // handle to send a request.
+        // Two short writes back to back; no reader can observe "new handle, old config" in a way that matters, because...
         if let Ok(mut w) = self.llm.write() {
             *w = handle;
         }
@@ -116,9 +80,6 @@ impl LiveProvider {
     }
 
     /// Everything a front end shows about the model, in one snapshot.
-    ///
-    /// One call rather than five getters: the GUI redraws the "model in use" row, the context ring and
-    /// the panel from this, and five separate reads could straddle a swap and mix two generations.
     pub fn info(&self) -> Info {
         let cfg = self.cfg();
         Info {
@@ -128,9 +89,7 @@ impl LiveProvider {
             max_tokens: cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
             temperature: cfg.temperature,
             thinking: cfg.thinking,
-            // The word written in `config.toml` (`auto` stays `auto`), as opposed to `wire`, which is
-            // what that word resolves to. The panel's chips edit this one: pinning the file to the
-            // resolved value would silently stop `auto` from following an endpoint change.
+            // The word written in `config.toml` (`auto` stays `auto`), as opposed to `wire`, which is what that word resolves...
             wire_setting: cfg.thinking_wire,
             wire: cfg.wire(),
             key_state: cfg.key_state(),
@@ -141,11 +100,6 @@ impl LiveProvider {
 }
 
 /// Why this configuration cannot answer a request yet, or `None` when it can.
-///
-/// Separate from "can `OpenAiProvider` be constructed": the shipped template carries the literal
-/// placeholder `sk-...`, which constructs fine and then 401s on the first message. Treating that as
-/// "configured" is what makes a fresh install look ready while nothing works, so the placeholder test
-/// belongs here, in front of the constructor.
 fn missing_piece(cfg: &ProviderConfig) -> Option<String> {
     if cfg.base_url.trim().is_empty() {
         return Some(crate::i18n::t("no endpoint configured: fill in base_url in Settings → Model").into());
@@ -224,9 +178,7 @@ mod tests {
         assert_eq!(live.info().context_window, 1_000_000);
     }
 
-    /// The placeholder the installer ships is **not** a configured key. This is the difference between
-    /// "a fresh install says it is ready" (and 401s on the first message) and "a fresh install opens the
-    /// Model tab", which is the entire point of the feature.
+    /// The placeholder the installer ships is not a configured key.
     #[test]
     fn the_shipped_placeholder_key_is_treated_as_not_configured() {
         let live = LiveProvider::new(cfg("deepseek-flash", Some("sk-..."), 1_000_000));
@@ -247,7 +199,7 @@ mod tests {
         let live = LiveProvider::new(cfg("good-model", Some("sk-good"), 128_000));
         assert!(live.ready());
 
-        // Empty key → `resolve_key` fails → apply fails.
+        // Empty key → `resolve_key` fails → apply fails
         let mut bad = cfg("bad-model", None, 4_000);
         bad.api_key = Some("   ".into());
         assert!(live.apply(bad).is_err());

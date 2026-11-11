@@ -13,12 +13,7 @@ use super::{AgentEvent, AuthDecision, ChoiceReply, Ui};
 use crate::history::UsageRecord;
 use crate::llm::{thousands, StreamSink};
 
-/// Feeds the model's reasoning process and body-text deltas live into shared state, for the waiting
-/// animation to scroll back on screen.
-///
-/// It doesn't paint the screen directly: rendering is the spinner background task's job (one frame
-/// every 80ms), so even high-frequency Provider callbacks just append strings to a buffer and never
-/// slow down the streaming read.
+/// Feeds the model's reasoning process and body-text deltas live into shared state, for the waiting animation...
 struct ReasoningSink {
     status: Arc<Status>,
 }
@@ -48,9 +43,7 @@ struct Step {
     result: Option<(bool, String)>,
 }
 
-/// The complete process of one turn (one user instruction → model + tool loop).
-/// While it runs only one status line shows in the terminal; once done it folds into a one-line
-/// summary and expands on demand.
+/// While it runs only one status line shows in the terminal; once done it folds into a one-line summary...
 struct TurnLog {
     steps: Vec<Step>,
     /// The assistant's interim narration (not shown on its own, visible when expanded)
@@ -169,12 +162,7 @@ impl CliUi {
         println!("{}", s::dim("────────────────────────────────────────────────────────────"));
     }
 
-    /// Look back at the **current conversation's per-turn** token account (`/usage`).
-    ///
-    /// The data comes from the ledger the agent holds — the very copy read back from the conversation
-    /// file, so it survives switching conversations and restarting the program. Listing it per turn
-    /// matters: a bare total can't answer "which turn was the most expensive", and the most expensive
-    /// turn is usually exactly the one that went wrong.
+    /// Look back at the current conversation's per-turn token account (`/usage`).
     pub fn show_usage(&self, log: &[UsageRecord]) {
         let rows: Vec<&UsageRecord> = log.iter().filter(|r| !r.is_empty()).collect();
         if rows.is_empty() {
@@ -225,11 +213,6 @@ impl CliUi {
     }
 
     /// Print the token breakdown for one finished turn.
-    ///
-    /// Splitting into three lines is a deliberate trade-off: the first holds the input / output / total
-    /// everyone looks at, the second the sub-items (reasoning, cache hits), and the third the call count
-    /// and context size. Items the endpoint didn't report simply don't appear — better to drop a line than
-    /// to fake "zero consumption" with a 0.
     fn print_usage(r: &UsageRecord) {
         println!();
         println!("{}", s::dim(&crate::tf!("  token usage · round {}", r.round)));
@@ -296,9 +279,7 @@ impl CliUi {
                     t.interim.push(text);
                 }
             }
-            // The checkpoint's plan changed. Nothing is printed mid-turn: the folded process area
-            // already shows the call, and a dim line per update would be noise for a 20-step task.
-            // `/task` and the GUI bar are where a human reads the plan.
+            // The checkpoint's plan changed.
             AgentEvent::Task(_) => {}
             AgentEvent::ToolCall { name, args } => {
                 if let Some(t) = self.turn.as_mut() {
@@ -325,10 +306,7 @@ impl CliUi {
             AgentEvent::Info(m) => self.push_note('i', m),
             AgentEvent::Warn(m) => self.push_note('w', m),
             AgentEvent::Error(m) => self.push_note('e', m),
-            // The files went to the recycle bin. A **note** here (folded into the turn summary,
-            // unfolded with `/expand`) rather than a line of its own: a terminal has no "vanish
-            // after a few seconds", so a permanent line per delete would end up as clutter — and
-            // the tool result printed just above already names the path.
+            // The files went to the recycle bin.
             AgentEvent::Recycled(n) => self.push_note('i', crate::recycle::notice(n)),
             // Compaction: the label is what the spinner shows while the summary call is in flight,
             // and the finished line goes into the process notes (visible with `/expand`).
@@ -348,10 +326,7 @@ impl CliUi {
                 );
                 self.set_label(crate::i18n::t("Thinking"));
             }
-            // An image produced by a tool: the terminal has nowhere to draw it. **Silently dropping
-            // it** is deliberate — the accompanying message already lists the filenames (see
-            // `attach`'s path list), and adding a "there's an image but it can't be shown" line
-            // would just be noise.
+            // An image produced by a tool: the terminal has nowhere to draw it.
             AgentEvent::ToolImages { .. } => {}
         }
     }
@@ -431,7 +406,7 @@ impl Ui for CliUi {
                     println!("{}", s::dim(&line));
                 }
             }
-            // ── Tool call: a yellow arrow + bold tool name + dim arguments
+            // Tool call: a yellow arrow + bold tool name + dim arguments
             AgentEvent::ToolCall { name, args } => {
                 println!(
                     "{} {} {}",
@@ -452,7 +427,7 @@ impl Ui for CliUi {
                 };
                 println!("  {}", s::dim(&line));
             }
-            // ── Tool result: a green/red marker + a one-line summary
+            // Tool result: a green/red marker + a one-line summary
             AgentEvent::ToolResult { name, is_error, preview, .. } => {
                 let (mark, tag) = if is_error {
                     (s::red("✗"), s::red(crate::i18n::t("failed")))
@@ -569,15 +544,6 @@ impl Ui for CliUi {
     }
 
     /// The text version of `ask_user`: print the numbered options and read one line.
-    ///
-    /// The same look as the authorisation box (`┌─ … │ … └─ >`), and the same reasoning: this is a
-    /// question-answer injected **mid-turn**, so the user has to see at a glance that "it's my turn
-    /// now".
-    ///
-    /// The tolerance is deliberately loosened: input that isn't recognised as a label is **treated as
-    /// a free-form answer**, rather than reported as "invalid input" and re-asked. A user typing "let's
-    /// just go with plan B" is giving a valid answer — bouncing it back with "please enter A/B/C" is
-    /// forcing them to translate what they wanted to say into a single click.
     async fn choose(&mut self, question: &str, options: &[String]) -> ChoiceReply {
         let was_running = self.spinner.is_some();
         self.stop_spinner().await;

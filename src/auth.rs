@@ -1,15 +1,6 @@
 //! Authorization policy (the Policy seam).
-//!
-//! Turns "should this tool call be allowed?" from a hard-coded three-tier check
-//! into a replaceable policy object: `Runtime` only holds an `Arc<dyn Policy>`
-//! and no longer knows how the decision is computed.
-//!
-//! Phase 3 only "carves the seam + moves the code verbatim": `ConfigPolicy` is
-//! the old `AuthPolicy`, and the three tiers (auto / ask / deny) plus the
-//! override precedence (**tool name > plugin name > category default**) are
-//! unchanged, not a single line. Adding another policy source later (a policy
-//! file, a plugin-provided policy, ...) means implementing a new `Policy`, not
-//! editing this one.
+//! Turns "should this tool call be allowed?" from a hard-coded three-tier check into a replaceable policy object...
+//! Phase 3 only "carves the seam + moves the code verbatim": `ConfigPolicy` is the old `AuthPolicy`, and the three...
 
 use crate::config::AuthConfig;
 use crate::tool::ToolKind;
@@ -36,65 +27,31 @@ impl AuthLevel {
 }
 
 /// The authorization policy: answers "should this tool call be auto, ask or deny".
-///
-/// `Send + Sync`: `Runtime` is shared between the agent thread and the GUI main
-/// thread, so a policy object must be holdable across threads.
 pub trait Policy: Send + Sync {
-    /// `caps`: the **capabilities requested** by this call.
-    ///
-    /// Phase 3 reserved the parameter slot and phase 4 still passed an empty
-    /// slice (neither of those two configs is a "capability request"), but
-    /// **phase 6 · 6b actually fills it in**: a component declares the
-    /// capabilities it wants in `[contributes] caps`, and the host passes that
-    /// plugin tool's request straight through here — so "a component requests a
-    /// capability" lands in the very same authorization decision (principle P7),
-    /// with no second decision path.
+    /// `caps`: the capabilities requested by this call.
     fn level_for(&self, kind: &ToolKind, tool_name: &str, caps: &[String]) -> AuthLevel;
 }
 
-/// The host's **command-line** tools — the names `[auth] shell` governs.
-///
-/// A name list rather than "every `ToolKind::Host` tool": `read_file` / `write_file` are host tools
-/// too, and putting a command line and a file write behind one switch would be wrong in both
-/// directions (someone who tightens the shell should not suddenly be prompted on every read).
+/// The host's command-line tools — the names `auth shell` governs.
 const SHELL_TOOLS: [&str; 3] = [
     crate::tool::shell::SHELL_TOOL,
     crate::tool::bash::BASH_TOOL,
     crate::tool::job::JOB_TOOL,
 ];
 
-/// The host's **network** tools — the names `[auth] web` governs.
-///
-/// Same shape and the same reasoning as [`SHELL_TOOLS`]: a name list, not "every `ToolKind::Host`
-/// tool", because one switch for "reach the internet" must not also gate `read_file`. It is a list
-/// of one, and it stays a list: a tier now means a second network tool inherits it instead of
-/// needing an override per tool name later.
+/// The host's network tools — the names `auth web` governs.
 const NET_TOOLS: [&str; 1] = [crate::tool::web::WEB_TOOL];
 
-/// The policy decided by `config.toml [auth]`: overrides win (by tool name, then
-/// by plugin name), otherwise the tool's category default applies.
-///
-/// Override keys come in two forms (since phase 4):
-/// - **a full name** (`shell_exec`) — an exact hit;
-/// - **a prefix with a trailing `*`** (`fs_*`) — hits every name starting with
-///   that prefix.
-///
-/// Wildcards only look at the prefix and don't respect separators: `fs*` will
-/// also hit `fsx`, so if you want to fence off just one group of tools, remember
-/// to include the underscore (`fs_*`). A lone `*` is "catch-all".
+/// The policy decided by `config.toml auth`: overrides win (by tool name, then by plugin name), otherwise...
 pub struct ConfigPolicy {
     meta: AuthLevel,
     plugin: AuthLevel,
-    /// The **command-line** tools' own tier (`[auth] shell`). Separate from `plugin` because what it
-    /// gates is not "a tool that does one job" but "arbitrary programs, plus the ability to read
-    /// every file the user can read". See [`SHELL_TOOLS`].
+    /// The command-line tools' own tier (`auth shell`).
     shell: AuthLevel,
     /// The **network** tools' own tier (`[auth] web`). See [`NET_TOOLS`].
     web: AuthLevel,
     overrides: HashMap<String, AuthLevel>,
-    /// The overrides carrying a `*` (stored as the prefix with `*` stripped),
-    /// sorted by prefix **longest first** — the more specific one hits first:
-    /// `fs_read_*` must beat `fs_*`.
+    /// The overrides carrying a `*` (stored as the prefix with `*` stripped), sorted by prefix longest first —...
     wildcards: Vec<(String, AuthLevel)>,
 }
 
@@ -112,9 +69,7 @@ impl ConfigPolicy {
                 }
             }
         }
-        // The sort serves two purposes: longer prefixes win (the more specific
-        // rule), and it makes the decision independent of HashMap's random
-        // iteration order — the same config must yield the same answer every time.
+        // The sort serves two purposes: longer prefixes win (the more specific rule), and it makes the decision...
         wildcards.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
         Self {
             meta: AuthLevel::parse(&cfg.meta_tools),
@@ -140,7 +95,6 @@ impl ConfigPolicy {
 
 impl Policy for ConfigPolicy {
     fn level_for(&self, kind: &ToolKind, tool_name: &str, caps: &[String]) -> AuthLevel {
-        // ① Tool name (exact → wildcard)
         if let Some(l) = self.lookup(tool_name) {
             return l;
         }
@@ -154,33 +108,11 @@ impl Policy for ConfigPolicy {
         if let Some(l) = plugin_hit {
             return l;
         }
-        // ③ Capability request (first filled in phase 6 · 6b, principle P7): a
-        //    component declares "what capability I want" in `[contributes] caps`,
-        //    and such a call is **always asked once** — it must not silently ride
-        //    the category default. E.g. `[auth] plugin_tools = "auto"` means
-        //    "ordinary plugins may run freely", which should not become "and by
-        //    the way the right to write files is granted too". The position is
-        //    deliberate: after the override, because a hand-written override is
-        //    an explicit stance and deserves to speak louder than a component's
-        //    request.
-        //
-        //    Only **plugin tools** are affected: a capability request can only
-        //    come from a component, whereas meta tools belong to the host and
-        //    request on nobody's behalf. This extra check exists so that
-        //    "passing it makes it take effect" cannot accidentally reach meta
-        //    tools.
+        // Capability request (first filled in phase 6 · 6b, principle P7): a component declares "what capability I want"...
         if matches!(kind, ToolKind::Plugin(_)) && !caps.is_empty() {
             return AuthLevel::Ask;
         }
-        // ④ Only when none of the above hit do we fall back to the category default
-        //
-        //    Host file tools (`ToolKind::Host`) follow the **same tier as plugin
-        //    tools**: both are "let something else do a job" rather than "modify
-        //    the host itself". So under `plugin_tools = "auto"` (the default) file
-        //    tools are auto too — consistent with plugin tools of the `fs_*` kind,
-        //    so the model behaves the same whichever tool it picks; to tighten one
-        //    specifically, use a name override (e.g. `read_file = "ask"`), which
-        //    step ① will hit first.
+        // Only when none of the above hit do we fall back to the category default.
         match kind {
             ToolKind::Meta => self.meta,
             // The command line gets its own tier: it is neither "modify the host" nor "one designed
@@ -245,9 +177,7 @@ mod tests {
         );
     }
 
-    /// The factory stance: nothing is special-cased into a prompt. If this ever changes, the
-    /// default policy has quietly become a gate again — which is the thing the 2026-11-10 change
-    /// was about, so it deserves a test rather than a comment.
+    /// The factory stance: nothing is special-cased into a prompt.
     #[test]
     fn the_factory_policy_asks_for_nothing() {
         let p = ConfigPolicy::from_config(&AuthConfig::default());
@@ -308,9 +238,7 @@ mod tests {
         assert_eq!(p.level_for(&ToolKind::Plugin("net".into()), "net_fetch", &[]), AuthLevel::Auto);
     }
 
-    /// The three-level precedence **did not change by a single word** once
-    /// wildcards were added: exact tool name > longer prefix > shorter prefix >
-    /// plugin default.
+    /// The three-level precedence did not change by a single word once wildcards were added: exact tool name > longer...
     #[test]
     fn exact_key_beats_wildcard_and_longer_prefix_wins() {
         let p = ConfigPolicy::from_config(&cfg_with_overrides(&[
@@ -388,10 +316,7 @@ mod tests {
         assert_eq!(p.level_for(&kind, "comp_other", &caps), AuthLevel::Auto, "the plugin-name override comes next");
     }
 
-    /// The capability slot **only affects the plugin-tool path**: meta tools
-    /// belong to the host, request capabilities on nobody's behalf and must not
-    /// be caught in the crossfire (this pins that "passing it makes it take
-    /// effect" cannot accidentally reach meta tools).
+    /// The capability slot only affects the plugin-tool path: meta tools belong to the host, request capabilities...
     #[test]
     fn caps_never_apply_to_meta_tools() {
         // meta_tools = deny: if the caps check leaked onto this path, the result

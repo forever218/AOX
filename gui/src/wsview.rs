@@ -1,32 +1,6 @@
-//! The **workspace view**: a read-only file browser for the conversation's workspace, plus this
-//! turn's edit list and each edited file's diff.
-//!
-//! # What it is for
-//!
-//! Every other window in this app answers "what is the agent *doing*". This one answers "what did
-//! it *touch*" — a question the transcript can only answer in prose, one tool row at a time, and
-//! only by scrolling back through it. The two halves are deliberately in that order left to right:
-//! the left column says **where** (the directory, with this turn's edits pinned above it), the right
-//! column says **what** (the file as it is now, or the diff that got it there).
-//!
-//! # Read-only, and structurally so
-//!
-//! This module contains exactly two filesystem calls: [`std::fs::read_dir`] and
-//! [`std::fs::read_to_string`]. There is no write path, no delete path, no "open in editor". That is
-//! not a policy that could be forgotten later — there is simply nothing here that writes.
-//!
-//! # The window shell is borrowed wholesale
-//!
-//! Borderless window, drag, edge resize, DWM rounded corners, pin / minimize / maximize / close: all
-//! of it is [`crate::gwin`], the same shell the activity stream and the cache-hit map use. This
-//! module owns **only** what is drawn inside, which is the point of that extraction (see `gwin`'s
-//! module docs).
-//!
-//! One deliberate difference from the other two windows: this one **never claims a poker slot**
-//! ([`gwin::want`]). Nothing here animates, and poking the main window would make it re-lay-out the
-//! whole transcript — an expensive pass — to keep a still picture still. The one thing that does
-//! move (the file currently being written) is refreshed on this window's own clock, which costs the
-//! main window nothing.
+//! The workspace view: a read-only file browser for the conversation's workspace, plus this turn's edit list...
+//! # What it is for.
+//! Every other window in this app answers "what is the agent *doing*". This one answers "what did it *touch*" —...
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -42,11 +16,9 @@ use crate::gwin::{self, Drive, Gwin};
 use crate::syntax;
 use crate::theme::{self, P};
 
-// ────────────────────────────── Metrics ──────────────────────────────
+// Metrics
 
-/// Width of the left column. Fixed rather than draggable: the content is a file tree whose rows are
-/// elided by pixel width, so it does not need to grow with the window — and a splitter would be a
-/// control nobody asked for on a window with two panes.
+/// Width of the left column. Fixed rather than draggable: the content is a file tree whose rows are elided...
 const TREE_W: f32 = 292.0;
 /// Height of one row in either list (change list and tree use the same value, so the two read as
 /// one column of rows rather than two lists that happen to be stacked).
@@ -60,9 +32,7 @@ const DIFF_LINE_H: f32 = 18.0;
 /// Initial and minimum window size.
 const MIN_W: f32 = 780.0;
 const MIN_H: f32 = 470.0;
-/// A file larger than this is not read at all — the pane says so instead. Code files are orders of
-/// magnitude below it; the cap only exists so that pointing the tree at a database dump cannot hang
-/// a frame.
+/// A file larger than this is not read at all — the pane says so instead.
 const MAX_READ: u64 = 2 * 1024 * 1024;
 /// Most entries drawn for one directory. A folder with 40 000 files in it would otherwise lay out
 /// 40 000 rows every frame; the cut is silent because the tree is a *view*, not an inventory.
@@ -73,12 +43,10 @@ const MAX_DEPTH: u16 = 24;
 /// Directories never drawn. Not a filter on what the agent may touch — purely "these are never the
 /// answer to 'where is the code'", and each one can contain tens of thousands of entries.
 const DIRS_SKIP: [&str; 6] = [".git", "node_modules", "target", "__pycache__", ".venv", "venv"];
-/// How often the selected file is re-read while a turn runs. A file being written is re-read on this
-/// clock, so the right pane shows the model's edits land instead of a snapshot from when the row was
-/// clicked.
+/// How often the selected file is re-read while a turn runs.
 const LIVE_MS: u64 = 400;
 
-// ─────────────────────────────── Data ───────────────────────────────
+// Data
 
 /// One write the model made, exactly as the tool reported it.
 #[derive(Debug, Clone)]
@@ -92,11 +60,6 @@ pub struct Edit {
 }
 
 /// One file, with every write this turn made to it.
-///
-/// Grouped by file rather than one row per write: the question the list answers is "which files did
-/// it change", and a file written three times is one answer. The individual writes are kept in
-/// order, so the diff pane can still show all three with a separator between them — summing them
-/// into one diff would be a lie (the second write's diff is against the first one's output).
 #[derive(Debug, Clone)]
 pub struct FileEdit {
     pub path: PathBuf,
@@ -144,9 +107,7 @@ pub enum Mode {
     Diff,
 }
 
-/// One row of the flattened tree. A flat list rather than a nested structure: the tree is drawn by
-/// iterating, and every row needs the same things (depth for indent, `open` for the caret), so
-/// nesting would only add a recursion to the draw path.
+/// One row of the flattened tree.
 struct Row {
     path: PathBuf,
     name: String,
@@ -158,10 +119,6 @@ struct Row {
 }
 
 /// The loaded file in the right pane, with the galley already laid out.
-///
-/// The galley is built **once per load** rather than per frame: a 2 000-line file is ~10 000 text
-/// sections, and re-laying that out sixty times a second for a pane nobody is touching is the kind
-/// of cost that turns into "the window feels heavy" without an obvious culprit.
 struct Loaded {
     path: PathBuf,
     /// `(len, mtime nanos)`, or `None` when the file does not exist. Compared against the disk to
@@ -176,18 +133,15 @@ pub struct WsView {
     /// The window shell, shared verbatim with the other independent windows.
     gw: Gwin,
 
-    // ── pushed in by the main window ──
-    /// The workspace root of the conversation being chatted in. `None` = full-access tier, or a
-    /// conversation whose ground has not been broken yet; the tree then has nothing to show, which
-    /// the pane says rather than drawing an empty box.
+    // ── pushed in by the main window ── The workspace root of the conversation being chatted in. `None` =...
     root: Option<PathBuf>,
-    /// This turn's edits, grouped by file, in first-touch order.
+    /// This turn's edits, grouped by file, in first-touch order
     files: Vec<FileEdit>,
     /// Set whenever `root` or `files` changes, so the tree is rebuilt on the next frame instead of
     /// on every one.
     dirty: bool,
 
-    // ── view state ──
+    // view state
     rows: Vec<Row>,
     expanded: BTreeSet<PathBuf>,
     sel: Option<PathBuf>,
@@ -215,7 +169,7 @@ impl Default for WsView {
     }
 }
 
-// ─────────────────────────── Shared state ───────────────────────────
+// Shared state
 
 pub type Shared = Arc<Mutex<WsView>>;
 
@@ -262,9 +216,7 @@ pub fn reset(a: &Shared) {
     st.fresh = true;
 }
 
-/// A turn is starting: last turn's edits are no longer "this turn's". They are dropped rather than
-/// archived — the transcript already has every one of them, with its own diff, at the position it
-/// happened.
+/// A turn is starting: last turn's edits are no longer "this turn's". They are dropped rather than archived —...
 pub fn begin_turn(a: &Shared) {
     let mut st = lock(a);
     st.files.clear();
@@ -289,7 +241,7 @@ pub fn note_edit(
     st.dirty = true;
 }
 
-// ───────────────────────────── The window ─────────────────────────────
+// The window
 
 fn ws_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("aox-wsview")
@@ -322,9 +274,7 @@ pub fn is_open(a: &Shared) -> bool {
     lock(a).gw.is_open()
 }
 
-/// Land the right pane on one file, optionally already in diff mode. The demo preview uses it so
-/// the window opens showing something; it is also the hook a future "reveal in workspace view"
-/// would call after unfolding the parent directories with [`expand`].
+/// Land the right pane on one file, optionally already in diff mode.
 pub fn select(a: &Shared, path: PathBuf, mode: Mode) {
     let mut st = lock(a);
     st.sel = Some(path);
@@ -367,9 +317,7 @@ fn window(ctx: &egui::Context, shared: &Shared) {
     let open = st.gw.open;
     let busy = st.gw.busy;
     drop(st);
-    // `busy: false` on purpose — see the module docs. This window has nothing to animate, so it
-    // never asks the main window to paint on its behalf; the `closing` half is still honoured,
-    // because the root is what actually retires the viewport.
+    // `busy: false` on purpose — see the module docs.
     gwin::drive(ctx, gwin::WIN_WSVIEW, Drive { busy: false, closing: d.closing });
     if open && busy {
         // The one live thing: the file being written, re-read on this window's own clock. A repaint
@@ -541,7 +489,7 @@ fn walk(
     }
 }
 
-// ─────────────────────────────── Left pane ───────────────────────────────
+// Left pane
 
 fn left_pane(ui: &mut Ui, st: &mut WsView) {
     ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -666,12 +614,7 @@ fn change_row(
         p.rect_filled(rect, CornerRadius::same(theme::R0), P::hover_fill());
     }
 
-    // The counts are measured first, because the name is elided against what is left: a path is the
-    // part that can be shortened without losing meaning, the numbers are not.
-    //
-    // `+` and `−` are drawn in the same two colours the diff pane uses for its bands, so the row's
-    // numbers read as "the same thing" as the lines below. Each part is its own galley: a single
-    // coloured string could only be one colour, and the two halves mean opposite things.
+    // The counts are measured first, because the name is elided against what is left: a path is the part that can...
     let mut parts: Vec<(String, Color32)> = Vec::new();
     if let Some(a) = added {
         parts.push((format!("+{a}"), P::add_green()));
@@ -745,9 +688,7 @@ fn tree_row(ui: &mut Ui, row: &Row, on: bool) -> egui::Response {
     }
 
     let name_x = x + 14.0;
-    // A written file gets a dot in the right margin. The change list above already names it, so the
-    // dot is only there to answer "is the file I am looking at in the tree one of them" while the
-    // list has been scrolled away.
+    // A written file gets a dot in the right margin.
     let mut right = rect.right() - 6.0;
     if row.edited {
         right -= 6.0;
@@ -772,7 +713,7 @@ fn hint(ui: &mut Ui, text: &str) {
     ui.add_space(8.0);
 }
 
-// ─────────────────────────────── Right pane ───────────────────────────────
+// Right pane
 
 fn right_pane(ui: &mut Ui, st: &mut WsView) {
     ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -790,7 +731,7 @@ fn right_pane(ui: &mut Ui, st: &mut WsView) {
         return;
     };
 
-    // ── the path bar ──
+    // the path bar
     let has_diff = st.current_edit().map(|f| f.has_diff()).unwrap_or(false);
     let mut want_mode: Option<Mode> = None;
     Frame::NONE
@@ -805,7 +746,7 @@ fn right_pane(ui: &mut Ui, st: &mut WsView) {
                 ui.painter().galley(r.min, g, P::text_dim());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if has_diff {
-                        // Right-to-left: "文件" is added first and lands rightmost.
+                        // In right-to-left layout the File entry is added first and lands rightmost.
                         if gwin::pill(ui, aox::i18n::t("File"), st.mode == Mode::File).clicked() {
                             want_mode = Some(Mode::File);
                         }
@@ -845,9 +786,7 @@ fn diff_pane(ui: &mut Ui, st: &WsView) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             for (i, e) in f.edits.iter().enumerate() {
-                // Each write's diff is against the version the **previous** write left behind, so
-                // they are shown in order and never merged: adding them up would produce a diff that
-                // no single write ever made.
+                // Each write's diff is against the version the previous write left behind, so they are shown in order and never...
                 if many {
                     edit_sep(ui, i + 1, total);
                 }
@@ -894,16 +833,10 @@ fn edit_sep(ui: &mut Ui, i: usize, total: usize) {
 }
 
 /// The diff itself, one tinted row per line.
-///
-/// The tint is what makes this readable at a glance: colouring only the glyph leaves a wall of
-/// monospace text where the eye has to find the `+` and `-` at the left edge of every line. The band
-/// is a 10% wash, so the text keeps its contrast against the paper.
 fn diff_lines(ui: &mut Ui, diff: &str) {
     let w = ui.available_width();
     for line in diff.lines() {
-        // The first character is the whole contract (see `diff_text`): `+` added, `-` removed, a
-        // space for context, and anything else is a marker — an elided stretch, or where a diff too
-        // large to draw was cut off.
+        // The first character is the whole contract (see `diff_text`): `+` added, `-` removed, a space for context...
         let (fg, band) = match line.chars().next() {
             Some('+') => (P::add_green(), Some(tint(P::add_green()))),
             Some('-') => (P::del_red(), Some(tint(P::del_red()))),
@@ -950,9 +883,7 @@ fn file_pane(ui: &mut Ui, st: &mut WsView) {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add_space(14.0);
-                // `Extend` rather than `Wrap`: code is laid out to its own width, and wrapping is
-                // what turns a 200-character line into an unreadable paragraph. The scroll area
-                // provides the horizontal axis for it.
+                // `Extend` rather than `Wrap`: code is laid out to its own width, and wrapping is what turns a 200-character line...
                 ui.add(
                     Label::new(g)
                         .selectable(true)
@@ -965,11 +896,6 @@ fn file_pane(ui: &mut Ui, st: &mut WsView) {
 
 impl WsView {
     /// Load the selected file if it is missing or has changed on disk.
-    ///
-    /// Re-reading is decided by `(len, mtime)`: while a turn runs this is called every [`LIVE_MS`],
-    /// and a stat is three orders of magnitude cheaper than a read. A file that is being written
-    /// changes both, so the pane follows the model's writes instead of freezing on the version that
-    /// happened to be on disk when the row was clicked.
     fn ensure_loaded(&mut self, ui: &Ui) {
         let Some(path) = self.sel.clone() else {
             self.open = None;
@@ -1000,10 +926,6 @@ impl WsView {
 }
 
 /// Lay a whole file out once, with a line-number gutter.
-///
-/// One `LayoutJob` for the entire file rather than one label per line: the galley is built once and
-/// then only cloned by reference-count on every frame, whereas a label per line would allocate a
-/// galley per line per frame.
 fn build_galley(ui: &Ui, path: &Path, text: &str) -> Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::default();
     // No wrapping (see `file_pane`); the horizontal scroll axis exists for exactly this.
@@ -1041,12 +963,9 @@ fn build_galley(ui: &Ui, path: &Path, text: &str) -> Arc<egui::Galley> {
     ui.painter().layout_job(job)
 }
 
-// ─────────────────────────────── Helpers ───────────────────────────────
+// Helpers
 
-/// A path's identity for comparison. Lower-cased and separator-normalised, because Windows is
-/// case-insensitive: the tool reports the path the model asked for (`E:\rustapp\SRC\main.rs`), while
-/// `read_dir` reports the on-disk casing (`src`), and a byte comparison would then never match the
-/// file the tree is drawing.
+/// A path's identity for comparison.
 fn key(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/").to_lowercase()
 }
@@ -1058,9 +977,7 @@ fn rel(root: &Path, path: &Path) -> String {
     let pk = key(path);
     let rk = rk.trim_end_matches('/');
     if pk.len() > rk.len() + 1 && pk.starts_with(rk) && pk.as_bytes().get(rk.len()) == Some(&b'/') {
-        // Slice the **original** string, not the lower-cased key: the display has to keep the real
-        // casing, and the two have the same byte length only because both are ASCII-ified — which
-        // they are not for a CJK path. So take the tail from the original by character count.
+        // Slice the original string, not the lower-cased key: the display has to keep the real casing, and the two have...
         let skip = rk.chars().count() + 1;
         let tail: String = path.to_string_lossy().chars().skip(skip).collect();
         if !tail.is_empty() {
@@ -1084,7 +1001,7 @@ fn stamp_of(p: &Path) -> Option<(u64, u128)> {
     Some((m.len(), t))
 }
 
-// ─────────────────────────────── Tests ───────────────────────────────
+// Tests
 
 #[cfg(test)]
 mod tests {
@@ -1096,7 +1013,7 @@ mod tests {
     fn rel_strips_the_root_and_keeps_case() {
         let root = Path::new("/work/App");
         assert_eq!(rel(root, Path::new("/work/App/src/Main.rs")), "src/Main.rs");
-        // Windows-style separators on both sides.
+        // Windows-style separators on both sides
         assert_eq!(rel(Path::new("E:\\a"), Path::new("E:\\a\\b\\c.rs")), "b/c.rs");
     }
 

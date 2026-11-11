@@ -1,28 +1,6 @@
-//! Retention and reachability: **what may be deleted, and in what order.**
-//!
-//! Two different questions live here, and mixing them is how a recovery system eats its own data:
-//!
-//! * **trim** — the branch is longer than `keep`. Cut the oldest *segment*. This is a structural
-//!   decision about which undo steps still exist, not about bytes.
-//! * **collect** — which blobs does nothing point at any more. Mark and sweep.
-//!
-//! # Order is correctness
-//!
-//! **Trim** rewrites the boundary node (`parent = None`), then moves the cursor's `truncated` flag,
-//! then deletes files. Deleting first would leave a cursor pointing at a node that no longer exists —
-//! the exact "oldest node is gone but the chain still expects it" state that makes a rollback fail
-//! halfway through writing files.
-//!
-//! **Collect** marks from every root before removing anything, and it never runs while a turn or a
-//! restore is in flight. That last part is not enforced here: the caller holds the workspace lock
-//! (see [`super::store::RecoveryStore::lock`]), and taking it a second time inside the same process
-//! would fail — so these functions deliberately do **not** lock.
-//!
-//! # No refcounts
-//!
-//! Object counts would have to survive crashes, copies of the directory and two processes GC-ing at
-//! once; every one of those drifts the number, and the symptom is "the blob I needed is gone". A
-//! mark-and-sweep pass is O(objects) and cannot drift.
+//! Retention and reachability: what may be deleted, and in what order.
+//! Two different questions live here, and mixing them is how a recovery system eats its own data.
+//! * trim — the branch is longer than `keep`. Cut the oldest *segment*. This is a structural decision about...
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -35,9 +13,7 @@ use super::{RecoveryError, RecoveryResult};
 /// How long an abandoned temp file is kept before it is considered garbage.
 const TMP_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// At or above this share of `max_total_mb`, a finished turn also runs a full sweep. Below it, the
-/// hot path only trims — walking every object after every turn is work with no benefit while there
-/// is room to breathe.
+/// At or above this share of `max_total_mb`, a finished turn also runs a full sweep.
 const SWEEP_AT_PERCENT: u64 = 80;
 
 #[derive(Clone, Debug, Default)]
@@ -47,7 +23,7 @@ pub struct Report {
     /// Content objects deleted.
     pub objects_dropped: usize,
     pub bytes_freed: u64,
-    /// Unreferenced `redo/` safety snapshots deleted.
+    /// Unreferenced `redo/` safety snapshots deleted
     pub safety_dropped: usize,
     pub tmp_dropped: usize,
     /// This pass cut the oldest part of the branch, so `/checkpoints` will say so.
@@ -73,9 +49,6 @@ impl Report {
 }
 
 /// Cut the oldest part of the branch so at most `keep` turn nodes stay undoable.
-///
-/// `keep = 0` means "no retention limit": it is the only reading that cannot silently destroy
-/// everything, which is what a literal zero would do.
 pub fn trim(store: &RecoveryStore, keep: usize) -> RecoveryResult<Report> {
     let mut report = Report::default();
     if keep == 0 {
@@ -84,10 +57,7 @@ pub fn trim(store: &RecoveryStore, keep: usize) -> RecoveryResult<Report> {
     let mut cursor = store.cursor()?;
     let nodes = chain(store, cursor.head.as_deref());
 
-    // The window is a prefix: newest first, keep everything up to and including the `keep`-th turn
-    // node. Everything older goes as one segment — including `manual` nodes, because "drop the
-    // oldest ancestors as a whole" is only meaningful if the segment boundary is uniform. A manual
-    // checkpoint therefore lives inside the same window as everything else, and `/checkpoint` says so.
+    // The window is a prefix: newest first, keep everything up to and including the `keep`-th turn node.
     let mut turns = 0usize;
     let mut last_kept = None;
     for (i, n) in nodes.iter().enumerate() {
@@ -139,11 +109,6 @@ pub fn trim(store: &RecoveryStore, keep: usize) -> RecoveryResult<Report> {
 }
 
 /// Mark from every root, then sweep `objects/`.
-///
-/// Roots, in the order the design lists them: the cursor's chain, the strict-shell baseline, every
-/// `redo/` safety snapshot, and every journal. Journals are read as "any 64-hex token is a root" —
-/// an over-approximation on purpose, because a journal exists precisely when the process died before
-/// it could say what it needed.
 pub fn collect(store: &RecoveryStore) -> RecoveryResult<Report> {
     let mut report = Report::default();
     let mut rooted: BTreeSet<String> = BTreeSet::new();
@@ -181,9 +146,7 @@ pub fn collect(store: &RecoveryStore) -> RecoveryResult<Report> {
         }
     }
 
-    // Unreachable node files: a crash between "write the node" and "move the cursor" leaves one
-    // behind, and nothing can ever roll back to it. A file that does not parse is left alone — it
-    // may be a newer schema, and deleting what we cannot read is worse than keeping it.
+    // Unreachable node files: a crash between "write the node" and "move the cursor" leaves one behind, and nothing...
     if let Ok(entries) = std::fs::read_dir(store.dir().join("nodes")) {
         for e in entries.flatten() {
             let path = e.path();
@@ -213,14 +176,6 @@ pub fn collect(store: &RecoveryStore) -> RecoveryResult<Report> {
 }
 
 /// Trim, then sweep — what `/backup prune` means, and what a turn does when the store is filling up.
-/// Drop **every** point in this workspace's store, into the system recycle bin.
-///
-/// "Clear all" has no reference-counting question: nothing is kept, so `nodes/`, `objects/` and
-/// `baseline/` all go as whole directories. They are **recycled**, not erased (`SHFileOperationW`),
-/// which is what makes a mis-click recoverable from the desktop instead of final. The three
-/// directories are re-created immediately — `RecoveryStore::open` expects them to exist.
-///
-/// Returns `(points, stored files)` for the message the user reads.
 pub fn clear_all(store: &RecoveryStore) -> anyhow::Result<(usize, usize)> {
     let dir = store.dir();
     let points = std::fs::read_dir(dir.join("nodes"))
@@ -252,14 +207,7 @@ pub fn prune(store: &RecoveryStore, keep: usize) -> RecoveryResult<Report> {
 }
 
 /// The cheap end-of-turn pass.
-///
-/// Trimming is structural and cheap (a walk of the chain, which is bounded by `keep`). A full sweep
-/// only happens once the store is 80% full: walking every object after every turn buys nothing while
-/// there is room, and the sweep is exactly the thing that must never run at a bad moment.
-///
-/// Returns the warnings a turn should surface. **Never fails the turn**: retention is housekeeping,
-/// and a turn that changed files has already committed; making it report failure because cleanup
-/// could not delete something would be a lie about the task.
+/// Trimming is structural and cheap (a walk of the chain, which is bounded by `keep`).
 pub fn maintain(store: &RecoveryStore, keep: usize, max_total_mb: u64) -> Vec<String> {
     let mut out = Vec::new();
     match trim(store, keep) {
@@ -489,7 +437,7 @@ mod tests {
         let m = RecoveryManager::new(RecoveryConfig::default(), d.clone());
         let a = d.join("a.txt");
         std::fs::write(&a, "v0").unwrap();
-        // turn 0: v0 -> v1, turn 1: v1 -> v2, turn 2: v2 -> v3.
+        // turn 0: v0 -> v1, turn 1: v1 -> v2, turn 2: v2 -> v3
         for i in 0..3 {
             m.begin_turn(&d, None, &format!("t{i}")).unwrap();
             let cap = m.capture_before(&a).unwrap();

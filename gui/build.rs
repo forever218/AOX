@@ -1,17 +1,6 @@
 //! Build script: write the icon and version info into the Windows resources of `aox-gui.exe`.
-//!
-//! Same approach as the root crate's `build.rs` (call the Windows SDK's rc.exe directly
-//! rather than winresource — the latter looks up the SDK via reg.exe, which local security
-//! policy forbids). Two differences:
-//!   * The icon lives at `assets/aox.ico` in the repo root (not under gui/), and the version
-//!     is read straight from the `CARGO_PKG_VERSION` cargo injects instead of a hand-written constant.
-//!   * If the icon is missing we still write the version resource, rather than skipping everything.
-//!
-//! Why this is mandatory: an exe with no resource section is a blank sheet in Explorer, the Start
-//! menu and the taskbar, and its version is invisible in "Settings -> Apps" — the CLI build has
-//! always had one, and the GUI build should not be missing it.
-//!
-//! Any failing step only emits a warning and never blocks the build (a missing icon does not affect functionality).
+//! Same approach as the root crate's `build.rs` (call the Windows SDK's rc.exe directly rather than winresource —...
+//! Why this is mandatory: an exe with no resource section is a blank sheet in Explorer, the Start menu...
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,9 +16,7 @@ fn main() {
         return;
     }
 
-    // Distribution safety gate: on Windows the CRT must be linked statically; the reasoning and
-    // criteria live in the root crate's build.rs. The GUI-only install is the most common one, so
-    // this package in particular must not depend on VCRUNTIME140.dll.
+    // Distribution safety gate: on Windows the CRT must be linked statically; the reasoning and criteria live...
     if !target_features().iter().any(|f| f == "crt-static") {
         println!(
             "cargo:warning=AOX GUI built without static CRT: the artifact will depend on VCRUNTIME140.dll \
@@ -43,7 +30,7 @@ fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    // The icon lives in the repo root, not under gui/
+    // The icon lives in the repo root, not under gui
     let ico = manifest_dir.join("..").join("assets").join("aox.ico");
     println!("cargo:rerun-if-changed={}", ico.display());
     println!("cargo:rerun-if-changed=build.rs");

@@ -1,12 +1,6 @@
 //! Paper-like black-and-white theme: palette, whitespace, corner radii, and CJK font loading.
-//!
-//! The design leans into "paper and ink" — no hue, only lightness steps and whitespace:
-//! light mode is a slightly warm sheet of paper; dark mode is a warm-tinted black.
-//! Status semantics (success / warning / failure) are told apart not by color but by lightness contrast and inverted blocks.
-//!
-//! egui built-in fonts lack CJK glyphs, so Chinese renders as blank boxes. Here we pick a
-//! modern sans-serif CJK font from the system font directories (preferring "Deng"/DengXian, then "Microsoft YaHei") and inject it as a fallback.
-//! We also register a genuine "bold" family so Markdown `**bold**` actually gets a heavier weight.
+//! The design leans into "paper and ink" — no hue, only lightness steps and whitespace: light mode is a slightly...
+//! Egui built-in fonts lack CJK glyphs, so Chinese renders as blank boxes.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -16,11 +10,7 @@ use egui::{
     Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Visuals,
 };
 
-// ─────────────────────────── Font sizes / whitespace scale ───────────────────────────
-//
-// These values now come from `[theme.metrics]` (the defaults equal the previously hard-coded
-// constants), so they can only be **runtime accessors** rather than `const`. `metrics()` goes
-// through `OnceLock`: written once at assembly time, then read-only, at constant cost.
+// ─────────────────────────── Font sizes / whitespace scale ───────────────────────────.
 
 static METRICS: OnceLock<MetricsConfig> = OnceLock::new();
 
@@ -43,7 +33,7 @@ pub fn button_size() -> f32 {
     metrics().button_size
 }
 
-/// Small-text font size.
+/// Small-text font size
 pub fn small_size() -> f32 {
     metrics().small_size
 }
@@ -58,21 +48,7 @@ pub fn card_radius() -> u8 {
     metrics().card_radius
 }
 
-// ─────────────────────────── Radius scale ───────────────────────────
-//
-// Before 2026-10-29 the project used fourteen different radii (1/2/4/5/6/7/8/9/10/11/12/
-// 13/16/20) with no rule behind which went where: three sibling controls in the drawer alone
-// took three values (6 for a conversation row, 9 for "New conversation", 7 for a menu row),
-// which is what made the surface read as "unfinished" rather than "quiet".
-//
-// There are now five steps, and one rule for using them:
-//
-//   * the radius follows the element's **size** — a big card with a small radius looks square,
-//     a small chip with a big radius looks swollen;
-//   * **concentric**: an inner box takes `outer − padding` (never less than [`R_XS`]), so the two
-//     corners share a centre point instead of running parallel at different curvatures.
-//
-// Everything that used to be an ad-hoc number now names one of these.
+// ─────────────────────────── Radius scale ───────────────────────────.
 
 /// Hairline pills, 1–2 px bars, checkboxes, the 15×12 glyph box in the drawer's icon.
 /// Small enough that anything larger reads as "rounded rectangle" instead of "dot".
@@ -87,18 +63,15 @@ pub const R1: u8 = 8;
 /// Cards, code blocks, tables, popups, dialogs.
 pub const R2: u8 = 12;
 
-/// The largest sheet: the input card and a user message bubble.
+/// The largest sheet: the input card and a user message bubble
 pub const R3: u8 = 18;
 
 /// A capsule of height `h` — progress segments, attachment chips, the plugin tag.
-///
-/// Half the height, exactly: a pill is defined by its ends being semicircles, so this is derived
-/// from the box rather than chosen, and it can never drift out of sync with the height.
 pub fn pill(h: f32) -> u8 {
     (h * 0.5).round().clamp(1.0, 127.0) as u8
 }
 
-/// Custom bold font-family name.
+/// Custom bold font-family name
 const BOLD_FAMILY: &str = "aox-strong";
 /// Custom serif font-family name (for sub-headings like blockquotes; falls back to the plain family if not found).
 const SERIF_FAMILY: &str = "aox-serif";
@@ -132,13 +105,6 @@ pub fn serif_font(size: f32) -> FontId {
 }
 
 /// Brand-font FontId (originally for the big greeting on the first screen).
-///
-/// Looser than the serif with a hint of handwritten stroke, so a line of greeting does not read like a document letterhead;
-/// when no display font is found it steps down serif to bold, so calling it is always safe.
-///
-/// WARNING: currently **has no caller**: the first-screen greeting "Hi there" was replaced by an illustration on 2026-10-06 (per user request).
-/// It is kept because this family is itself a **config item** (`brand` / `AOX_GUI_FONT_BRAND`; the font stack is still installed in
-/// `install_fonts`) — if the user ever wants a display font somewhere again, just call it instead of re-implementing it.
 #[allow(dead_code)]
 pub fn brand_font(size: f32) -> FontId {
     if BRAND_OK.load(Ordering::Relaxed) {
@@ -156,13 +122,9 @@ pub fn mono_font(size: f32) -> FontId {
     FontId::monospace(size)
 }
 
-// ─────────────────────────── Light / dark mode ───────────────────────────
+// Light / dark mode
 
-/// The **actually active** palette (two variants).
-///
-/// Kept separate from [`Pref`] on purpose: `Mode` answers "which color set is in use right now" and is always either light or dark, whereas the user can also pick a third option — "follow
-/// the system". If that option lived in `Mode`, every `mode() == Mode::Dark` check would have to also wonder "and what does System count as?", and the answer
-/// would shift with the system.
+/// The actually active palette (two variants).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     /// Paper
@@ -238,12 +200,7 @@ fn set_pref(p: Pref) {
     );
 }
 
-/// Compute the **actually** active palette from "user preference + current system theme".
-///
-/// Extracted as a pure function so it can be asserted directly — everything about the "follow
-/// system" option is this truth table, and it is exactly the kind of thing that gets written as
-/// "follow == always dark" (silently falling back to dark when the system theme is unavailable,
-/// so "follow system" appears to never take effect).
+/// Compute the actually active palette from "user preference + current system theme".
 pub fn effective(p: Pref, system: Option<egui::Theme>) -> Mode {
     match p {
         Pref::Light => Mode::Light,
@@ -265,11 +222,7 @@ pub fn apply_pref(ctx: &egui::Context, p: Pref) {
     save_pref();
 }
 
-/// Per-frame check for "follow system": switch along when the system theme changes. Returns whether it actually changed.
-///
-/// Why not compute it only at the switch moment: the system theme **changes at runtime** (the user flips to dark
-/// in the OS settings), and egui puts the current value in `ctx` every frame. Without this check "follow system"
-/// would only mean "decide once at startup from the system".
+/// Per-frame check for "follow system": switch along when the system theme changes.
 pub fn follow_system(ctx: &egui::Context) -> bool {
     if pref() != Pref::System {
         return false;
@@ -312,17 +265,14 @@ fn parse_pref(s: &str) -> Option<Pref> {
     }
 }
 
-/// What gets persisted is the **preference**, not the active mode.
-///
-/// This must be stated clearly: persisting the active mode would erase "follow system" after the first time it follows —
-/// a light system writes `"light"`, and on next launch it never follows again.
+/// What gets persisted is the preference, not the active mode.
 fn save_pref() {
     if let Some(p) = pref_path() {
         let _ = std::fs::write(p, pref().key());
     }
 }
 
-// ─────────────────────────── Palette ───────────────────────────
+// Palette
 
 /// A complete color set. The fields deliberately differ only by lightness, carrying no hue.
 #[derive(Clone, Copy)]
@@ -343,11 +293,6 @@ struct Palette {
     user_bg: Color32,
     code_bg: Color32,
     /// The "chip" background for inline code.
-    ///
-    /// It must clearly depart from `bg` / `surface`; otherwise inline code is just a smeared
-    /// light patch and the reader can't tell it's code. Fenced code blocks use `code_bg`
-    /// (a full block of background) instead; the two are deliberately set at different depths
-    /// so "block" and "inline" read apart at a glance.
     code_chip: Color32,
     quote_bar: Color32,
     /// Background of the inverted block (used for error hints: ink-black in light mode, near-white in dark).
@@ -357,22 +302,13 @@ struct Palette {
     /// Drop-shadow color for floating cards. A faint ink is enough in light mode; in dark mode shadows are nearly invisible, so we compensate by darkening.
     shadow: Color32,
     /// Dangerous actions — a brick-red (used at the single "full access" point).
-    ///
-    /// Most of this palette expresses meaning through lightness alone; this is the first deliberate
-    /// exception, because "past the boundary there is no boundary" is not something a lightness step
-    /// can say. `add_green` / `del_red` and the `toast_*` trio are the other, smaller exceptions —
-    /// every hue in the struct carries a meaning, none of them is decoration.
     danger: Color32,
     /// Lines **added** by an edit (the `+N` after a tool name). A calm green: it sits inside a text
     /// row, so it has to read as information rather than as a signal light.
     add_green: Color32,
-    /// Lines **removed** by an edit (the `−N` after a tool name).
+    /// Lines **removed** by an edit (the `−N` after a tool name)
     del_red: Color32,
-    /// Background of the transient toast. A pale red — a softened relative of `danger`.
-    ///
-    /// The toast reports something that already happened (e.g. files moved to the recycle bin), so it
-    /// must read as a notice at a glance instead of blending into the ordinary gray cards. A washed-out
-    /// red does that without shouting; the text stays the regular ink color, so it remains legible.
+    /// Background of the transient toast.
     toast_bg: Color32,
     /// Border of the transient toast: one step darker than `toast_bg`, same hue.
     toast_border: Color32,
@@ -381,7 +317,7 @@ struct Palette {
     toast_text: Color32,
 }
 
-/// Paper: a slightly warm white, not pure white.
+/// Paper: a slightly warm white, not pure white
 const LIGHT: Palette = Palette {
     bg: Color32::from_rgb(0xF2, 0xEF, 0xE8),
     panel: Color32::from_rgb(0xEB, 0xE7, 0xDE),
@@ -390,12 +326,7 @@ const LIGHT: Palette = Palette {
     border: Color32::from_rgb(0xDD, 0xD7, 0xC9),
     border_strong: Color32::from_rgb(0xC2, 0xBA, 0xA8),
     text: Color32::from_rgb(0x1A, 0x19, 0x16),
-    // The three text tiers are **readability first, hierarchy second** (2026-10-22). The old
-    // `text_faint` (#9B9486) sat at 2.6:1 on this paper base — half the WCAG AA floor for body
-    // text — so every label drawn with it looked switched off rather than quiet. The tiers are now
-    // measured (see `every_text_tier_stays_readable`): `text_dim` ~7.6:1, `text_faint` ~5.7:1.
-    // A deliberately grey tier still exists, but only for things that are *not content*:
-    // [`P::quiet`] (input placeholders, disabled glyphs).
+    // The three text tiers are readability first, hierarchy second.
     text_dim: Color32::from_rgb(0x4A, 0x46, 0x3D),
     text_faint: Color32::from_rgb(0x5E, 0x59, 0x4E),
     ink: Color32::from_rgb(0x1A, 0x19, 0x16),
@@ -419,7 +350,7 @@ const LIGHT: Palette = Palette {
     toast_text: Color32::from_rgb(0x7A, 0x23, 0x1B),
 };
 
-/// Ink: a warm-tinted black, not pure black.
+/// Ink: a warm-tinted black, not pure black
 const DARK: Palette = Palette {
     bg: Color32::from_rgb(0x14, 0x14, 0x12),
     panel: Color32::from_rgb(0x19, 0x19, 0x17),
@@ -428,9 +359,7 @@ const DARK: Palette = Palette {
     border: Color32::from_rgb(0x33, 0x33, 0x2E),
     border_strong: Color32::from_rgb(0x4C, 0x4C, 0x45),
     text: Color32::from_rgb(0xEA, 0xE7, 0xDF),
-    // Same calibration as the light palette, inverted (see the note there): `text_dim` ~11.5:1,
-    // `text_faint` ~7:1 on this base. The old #716E66 was 3.6:1 — the dark theme's copy of the
-    // same "everything looks greyed out" complaint.
+    // Same calibration as the light palette, inverted (see the note there): `text_dim` ~11.5:1, `text_faint` ~7:1...
     text_dim: Color32::from_rgb(0xDC, 0xD8, 0xCE),
     text_faint: Color32::from_rgb(0xAD, 0xA9, 0x9F),
     ink: Color32::from_rgb(0xEC, 0xE9, 0xE1),
@@ -468,8 +397,6 @@ fn pal() -> &'static Palette {
 }
 
 /// Merge per-field config overrides onto the built-in palette; fields not specified are kept.
-///
-/// Overriding only a single field (e.g. just `text`) is completely safe: the other 18 entries remain the built-in values.
 fn merge_palette(base: &Palette, ov: &PaletteConfig) -> Palette {
     let c = |d: Color32, o: Option<RgbColor>| match o {
         Some(x) => Color32::from_rgba_unmultiplied(x.r, x.g, x.b, x.a),
@@ -522,23 +449,14 @@ impl P {
         pal().surface_hi
     }
 
-    /// The fill of a **plate floating on the content** — see `gwin::float_plate`.
-    ///
-    /// [`P::surface`] at ~80% opacity. The window's top row no longer sits on a bar: it sits on the
-    /// first screen's background image, and a plate has to do both jobs at once — let the picture
-    /// through (an opaque chip would read as a bar of its own, which is exactly what was removed)
-    /// and still give the glyph a defined edge (fully transparent leaves the icon swimming).
+    /// The fill of a plate floating on the content — see `gwin::float_plate`.
     pub fn float_fill() -> Color32 {
         let s = Self::surface();
         let a = if mode() == Mode::Dark { 214 } else { 205 };
         Color32::from_rgba_unmultiplied(s.r(), s.g(), s.b(), a)
     }
 
-    /// The fill of a **row** under the pointer — one soft step above [`P::surface`].
-    ///
-    /// `surface_hi` is a 22-unit step: right for a button or a menu row, too loud for a column of
-    /// twenty list rows, where it turns the whole panel grey. This is the same idea at ~3% ink, so
-    /// a hovered row reads as *touched* without becoming a block of colour.
+    /// The fill of a row under the pointer — one soft step above P::surface.
     pub fn hover_fill() -> Color32 {
         match mode() {
             Mode::Light => Color32::from_rgb(0xF3, 0xF0, 0xE8),
@@ -546,10 +464,7 @@ impl P {
         }
     }
 
-    /// The fill of the **selected** row: one more step (~6% ink) on top of [`P::hover_fill`].
-    ///
-    /// Deliberately the only marker the current conversation gets (no dot, no bar): at rest the
-    /// list is plain text on paper, and the one row you are in is a shade darker than the rest.
+    /// The fill of the selected row: one more step (~6% ink) on top of P::hover_fill.
     pub fn active_fill() -> Color32 {
         match mode() {
             Mode::Light => Color32::from_rgb(0xEC, 0xE8, 0xDE),
@@ -561,10 +476,6 @@ impl P {
     }
 
     /// A neutral shadow tint at `a` opacity, for hand-drawn shadows under round or custom shapes.
-    ///
-    /// Not `gamma_multiply`: that multiplies the ink colour's own alpha as well, so on an opaque
-    /// colour it yields a *lighter grey* instead of a translucent black — a hand-drawn shadow made
-    /// with it turns grey and stops reading as shade.
     pub fn shade(a: f32) -> Color32 {
         let a = (a.clamp(0.0, 1.0) * 255.0) as u8;
         match mode() {
@@ -573,12 +484,7 @@ impl P {
         }
     }
 
-    /// A band **sunk into** a card: table headers, diff headers, inert section strips.
-    ///
-    /// Not [`P::surface_hi`]: that is a full lightness step, sized for a control under the pointer,
-    /// so a table header painted with it reads as one big disabled button. This is 4% ink over
-    /// whatever is underneath — enough to say "this row is a label, not data", quiet enough that the
-    /// header still looks like part of the sheet rather than a block laid on top of it.
+    /// A band sunk into a card: table headers, diff headers, inert section strips.
     pub fn band() -> Color32 {
         match mode() {
             Mode::Light => Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x0A),
@@ -598,15 +504,7 @@ impl P {
         pal().text_faint
     }
 
-    /// The **deliberately low-contrast** tier: input placeholders and disabled glyphs.
-    ///
-    /// This is the only text colour allowed to fail the readability floor, and it is allowed to
-    /// here because of what it means: a placeholder is not content (it disappears the moment you
-    /// type), and a disabled glyph is saying "not now". Both read as *absent* only if they stay
-    /// clearly quieter than every real label — which is why it keeps the values the third tier
-    /// used to have before the 2026-10-22 readability pass, instead of following it down.
-    ///
-    /// Everything else must use [`P::text`] / [`P::text_dim`] / [`P::text_faint`].
+    /// The deliberately low-contrast tier: input placeholders and disabled glyphs.
     pub fn quiet() -> Color32 {
         match mode() {
             Mode::Light => Color32::from_rgb(0x9B, 0x94, 0x86),
@@ -617,7 +515,7 @@ impl P {
     pub fn ink() -> Color32 {
         pal().ink
     }
-    /// Softened accent color (formerly ACCENT_DIM).
+    /// Softened accent color (formerly ACCENT_DIM)
     pub fn ink_soft() -> Color32 {
         pal().ink_soft
     }
@@ -641,7 +539,7 @@ impl P {
     pub fn warn() -> Color32 {
         pal().text_dim
     }
-    /// Inverted-block background.
+    /// Inverted-block background
     pub fn reverse_bg() -> Color32 {
         pal().reverse_bg
     }
@@ -649,7 +547,7 @@ impl P {
     pub fn on_reverse() -> Color32 {
         pal().on_reverse
     }
-    /// Drop-shadow color for floating cards.
+    /// Drop-shadow color for floating cards
     pub fn shadow() -> Color32 {
         pal().shadow
     }
@@ -679,16 +577,8 @@ impl P {
         pal().toast_text
     }
 
-    /// The 1px line around a **card**.
-    ///
-    /// Deliberately not [`P::border`]. `border` is a fixed grey, which is right for hairlines
-    /// *inside* a surface (table cells, separators) where they must not compete with the content.
-    /// A card's outer edge is different: it sits on a base that varies (`bg`, `panel`, another
-    /// card), so a fixed grey comes out too faint on one and too loud on the other — which is
-    /// exactly why the cards used to dissolve into the page.
-    ///
-    /// So the edge is **ink at a fixed opacity**: it mixes with whatever is underneath and is
-    /// visible by the same amount everywhere, on both themes.
+    /// The 1px line around a card.
+    /// Deliberately not P::border. `border` is a fixed grey, which is right for hairlines *inside* a surface (table...
     pub fn edge() -> Color32 {
         match mode() {
             // 24% ink on paper: unmistakably a line, still quieter than text.
@@ -708,11 +598,6 @@ impl P {
     }
 
     /// The veil drawn behind a modal dialog.
-    ///
-    /// egui's default is a flat 39% **black**, which on a warm paper base turns the whole window a
-    /// grey-green and drains the colour out of it — the page stops looking like paper and starts
-    /// looking like a screenshot of one. Tinted with the theme's own ink instead, the veil only
-    /// takes light away and leaves the hue alone, so the page still reads as paper behind glass.
     pub fn scrim() -> Color32 {
         match mode() {
             Mode::Light => Color32::from_rgba_unmultiplied(0x1A, 0x19, 0x16, 0x38),
@@ -721,13 +606,7 @@ impl P {
     }
 }
 
-/// L2 — the shadow under a sheet **lifted off** the page: the input card, the drawer, popovers.
-///
-/// The single-layer shadow this replaces (`offset 4 / blur 16 / α14%`) was the mechanical cause of
-/// "everything looks flat": a shadow that is short *and* sharp reads as a **smudge under the edge**,
-/// not as distance — the eye gets no gradient to measure. What sells height is a long, soft falloff
-/// with a small offset: the sheet stays close to the page, but the darkness under it spreads far
-/// enough to be read as ambient occlusion.
+/// L2 — the shadow under a sheet lifted off the page: the input card, the drawer, popovers.
 pub fn card_shadow() -> egui::Shadow {
     match mode() {
         Mode::Light => egui::Shadow {
@@ -745,10 +624,7 @@ pub fn card_shadow() -> egui::Shadow {
     }
 }
 
-/// L3 — floating **above** everything: dialogs, menus, the usage popover.
-///
-/// Further out than [`card_shadow`] in both offset and blur, so a dialog and the input card are
-/// distinguishable by depth alone, without a second border weight or a different fill.
+/// L3 — floating above everything: dialogs, menus, the usage popover.
 pub fn float_shadow() -> egui::Shadow {
     match mode() {
         Mode::Light => egui::Shadow {
@@ -766,12 +642,7 @@ pub fn float_shadow() -> egui::Shadow {
     }
 }
 
-/// The shadow of a card lying **on** the page: a *contact* shadow, nearly all of it directly under
-/// the edge.
-///
-/// Not a drop shadow — nothing is floating, so it must not look lifted. What it does is darken the
-/// one pixel right under the bottom edge. On a warm paper base that is what turns the outline into a
-/// clean line; a grey border on its own keeps dissolving into the page, however dark it is made.
+/// The shadow of a card lying on the page: a *contact* shadow, nearly all of it directly under the edge.
 pub fn contact_shadow() -> egui::Shadow {
     match mode() {
         Mode::Light => egui::Shadow {
@@ -807,17 +678,14 @@ pub fn floating(radius: u8) -> egui::Frame {
         .shadow(float_shadow())
 }
 
-/// A **well**: a block sunk *into* a card (code, quotes, inert insets).
-///
-/// No edge and no shadow on purpose — it is a change of depth inside one sheet, not a second sheet
-/// laid on top. Giving it a border is what made the transcript look like a stack of boxes.
+/// A well: a block sunk *into* a card (code, quotes, inert insets).
 pub fn well(radius: u8) -> egui::Frame {
     egui::Frame::NONE
         .fill(P::code_bg())
         .corner_radius(CornerRadius::same(radius))
 }
 
-// ─────────────────────────── Font loading ───────────────────────────
+// Font loading
 
 fn font_dirs() -> Vec<String> {
     let mut v = Vec::new();
@@ -874,7 +742,7 @@ const BOLD_CANDIDATES: &[&str] = &[
     "NotoSansSC-Bold.otf",
 ];
 
-/// Serif candidates (for sub-headings).
+/// Serif candidates (for sub-headings)
 const SERIF_CANDIDATES: &[&str] = &[
     "georgia.ttf",
     "times.ttf",
@@ -885,9 +753,6 @@ const SERIF_CANDIDATES: &[&str] = &[
 ];
 
 /// Brand-font candidates (for the first-screen greeting).
-///
-/// Ordered "strongest to weakest stroke"; all are Windows-bundled fonts (Gabriola / Inkfree ship with the OS from Win10 onward).
-/// If none are found we fall back to serif and the UI never loses glyphs because of it.
 const BRAND_CANDIDATES: &[&str] = &[
     "Gabriola.ttf",  // Calligraphic, brush-connected strokes, strongest gesture
     "Inkfree.ttf",   // Pen handwriting, thin and relaxed
@@ -933,11 +798,8 @@ fn read_font_file(path: &str) -> Option<(String, Vec<u8>)> {
     }
 }
 
-/// Walk the levels top to bottom: `[theme.fonts]` config → environment variable → built-in
-/// candidate list.
-///
-/// The two upper levels collapse "path missing / file empty" into `None`, so a wrong config
-/// won't make the UI lose glyphs — it just silently steps down to the next level.
+/// Candidate list.
+/// The two upper levels collapse "path missing / file empty" into `None`, so a wrong config won't make the UI lose...
 fn font_source(cfg: Option<&String>, env_key: &str, cands: &[&str]) -> Option<(String, Vec<u8>)> {
     cfg.and_then(|p| read_font_file(p))
         .or_else(|| read_env(env_key))
@@ -1027,7 +889,7 @@ pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-// ─────────────────────────── Style ───────────────────────────
+// Style
 
 fn widget(v: &mut Visuals, f: impl Fn(&mut egui::style::WidgetVisuals)) {
     f(&mut v.widgets.noninteractive);
@@ -1037,12 +899,7 @@ fn widget(v: &mut Visuals, f: impl Fn(&mut egui::style::WidgetVisuals)) {
     f(&mut v.widgets.open);
 }
 
-/// Build the one [`egui::style::Style`] that both of egui's theme slots will carry.
-///
-/// Built **once**, for the current [`mode`] — not once per mode. The colour accessors this uses
-/// ([`P::edge`], [`P::edge_raised`], [`P::surface`], …) read the `mode` atomic themselves, so a
-/// second build for the other mode would mean threading a `Mode` through a dozen colour helpers —
-/// for a slot that can never be read (see [`install_style`], which pins the active one to `mode`).
+/// Build the one egui::style::Style that both of egui's theme slots will carry.
 fn build_style() -> egui::style::Style {
     let mut style = egui::style::Style::default();
 
@@ -1057,9 +914,7 @@ fn build_style() -> egui::style::Style {
     v.code_bg_color = P::code_bg();
     v.window_stroke = Stroke::new(1.0, P::edge_raised());
     v.window_corner_radius = CornerRadius::same(card_radius());
-    // Everything egui builds for itself (popups, combo boxes, tooltips, modal backdrops) is raised
-    // **above** the page, so it takes the L3 shadow. Set here rather than at each call site: a
-    // hand-drawn dialog and a built-in one then look like the same kind of object.
+    // Everything egui builds for itself (popups, combo boxes, tooltips, modal backdrops) is raised above the page...
     v.window_shadow = float_shadow();
     v.popup_shadow = float_shadow();
     v.hyperlink_color = P::ink();
@@ -1086,17 +941,13 @@ fn build_style() -> egui::style::Style {
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::TRANSPARENT);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, P::text_dim());
 
-    // Hover is **one** language everywhere: the fill steps up to `surface_hi`, the text comes
-    // forward to full ink, and the outline steps to `edge` — it does not jump to a hard grey ring
-    // (that was what made a resting control look "activated" the moment the pointer touched it).
+    // Hover is one language everywhere: the fill steps up to `surface_hi`, the text comes forward to full ink...
     v.widgets.hovered.bg_fill = P::surface_hi();
     v.widgets.hovered.weak_bg_fill = P::surface_hi();
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, P::edge());
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, P::text());
 
-    // Press must be **darker than hover**, not equal to it. Both used to be `surface_hi`, so a
-    // click produced no visual change at all — the button looked identical while being pushed,
-    // which is most of why the UI felt unresponsive (reported 2026-10-29).
+    // Press must be darker than hover, not equal to it.
     v.widgets.active.bg_fill = P::active_fill();
     v.widgets.active.weak_bg_fill = P::active_fill();
     v.widgets.active.bg_stroke = Stroke::new(1.0, P::edge_raised());
@@ -1108,24 +959,11 @@ fn build_style() -> egui::style::Style {
 
     style.visuals = v;
 
-    // ── Motion ──
-    //
-    // egui's default is 0.083 s, which is **below the threshold where a change reads as motion**:
-    // at that speed a hover fill looks switched on rather than touched, and the whole UI felt like
-    // it had no transitions at all (reported 2026-10-29). 0.12 s is the shortest duration that
-    // still registers as a transition while staying out of the way of a fast pointer.
-    //
-    // Deliberately global: every `animate_bool` in the app (drawer push, plan unfold, chip removal)
-    // was already tuned against egui's default, and most of them divide the same budget, so raising
-    // it here keeps them in proportion instead of needing twenty call sites re-tuned.
+    // ── Motion ──.
+    // Egui's default is 0.083 s, which is below the threshold where a change reads as motion: at that speed a hover...
     style.animation_time = 0.12;
 
-    // Turn off "text in labels is selectable".    //
-    // This flag is on by default, at the cost of **every ui.label grabbing the mouse**: on hover
-    // the cursor becomes the text-selection I-beam and a press can drag out a selection. Any
-    // button built from labels (the "clear" / "close" / "allow once" buttons and the example
-    // rows) then sits under a text cursor on hover, looking like you clicked the wrong spot. The
-    // UI has no paragraph text worth copying, so just disabling it globally is cleanest.
+    // Turn off "text in labels is selectable". // This flag is on by default, at the cost of every ui.label grabbing...
     style.interaction.selectable_labels = false;
 
     // Whitespace is scaled up a notch overall — the main reason cards grow and stop feeling cramped.
@@ -1149,27 +987,7 @@ fn build_style() -> egui::style::Style {
     style
 }
 
-/// Install the app style into **both** of egui's theme slots, and pin the active slot to [`mode`].
-///
-/// Make the whole app read as "no border noise, low contrast, speaking only through lightness".
-/// Call it again after switching themes (fonts need not be reinstalled).
-///
-/// # Why both slots
-///
-/// egui 0.33 keeps two styles — `Options::dark_style` / `light_style` — and `Context::set_style`
-/// writes **only the one `Options::theme()` currently selects**. Which one that is depends on
-/// `theme_preference` (default `System`) plus the *system* theme, i.e. on something this crate does
-/// not control; the other slot silently keeps egui's built-in defaults. That is exactly the bug
-/// this function now prevents: a freshly started window rendered its composer at egui's 13px body
-/// size, painted text selection in `Selection::light()`'s bright blue, and in dark mode drew
-/// near-black text on a dark card — because `App::new` ran the install while
-/// `Context::system_theme()` was still `None` (it is only copied in from the frame's input at
-/// `begin_pass`), so the custom style landed in `dark_style` while the first frame then activated
-/// `light_style`. Switching the theme in settings only "cured" it by re-running this function once
-/// the system theme had settled.
-///
-/// Writing the same style to both slots means no theme flip can ever fall back to the built-ins;
-/// pinning the active slot to [`mode`] means it stops depending on the OS round-trip at all.
+/// Install the app style into both of egui's theme slots, and pin the active slot to mode.
 pub fn install_style(ctx: &egui::Context) {
     let style = Arc::new(build_style());
     ctx.set_style_of(egui::Theme::Light, style.clone());
@@ -1183,16 +1001,7 @@ pub fn install_style(ctx: &egui::Context) {
 /// Whether the appearance install still owes its first run (armed by [`apply`], paid by [`settle`]).
 static SETTLE_PENDING: AtomicBool = AtomicBool::new(true);
 
-/// Pay the first-frame debt: install style + native theme **here**, not in `App::new`.
-///
-/// [`apply`] runs inside `App::new`, before any pass has started, so `Context::system_theme()` is
-/// still `None` there — eframe only copies it in from the frame's input at `begin_pass`. Anything
-/// decided at that point is a guess (the fallback is dark), and a "follow system" start on a light
-/// desktop would begin one mode off. Deferring to the first `update` — called before a single
-/// widget is painted — means the first frame drawn is already the right one, and the window never
-/// receives a native theme command for a mode it is not about to show.
-///
-/// Costs nothing after the first call: the flag is swapped, not read.
+/// Pay the first-frame debt: install style + native theme here, not in `App::new`.
 pub fn settle(ctx: &egui::Context) {
     if !SETTLE_PENDING.swap(false, Ordering::Relaxed) {
         return;
@@ -1206,13 +1015,8 @@ pub fn settle(ctx: &egui::Context) {
 }
 
 /// One-time assembly: merge the appearance overrides from config onto the built-in theme.
-///
-/// **Light/dark precedence**: last manual switch record > `[theme] mode` > default (ink).
-/// The most recent click wins; `[theme] mode` only counts when "never switched before".
 pub fn apply(ctx: &egui::Context, cfg: &ThemeConfig) {
-    // Preference order: last choice on the settings page (`.aox-gui-theme`) to `[theme] mode` from `config.toml` to factory default (dark).
-    // Note that the `config.toml` layer is only a **starting value**; once the user picks something on the settings page that wins —
-    // otherwise "change config to switch theme" makes the settings page pointless.
+    // Preference order: last choice on the settings page (`.aox-gui-theme`) to `theme mode` from `config.toml`...
     let pref = read_pref()
         .or_else(|| cfg.mode.as_deref().and_then(parse_pref))
         .unwrap_or(Pref::Dark);
@@ -1228,18 +1032,11 @@ pub fn apply(ctx: &egui::Context, cfg: &ThemeConfig) {
     let _ = FONTS.set(cfg.fonts.clone());
 
     install_fonts(ctx);
-    // Style and native theme wait for the **first frame** (see [`settle`]): right here
-    // `Context::system_theme()` is still `None`, so a "follow system" start would have to guess —
-    // and guess wrong on a light desktop. Fonts, on the other hand, are mode-independent and must
-    // be in place before the first glyph is laid out, so they are installed now.
+    // Style and native theme wait for the first frame (see settle): right here `Context::system_theme()`...
     SETTLE_PENDING.store(true, Ordering::Relaxed);
 }
 
 /// Make the OS window decorations (title bar, border) follow the app theme.
-///
-/// The native title bar is not drawn by egui but by the window manager (DWM on Windows) and
-/// follows the system theme by default. Without syncing, a light paper-white UI would sit under
-/// a dark title bar — jarring.
 pub fn sync_native_theme(ctx: &egui::Context) {
     let t = match mode() {
         Mode::Light => egui::SystemTheme::Light,
@@ -1249,13 +1046,6 @@ pub fn sync_native_theme(ctx: &egui::Context) {
 }
 
 /// Set a DWM window attribute (`DWMWA_*`).
-///
-/// Windows 11 (build 22000+) recognizes these attributes; on older systems the call fails —
-/// **just ignore it silently**, the only effect is falling back to the system default, not an error.
-///
-/// Pulled out on its own so that **this is the only extern declaration across the whole crate**. If the same symbol is declared in two files, any slight signature mismatch makes the compiler
-/// emit `clashing_extern_declarations` (we actually hit this: `hwnd` was `isize` on one side and
-/// `*mut c_void` on the other).
 #[cfg(windows)]
 pub(crate) fn dwm_set_attribute(
     hwnd: isize,
@@ -1285,13 +1075,7 @@ pub(crate) fn dwm_set_attribute(
     -1
 }
 
-/// `SM_CXICON`: the edge length of the icon used for the taskbar / Alt+Tab (32 at 100% scaling,
-/// 48 at 150%).
-///
-/// We use it because it is **exactly 2:1** with `SM_CXSMICON` (the title-bar size), while
-/// `window_icon` can only hand back **one** size: so the large size maps 1:1 unscaled and the
-/// small size is a clean 2:1 downscale (a 2:1 bitmap downscale is exactly the next-smaller
-/// original redrawn).
+/// `SM_CXICON`: the edge length of the icon used for the taskbar / Alt+Tab (32 at 100% scaling, 48 at 150%).
 #[cfg(windows)]
 pub fn system_icon_size() -> i32 {
     const SM_CXICON: i32 = 11;
@@ -1319,15 +1103,7 @@ pub(crate) const DWMWA_CORNER_PREFERENCE: u32 = 33;
 /// `DWMWCP_ROUND`: the system standard rounded corners. `DONOTROUND` = 1, `ROUND` = 2, `ROUNDSMALL` = 3.
 pub(crate) const DWMWCP_ROUND: i32 = 2;
 
-/// Dye the native title bar to a color **identical** to the UI, so it melts into the window.
-///
-/// `sync_native_theme` can only make the title bar pick one of "system light / system dark", yielding DWM own gray
-/// (~`#F3F3F3` light, ~`#202020` dark) that does not match the warm paper-and-ink tones.
-/// To truly fit, we must set the DWM attributes directly:
-///
-/// - `DWMWA_CAPTION_COLOR`(35): title-bar background
-/// - `DWMWA_TEXT_COLOR`(36): title-bar text color
-/// - `DWMWA_BORDER_COLOR`(34): window outer border
+/// Dye the native title bar to a color identical to the UI, so it melts into the window.
 
 pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
     use raw_window_handle::RawWindowHandle;
@@ -1343,10 +1119,7 @@ pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
         ((c.b() as u32) << 16) | ((c.g() as u32) << 8) | c.r() as u32
     };
 
-    // Both the title bar and the border take the UI base color: once the top bar was removed, the conversation area base color is the whole window base color,
-    // so using panel for the title bar would leave a glaring color mismatch (user asked for "no color difference" on 2026-10-04).
-    // The border is flattened too — otherwise a ring of "another shade of gray" would remain around the window.
-    // (Using panel was the choice when the top bar still existed: top bar and title bar sharing a color read as one piece. With the top bar gone, follow bg.)
+    // Both the title bar and the border take the UI base color: once the top bar was removed, the conversation area...
     let cap = colorref(P::bg());
     let text = colorref(P::text_dim());
     let border = colorref(P::bg());
@@ -1354,29 +1127,13 @@ pub fn sync_caption(handle: &dyn raw_window_handle::HasWindowHandle) {
     dwm_set_attribute(hwnd, DWMWA_CAPTION_COLOR, std::ptr::addr_of!(cap).cast(), 4);
     dwm_set_attribute(hwnd, DWMWA_TEXT_COLOR, std::ptr::addr_of!(text).cast(), 4);
     dwm_set_attribute(hwnd, DWMWA_BORDER_COLOR, std::ptr::addr_of!(border).cast(), 4);
-    // The icon at the top-left of the title bar is **left alone**: it is now the `assets/aox.ico` from the exe resources
-    // (see the comment around `with_icon(IconData::default())` in `main.rs`).
-    // We used to call `hide_caption_icon(hwnd)` here to swap in a 1x1 transparent image (user asked for "title bar shows only the system buttons" on 2026-10-04); on
-    // 2026-10-06 the user changed their mind and wanted the app icon shown, so we removed it —
-    // worth noting: that approach later stopped working anyway, because eframe installs its own default icon (a white "e" on black) and
-    // **afterwards** overrides the HICON we set, so the title bar ended up showing eframe mark.
+    // The icon at the top-left of the title bar is left alone: it is now the `assets/aox.ico` from the exe resources...
 }
 
 #[cfg(not(windows))]
 pub fn sync_caption(_handle: &dyn raw_window_handle::HasWindowHandle) {}
 
-/// Let the system round this window's corners **and keep its shadow**.
-///
-/// The main window got this for free from its native caption; going undecorated (`with_decorations
-/// (false)`, 2026-10-18) throws it away with the rest of the frame — square corners, no shadow.
-/// DWM puts both back, and the radius then matches every other window in the app by construction.
-///
-/// The independent windows do the same thing by **title lookup** (`gwin::set_round_corners`): they
-/// are built by a viewport callback that never sees a window handle. The root window has its handle
-/// in hand (`eframe::Frame`), so no lookup here.
-///
-/// Win10 doesn't know the attribute — the call fails and the corners stay square, which is the
-/// same thing Windows does for any other window there.
+/// Let the system round this window's corners and keep its shadow.
 #[cfg(windows)]
 pub fn round_corners(handle: &dyn raw_window_handle::HasWindowHandle) {
     use raw_window_handle::RawWindowHandle;
@@ -1403,11 +1160,6 @@ mod tests {
     use super::*;
 
     /// The whole logic of the "follow system" option is this truth table.
-    ///
-    /// It gets its own test because it's the easiest thing to write as a single `_ => Mode::Dark`
-    /// and call it done — then "follow system" would always show dark even when the system is
-    /// light, and **reading the code gives no hint**: the branch is there, the assignment is
-    /// correct, only the basis for the decision is wrong.
     #[test]
     fn effective_follows_the_system_only_when_asked_to() {
         use egui::Theme;
@@ -1428,11 +1180,7 @@ mod tests {
         assert_eq!(parse_pref(""), None);
     }
 
-    /// What is persisted is the **preference**, not the active mode.
-    ///
-    /// This pins down a very sneaky regression: writing the active mode would erase "follow system" after the first time it follows —
-    /// the system being light right now writes `"light"`, and on next launch it never follows again.
-    /// So here we assert on `Pref::key()`, not on `mode()`.
+    /// What is persisted is the preference, not the active mode.
     #[test]
     fn the_persisted_string_is_the_preference_not_the_effective_mode() {
         assert_eq!(Pref::System.key(), "system");
@@ -1442,14 +1190,7 @@ mod tests {
         }
     }
 
-    /// Both of egui's style slots must carry the app's style, and the active one must be pinned to
-    /// [`mode`] instead of being decided by the system theme.
-    ///
-    /// This is the regression guard for a startup bug that only showed up in *some* system/app theme
-    /// combinations: `Context::set_style` writes one slot (the active one), so the other kept egui's
-    /// built-ins — 13px composer text, bright-blue selection, near-black text in dark mode. Asserting
-    /// on **both** slots is the point: checking only the active one would have passed even while the
-    /// bug was live.
+    /// Both of egui's style slots must carry the app's style, and the active one must be pinned to mode instead...
     #[test]
     fn both_style_slots_carry_the_app_style() {
         let ctx = egui::Context::default();
@@ -1511,16 +1252,7 @@ mod tests {
         (hi + 0.05) / (lo + 0.05)
     }
 
-    /// Every readable tier must clear 4.5:1 on every base it can land on — in **both** themes.
-    ///
-    /// This is the regression guard for the 2026-10-22 complaint ("labels look greyed out and are
-    /// hard to read in either theme"). The old `text_faint` measured 2.6:1 on the light page: half
-    /// the AA floor, and it carried 109 call sites (timestamps, counts, settings values, section
-    /// labels). Numbers, not eyeballs — a future palette tweak that "looks fine" on one monitor
-    /// fails here instead of shipping.
-    ///
-    /// `P::quiet` is deliberately **not** in the list: it is the one tier meant to look switched
-    /// off (placeholders, disabled glyphs).
+    /// Every readable tier must clear 4.5:1 on every base it can land on — in both themes.
     #[test]
     fn every_text_tier_stays_readable_on_every_base() {
         for (name, p) in [("light", LIGHT), ("dark", DARK)] {

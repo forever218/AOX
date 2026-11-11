@@ -1,25 +1,6 @@
-//! The **saved model list** — one record per model the user has set up, plus the little bit of state
-//! each one needs.
-//!
-//! Three things this file is, in order of importance:
-//!
-//! 1. **A list of models, not a list of endpoints.** Earlier (2026-10-27 morning) the unit here was
-//!    "an endpoint with a key and a scan result". That was the wrong grain: one endpoint serves many
-//!    models, and people switch *models*, not hosts. Each record now carries its own endpoint, key,
-//!    model name and per-model parameters, so two records may point at the same host with different
-//!    keys and different windows.
-//! 2. **Convenience data, not configuration.** `config.toml` stays the single statement of **what is
-//!    running right now** (that is what the CLI reads and what a hand edit is checked against). This
-//!    file is what the GUI remembers so the list is there next launch; activating a record is a copy
-//!    of its values into `config.toml`, exactly as if they had been typed there.
-//! 3. **Never fatal.** Missing / unreadable / wrong-version → an empty list. A broken book must cost
-//!    the user their saved list, never their session.
-//!
-//! The file is `<app root>/.aox/models.json`, beside `ui.json` / `spaces.json`: it describes this
-//! installation's models, not any one workspace. It is written atomically (temp + rename), because the
-//! GUI can be killed at any moment and a half-written file would take every record with it.
-//!
-//! ⚠️ It holds API keys in clear text, like `config.toml` does. Nothing here may be logged.
+//! The saved model list — one record per model the user has set up, plus the little bit of state each one needs.
+//! Three things this file is, in order of importance.
+//! 1. A list of models, not a list of endpoints. Earlier the unit here was "an endpoint with a key and a scan...
 
 use std::path::{Path, PathBuf};
 
@@ -33,11 +14,7 @@ use crate::workplace::AOX_DIR;
 const FILE_NAME: &str = "models.json";
 /// The file this one grew out of (2026-10-27 morning). Read once for migration, never written again.
 const LEGACY_FILE: &str = "endpoints.json";
-/// On-disk layout version — **rejected, not guessed at**, when it does not match.
-///
-/// 2 = the book is the model source of truth (`active` names the record in force). Version 1 is
-/// still read, with `active` empty: it costs three lines and keeps this install's list, which is
-/// the only copy of it.
+/// On-disk layout version — rejected, not guessed at, when it does not match.
 const VERSION: u32 = 2;
 
 /// One saved model.
@@ -97,13 +74,7 @@ pub struct SavedModel {
     pub window: Option<u32>,
 }
 
-/// The whole list, and **which one is running**.
-///
-/// Since 2026-10-28 this file is the program's model configuration, not a GUI convenience copy:
-/// `config.toml` no longer carries `[provider]`, the CLI and the GUI both read the active record
-/// here, and "switch model" is one write to this file. `active` is an id rather than an
-/// (endpoint, model) pair because a pair can match two records — which is how two rows once both
-/// claimed to be in use.
+/// The whole list, and which one is running.
 #[derive(Debug, Default, Clone)]
 pub struct Book {
     /// [`ModelRecord::id`] of the record in force. `None` = nothing has been chosen yet (a fresh
@@ -144,11 +115,7 @@ impl ModelRecord {
         }
     }
 
-    /// The line under the name: `model · host`, or just the host when the name **is** the model.
-    ///
-    /// Built here so the list and the pop-up say the same thing about the same record. The
-    /// de-duplication matters: the default name of a saved model is its model name, so without this
-    /// every ordinary row read `deepseek-flash` / `deepseek-flash · api.deepseek.com`.
+    /// The line under the name: `model · host`, or just the host when the name is the model.
     pub fn subtitle(&self) -> String {
         let host = host_of(&self.base_url);
         let model = if self.model == self.name { "" } else { self.model.as_str() };
@@ -160,9 +127,7 @@ impl ModelRecord {
         }
     }
 
-    /// The window to use when this record is activated: the one it carries, else what the endpoint
-    /// reported for this model in the last scan, else nothing (the caller falls back to the config
-    /// default and says so in the UI).
+    /// The window to use when this record is activated: the one it carries, else what the endpoint reported...
     pub fn window(&self) -> Option<u32> {
         self.context_window.or_else(|| {
             self.scanned
@@ -173,10 +138,6 @@ impl ModelRecord {
     }
 
     /// This record as the runtime's provider configuration.
-    ///
-    /// The single conversion point. Before 2026-10-28 the same mapping existed three times (the
-    /// bridge's `edit_to_config`, the dialogs, and `config.toml` itself); with the book as the only
-    /// source it lives here, and "what runs" cannot drift from "what is saved".
     pub fn to_config(&self) -> ProviderConfig {
         ProviderConfig {
             base_url: self.base_url.trim().to_string(),
@@ -193,10 +154,6 @@ impl ModelRecord {
     }
 
     /// Whether this record is the one currently in force, given what the runtime reports.
-    ///
-    /// Matched on **(endpoint, model)** and not on the id: the id is a GUI invention the runtime has
-    /// never heard of, `config.toml` may have been edited by hand, and the same model may legitimately
-    /// be saved twice against two endpoints.
     pub fn is_active(&self, base_url: &str, model: &str) -> bool {
         self.model == model && norm(&self.base_url) == norm(base_url)
     }
@@ -207,9 +164,7 @@ impl Book {
         if let Some(b) = Self::load_models(app_root) {
             return b;
         }
-        // One-time pickup of the earlier layout. It is read, converted, and the next save writes the
-        // new file — the old one is left alone (it costs 300 bytes and is the only copy of anything
-        // that did not convert).
+        // One-time pickup of the earlier layout.
         Self::migrate_from_endpoints(app_root).unwrap_or_default()
     }
 
@@ -281,16 +236,12 @@ impl Book {
         Ok(())
     }
 
-    /// The record in force, resolved through [`Book::active`].
+    /// The record in force, resolved through [`Book::active`]
     pub fn active_record(&self) -> Option<&ModelRecord> {
         self.active.as_ref().and_then(|id| self.by_id(id))
     }
 
     /// The runtime's configuration: the record in force, or `None` when nothing has been chosen.
-    ///
-    /// Every front end goes through here — that is the whole point of the book being in the library
-    /// rather than in the GUI. `Runtime::new` falls back to the layered `[provider]` when this is
-    /// `None`, which is what a fresh install starts from.
     pub fn active_config(&self) -> Option<ProviderConfig> {
         self.active_record().map(ModelRecord::to_config)
     }
@@ -304,14 +255,7 @@ impl Book {
         true
     }
 
-    /// Seed the book from a `[provider]` still sitting in `config.toml`, and put it in force.
-    ///
-    /// Runs once, at startup. A **no-op as soon as there is an active record**: the book wins, which
-    /// is the entire contract of this file. The key is copied on purpose — the book is the only place
-    /// a key lives now, and a seeded record without one is a model that cannot answer, which reads as
-    /// a regression rather than as an invitation to retype it.
-    ///
-    /// Returns whether anything changed (and therefore whether the file was rewritten).
+    /// Seed the book from a `provider` still sitting in `config.toml`, and put it in force.
     pub fn adopt(&mut self, cfg: &ProviderConfig, app_root: &Path) -> bool {
         if self.active.is_some() {
             return false;
@@ -324,15 +268,7 @@ impl Book {
         true
     }
 
-    /// Make `cfg` the record in force, creating it if this (endpoint, model) is new. Returns its id.
-    ///
-    /// The one place "the thing that runs" is folded back into the list — used by `adopt` at startup
-    /// and by the GUI after a successful apply. Two rules it keeps:
-    ///
-    /// * a **stored key is never replaced by an empty one**. The dialogs show a blank key field to
-    ///   mean "unchanged", so an edit arrives here with no key at all;
-    /// * `enabled` is left alone. A record can be hidden from the picker while still running (see
-    ///   `ModelUi::toggle_enabled`); re-applying it must not silently un-hide it.
+    /// Make `cfg` the record in force, creating it if this (endpoint, model) is new.
     pub fn remember(&mut self, cfg: &ProviderConfig) -> String {
         let id = match self.find_same(&cfg.base_url, &cfg.model) {
             Some(r) => r.id.clone(),
@@ -379,10 +315,6 @@ impl Book {
     }
 
     /// The record that matches what the runtime reports as in force.
-    ///
-    /// **One**, even when two records tie on (endpoint, model) — which happens for real: an install
-    /// that upgraded into this layout can carry a migrated record *and* one adopted later, and marking
-    /// both "in use" is what "why are two models shown as current" was.
     pub fn active(&self, base_url: &str, model: &str) -> Option<&ModelRecord> {
         self.models.iter().find(|m| m.is_active(base_url, model))
     }
@@ -393,10 +325,6 @@ impl Book {
     }
 
     /// The record already saved for this (endpoint, model), if any.
-    ///
-    /// "Add model" twice with the same endpoint and model is a duplicate the user cannot tell apart
-    /// from an edit — two identical rows, one of them dead weight. Editing the existing record is what
-    /// pressing "Save" in that situation means.
     pub fn find_same(&self, base_url: &str, model: &str) -> Option<&ModelRecord> {
         self.active(base_url, model)
     }
@@ -415,9 +343,7 @@ impl Book {
         }
     }
 
-    /// Drop a record. When it was the one in force, `active` is cleared with it: a dangling id would
-    /// make `active_config()` return `None` for a reason the user cannot see (the record is simply
-    /// gone), and "nothing is chosen" is the truth at that point.
+    /// Drop a record. When it was the one in force, `active` is cleared with it: a dangling id would make...
     pub fn remove(&mut self, id: &str) {
         self.models.retain(|m| m.id != id);
         if self.active.as_deref() == Some(id) {
@@ -437,10 +363,6 @@ impl Book {
     }
 
     /// Store a completed scan on every record pointing at that endpoint.
-    ///
-    /// Every record, not just one: two records on the same host differ in key and model, and both
-    /// benefit from the list. Windows the user set by hand outlive a rescan (most endpoints report
-    /// none), so the fresh list wins on membership while a known number is kept.
     pub fn set_scan(&mut self, base_url: &str, models: Vec<SavedModel>, url: Option<String>) {
         let key = norm(base_url);
         for rec in self.models.iter_mut().filter(|m| norm(&m.base_url) == key) {
@@ -470,7 +392,7 @@ fn norm(url: &str) -> String {
     url.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
-/// `https://api.deepseek.com/v1` → `api.deepseek.com`.
+/// `https://api.deepseek.com/v1` → `api.deepseek.com`
 pub fn host_of(base_url: &str) -> String {
     let s = base_url.trim();
     let s = s.split_once("://").map_or(s, |(_, rest)| rest);
@@ -485,7 +407,7 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-// ─────────────────────────── `/model`: the CLI's window onto this file ───────────────────────────
+// `/model`: the CLI's window onto this file
 
 /// A window as a person reads it: `1M`, `128K`, `8192`. Rounded to the nearest unit, because a real
 /// window is 1048576 or 131072 and printing those raw reads as a serial number.
@@ -505,11 +427,6 @@ pub fn is_cmd(line: &str) -> bool {
 }
 
 /// `/model` lists the saved models; `/model <n|name>` switches to one.
-///
-/// The CLI's window onto the same file the GUI's Model tab edits, and the **same switch path**: write
-/// `active`, then hand the record to `LiveProvider::apply` (construct-then-swap). No `Runtime` is
-/// rebuilt, so the conversation, its history file and the task checkpoint all stay where they are —
-/// switching model mid-task is a property change, not a restart.
 pub fn command(rt: &crate::runtime::Runtime, line: &str) -> anyhow::Result<String> {
     let mut book = Book::load(&rt.root);
     let arg = line.strip_prefix("/model").unwrap_or("").trim();
@@ -552,11 +469,7 @@ fn list(book: &Book) -> String {
     for (i, r) in book.models.iter().enumerate() {
         let cur = book.active.as_deref() == Some(r.id.as_str());
         let window = r.window().map(window_label).unwrap_or_else(|| "—".into());
-        // `·`-separated rather than padded columns: the names are user text, often Chinese, and
-        // `{:<20}` pads by chars, not by display width, so a padded table is crooked half the time.
-        // Identity, then the two facts worth comparing. Each part is conditional because otherwise
-        // the same string shows up twice: a record whose name is the host read
-        // `1. api.deepseek.com · api.deepseek.com · …`.
+        // `·`-separated rather than padded columns: the names are user text, often Chinese, and `{:<20}` pads by chars...
         let host = host_of(&r.base_url);
         let mut row = format!("\n  {}. {}", i + 1, r.name);
         if !r.model.is_empty() && !r.model.eq_ignore_ascii_case(&r.name) {
@@ -580,9 +493,7 @@ fn list(book: &Book) -> String {
     out
 }
 
-/// Turn an argument into a record id: 1-based number, then id / name / model name, then a unique
-/// substring. Ambiguity is an error that lists the candidates — a wrong guess would silently change
-/// which model answers, and that is the one thing a switch must never do by accident.
+/// Turn an argument into a record id: 1-based number, then id / name / model name, then a unique substring.
 fn resolve(book: &Book, arg: &str) -> anyhow::Result<String> {
     if let Ok(n) = arg.parse::<usize>() {
         return match book.models.get(n.wrapping_sub(1)) {
@@ -718,9 +629,7 @@ mod tests {
         assert!(b.active_record().unwrap().api_key_env.is_none());
     }
 
-    /// `/model`'s argument resolution: number → id, exact name → id, unique substring → id, and
-    /// **ambiguity is refused**. A wrong guess here silently changes which model answers, which is the
-    /// one thing a switch must never do by accident.
+    /// Ambiguity is refused. A wrong guess here silently changes which model answers, which is the one thing a switch...
     #[test]
     fn a_model_argument_resolves_or_refuses() {
         let mut b = Book::default();

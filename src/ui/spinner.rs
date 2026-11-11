@@ -1,12 +1,6 @@
-//! A wait-state animation: a single-line spinner plus a live, scrolling echo of the
-//! model's reasoning as it is produced.
-//!
-//! Played only on a real TTY; automatically silent when redirected to a file/pipe
-//! (self-checks, log capture) so cursor-control characters are never written to output.
-//!
-//! Reasoning is "shown the moment it arrives and gone the moment it ends": the Provider
-//! keeps feeding increments via `Status::push_reasoning`, and a background task scrolls the
-//! most recent lines in place; once a response finishes (`clear_reasoning`) it is removed at once.
+//! A wait-state animation: a single-line spinner plus a live, scrolling echo of the model's reasoning...
+//! Played only on a real TTY; automatically silent when redirected to a file/pipe (self-checks, log capture)...
+//! Reasoning is "shown the moment it arrives and gone the moment it ends": the Provider keeps feeding increments...
 
 use std::io::{IsTerminal, Write};
 use std::sync::{Arc, Mutex};
@@ -29,9 +23,7 @@ const REASONING_KEEP: usize = 4000;
 /// Left indent for each reasoning line (pure ASCII, so width math never mis-aligns).
 const REASONING_INDENT: &str = "  ";
 
-/// Whether the animation is enabled: by default it plays only on a real terminal, to avoid
-/// polluting piped/redirected output. Override with the `AOX_ANIM` env var: `1` forces it on
-/// (handy for recording/debugging), `0` forces it off.
+/// Whether the animation is enabled: by default it plays only on a real terminal, to avoid polluting...
 pub fn supported() -> bool {
     match std::env::var("AOX_ANIM").ok().as_deref() {
         Some("1") | Some("true") | Some("on") => true,
@@ -46,12 +38,7 @@ pub struct Status {
     started: Instant,
     /// Live increments of the model's reasoning (non-empty only for streaming reasoning models).
     reasoning: Mutex<String>,
-    /// Character count received on the output side (reasoning + body), used to estimate a
-    /// rising live token count.
-    ///
-    /// Estimate only — in a streaming response the server only reports usage in the final frame,
-    /// so there is no other source mid-response. `turn_usage` reports the exact value once the
-    /// turn ends; the two never appear on screen at once.
+    /// Character count received on the output side (reasoning + body), used to estimate a rising live token count.
     out: Mutex<TokenEstimate>,
 }
 
@@ -65,7 +52,7 @@ impl Status {
         })
     }
 
-    /// Update the label (e.g. "thinking" → "running fs_read").
+    /// Update the label (e.g. "thinking" → "running fs_read")
     pub fn set(&self, label: impl Into<String>) {
         if let Ok(mut l) = self.label.lock() {
             *l = label.into();
@@ -101,8 +88,6 @@ impl Status {
     }
 
     /// Clear the reasoning: called when a response finishes, to achieve the "disappear at once" effect.
-    /// Note it does **not** clear the token estimate: within one turn the model may be called many
-    /// times, and the count must accumulate across responses — clearing it would report only the last.
     pub fn clear_reasoning(&self) {
         if let Ok(mut r) = self.reasoning.lock() {
             r.clear();
@@ -178,9 +163,7 @@ fn draw(frame: &str, status: &Status, width: usize, drawn: &mut usize) {
         s::bold(&label),
         s::dim(&format!("{secs:.1}s"))
     );
-    // The output token count ticks live. The `~` is because during streaming the server has not
-    // reported a number yet — this value is estimated per character; at turn end the exact value
-    // is reported separately.
+    // The output token count ticks live.
     if tok > 0 {
         head.push_str(&format!("  {}", s::dim(&format!("~{} tok", thousands(tok)))));
     }
@@ -244,8 +227,7 @@ fn clear_block(drawn: &mut usize) {
     let _ = std::io::stdout().flush();
 }
 
-/// Take the trailing few lines of text for the scrolling echo: split on newlines → wrap to display
-/// width → keep the last `max` lines.
+/// width → keep the last `max` lines
 fn tail_lines(text: &str, width: usize, max: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for raw in text.split(['\n', '\r']) {

@@ -1,10 +1,6 @@
 //! Throw-away probe: print the exact system + user message the first-screen greeting sends.
-//!
-//! The message is built by `hello::generate`, which needs a provider only to send it. This fake one
-//! refuses instead of sending, after printing what it was handed — the point is to read the prompt,
-//! not to talk to a model.
-//!
-//!     AOX_LANG=zh cargo run --release --example hello_prompt
+//! The message is built by `hello::generate`, which needs a provider only to send it.
+//! AOX_LANG=zh cargo run --release --example hello_prompt.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;

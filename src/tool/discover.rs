@@ -1,31 +1,6 @@
-//! `find_tools` — lets the model **call up** tools that are registered but not advertised.
-//!
-//! # Why a tool
-//!
-//! On-demand advertising (see [`super::scope`]) saves a few thousand tokens per round, at the price
-//! of "the model no longer knows what else exists". There is exactly one way to pay that price back:
-//! give it a **look in the catalogue**. Not "remind it every round how many tools are left" — that
-//! is noise, and every sentence the model reads crowds out the actual task context; just one passive
-//! entry point, used when needed.
-//!
-//! # Why it can't go through `Runtime::execute` itself
-//!
-//! Because "call up" means **changing this conversation's visibility policy**, and `Tool::call` only
-//! receives `&Runtime`, never `&mut Agent`. So it gets the same treatment as `ask_user` /
-//! `task_state`: registered in the tool table (otherwise the model cannot see the entry point), with
-//! execution intercepted by [`crate::agent::Agent::authorize_and_execute`]. Its `call` is reached
-//! only when "someone bypassed the Agent and called `rt.execute` directly", and then it can only
-//! report the failure — succeeding silently would let the caller believe the tools were revealed.
-//!
-//! # What it returns
-//!
-//! Name + one line + **full parameters** for each hit. All three are needed: the name alone leaves
-//! the model guessing at arguments (another round trip); name and description together still don't
-//! let it call anything. Give everything at once and the next round can use them directly.
-//!
-//! A hit is **enabled immediately** (written into `Scope::discovered`); no second call to "confirm".
-//! That is deliberate: two steps (search, then enable) save nothing, cost one extra round trip, and
-//! add one more way to fail — "found it, forgot to enable it".
+//! `find_tools` — lets the model call up tools that are registered but not advertised.
+//! # Why a tool.
+//! On-demand advertising (see super::scope) saves a few thousand tokens per round, at the price of "the model...
 
 use std::sync::Arc;
 
@@ -40,14 +15,9 @@ use crate::runtime::Runtime;
 pub const FIND_TOOL: &str = "find_tools";
 
 /// How many hits one call may reveal.
-///
-/// 8 is a rule of thumb: hit too many at once and "on demand" turns back into "everything" (while
-/// still paying a round trip); hit too few and the model has to search again and again. The excess
-/// is cut off in a stable name order — not ranked by a second "relevance" tier, because word
-/// frequency in a description is a very poor ranking signal.
 pub const MAX_HITS: usize = 8;
 
-/// The host's tool-discovery tool.
+/// The host's tool-discovery tool
 pub fn find_tools() -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(FindToolsTool)]
 }
@@ -60,10 +30,7 @@ impl Tool for FindToolsTool {
         FIND_TOOL
     }
     fn kind(&self) -> ToolKind {
-        // `Host`: it changes neither the host machine nor any file, only "which tools are visible in
-        // this conversation" — the same tier as `task_state` => it follows `[auth] plugin_tools`
-        // (auto by default). Pop an authorization dialog for a catalogue lookup and the model learns
-        // to route around it.
+        // `Host`: it changes neither the host machine nor any file, only "which tools are visible in this conversation" —...
         ToolKind::Host
     }
     fn access(&self) -> crate::workplace::Access {
@@ -85,9 +52,7 @@ impl Tool for FindToolsTool {
     }
 
     async fn call(&self, _args: Value, _rt: &Arc<Runtime>) -> ToolOutput {
-        // Only a call that bypassed the Agent lands here (`Runtime::execute` called directly). This
-        // path has no conversation, so it has no visibility policy to change; pretending to succeed
-        // is the worst answer — the caller would believe the tools had already appeared.
+        // Only a call that bypassed the Agent lands here (`Runtime::execute` called directly).
         ToolOutput::err(crate::i18n::t(
             "find_tools is executed by the agent loop, not by the tool registry: it changes which tools this conversation can see, and this path has no conversation.",
         ))
@@ -105,9 +70,7 @@ pub async fn search(rt: &Runtime, scope: &mut Scope, query: &str) -> ToolOutput 
 
     let entries = rt.tool_entries().await;
     let needle = query.trim().to_lowercase();
-    // A name the model can already see answers the question directly. **Exact** name only: a loose
-    // match here would steal real queries (searching "file" would answer "read_file" and never look
-    // at the hidden `fs_*` tools), so partial matches fall through to the search below.
+    // A name the model can already see answers the question directly.
     if let Some(visible) = entries
         .iter()
         .find(|e| scope.advertises(&e.name, e.plugin) && e.name.eq_ignore_ascii_case(&needle))
@@ -138,18 +101,14 @@ pub async fn search(rt: &Runtime, scope: &mut Scope, query: &str) -> ToolOutput 
             if !tokens.iter().all(|t| hay.contains(t.as_str())) {
                 return None;
             }
-            // A full name match ranks above a description-only hit; within a tier the name decides,
-            // so the same query always returns the same order (the order goes into the context, and
-            // an arbitrary order means arbitrary cache hits).
+            // A full name match ranks above a description-only hit; within a tier the name decides, so the same query always...
             let tier = if tokens.iter().all(|t| name.contains(t.as_str())) { 2 } else { 1 };
             Some((tier, *e))
         })
         .collect();
 
     if hits.is_empty() {
-        // Getting here means "not in the list, and not held back either": the name was already
-        // checked at the top of the function, so the honest answer is "nothing", plus the next step
-        // (narrow the query / look at plugin names).
+        // Getting here means "not in the list, and not held back either": the name was already checked at the top...
         return ToolOutput::err(crate::tf!(
             "no hidden tool matches \"{}\" ({} tool(s) are hidden right now). Try a shorter word — plugin tool names are usually prefixed by the plugin name, which list_plugins can show you.",
             query.trim(),
@@ -373,7 +332,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ───────── Wiring into `Agent` (real interception, real Scope) ─────────
+    // Wiring into `Agent` (real interception, real Scope)
 
     use crate::message::Message;
     use crate::ui::{AgentEvent, AuthDecision, Ui};

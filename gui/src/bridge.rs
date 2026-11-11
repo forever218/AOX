@@ -1,11 +1,5 @@
 //! GUI ↔ Agent bridge layer.
-//!
-//! Design point: **fully reuse the existing architecture**.
-//! - A background thread runs a tokio runtime, driving the task with `aox::agent::Agent`'s loop unchanged;
-//! - `GuiUi` implements the `aox::ui::Ui` trait, forwarding `AgentEvent`, status and the streaming
-//!   reasoning process to the egui main thread;
-//! - user input, authorization decisions and abort signals travel back through channels.
-//!
+//! Design point: fully reuse the existing architecture. - A background thread runs a tokio runtime, driving...
 //! As a result the CLI and GUI share one Agent / Provider / plugin-host implementation, with no logic fork.
 
 use std::path::PathBuf;
@@ -24,95 +18,38 @@ use aox::llm::{StreamSink, Usage};
 use aox::runtime::Runtime;
 use aox::ui::{AgentEvent, AuthDecision, ChoiceReply, Ui};
 
-/// Main thread → Agent thread
 pub enum ToAgent {
     /// One user instruction plus the attachments it carries (local paths).
-    ///
-    /// Attachments only travel with **this one** message (one-shot): if the model needs that file in
-    /// a later turn, it reads it itself (via `read_file`) following the path referenced in the
-    /// message — keeping the attachment bytes in the context would cost tokens for it every turn.
     Input(String, Vec<PathBuf>),
     /// Switch to some past conversation (`id` is the file-name stem).
-    ///
-    /// Switching "replaces the context in place", so it must happen back on the Agent's thread; the
-    /// main thread cannot read the file itself and hand it over.
     Resume(String),
     /// Start a new conversation. The old one needs no wrap-up — it was written to `history/` as it went.
     NewConversation,
     /// This turn's activity-stream records, appended to the same conversation file (`kind:"act"` lines).
-    ///
-    /// This goes through the queue rather than letting the main thread open the file itself: the
-    /// handle is in the Agent thread's hands, and "new conversation" and "abort rollback" also happen
-    /// on that thread — the queue naturally preserves write order.
     Act(Vec<Value>),
     /// Rename a conversation (the history panel's conversation menu).
-    ///
-    /// Goes through the queue for the same reason `Act` does: the file handle for the conversation
-    /// being chatted in is in this thread's hands, and the row we append to ends up in that same file.
-    /// `title: None` = "show the automatic title again".
     RenameConversation { id: String, title: Option<String> },
     /// Workplace: switch tier (the button at the bottom-left of the input box, see `gui/src/workplace_ui.rs`).
-    ///
-    /// Like `Input`, this can only be done **back on the Agent's thread** — `Workplace` lives inside
-    /// `Runtime`, and only this thread can reach it; the UI cannot call `set_mode` itself and can only
-    /// send the request over.
-    ///
-    /// It carries only "which tier to switch to": the UI need not ask for the current state, because on
-    /// startup / at the end of every turn / after every tier switch the bridge proactively pushes a
-    /// [`FromAgent::Workplace`].
     Workplace(aox::workplace::Mode),
     /// The recovery panel: list points, preview a rollback, apply one, redo, verify, prune.
-    ///
-    /// Every variant is answered on **this** thread ([`recovery_request`]): the store lives inside
-    /// the workspace and the recovery API is synchronous, so the UI must never run it — a 100 MB
-    /// tree walk on the main thread is a frozen window, not a slow one.
     Recovery(RecoveryReq),
     /// Move these paths to the system recycle bin and report the total.
-    ///
-    /// The main thread cannot do this itself: `recycle` is async and can block for a while on the
-    /// shell, and the "N files moved to the recycle bin" notice is an [`AgentEvent`] — routing it
-    /// through the **same event** the model's own file deletion produces means both deletions look
-    /// identical to the user (one toast, same wording), instead of the GUI growing a second, subtly
-    /// different notion of "delete".
     Recycle(Vec<PathBuf>),
     /// The Model tab / the input-box switcher: put this configuration into force.
-    ///
-    /// Handled **on this thread**, for two reasons. The provider lives in `Runtime`, and only the agent
-    /// thread owns it — the UI physically cannot swap it. And the write to `config.toml` has to agree
-    /// with what is in memory: doing it here keeps "construct → apply → save" in one place and in the
-    /// right order, instead of the main thread writing a file the host may reject.
     ApplyProvider(Box<ProviderEdit>),
-    /// Ask the endpoint which models it serves (`GET …/models`). Answered with [`FromAgent::Models`].
-    ///
-    /// It runs here rather than on the UI thread because it is a network call with a timeout, and the
-    /// UI thread draws the window: a slow endpoint there is a frozen window, not a slow panel.
+    /// Ask the endpoint which models it serves (`GET …/models`).
     ScanModels { base_url: String, api_key: Option<String> },
-    /// "Test connection": one tiny chat request to this endpoint + key + model (see
-    /// `aox::llm::models::probe`). Answered with [`FromAgent::TestResult`].
-    ///
-    /// A different question from a scan, which is why it is a different message: a key can list models
-    /// and still fail to chat, and a model name can be wrong in a way no list reveals.
+    /// "Test connection": one tiny chat request to this endpoint + key + model (see `aox::llm::models::probe`).
     TestModel { base_url: String, api_key: Option<String>, model: String },
     /// One line for the empty first screen, fetched from the user's quoting API (`aox::hello`).
-    ///
-    /// Answered with [`FromAgent::HelloLine`]. It is a *message* rather than a direct call because
-    /// the request sits on the startup path: this thread must never block on it, and the answer has
-    /// to be able to arrive while a turn is running.
     HelloFromApi(String),
     /// One line for the empty first screen, written by the model in use.
-    ///
-    /// It carries **nothing**: the greeting prompt gets the clock and a style, never anything from
-    /// the conversation (see `aox::hello::generate`).
     HelloFromModel,
     /// Exit: close the plugin child processes and end the driver thread
     Shutdown,
 }
 
 /// What the Model tab can change, as it arrives from the UI.
-///
-/// A struct of plain values rather than "the new `ProviderConfig`": the UI has no business knowing
-/// about `stream`, `api_key_env`, or which of the two key sources wins. It says what the person typed;
-/// the bridge merges that onto what is already in force (see [`edit_to_config`]).
 #[derive(Clone, Debug)]
 pub struct ProviderEdit {
     pub base_url: String,
@@ -144,7 +81,7 @@ pub struct ProviderView {
     pub error: Option<String>,
 }
 
-/// The answer to [`ToAgent::ScanModels`].
+/// The answer to [`ToAgent::ScanModels`]
 #[derive(Clone, Debug)]
 pub struct ModelsView {
     pub base_url: String,
@@ -152,16 +89,11 @@ pub struct ModelsView {
     pub entries: Vec<(String, Option<u32>)>,
     /// The URL that answered — remembered so the next scan asks once.
     pub url: Option<String>,
-    /// A scan that failed says why here; `entries` is then empty. Failure is **not** an error state for
-    /// the app: the model field stays hand-editable, which is the escape hatch for an endpoint that
-    /// cannot list at all.
+    /// A scan that failed says why here; `entries` is then empty.
     pub error: Option<String>,
 }
 
 /// Move every path to the system recycle bin, reporting the total through `AgentEvent::Recycled`.
-///
-/// A failure is reported per path rather than swallowed: "I deleted three and only two went" is
-/// exactly the case where silence is worst, because the user believes the file is safely recoverable.
 async fn recycle_all(paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<FromAgent>) {
     let mut moved = 0usize;
     for p in paths {
@@ -181,17 +113,10 @@ async fn recycle_all(paths: Vec<PathBuf>, tx: &mpsc::UnboundedSender<FromAgent>)
     }
 }
 
-/// Agent thread → main thread
 pub enum FromAgent {
     /// Startup info (config / model / paths / whether usable)
     Boot(Box<BootInfo>),
-    /// A model request is **starting**: `n == 0` is the first attempt, `n >= 1` is a retry after a
-    /// failure, and `delay_ms` is how long the loop waited before it (see
-    /// [`aox::llm::StreamSink::on_attempt`]).
-    ///
-    /// A retry needs its own event rather than a `Warn`, because the UI has to *undo* work: a stream
-    /// that was cut has already drawn half an answer, and the retyped one must replace it, not
-    /// appear beneath it.
+    /// A model request is starting: `n == 0` is the first attempt, `n >= 1` is a retry after a failure, and `delay_ms`...
     Attempt { n: u32, delay_ms: u64 },
     /// The core event stream (fully shared with the CLI)
     Event(AgentEvent),
@@ -202,20 +127,10 @@ pub enum FromAgent {
     /// This turn's token ledger — exactly the line written into the conversation file (sent after `TurnEnd`)
     Usage(Box<UsageRecord>),
     /// The usage ledger for the whole conversation (resent after switching / creating a conversation).
-    ///
-    /// **Must be sent after `Switched`**: on receiving `Switched` the main thread clears the ledger;
-    /// if the order were reversed, the just-restored data would be wiped by itself.
     UsageLog(Vec<UsageRecord>),
-    /// What the request about to be sent is made of: sections in body order, each with a rough token
-    /// estimate. Sent before every model call (see `Ui::context_map`), and used by the cache-hit
-    /// window to attribute blocks to the sections they came from.
+    /// What the request about to be sent is made of: sections in body order, each with a rough token estimate.
     ContextMap(Vec<(&'static str, u64)>),
-    /// One model call finished **inside** the current turn (see `Ui::call_usage`).
-    ///
-    /// Distinct from [`FromAgent::Usage`], which carries the turn's **aggregate** and only arrives
-    /// after the turn is over. This one is what lets the cache-hit map move while the model is still
-    /// working: `UsageRecord::usage` is a sum over calls, so a mid-turn update cannot be recovered
-    /// from it — the last call's figures have to be sent on their own.
+    /// One model call finished inside the current turn (see `Ui::call_usage`).
     CallUsage { usage: Usage, last_prompt: Option<u64> },
     /// A turn was aborted
     TurnAborted,
@@ -225,26 +140,13 @@ pub enum FromAgent {
     Reasoning(String),
     /// The reasoning stream of one response is over (it disappears immediately)
     ReasoningEnd,
-    /// Streaming content delta. The content itself goes through `Event(AssistantText)`; this one is
-    /// **only for live token counting** — the main thread needs to know "how many more characters just
-    /// came out this instant" for the number to keep climbing.
+    /// Streaming content delta. The content itself goes through `Event(AssistantText)`; this one is only for live...
     Content(String),
-    /// A fragment of a tool call the model is **still writing** (its arguments are arriving in
-    /// pieces) — see `StreamSink::on_tool_call`.
-    ///
-    /// This is the one signal that arrives *before* a tool runs, and it is what lets the main thread
-    /// put the call's row on screen and keep a live reading on it while the model writes, instead of
-    /// showing nothing until the whole call has come back. `index` identifies the call within the
-    /// response; `name` is filled in only on the fragment that first carries it.
+    /// A fragment of a tool call the model is still writing (its arguments are arriving in pieces) — see...
     ToolDelta { index: u64, name: String, delta: String },
     /// Request authorization (blocks waiting for the main thread to fill in)
     AuthRequest { tool: String, args: String, reply: oneshot::Sender<AuthDecision> },
     /// A "multiple-choice question" (`ask_user`): likewise blocks waiting for the main thread to fill in.
-    ///
-    /// It is a separate variant from `AuthRequest` rather than merged into one: their **UI shapes** and
-    /// **answer types** differ (authorization is an "allow/deny" confirmation box, a choice is a row of
-    /// "pick one" buttons), and merging would force both sides to decide "which kind is this" from the
-    /// parameters — which is exactly where mistakes are most likely.
     ChoiceRequest {
         question: String,
         options: Vec<String>,
@@ -255,69 +157,37 @@ pub enum FromAgent {
     /// Plugin runtime status (for the "About" window); resent once assembly completes
     Runtimes(RuntimeView),
     /// The id of the conversation file being written this session (`None` before a conversation starts).
-    ///
-    /// The main thread uses it to mark "current" in the history list and to rescan the directory when
-    /// needed — the history files themselves are read from disk by the main thread directly, not
-    /// through this channel (see `aox::history`).
     HistoryCurrent(Option<String>),
     /// The session was switched (opened a history conversation / created a new one).
-    ///
-    /// `opened` is the conversation id after switching (`None` when creating a new one); a non-empty
-    /// `error` means loading failed — in that case the Agent's context **was not touched** and the main
-    /// thread should change nothing.
-    ///
-    /// It carries only the id, not the messages: the loaded content is re-read from disk by the main
-    /// thread itself (see the note above).
     Switched { opened: Option<String>, error: Option<String> },
     /// The current workplace (tier + the root in effect).
-    ///
-    /// Sent as a receipt on startup, at the end of every turn, and after any tier switch: the UI needs
-    /// it for two things — showing the current tier name on the button, and ticking the current tier in
-    /// the three-way list. A struct rather than a line of text: ticking requires comparing tiers with
-    /// `PartialEq`, and parsing a string like "Picked workspace" is too brittle (a copy change silently breaks
-    /// it), for the same reason as [`RuntimeView`].
     Workplace(Box<WorkplaceView>),
     /// An answer for the recovery panel (see [`ToAgent::Recovery`]).
     Recovery(Box<RecoveryView>),
     /// The model in force changed (startup, and after every successful apply).
-    ///
-    /// Pushed rather than pulled: the ring's denominator, the "Model in use" row and the panel's form
-    /// all have to agree, and the authoritative values live on the agent thread. A UI that kept its
-    /// own copy would drift the first time an apply failed halfway.
     Provider(Box<ProviderView>),
-    /// The answer to a scan (see [`ToAgent::ScanModels`]).
+    /// The answer to a scan (see [`ToAgent::ScanModels`])
     Models(Box<ModelsView>),
     /// The answer to [`ToAgent::TestModel`]. `model` comes back so a slow reply cannot land in the
     /// wrong dialog (the user may have moved on to another model by then).
     TestResult { base_url: String, model: String, ok: bool, text: String },
     /// One line about a model operation, for the panel's status line.
-    ///
-    /// Separate from [`AgentEvent`] on purpose: an apply failure is not a conversation event, and
-    /// putting it in the activity stream would file it under "things the model did".
     ModelNotice { ok: bool, text: String },
-    /// The first screen's line (the answer to [`ToAgent::HelloFromApi`] / [`ToAgent::HelloFromModel`]).
-    ///
-    /// `ok = false` carries the reason in `why`; the first screen never shows it (it falls back to a
-    /// local sentence instead) — it is the settings panel's status line that names the failure, so a
-    /// broken endpoint is diagnosable without being shouted at every launch.
+    /// The first screen's line (the answer to ToAgent::HelloFromApi / ToAgent::HelloFromModel).
     HelloLine { ok: bool, text: String, why: String },
     /// An unrecoverable error occurred this turn
     Fatal(String),
 }
 
-/// The current workplace (see [`FromAgent::Workplace`]).
+/// The current workplace (see [`FromAgent::Workplace`])
 #[derive(Debug, Clone)]
 pub struct WorkplaceView {
     pub mode: aox::workplace::Mode,
-    /// The currently effective root. `None` in the `full` tier, and in the `default` tier when the
-    /// **ground has not been broken yet** — the latter is not "unrestricted" but "this conversation has
-    /// not begun"; the UI must not present the two as the same thing.
+    /// The currently effective root. `None` in the `full` tier, and in the `default` tier when the ground has not been...
     pub root: Option<PathBuf>,
 }
 
 /// Send the current workplace state to the UI.
-///
-/// What the recovery panel asks the agent thread to do.
 #[derive(Clone, Debug)]
 pub enum RecoveryReq {
     /// The list, plus how far back it can go. Sent when the panel opens and after every change.
@@ -339,27 +209,17 @@ pub enum RecoveryReq {
 pub enum RecoveryView {
     Points(Box<aox::recovery::view::PointsView>),
     Preview(Box<aox::recovery::view::PreviewView>),
-    /// Something to say inside the panel: the outcome of a rollback / verify / prune, or a refusal.
-    /// `ok == false` is shown in the danger colour and **is not a modal** — the panel is already
-    /// the place the user is looking.
+    /// Something to say inside the panel: the outcome of a rollback / verify / prune, or a refusal. `ok == false`...
     Notice { text: String, ok: bool },
 }
 
-/// One lock acquisition takes both tier and root ([`aox::workplace::Workplace::snapshot`]), reading the
-/// same state as the CLI's `/workplace` — the two frontends do not each keep their own "what tier is it
-/// now" judgment.
+/// One lock acquisition takes both tier and root (aox::workplace::Workplace::snapshot), reading the same state...
 fn sync_workplace(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
     let (mode, root) = rt.workplace.snapshot();
     let _ = tx.send(FromAgent::Workplace(Box::new(WorkplaceView { mode, root })));
 }
 
-/// Handle a workplace request from the UI (the button at the bottom-left of the input box, see `gui/src/workplace_ui.rs`).
-///
-/// It is the **same implementation** as the CLI's `/workplace` ([`aox::workplace::Workplace::set_mode`]);
-/// here it only decides "where the result goes": a successful/failed switch goes into the activity
-/// stream (feedback the user can see), and afterwards a state receipt is sent regardless of outcome —
-/// so the tier name on the button and the tick in the three-way list catch up immediately, without
-/// waiting for the next turn to end.
+/// Handle a workplace request from the UI (the button at the bottom-left of the input box, see...
 fn set_workplace(ui: &mut GuiUi, rt: &Arc<Runtime>, mode: aox::workplace::Mode) {
     // Take the name first: `set_mode` consumes `mode`, and the error text needs it.
     let label = mode.label();
@@ -372,11 +232,7 @@ fn set_workplace(ui: &mut GuiUi, rt: &Arc<Runtime>, mode: aox::workplace::Mode) 
 
 pub struct BootInfo {
     pub config_path: String,
-    /// The layers used to compose this config (low → high, later ones override earlier ones).
-    ///
-    /// Only used to show one line in the "About" window; the full source tree goes through the CLI's
-    /// `--dump-config` — that table does not fit in a 380px card, and squeezing it in would just be
-    /// noise nobody reads.
+    /// Only used to show one line in the "About" window; the full source tree goes through the CLI's `--dump-config` —...
     pub config_layers: Vec<String>,
     pub model: String,
     /// The model's context window, for the ring in the input box. `0` = not configured.
@@ -385,30 +241,16 @@ pub struct BootInfo {
     /// Whether task recovery is on (`[recovery] enabled`). The panel's chip is **not drawn** when it
     /// is off: a control for a feature that does not exist is a lie with a hover state.
     pub recovery: bool,
-    /// This launch **created** `config.toml` (there was none before).
-    ///
-    /// Only then does the window open on Settings → Model by itself. Not "whenever the model is not
-    /// ready": someone whose key expired would get a dialog in the face on every launch, which is the
-    /// kind of help that becomes an obstacle.
+    /// This launch created `config.toml` (there was none before).
     pub first_run: bool,
     pub note: Option<String>,
     /// The paths and host info the "System" tab needs (see [`BootPaths`]).
     pub paths: BootPaths,
     /// The storage instance the UI side reads history with (read-only use).
-    ///
-    /// The **same backend implementation** as the agent thread, pointing at the same data — the UI does
-    /// not build paths itself, nor decide the persistence format (see `aox::store`). On a normal start
-    /// it is a clone of `rt.store`; when the config cannot be read, the default backend is a fallback, so
-    /// at least old conversations in the sidebar remain visible.
     pub store: Arc<dyn aox::store::Store>,
 }
 
 /// The paths and host info in the "System" tab.
-///
-/// Why one struct rather than adding seven or eight more `String` fields to `BootInfo`: these values
-/// live and die together (all come from the same `Runtime`), and **more will be added** (e.g. a log
-/// directory). Bundling them keeps `boot()`'s signature from growing with "one more displayed row", and
-/// the three call sites need change in only one construction.
 #[derive(Debug, Clone, Default)]
 pub struct BootPaths {
     /// Application root directory (config / plugins / history / runtime all hang off it).
@@ -421,22 +263,14 @@ pub struct BootPaths {
     pub history: String,
     /// The bundled runtime directory (`<root>/runtime`) — it exists even when no bundled runtime is installed, just empty.
     pub runtime: String,
-    /// Host info, e.g. `windows x86_64 · 16 cores · 31.7 GB RAM`.
+    /// Host info, e.g. `windows x86_64 · 16 cores · 31.7 GB RAM`
     pub host: String,
     /// Which command-line tool the model gets first, e.g. `bash · git-bash — C://Program Files\Git\bin\bash.exe`.
-    ///
-    /// Computed by the core (`aox::shell::command_line_summary`) so the row cannot drift from what is
-    /// actually registered: the sentence is a claim about behaviour, not decoration.
     pub command_line: String,
 }
 
 impl BootPaths {
     /// Assemble one from several paths (host info asks the core library itself).
-    ///
-    /// All three startup branches go through it — including the two degraded branches "config cannot be
-    /// read" and "model not ready": those branches cannot get a full `Runtime`, but **the paths are
-    /// known**, and "where the config file actually is" is exactly what should be shown then (the user
-    /// came to find out why it did not load).
     pub fn new(
         root: &std::path::Path,
         config: &std::path::Path,
@@ -462,11 +296,6 @@ pub struct Snapshot {
 }
 
 /// The status of one plugin runtime language (a row in the "System" tab).
-///
-/// Structured rather than a pre-joined string: the CLI wants one compact line (`runtimes::one_line`),
-/// while the settings page wants three columns "language / resolved command / origin" — the same data
-/// laid out two ways. Joining into a string and splitting it back is asking for trouble, and this line
-/// is meant for human eyes anyway, so it cannot be split.
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeItem {
     pub lang: String,
@@ -478,10 +307,7 @@ pub struct RuntimeItem {
 }
 
 /// The runtime status view.
-///
-/// Deliberately a struct rather than a few lines of string: the UI decides "whether to show an install
-/// button" from it, and judging by parsing text like `✗ python` is too brittle (a copy change silently
-/// breaks it).
+/// Deliberately a struct rather than a few lines of string: the UI decides "whether to show an install button"...
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeView {
     /// One row per language (structured, see [`RuntimeItem`]).
@@ -549,7 +375,7 @@ impl StreamSink for ChanSink {
     }
 }
 
-/// The graphical implementation of `aox::ui::Ui`.
+/// The graphical implementation of `aox::ui::Ui`
 pub struct GuiUi {
     tx: mpsc::UnboundedSender<FromAgent>,
     rx: mpsc::UnboundedReceiver<ToAgent>,
@@ -563,10 +389,7 @@ impl Ui for GuiUi {
         loop {
             match self.rx.recv().await {
                 Some(ToAgent::Input(s, files)) => {
-                    // The GUI's real instruction path is `next_command` (see its docs); this trait
-                    // implementation exists only to satisfy the signature. If execution really reaches
-                    // here, **speak up** — silently dropping attachments would one day, when this path
-                    // comes alive, yield a ghost bug of "the image was clearly dragged but not sent".
+                    // The GUI's real instruction path is `next_command` (see its docs); this trait implementation exists only...
                     if !files.is_empty() {
                         let _ = self.tx.send(FromAgent::Event(AgentEvent::Warn(aox::tf!(
                             "internal error: this path does not support attachments; {} attachment(s) were not sent with the message.",
@@ -614,13 +437,7 @@ impl Ui for GuiUi {
         rx.await.unwrap_or(AuthDecision::Deny)
     }
 
-    /// The graphical version of `ask_user`: send the question and options to the main thread, draw them
-    /// as the row of buttons above the input box, and wait to be filled in.
-    ///
-    /// All three failure paths (cannot send / main thread did not reply / reply channel broken) return
-    /// `Cancelled`: that is far safer than "default to the first option" — the former merely leaves it
-    /// unanswered and the model proceeds in its own words and explains, whereas the latter **makes a
-    /// choice for the user that they never made**, and nobody would notice.
+    /// The graphical version of `ask_user`: send the question and options to the main thread, draw them as the row...
     async fn choose(&mut self, question: &str, options: &[String]) -> ChoiceReply {
         let (reply, rx) = oneshot::channel();
         let sent = self.tx.send(FromAgent::ChoiceRequest {
@@ -665,9 +482,6 @@ impl Ui for GuiUi {
 }
 
 /// Send the runtime status to the "About" window.
-///
-/// Pass the **raw** `config.runtimes` (not a resolved snapshot), otherwise the "origin" would be
-/// misjudged as "specified in config.toml" — see the notes in `aox::runtimes::status`.
 fn send_runtime_status(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
     let st = aox::runtimes::status(&rt.root, &rt.config.runtimes);
     let view = RuntimeView {
@@ -687,9 +501,7 @@ fn send_runtime_status(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
     let _ = tx.send(FromAgent::Runtimes(view));
 }
 
-/// The GUI implementation of the recovery commands. Parsing and the actual work are shared with
-/// the CLI; the GUI only routes the report to its event stream and tells the Agent to invalidate
-/// stale task evidence after a successful restore.
+/// The GUI implementation of the recovery commands.
 fn recovery_command(ui: &mut GuiUi, agent: &mut Agent, line: &str) {
     let rt = agent.rt().clone();
     let parsed = match aox::recovery::command::parse(line) {
@@ -711,18 +523,12 @@ fn recovery_command(ui: &mut GuiUi, agent: &mut Agent, line: &str) {
 }
 
 /// The recovery panel's backend: one request in, one view out.
-///
-/// The store work itself is [`aox::recovery::command`] — the same functions the CLI's `/checkpoints`,
-/// `/rollback` and `/backup` call. The GUI deliberately owns **no** recovery logic: it decides what
-/// it looks like, never what it means.
 fn recovery_request(agent: &mut Agent, tx: &mpsc::UnboundedSender<FromAgent>, req: RecoveryReq) {
     use aox::recovery::command as cmd;
     use aox::recovery::view;
     let rt = agent.rt().clone();
     let view = match req {
-        // `history_id()` is the conversation whose turn is running (or the one just opened): it is what
-        // makes "this point is mine" answerable. Without it every row would look foreign in a new
-        // conversation, and a row that belongs to someone else would look like the user's own work.
+        // `history_id()` is the conversation whose turn is running (or the one just opened): it is what makes "this point...
         RecoveryReq::List => match view::points_view(&rt, agent.history_id()) {
             Ok(v) => RecoveryView::Points(Box::new(v)),
             Err(e) => RecoveryView::Notice { text: e, ok: false },
@@ -734,9 +540,7 @@ fn recovery_request(agent: &mut Agent, tx: &mpsc::UnboundedSender<FromAgent>, re
         RecoveryReq::Rollback { target, force, allow_partial } => {
             match view::rollback_to(&rt, &target, force, allow_partial) {
                 Ok(rep) => {
-                    // Same bookkeeping as `/rollback` typed into the input box: the task checkpoint's
-                    // evidence is stale after a restore, and the transcript gets a host note. Routing
-                    // both doors through this one call is what keeps them from diverging.
+                    // Same bookkeeping as `/rollback` typed into the input box: the task checkpoint's evidence is stale after...
                     if let Some(report) = &rep.restore {
                         agent.note_workspace_restored(report);
                     }
@@ -769,10 +573,6 @@ fn notice_from(result: Result<aox::recovery::command::CommandReport, String>) ->
 }
 
 /// The GUI implementation of `/runtime`.
-///
-/// Parsing, provisioning and copy all reuse `aox::runtimes`, shared with the CLI; here it only decides
-/// "where the output goes": progress and results go into the activity stream, so a 10 MB download does
-/// not make the UI look frozen.
 async fn runtime_command(ui: &mut GuiUi, rt: &Arc<Runtime>, line: &str) {
     let parsed = match aox::runtimes::parse_cmd(line) {
         Ok(c) => c,
@@ -808,17 +608,12 @@ async fn runtime_command(ui: &mut GuiUi, rt: &Arc<Runtime>, line: &str) {
 }
 
 /// The configured context window, or `0` for "the config didn't say".
-///
-/// A tiny wrapper so the two call sites that have a `Runtime` in hand don't each repeat the
-/// `Option → 0` dance; the GUI turns `0` into its own default (see `DEFAULT_CONTEXT_WINDOW`).
 fn ctx_window(rt: &Arc<Runtime>) -> u64 {
-    // Read from the **live** provider, not from the config snapshot taken at startup: after a model
-    // switch the ring's denominator has to follow, and this is the one place that answers "how big is
-    // the window right now".
+    // Read from the live provider, not from the config snapshot taken at startup: after a model switch the ring's...
     u64::from(rt.provider.info().context_window)
 }
 
-// ─────────────────────────── the model seam ───────────────────────────
+// the model seam
 
 /// Push the model in force to the UI. One call site for "something about the model changed".
 fn push_provider(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
@@ -836,10 +631,6 @@ fn push_provider(tx: &mpsc::UnboundedSender<FromAgent>, rt: &Runtime) {
 }
 
 /// Merge what the panel typed onto what is already in force.
-///
-/// The fields the UI cannot see are **carried over** rather than defaulted: `stream` is a config-only
-/// preference, and `api_key_env` must survive as long as no new key was typed (an install that keeps
-/// its key in the environment must not lose that by pressing "apply" on the model name).
 fn edit_to_config(edit: &ProviderEdit, prev: &aox::config::ProviderConfig) -> aox::config::ProviderConfig {
     let mut cfg = prev.clone();
     cfg.base_url = edit.base_url.trim().to_string();
@@ -859,12 +650,7 @@ fn edit_to_config(edit: &ProviderEdit, prev: &aox::config::ProviderConfig) -> ao
     cfg
 }
 
-/// Put an edit into force **and** remember it, in that order.
-///
-/// The order is the contract: a configuration that cannot be built (empty key, unusable URL) must never
-/// reach the file, or the next launch starts from a config that cannot run. So: construct → swap →
-/// save. If the save fails after a successful swap, the session keeps working and says so — the
-/// alternative (roll the live provider back because a file write failed) would be strictly worse.
+/// Put an edit into force and remember it, in that order.
 fn apply_provider(
     rt: &Runtime,
     edit: &ProviderEdit,
@@ -881,9 +667,7 @@ fn apply_provider(
     }
     // Applied. The UI hears about the new state first, so the panel is correct even if the disk is not.
     push_provider(tx, rt);
-    // Remember it: since 2026-10-28 the book's active record **is** the model configuration, so this
-    // replaces the old `config.toml` write. Same contract as before — the swap has already happened,
-    // so a failed save costs the memory of the choice and says so, rather than rolling the session back.
+    // Remember it: since 2026-10-28 the book's active record is the model configuration, so this replaces the old...
     match remember_model(&rt.root, &cfg) {
         Ok(()) => {
             let _ = tx.send(FromAgent::ModelNotice {
@@ -904,18 +688,13 @@ fn apply_provider(
 }
 
 /// Fold a configuration into `.aox/models.json` and mark it in force.
-///
-/// The GUI's half of `aox::modelbook::Book::remember`: loading and saving live here so the runtime
-/// does not have to hold a mutable copy of a file the panel also edits.
 fn remember_model(app_root: &std::path::Path, cfg: &aox::config::ProviderConfig) -> anyhow::Result<()> {
     let mut book = aox::modelbook::Book::load(app_root);
     book.remember(cfg);
     book.save(app_root)
 }
 
-/// Answer a scan request. Never fails the app: a scan error is a line in the panel, and the model
-/// field stays hand-editable — that is the escape hatch for an endpoint that cannot list at all.
-/// Answer a "test connection" request.
+/// Answer a scan request. Never fails the app: a scan error is a line in the panel, and the model field stays...
 async fn test_model(
     tx: &mpsc::UnboundedSender<FromAgent>,
     base_url: String,
@@ -930,10 +709,6 @@ async fn test_model(
 }
 
 /// Ask the quoting API for the first screen's line.
-///
-/// **Detached on purpose**: this request is fired while the user is looking at an empty window, and
-/// the driver loop is the thing that starts turns — making it wait 4 seconds for a nice-to-have would
-/// freeze the whole application behind a greeting.
 fn spawn_hello_api(tx: &mpsc::UnboundedSender<FromAgent>, url: String) {
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -978,15 +753,13 @@ fn boot(
     tx: &mpsc::UnboundedSender<FromAgent>,
     config_path: &std::path::Path,
     model: &str,
-    // The model's context window (`[provider] context_window`), or 0 when unknown -- the ring in
-    // the input box needs a denominator, and "unknown" is the honest answer for a config that
-    // didn't say.
+    // The model's context window (`provider context_window`), or 0 when unknown -- the ring in the input box needs...
     context_window: u64,
     ready: bool,
     recovery: bool,
     note: Option<String>,
     store: Arc<dyn aox::store::Store>,
-    // Which layers this config was composed from (low → high). An empty list when the config cannot be read — do not invent layers that don't exist.
+    // Which layers this config was composed from (low → high). An empty list when the config cannot be read — do not invent layers that don't exist
     layers: Vec<String>,
     paths: BootPaths,
     // A fresh install: `config.toml` was written by this launch (see `BootInfo::first_run`).
@@ -1007,10 +780,6 @@ fn boot(
 }
 
 /// The path list all three startup branches need.
-///
-/// The history directory is asked of the storage backend (`Store::location`) — the UI does not build
-/// `<root>/history` itself: after a backend change (the very point of the storage seam existing), a
-/// built path would be fake, whereas this follows along.
 fn boot_paths(
     root: &std::path::Path,
     config: &std::path::Path,
@@ -1022,14 +791,6 @@ fn boot_paths(
 }
 
 /// Restore persisted plugins and report everything about them the user needs to know.
-///
-/// Split out of `boot_and_run` for two reasons. Both startup branches need it — the normal one and
-/// the "model not configured" one, where the plugin panel should still show what is on disk — and it
-/// is the **one startup step that can block**: a plugin whose metadata cache is cold or stale has to
-/// be started to ask it its own tool list, and a broken one makes that wait out `INIT_TIMEOUT` (20 s)
-/// per plugin. Callers therefore run it **after** the session has been handed to the UI via `boot`,
-/// never before: the history sidebar lives off the store that `boot` carries, so anything scheduled
-/// ahead of `boot` silently blanks it for as long as it blocks.
 async fn restore_plugins(ui: &mut GuiUi, rt: &Arc<Runtime>) {
     // Success stays silent — startup should not flush a screenful of "plugin xxx restored" into the
     // activity stream, pushing the information you really need out of view. Only failure speaks up.
@@ -1039,8 +800,6 @@ async fn restore_plugins(ui: &mut GuiUi, rt: &Arc<Runtime>) {
         }
     }
     // Plugins without a fence must speak up too (sharing the same judgment and copy as the CLI).
-    // A fence failure is not a fatal error, but "thinking there is protection when there is none"
-    // deserves a look.
     let unfenced = aox::sandbox::unfenced(rt).await;
     if !unfenced.is_empty() {
         ui.emit(AgentEvent::Warn(aox::tf!(
@@ -1051,10 +810,6 @@ async fn restore_plugins(ui: &mut GuiUi, rt: &Arc<Runtime>) {
 }
 
 /// Tell the main thread "which conversation this session is writing".
-///
-/// Called once after each turn: the first time the id appears, the main thread adds the new
-/// conversation to the sidebar; repeated notifications with the same id then tell it "this one's content
-/// changed, the count should refresh".
 fn send_history_current(tx: &mpsc::UnboundedSender<FromAgent>, agent: &Agent) {
     let _ = tx.send(FromAgent::HistoryCurrent(agent.history_id().map(str::to_string)));
 }
@@ -1068,19 +823,7 @@ enum Wait {
     Configured,
 }
 
-/// The "startup is thwarted" loop: keep answering the channel until either the window closes or the
-/// Model tab supplies a configuration that works.
-///
-/// Two very different states land here, and both must stay *usable* rather than exit:
-///
-/// * the config could not be read at all (`rt == None`) — the settings panel is still on screen, but
-///   there is no `Runtime` to apply anything to, so a save only writes the file and the caller starts
-///   over;
-/// * the config reads but has no usable `[provider]` (`rt == Some`) — the save is applied in place.
-///
-/// It must also answer switch-session requests: after sending one the main thread greys out the list
-/// and waits for a receipt to unlock it, while those messages are doomed to do nothing in this state —
-/// silence would freeze the sidebar forever.
+/// The "startup is thwarted" loop: keep answering the channel until either the window closes or the Model tab...
 async fn idle_until_shutdown(
     rx: &mut mpsc::UnboundedReceiver<ToAgent>,
     tx: &mpsc::UnboundedSender<FromAgent>,
@@ -1089,10 +832,8 @@ async fn idle_until_shutdown(
     while let Some(msg) = rx.recv().await {
         match msg {
             ToAgent::Shutdown => return Wait::Shutdown,
-            // ── the repair path ──
-            //
-            // This is why the state exists at all: a fresh install opens with nothing configured, and
-            // filling the panel in has to *work* rather than tell the user to restart.
+            // ── the repair path ──.
+            // This is why the state exists at all: a fresh install opens with nothing configured, and filling the panel...
             ToAgent::ApplyProvider(edit) => {
                 match rt {
                     Some(rt) => {
@@ -1165,26 +906,20 @@ async fn idle_until_shutdown(
             // Recycling needs no Runtime at all (it is a shell call on a path), so unlike the arms
             // around it this one really does the work.
             ToAgent::Recycle(paths) => recycle_all(paths, tx).await,
-            // A rename does need the storage layer, and the storage layer only exists inside
-            // `Runtime` — which never started in this stretch. Say so rather than let the menu row
-            // look like it did nothing.
+            // A rename does need the storage layer, and the storage layer only exists inside `Runtime` — which never started...
             ToAgent::RenameConversation { .. } => {
                 let _ = tx.send(FromAgent::Event(AgentEvent::Warn(
                     aox::i18n::t("model not ready; the conversation cannot be renamed right now.")
                         .into(),
                 )));
             }
-            // The workplace button is also dead here — `Workplace` lives in `Runtime`, and the Runtime
-            // never started. Say something rather than let the button look "unresponsive when clicked"
-            // (the same reason as the `Input` arm above).
+            // The workplace button is also dead here — `Workplace` lives in `Runtime`, and the Runtime never started.
             ToAgent::Workplace(_) => {
                 let _ = tx.send(FromAgent::Event(AgentEvent::Warn(
                     aox::i18n::t("model not ready; the workplace cannot be switched right now.").into(),
                 )));
             }
-            // Recovery reads the workspace store, and the store lives inside the Runtime that never
-            // started. Answer with a view rather than silence: the panel would otherwise sit on its
-            // skeleton with no way to learn why.
+            // Recovery reads the workspace store, and the store lives inside the Runtime that never started.
             ToAgent::Recovery(_) => {
                 let _ = tx.send(FromAgent::Recovery(Box::new(RecoveryView::Notice {
                     text: aox::i18n::t("The model is not ready, so the recovery store cannot be read yet.").into(),
@@ -1214,14 +949,6 @@ fn blank_provider_config() -> aox::config::ProviderConfig {
 }
 
 /// Take the next user instruction, handling control messages like "switch session" along the way.
-///
-/// This does not go through `Ui::read_user_input()`: that method can only return user text, whereas
-/// switching a session must **modify `agent` in place**, which only this thread can reach. The channel is
-/// still the same one, so the order naturally matches the user's order of operations.
-///
-/// The return value carries the attachment paths: attachments must be assembled into the message **on the
-/// Agent thread** (`Message::user_with_files`); the UI side must not build it itself — otherwise the
-/// "in memory but not in the history file" divergence comes right back.
 async fn next_command(
     ui: &mut GuiUi,
     agent: &mut Agent,
@@ -1240,32 +967,19 @@ async fn next_command(
                 // The ledger is sent right after Switched: on receiving Switched the main thread first
                 // clears the UI ledger, so a reversed order would wipe the just-restored data by itself.
                 let _ = tx.send(FromAgent::UsageLog(agent.usage_log().to_vec()));
-                // The workplace must be pushed along too: each conversation has its own tier and root
-                // (`resume` has already restored the persisted one). Without it the button would keep
-                // showing **the previous conversation's** tier — which is the "open an old conversation,
-                // the workplace is still the last one" that was hit on a real run.
+                // The workplace must be pushed along too: each conversation has its own tier and root (`resume` has already...
                 sync_workplace(&tx, agent.rt());
             }
             Some(ToAgent::NewConversation) => {
                 agent.new_conversation();
                 let _ = tx.send(FromAgent::Switched { opened: None, error: None });
                 let _ = tx.send(FromAgent::UsageLog(Vec::new()));
-                // A new conversation always returns to the "default" tier (`new_conversation` already
-                // switched it); the UI must catch up immediately, or the button keeps showing the last
-                // conversation's tier.
+                // A new conversation always returns to the "default" tier (`new_conversation` already switched it); the UI must...
                 sync_workplace(&tx, agent.rt());
             }
-            // Activity-stream persistence: done in place, without entering the next turn — the order is
-            // exactly the user's order of operations, so "this turn's timeline" always lands in this
-            // turn's conversation file.
+            // Activity-stream persistence: done in place, without entering the next turn — the order is exactly the user's...
             Some(ToAgent::Act(acts)) => agent.append_acts(&acts),
-            // Renaming a conversation: one appended row, written in place, without entering the next
-            // turn — nothing about the model's context changes, so there is nothing to re-read.
-            //
-            // The receipt is `HistoryCurrent`: its meaning is already "a conversation file changed on
-            // disk, rescan the directory", which is exactly what the list needs to show the new name
-            // (and it is the only thing that refreshes the panel). A failed rename has to speak up —
-            // the user typed a name and would otherwise be left thinking it took.
+            // Renaming a conversation: one appended row, written in place, without entering the next turn — nothing about...
             Some(ToAgent::RenameConversation { id, title }) => {
                 match agent.rename_conversation(&id, title.as_deref()) {
                     Ok(()) => send_history_current(tx, agent),
@@ -1275,47 +989,29 @@ async fn next_command(
                     ))),
                 }
             }
-            // Deleting a conversation from the history list. Nothing about it needs the Agent: the
-            // file is moved to the recycle bin and the count comes back as an `AgentEvent`, exactly
-            // as if a tool had deleted it.
+            // Deleting a conversation from the history list.
             Some(ToAgent::Recycle(paths)) => recycle_all(paths, tx).await,
-            // ── the Model tab, while the session is running ──
-            //
-            // Deliberately **in place**: no rebuild of the Runtime, no new Agent. Changing the model
-            // mid-conversation keeps the messages, the history file and the token ledger exactly where
-            // they are; only the next request goes to a different model. Rebuilding here would look
-            // identical on screen and silently drop the conversation.
+            // ── the Model tab, while the session is running ──.
             Some(ToAgent::ApplyProvider(edit)) => {
                 {
                     let rt = agent.rt();
                     apply_provider(rt, &edit, tx);
                 }
-                // The folded-history cache was computed against the **old** budget. Keeping it would
-                // mean one round still being requested at the previous window's size, which is either a
-                // 400 (the window shrank) or a needless re-fold (it grew). Dropping it costs one
-                // recomputation and removes the only way the two can disagree.
+                // The folded-history cache was computed against the old budget.
                 agent.set_view_cache(None);
             }
             Some(ToAgent::ScanModels { base_url, api_key }) => scan_models(tx, base_url, api_key).await,
             Some(ToAgent::TestModel { base_url, api_key, model }) => {
                 test_model(tx, base_url, api_key, model).await
             }
-            // The first screen's line. Both sources are fire-and-forget: the panel is drawn by the
-            // other thread, and an answer that arrives late is simply used next time (see
-            // `gui::welcome`, rule 1).
+            // The first screen's line. Both sources are fire-and-forget: the panel is drawn by the other thread...
             Some(ToAgent::HelloFromApi(url)) => spawn_hello_api(tx, url),
             Some(ToAgent::HelloFromModel) => spawn_hello_model(tx, agent.rt().provider.llm()),
-            // Workplace button: switch tier / query state. Done in place — `Workplace` lives inside
-            // `Runtime`, and this thread is the only place that can reach the Agent (and through it its
-            // `rt`). It does not enter the next turn: a tier switch is a pure host action, unrelated to
-            // the model conversation.
+            // Workplace button: switch tier / query state.
             Some(ToAgent::Workplace(mode)) => {
                 let rt = agent.rt().clone();
                 set_workplace(ui, &rt, mode);
-                // A tier switch must also be recorded in **this conversation's** archive: the workplace
-                // follows the conversation, and without recording it, opening this conversation next time
-                // would fall back to the default ground. `persist_workplace` compares for itself and does
-                // not write when nothing changed, so neither failure nor no-change leaves junk lines.
+                // A tier switch must also be recorded in this conversation's archive: the workplace follows the conversation...
                 agent.persist_workplace();
             }
             // The recovery panel. Nothing here enters the model conversation: like the workplace
@@ -1326,7 +1022,7 @@ async fn next_command(
     }
 }
 
-/// Start it on a dedicated thread: build the tokio runtime → load the runtime → run the driver loop.
+/// Start it on a dedicated thread: build the tokio runtime → load the runtime → run the driver loop
 pub fn spawn(
     tx: mpsc::UnboundedSender<FromAgent>,
     rx: mpsc::UnboundedReceiver<ToAgent>,
@@ -1370,21 +1066,7 @@ async fn boot_and_run(
         ))));
     }
 
-    // ── a fresh install has no config.toml ────────────────────────────────────────────────
-    //
-    // The installer ships `config.example.toml` only, on purpose: no personal key is ever baked into
-    // an installer. The CLI has always written the template on its first run; the GUI never did, so a
-    // fresh install opened onto "config file not found" and the only way forward was to leave the
-    // program and edit a file by hand — exactly the friction the Model tab exists to remove. Now the
-    // template lands first (documentation included), the panel opens on top of it, and the two things
-    // that were missing get filled in there.
-    // "Nothing has been chosen yet" rather than "there is no config.toml": since the model
-    // configuration moved into `.aox/models.json`, a fresh install can perfectly well have a config
-    // file and still need the panel (and the other way round).
-    //
-    // `mut` because it is **spent** by the first `boot` below: the "not configured" branch announces
-    // itself, and the `boot` that follows a successful save must not announce it a second time (see
-    // the reset after that first boot).
+    // ── a fresh install has no config.toml ────────────────────────────────────────────────.
     let mut first_run = aox::modelbook::Book::load(&root).active.is_none();
     if first_run {
         match std::fs::write(&config_path, aox::config::TEMPLATE) {
@@ -1414,9 +1096,7 @@ async fn boot_and_run(
     ) {
         Ok(r) => r,
         Err(e) => {
-            // Config missing/invalid: the GUI still opens, showing guidance, and the input area is
-            // disabled. The history-reading backend uses the default one (the config is not read yet),
-            // so the sidebar doesn't go empty along with it.
+            // Config missing/invalid: the GUI still opens, showing guidance, and the input area is disabled.
             let store = aox::store::default_store(&root, 0);
             // The store is one directory since 2026-11-05, so a broken config can no longer cost the
             // user their conversations: there is nothing to "feed" it any more.
@@ -1443,11 +1123,7 @@ async fn boot_and_run(
                 paths,
                 false,
             );
-            // Config unreadable, and there is **no Runtime to apply anything to**. The panel is still
-            // on screen (a save lands in `config.toml` and reports success or failure through
-            // `ModelNotice`), but nothing can be applied in this process: the layers that failed are
-            // read once, at startup. So the window stays open rather than vanishing — the user has to
-            // see the reason and the file it points at.
+            // Config unreadable, and there is no Runtime to apply anything to.
             let _ = idle_until_shutdown(&mut rx, &tx, None).await;
             return Ok(());
         }
@@ -1460,15 +1136,10 @@ async fn boot_and_run(
         rt.register(t).await?;
     }
     // Host file tools (the workspace boundary, see src/workplace.rs and src/tool/hostfs.rs).
-    // The same group and the same implementation registered as the CLI; with the default
-    // `[workplace] mode = "full"` they behave no differently from ordinary read/write tools — the
-    // boundary takes effect only after you tighten the tier.
     for t in aox::tool::hostfs::host_file_tools() {
         rt.register(t).await?;
     }
-    // Interaction tools (`ask_user`): let the model hand a "multiple-choice question" to the UI, rather
-    // than writing it in the body and waiting for the user to type. Registering them here matters because
-    // it **makes the model see them in the tools list**.
+    // Interaction tools (`ask_user`): let the model hand a "multiple-choice question" to the UI, rather than writing...
     for t in aox::tool::ask::ask_tools() {
         rt.register(t).await?;
     }
@@ -1482,9 +1153,7 @@ async fn boot_and_run(
     for t in aox::tool::task::task_tools() {
         rt.register(t).await?;
     }
-    // Verification (`aox::tool::verify`). Same story: visible to the model, executed by the agent loop.
-    // The built-in command line (`aox::tool::shell`): same tool, same boundary, same executor as in
-    // the CLI. Registering it here is what makes "the GUI has no shell" stop being true.
+    // Verification (`aox::tool::verify`).
     if rt.config.shell.enabled {
         for t in aox::tool::shell::shell_tools(&rt.config.shell) {
             rt.register(t).await?;
@@ -1511,22 +1180,13 @@ async fn boot_and_run(
 
     let mut ui = GuiUi { tx: tx.clone(), rx };
 
-    // Runtime status: one line to the "About" window, one missing-interpreter hint into the activity
-    // stream (the same copy as the CLI). So the user knows immediately in the GUI that "this machine
-    // lacks python, click here to install", rather than discovering it only when the model fails to
-    // build a plugin.
+    // Runtime status: one line to the "About" window, one missing-interpreter hint into the activity stream (the...
     send_runtime_status(&tx, &rt);
     if let Some(hint) = aox::runtimes::missing_hint(&rt.root, &rt.config.runtimes) {
         ui.emit(AgentEvent::Warn(hint));
     }
 
-    // ── model not configured yet: stay up, and wait for the Model tab ─────────────────────
-    //
-    // This used to be a dead end: report "LLM not ready", disable the input box, and idle until the
-    // window closed — with the fix being "edit config.toml and restart". On a fresh install that was
-    // the *first* thing a user met. The window is now fully usable in this state (history, plugins,
-    // settings), and a save from the Model tab comes back through the same channel, is applied here,
-    // and the session simply carries on into the code below.
+    // ── model not configured yet: stay up, and wait for the Model tab ─────────────────────.
     let mut plugins_restored = false;
     if let Some(reason) = rt.provider.error() {
         ui.emit(AgentEvent::Error(aox::tf!("LLM not ready: {}", reason)));
@@ -1547,9 +1207,7 @@ async fn boot_and_run(
             paths,
             first_run,
         );
-        // The "add your model" prompt has been handed to the UI. Spending the flag here is what
-        // stops the *second* `boot` (below, after the save makes the provider usable) from asking
-        // again — the "saved it, and now there is another one" report of 2026-10-28.
+        // The "add your model" prompt has been handed to the UI. Spending the flag here is what stops the *second* `boot`...
         first_run = false;
         // Even in the "not ready" state, fill the plugin panel with what is on disk.
         restore_plugins(&mut ui, &rt).await;
@@ -1557,9 +1215,7 @@ async fn boot_and_run(
         // Still in "not ready" state, but send the workplace state anyway: if the button is visible, at least it shows the real tier.
         sync_workplace(&tx, &rt);
         push_provider(&tx, &rt);
-        // One iteration is the normal case; the loop is here so that a save which fails to make the
-        // provider usable (wrong key, unreachable host) leaves the window waiting instead of starting a
-        // session that cannot answer.
+        // One iteration is the normal case; the loop is here so that a save which fails to make the provider usable...
         loop {
             match idle_until_shutdown(&mut ui.rx, &tx, Some(&rt)).await {
                 Wait::Shutdown => return Ok(()),
@@ -1576,9 +1232,7 @@ async fn boot_and_run(
     // each in the GUI and CLI (see src/prompt.rs).
     let mut agent = Agent::new(rt.clone());
     let paths = boot_paths(&root, &config_path, &plugins_dir, &rt.store, &rt.config.shell);
-    // Hand the session to the UI **before** touching plugins. The history sidebar reads off the store
-    // that `boot` carries, so restoring plugins first used to blank it for the whole wait — up to
-    // `INIT_TIMEOUT` (20 s) per cold-or-broken plugin. This order is the point of the fix.
+    // Hand the session to the UI before touching plugins.
     boot(
         &tx,
         &config_path,
@@ -1594,12 +1248,7 @@ async fn boot_and_run(
     );
     push_provider(&tx, &rt);
     send_history_current(&tx, &agent);
-    // Now restore persisted plugins (the same path as the CLI). It is the one startup step that can
-    // block, so it runs here — after the UI already has the session — and finishes before the driver
-    // loop below, so the very first turn still sees every plugin tool.
-    //
-    // Skipped when the "not configured yet" branch already did it: `load_all` starts every plugin
-    // process, and running it twice would start each one twice for no reason.
+    // Now restore persisted plugins (the same path as the CLI).
     if !plugins_restored {
         restore_plugins(&mut ui, &rt).await;
     }
@@ -1607,9 +1256,7 @@ async fn boot_and_run(
     // item to tick in the three-way list depend on it.
     sync_workplace(&tx, &rt);
 
-    // Broadcast plugin snapshots periodically: every new plugin the model creates becomes visible in the
-    // right panel immediately. (Tool names are no longer broadcast — the top-bar tool chips were removed,
-    // so there is no consumer.)
+    // Broadcast plugin snapshots periodically: every new plugin the model creates becomes visible in the right panel...
     let snap_tx = tx.clone();
     let snap_rt = rt.clone();
     let snap_task = tokio::spawn(async move {
@@ -1627,7 +1274,7 @@ async fn boot_and_run(
         }
     });
 
-    // ---- Driver loop: one-to-one with the CLI's REPL
+    // Driver loop: one-to-one with the CLI's REPL
     loop {
         let Some((input, files)) = next_command(&mut ui, &mut agent, &tx).await? else { break };
         let line = input.trim().to_string();
@@ -1664,14 +1311,7 @@ async fn boot_and_run(
                 let _ = ui.tx.send(FromAgent::Fatal(format!("{e:#}")));
             }
             Outcome::Aborted => {
-                // Roll back to the last **legal** boundary, not to the start of the turn: the
-                // user's instruction and every completed step stay in the model's context, and only
-                // the in-flight step is dropped. Exactly the same call as the CLI's — the
-                // granularity decision lives in `Agent::interrupt_rollback_point`, so the two front
-                // ends cannot drift apart.
-                //
-                // The attachment tray needs nothing here: the GUI clears it at send time
-                // (`app.rs`), which is already consistent with "this message was delivered".
+                // Roll back to the last legal boundary, not to the start of the turn: the user's instruction and every completed...
                 agent.rollback_interrupted_turn(mark);
                 // The future was dropped, so `run_turn` cannot close the recovery transaction.
                 let rec = agent.finish_recovery_turn(aox::recovery::model::TurnStatus::Interrupted);
@@ -1687,9 +1327,7 @@ async fn boot_and_run(
         // Sync "current conversation" once after each turn: the first turn creates the file (a new entry
         // appears in the sidebar), and repeated notifications with the same id make the sidebar refresh the count.
         send_history_current(&tx, &agent);
-        // Sync the workplace along the way: the `default` tier's root is created **on the first message**,
-        // so under the "default" tier the directory behind the button has a value only at the end of this
-        // turn — without resending, the UI would keep showing "root: not decided yet".
+        // Sync the workplace along the way: the `default` tier's root is created on the first message, so under...
         sync_workplace(&tx, &rt);
     }
 
@@ -1739,9 +1377,7 @@ mod tests {
         }
     }
 
-    /// The panel never shows the stored key, so an untouched key field must mean "keep using the
-    /// environment variable" — dropping it would silently break every install that keeps its key in
-    /// the environment, on the first press of any control.
+    /// The panel never shows the stored key, so an untouched key field must mean "keep using the environment variable"...
     #[test]
     fn an_edit_without_a_key_keeps_the_environment_variable() {
         let c = edit_to_config(&edit(None), &prev());
@@ -1761,10 +1397,7 @@ mod tests {
         assert!(c.api_key_env.is_none());
     }
 
-    /// Streaming used to be a config-only preference that had to be carried over by hand. It is a
-    /// switch in the dialog now (a per-model field), so the edit **replaces** it — in both directions,
-    /// which is what makes "turn it off for this gateway" survivable: the setting belongs to the record,
-    /// not to the session.
+    /// Streaming used to be a config-only preference that had to be carried over by hand.
     #[test]
     fn the_streaming_switch_comes_from_the_edit() {
         let mut e = edit(None);

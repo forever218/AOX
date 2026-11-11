@@ -1,32 +1,6 @@
 //! `task_state` — the checkpoint entry point for long-horizon tasks.
-//!
-//! # Why a tool, and not something the host generates on its own
-//!
-//! The columns that carry the value — goal, constraints, acceptance criteria, why a decision was
-//! made — are **known only to the model**: the user's intent lives in the conversation, but "this
-//! constraint must not be broken" is the model's reading of the context. All the host can know by
-//! itself is "which files were touched" (from real tool results), so that one column is written by
-//! the host alone; every other column has to be submitted explicitly by the model.
-//!
-//! The host also has to audit what the model says about itself: `modified_files` — and the
-//! verification status that lands with the verification work — cannot be set from here; passing
-//! them is an error. With one self-reported column, a checkpoint degrades from "the facts" to "the
-//! facts as the model believes them", and that is the most dangerous thing at restore time.
-//!
-//! # Why ordinary Q&A should never touch it
-//!
-//! A single question, or a single-file edit, has zero restore value; writing a line of state for it
-//! only buys one more tool round trip and one more row on disk. So the tool's **own description**
-//! says "only for multi-stage / multi-file / interruptible or compacted work", and the host never
-//! creates a checkpoint by itself.
-//!
-//! # Execution path
-//!
-//! This tool cannot go through `Runtime::execute`: the checkpoint hangs off `Agent` (it belongs to
-//! **this conversation**, not to the tool table). So, like `ask_user`, it is intercepted by
-//! `Agent::authorize_and_execute` **after authorization** (see `agent::Agent::task_tool`).
-//! Registering it in the tool table exists purely so "the model can see it in its tool list" —
-//! nobody calls a tool they cannot see.
+//! # Why a tool, and not something the host generates on its own.
+//! The columns that carry the value — goal, constraints, acceptance criteria, why a decision was made — are known...
 
 use std::sync::Arc;
 
@@ -40,7 +14,7 @@ use crate::runtime::Runtime;
 /// side can drift onto its own literal.
 pub const TASK_TOOL: &str = "task_state";
 
-/// The host's task-checkpoint tool.
+/// The host's task-checkpoint tool
 pub fn task_tools() -> Vec<Arc<dyn Tool>> {
     vec![Arc::new(TaskStateTool)]
 }
@@ -53,10 +27,7 @@ impl Tool for TaskStateTool {
         TASK_TOOL
     }
     fn kind(&self) -> ToolKind {
-        // `Host`: it changes nothing outside this conversation (no paths, no files), so it belongs to
-        // the "let the host do a job" tier rather than the "change the host itself" one. Concretely it
-        // follows `[auth] plugin_tools` (auto by default) — a checkpoint write must never pop an
-        // authorization dialog, or the model learns to skip checkpoints.
+        // `Host`: it changes nothing outside this conversation (no paths, no files), so it belongs to the "let the host...
         ToolKind::Host
     }
     fn description(&self) -> &str {
@@ -105,8 +76,6 @@ impl Tool for TaskStateTool {
 
     async fn call(&self, _args: Value, _rt: &Arc<Runtime>) -> ToolOutput {
         // Reached only when something bypassed the agent loop (`Runtime::execute` called directly).
-        // There is no conversation to attach a checkpoint to in that case, and silently succeeding
-        // would be the worst answer: the caller would believe a checkpoint exists.
         ToolOutput::err(crate::i18n::t(
             "task_state is executed by the agent loop, not by the tool registry: a checkpoint belongs to a conversation, and this path has none.",
         ))

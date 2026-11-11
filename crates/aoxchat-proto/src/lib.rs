@@ -1,29 +1,6 @@
-//! AOX Remote wire protocol.
-//!
-//! **This crate is the single source of truth.** The server (`server/`) and the host bridge
-//! (AOX's `src/remote/`) both depend on it, so a field cannot be renamed on one side only.
-//!
-//! # Versioning rules
-//!
-//! 1. `PROTO_VERSION` bumps **only** on a breaking change (removed/renamed field, changed meaning).
-//! 2. Adding an optional field is **not** breaking: every payload struct tolerates unknown keys on
-//!    read (serde ignores them by default) and skips `None` on write, so an old peer simply does
-//!    not see it.
-//! 3. The server rejects a `hello` whose `proto` it cannot speak, with `error.proto_mismatch`.
-//!    It never guesses.
-//!
-//! # Envelope
-//!
-//! Every frame is one JSON object: the envelope (`v` / `id` / `ts` / `room`) plus the body
-//! flattened in, tagged by `type`:
-//!
-//! ```json
-//! {"v":1,"id":"01J...","ts":1730000000000,"room":"r_1",
-//!  "type":"msg_send","client_msg_id":"c_1","body":{"kind":"text","text":"构建 release"}}
-//! ```
-//!
-//! `room` lives on the envelope rather than inside each body: half the frames are about a room,
-//! and repeating the field in ten structs is how two of them end up disagreeing.
+//! AOX Remote wire protocol: the single source of truth shared by the server and the host bridge.
+//! PROTO_VERSION bumps only on breaking changes; optional fields are safe (unknown keys ignored, None skipped).
+//! Every frame is one JSON object: envelope (v/id/ts/room) plus a type-tagged body; room lives on the envelope.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -53,9 +30,7 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Envelope
-// ─────────────────────────────────────────────────────────────────────────────
+// Envelope.
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Frame {
@@ -87,7 +62,7 @@ impl Frame {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Body {
-    // ── client → server ──────────────────────────────────────────────────
+    // client → server
     Hello(Hello),
     Ping(Ping),
     MsgSend(MsgSend),
@@ -102,20 +77,16 @@ pub enum Body {
     AgentOnline(AgentOnline),
     /// The host answers a dispatched task: accepted, or refused (offline / quota / unknown room).
     TaskAccept(TaskAccept),
-    /// The host asks its owner for permission to run **someone else's** instruction. Delivered only
-    /// to the owner's phones — sending it back to the asking host would leave it waiting for an
-    /// answer only it could give.
+    /// The host asks its owner for permission to run someone else's instruction.
     CallRequest(CallRequest),
-    /// 宿主宣告"我开始/结束干活了"。服务端据此把该 Agent 标成占用中，并向它所在的房间广播
-    /// `Presence`（`status` 为 `busy` / `idle`）。
+    /// Host announces work start/stop; the server marks the Agent busy or idle and broadcasts Presence to its room.
     AgentBusy(AgentBusy),
 
-    // ── server → client ──────────────────────────────────────────────────
+    // server → client
     HelloOk(HelloOk),
     Pong(Pong),
     MsgNew(MsgNew),
-    /// 房间待办的最新**全量**列表。增删改都发整份：一个群的待办不会多到需要 diff，
-    /// 而三种操作合并成一条帧，客户端就不必维护命令重放的顺序。
+    /// Full room todo list sent on each change; one frame merges add/edit/delete, so clients need no replay order.
     Todos(Todos),
     /// Transient progress — **never persisted**, safe to drop when a client is slow.
     TaskUpdate(TaskUpdate),
@@ -132,9 +103,7 @@ pub enum Body {
     Error(FrameError),
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Handshake
-// ─────────────────────────────────────────────────────────────────────────────
+// Handshake.
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hello {
@@ -147,7 +116,7 @@ pub struct Hello {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Auth {
-    /// Opaque device token. Never a JWT — see the design doc D5.
+    /// Opaque device token. Never a JWT — see the design doc D5
     pub token: String,
     pub device_id: String,
     pub proto: u32,
@@ -179,19 +148,14 @@ pub struct HelloOk {
     pub proto: u32,
 }
 
-/// Heartbeat payload. **Deliberately empty**: the envelope already carries `ts`, and a `ts` here
-/// would be flattened next to it — producing `{"ts":…,"ts":…}` and a `duplicate field` error on
-/// the receiving side. (Found the hard way: the first `aox remote serve` connection killed itself
-/// on its own first ping.) Use `Frame::ts`.
+/// Heartbeat payload. Deliberately empty: the envelope already carries `ts`, and a `ts` here would be flattened...
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Ping {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pong {}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Core entities
-// ─────────────────────────────────────────────────────────────────────────────
+// Core entities.
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct User {
@@ -210,50 +174,40 @@ pub struct Room {
     pub policy: RoomPolicy,
     pub owner_id: String,
     pub last_seq: i64,
-    /// 群头像，房主可改。**相对路径**（`/api/avatars/<token>.jpg`），客户端自己拼上服务端
-    /// 地址——服务端不知道自己对外叫什么域名，写死绝对地址等于把换域名变成数据迁移。
+    /// Owner-editable room avatar as a relative path; clients prepend the host, avoiding domain-change migrations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
     #[serde(default)]
     pub members: Vec<MemberView>,
     #[serde(default)]
     pub agents: Vec<AgentView>,
-    /// 这个房间最多能占多少 MB 文件（图片与产物），0 = 不限。房主可改。
-    ///
-    /// 服务端按它挡上传，宿主按它清自己的 inbox 副本——两边共用一个数字，否则"房间上限"
-    /// 只是服务端的账，手机那头照样把磁盘吃满。旧服务端不带这个字段，缺省按 200 理解，
-    /// 与改动前宿主写死的上限一致。
+    /// Room file quota in MB (0 = unlimited); server blocks uploads, host prunes inbox; old servers default to 200.
     #[serde(default = "default_storage_mb")]
     pub max_storage_mb: u32,
-    /// 只保留最近多少条消息，更早的在写入时删掉，0 = 全留。房主可改。
+    /// Keep only the most recent N messages, deleting older ones on write; 0 keeps all. Owner-editable.
     #[serde(default)]
     pub keep_messages: i64,
-    /// 房间里的文件现在占了服务端多少字节。上限没有用量就是猜谜：给房主看的进度。
+    /// Bytes the room's files currently occupy on the server; a quota needs usage to show the owner a progress bar.
     #[serde(default)]
     pub storage_used: u64,
-    /// 最后一条消息的摘要，会话列表那一行要用。没有消息的房间是 `None`。
-    ///
-    /// 只在这里带一句话预览，不是把整条消息塞进房间对象：列表页每行只需要"谁说了什么、什么时候"，
-    /// 真正的消息仍按 seq 拉。旧服务端不带这个字段，缺省为 None（列表退回只显示成员数）。
+    /// Last-message preview for the conversation list; full messages fetch by seq, and old servers default to None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_msg: Option<LastMsg>,
 }
 
-/// 会话列表里"最后一条"的摘要。
+/// The one-line preview of the last message shown in the conversation list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LastMsg {
     pub seq: i64,
     pub sender_name: String,
-    /// 消息种类（`text` / `media` / `artifact` / `task` / `system` / `approval`），
-    /// 和 [`MessageBody`] 的 tag 一致。
+    /// Message kind (text/media/artifact/task/system/approval), matching the tag of MessageBody.
     pub kind: String,
-    /// **已经截断过**的一句话。截断放在服务端：一条 8 KB 的回复不该跟着每次列表请求跑一遍。
+    /// An already-truncated one-liner, truncated server-side so an 8 KB reply is not sent with every list request.
     pub preview: String,
     pub created_at: i64,
 }
 
-/// 旧服务端不发这个字段。缺省值必须是改动前写死的那一个，否则升级瞬间所有房间"变成不限"，
-/// 或者反过来"变成 0 兆谁都传不了"。
+/// Old servers omit it; the default must match the old value or rooms silently flip to unlimited/zero.
 fn default_storage_mb() -> u32 {
     200
 }
@@ -269,9 +223,9 @@ pub enum RoomKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoomPolicy {
-    /// Read-only:问答与读文件, nothing that writes.
+    /// Read-only mode: answering questions and reading files, with nothing that writes.
     Readonly,
-    /// Default: every write/command needs an approval.
+    /// Default: every write/command needs an approval
     Ask,
     /// Auto-run, still bounded by workplace + tool allowlist + quota.
     Trusted,
@@ -285,7 +239,7 @@ pub struct MemberView {
     pub role: Role,
     #[serde(default)]
     pub online: bool,
-    /// 头像相对路径。没有设置就是 None，客户端退回"首字方块"。
+    /// Relative avatar path; None when unset, so clients fall back to a first-letter tile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
 }
@@ -306,15 +260,14 @@ pub struct AgentView {
     pub owner_id: String,
     #[serde(default)]
     pub online: bool,
-    /// 正在执行任务。为真时别的群发来的 `@` 会排队，客户端要把它显示成"占用中"，
-    /// 否则用户只会看到"发了没反应"。
+    /// True while busy: foreign @-mentions queue and clients show busy, so a send does not look unanswered.
     #[serde(default)]
     pub busy: bool,
     #[serde(default)]
     pub share_policy: SharePolicy,
     #[serde(default)]
     pub caps: Caps,
-    /// 头像相对路径。由 Agent 的主人设置，所有房间共用一张。
+    /// Relative avatar path, set by the Agent's owner and shared across all rooms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
 }
@@ -350,9 +303,7 @@ pub struct Caps {
     pub tools: Vec<String>,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Messages
-// ─────────────────────────────────────────────────────────────────────────────
+// Messages.
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
@@ -362,42 +313,29 @@ pub struct Message {
     pub sender_id: String,
     pub sender_kind: SenderKind,
     pub sender_name: String,
-    /// 发送者的头像（相对路径）。**读的时候现查**，不是落库时冗余的那一份：刚设置完头像的人
-    /// 应该连历史消息里也立刻显示新头像，否则"我设了头像"这件事在自己的旧对话里看不出来。
-    ///
-    /// 代价是一页消息多两次 `IN` 查询（users / agents 各一次，按发送者去重），与引用的展开
-    /// 同一次批量完成，不是每条一次往返。
+    /// Sender avatar read live, not stored, so new avatars show in history; two batched IN queries per page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_avatar: Option<String>,
     pub created_at: i64,
-    /// 这条消息引用的是哪一条。**已展开**成一小段摘要，手机不用为了画引用条再拉一次原消息。
-    ///
-    /// 展开在服务端做：引用条只需要 20 个字，让客户端自己按 id 回查会变成每条引用一次往返。
+    /// Which message is quoted, pre-expanded into a short summary so the phone draws the quote bar without a refetch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<ReplyView>,
     #[serde(flatten)]
     pub body: MessageBody,
 }
 
-/// 引用条要显示的东西：谁说的、说了什么（已截断）、跳回去时按 seq 定位。
+/// What the quote bar shows: who said it, what (truncated), and the seq to jump back to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplyView {
     pub id: String,
     pub seq: i64,
     pub sender_name: String,
-    /// 已经压成一行并截断，规则和会话列表的预览是同一套（`preview_of`）。
-    ///
-    /// 加密房间的正文是 `enc:v1:<base64>`，**不能截**：base64 少一个字符就再也解不开。
-    /// 所以这种情况下这里是占位（"加密消息"），完整密文在 `sealed` 里。
+    /// One truncated line; encrypted rooms use a placeholder (base64 cannot be cut) and keep ciphertext in sealed.
     pub preview: String,
-    /// 原文是密文时的那份完整密文。客户端有房间口令就解它、自己截断；没有口令就显示
-    /// `preview` 那句占位。服务端不解密，也不需要密钥——它只负责别把密文截坏。
+    /// Full ciphertext for encrypted messages; clients with the passphrase decrypt it, and the server holds no keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealed: Option<String>,
-    /// 被引用那条消息里的产物。
-    ///
-    /// 引用条要能写出"引了哪几个"（`[3 个附件]` 这种摘要认不出东西），宿主也要照着
-    /// 这份清单去拉取——本机的 `artifacts_of()` 之外再给一份权威版本，省一次往返。
+    /// Artifacts of the quoted message, so the quote bar names them and the host fetches an authoritative list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ArtifactView>,
 }
@@ -414,8 +352,7 @@ pub enum SenderKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageBody {
     Text { text: String },
-    /// 一句话 + 最多 9 张图。图必须先经 `/artifacts?defer=1` 上传拿到 id，发送时服务端会用
-    /// 库里的数据覆盖一遍，所以客户端伪造 url / size 没有意义。
+    /// One line plus up to 9 images uploaded first; the server overwrites url/size from the DB so fakes are ignored.
     Media { text: String, artifacts: Vec<ArtifactView> },
     Task { task: TaskView },
     Artifact { artifact: ArtifactView },
@@ -427,17 +364,12 @@ pub enum MessageBody {
 pub struct MsgSend {
     /// Client-generated idempotency key. A retry after a timeout must not double-post.
     pub client_msg_id: String,
-    /// Nested on purpose (no `flatten`): the frame already has a `type`, and collapsing the
-    /// message body into the envelope would put `kind` and `type` side by side and make
-    /// "which one am I reading" a coin flip.
+    /// Nested on purpose (no `flatten`): the frame already has a `type`, and collapsing the message body...
     pub body: MessageBody,
-    /// 引用的是哪一条（消息 id）。只传 id：摘要由服务端按库里的原文展开，客户端伪造不了。
+    /// Which message is quoted (id only); the server expands the summary from stored text so clients cannot forge it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
-    /// 引用一条带多个文件的消息时，**只引这几个**（空 = 整条都引）。
-    ///
-    /// 服务端会校验这些 id 确实属于被引用的那条消息，并把结果落在消息的 payload 里
-    /// （`{"pick":[…]}`），这样所有人看到的引用条都是同一份清单，宿主也只拉这几个文件。
+    /// Only these ids are cited (empty = all); the server validates and stores the pick so clients agree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reply_artifact_ids: Vec<String>,
 }
@@ -447,10 +379,7 @@ pub struct MsgNew {
     pub msg: Message,
 }
 
-/// 群里的一条待办。
-///
-/// 没有"谁能不能改"的字段：**房间里所有人都能增删改**（这是产品决定，不是漏了权限）。
-/// `created_by` 只用来在行尾写一句"谁加的"，不参与判断。
+/// One room todo; editing is open to everyone (a product decision), and created_by only labels who added it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub id: String,
@@ -458,7 +387,7 @@ pub struct TodoItem {
     #[serde(default)]
     pub done: bool,
     pub created_by: String,
-    /// 加待办那个人的显示名。改名/退群后这里留的是当时的名字——一条记录，不是引用。
+    /// Display name of whoever added the todo, kept as a snapshot: renaming or leaving does not change it.
     #[serde(default)]
     pub created_by_name: String,
     pub created_at: i64,
@@ -466,7 +395,7 @@ pub struct TodoItem {
     pub updated_at: i64,
 }
 
-/// 一个房间的待办全量快照。
+/// A full snapshot of one room's todos.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Todos {
     pub room: String,
@@ -479,9 +408,7 @@ pub struct Typing {
     pub on: bool,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tasks
-// ─────────────────────────────────────────────────────────────────────────────
+// Tasks.
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskView {
@@ -491,11 +418,7 @@ pub struct TaskView {
     pub created_by: String,
     /// The instruction as the human wrote it, without the @mention.
     pub prompt: String,
-    /// 触发这一轮的那条消息。
-    ///
-    /// 手机要把"运行中"的呼吸条挂在那条 `@agent` 的消息下面——而 `prompt` 是剥掉 @ 之后的
-    /// 正文，靠它反查原文等于做一次模糊匹配。跑在房间里的任务可以有好几轮，匹配错一行的
-    /// 观感比没有这条动画更糟，所以宿主直接把消息 id 带下来。
+    /// The triggering message id, so the phone attaches the running bar to the exact @agent line, not a fuzzy match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_msg_id: Option<String>,
     pub status: TaskStatus,
@@ -542,7 +465,7 @@ pub struct StepView {
     pub state: StepState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ms: Option<u64>,
-    /// Lines added / removed, for an edit.
+    /// Lines added / removed, for an edit
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<(u32, u32)>,
     /// First line(s) of the result, already redacted on the host. Never the full output.
@@ -564,7 +487,7 @@ pub struct UsageView {
     pub prompt: u64,
     #[serde(default)]
     pub completion: u64,
-    /// 端点只报了总数（没拆输入/输出）时用它。0 = 没报。
+    /// Total token count used when the endpoint reports only a total, not split input/output; 0 means unreported.
     #[serde(default)]
     pub total: u64,
     #[serde(default)]
@@ -574,16 +497,10 @@ pub struct UsageView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskUpdate {
     pub task_id: String,
-    /// 这一轮是哪台机器在跑。
-    ///
-    /// 手机要把任务归到具体的 agent 名下（"点开 @text 看它在干什么"），而 `task_id` 里没有
-    /// 任何归属信息。收尾快照 `TaskView` 一直有这个字段，只有瞬态帧漏了。
-    ///
-    /// 服务端转发时会用**连接自身的 agent_id** 覆盖它——一台宿主只承载一台 Agent，服务端
-    /// 比宿主更可信；顺带让还没升级的老宿主也能被正确归类。
+    /// Machine running this round; task_id has no owner, so the server overwrites it with the connection's agent_id.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub agent_id: String,
-    /// 触发这一轮的那条消息（原帧里就是 `@agent` 那一句）。
+    /// The message that triggered this round (the original @agent line).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_msg_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -592,11 +509,10 @@ pub struct TaskUpdate {
     pub step: Option<StepView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageView>,
-    /// One line of interim narration ("先看目录结构").
+    /// One line of interim narration (e.g. looking at the directory structure first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// 这一轮从房间里取到了什么。取完就发一次，不用等整轮结束——人想马上知道"它到底看到了
-    /// 什么"，而不是在两分钟后翻历史。
+    /// What the round gathered from the room, sent once collected so users see it at once, not later in history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_digest: Option<String>,
 }
@@ -619,34 +535,28 @@ pub struct TaskAccept {
     pub reason: Option<String>,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Approvals
-// ─────────────────────────────────────────────────────────────────────────────
+// Approvals.
 
-/// 一个人请求调用另一个人的机器。由宿主发出，只投递给 Agent 的主人。
-///
-/// 与 `ApprovalView` 的区别：那个问的是"这条命令能不能跑"（任务进行中，带 task_id），
-/// 这个问的是"这个人能不能用我的机器"（任务开始前，没有 task_id）。
+/// Host request for machine access, sent only to the Agent's owner; pre-task (no task_id), unlike ApprovalView.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallRequest {
-    /// 注意字段名是 `call_id` 而不是 `id`：`Body` 会被 flatten 到信封上，而信封已经有 `id`
-    /// （帧编号）。两个 `id` 并排会让 serde 报 duplicate field —— 和 `Ping{ts}` 是同一个坑。
+    /// Named call_id, not id: Body flattens beside the envelope's id, so serde would see a duplicate field.
     pub call_id: String,
     pub agent_id: String,
     pub agent_handle: String,
     pub from_user_id: String,
     pub from_name: String,
-    /// 原始指令，宿主已截断到 200 字。不脱敏：房间里的人本来就看得见原文。
+    /// The raw command, host-truncated to 200 chars and not redacted since room members can already see the original.
     pub text: String,
     pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallDecide {
-    /// 同上：不能叫 `id`。
+    /// Same as above: this field cannot be named id either.
     pub call_id: String,
     pub allow: bool,
-    /// 在这个时长内，同房间、同一个人再 `@` 不再询问。缺省 = 只此一次。
+    /// For this duration, repeat @-mentions from the same person/room skip the prompt; default is once only.
     #[serde(default)]
     pub remember_secs: Option<u32>,
 }
@@ -694,9 +604,7 @@ pub struct ApprovalDecide {
     pub for_task: bool,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Presence / room / sync / errors
-// ─────────────────────────────────────────────────────────────────────────────
+// Presence / room / sync / errors.
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentOnline {
@@ -773,8 +681,7 @@ pub enum ErrorCode {
     /// The agent's owner has no phone connected, so a `call_request` cannot be delivered. Distinct
     /// from `not_found`: the host should tell the requester "owner is away", not retry.
     OwnerOffline,
-    /// 房间的文件总额度用完了。与 `PayloadTooLarge` 分开：那个是"这一个文件太大"，
-    /// 换个小文件就能过；这个只能等清理、调高上限或删掉旧内容，重试没有意义。
+    /// Room quota exhausted; retrying is pointless (unlike PayloadTooLarge) until space is freed or the limit raised.
     StorageFull,
     Internal,
 }
@@ -790,19 +697,17 @@ pub struct ArtifactView {
     #[serde(default)]
     pub sha256: String,
     pub url: String,
-    /// 谁传的：`user`（手机相册 / 拍照）还是 `agent`（宿主产出）。
+    /// Who uploaded it: user (phone album/camera) or agent (host-produced).
     #[serde(default)]
     pub origin: String,
-    /// 图片像素尺寸，非图片为 0。客户端靠它在图片加载完成前把位置占好，列表不会跳。
+    /// Image pixel dimensions, 0 for non-images; clients reserve the space before load so the list does not jump.
     #[serde(default)]
     pub width: u32,
     #[serde(default)]
     pub height: u32,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests — the point is that the wire shape is pinned, not that serde works
-// ─────────────────────────────────────────────────────────────────────────────
+// Tests — the point is that the wire shape is pinned, not that serde works.
 
 #[cfg(test)]
 mod tests {
@@ -820,7 +725,7 @@ mod tests {
             now_ms(),
             Body::MsgSend(MsgSend {
                 client_msg_id: "c_1".into(),
-                body: MessageBody::Text { text: "构建 release".into() },
+                body: MessageBody::Text { text: "Build the release".into() },
                 reply_to: None,
                 reply_artifact_ids: vec![],
             }),
@@ -831,7 +736,7 @@ mod tests {
         assert_eq!(v["type"], "msg_send");
         assert_eq!(v["room"], "r_1");
         assert_eq!(v["body"]["kind"], "text");
-        assert_eq!(v["body"]["text"], "构建 release");
+        assert_eq!(v["body"]["text"], "Build the release");
         assert_eq!(v["v"], PROTO_VERSION);
 
         assert_eq!(round_trip(&f), f);
@@ -867,20 +772,20 @@ mod tests {
             agent_id: "a_1".into(),
             agent_handle: "aox-alice".into(),
             created_by: "u_1".into(),
-            prompt: "做一个番茄钟".into(),
+            prompt: "Build a pomodoro timer".into(),
             source_msg_id: Some("m_9".into()),
             status: TaskStatus::Running,
             steps: vec![StepView {
                 idx: 0,
                 tool: "write_file".into(),
-                purpose: Some("写 main.dart".into()),
+                purpose: Some("write main.dart".into()),
                 state: StepState::Ok,
                 ms: Some(120),
                 diff: Some((184, 0)),
                 preview: None,
             }],
             usage: UsageView { prompt: 12_400, completion: 900, total: 0, calls: 3 },
-            context_digest: Some("20 条消息 / 1 个产物".into()),
+            context_digest: Some("20 messages / 1 artifact".into()),
             error: None,
             artifacts: vec![],
             started_at: Some(100),
@@ -905,16 +810,16 @@ mod tests {
             sender_avatar: None,
             created_at: 1,
             reply_to: None,
-            body: MessageBody::System { text: "任务已排队".into() },
+            body: MessageBody::System { text: "Task queued".into() },
         };
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["kind"], "system");
         assert_eq!(v["seq"], 7);
-        // 没引用时整个键都不出现：老客户端不用看见一个永远为 null 的字段。
+        // With no quote the whole key is omitted, so old clients never see a permanently null field.
         assert!(v.get("reply_to").is_none());
     }
 
-    /// 引用是**展开后**下发的：手机拿到就能画引用条，不用再回查一次原消息。
+    /// Quotes are delivered pre-expanded, so the phone draws the quote bar without refetching the original.
     #[test]
     fn a_reply_carries_the_quote_itself() {
         let m = Message {
@@ -930,22 +835,21 @@ mod tests {
                 id: "m_1".into(),
                 seq: 7,
                 sender_name: "aox-A".into(),
-                preview: "任务已排队".into(),
+                preview: "Task queued".into(),
                 sealed: None,
                 artifacts: vec![],
             }),
-            body: MessageBody::Text { text: "好".into() },
+            body: MessageBody::Text { text: "ok".into() },
         };
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["reply_to"]["seq"], 7);
-        assert_eq!(v["reply_to"]["preview"], "任务已排队");
-        // flatten 的 body 和 reply_to 并列，不互相盖掉。
+        assert_eq!(v["reply_to"]["preview"], "Task queued");
+        // The flattened body and reply_to sit side by side without overwriting each other.
         assert_eq!(v["kind"], "text");
-        assert_eq!(v["text"], "好");
+        assert_eq!(v["text"], "ok");
     }
 
-    /// 加密房间：密文不能被截断（base64 少一个字符就解不开），所以整份走 `sealed`，
-    /// `preview` 只放一句占位。
+    /// Encrypted ciphertext must not be cut (base64 breaks), so it goes to sealed and preview is only a placeholder.
     #[test]
     fn a_sealed_reply_keeps_the_ciphertext_whole() {
         let ct = "enc:v1:AAAABBBBCCCCDDDD";
@@ -953,15 +857,15 @@ mod tests {
             id: "m_1".into(),
             seq: 3,
             sender_name: "B".into(),
-            preview: "加密消息".into(),
+            preview: "Encrypted message".into(),
             sealed: Some(ct.into()),
             artifacts: vec![],
         };
         let v = serde_json::to_value(&sealed).unwrap();
         assert_eq!(v["sealed"], ct);
-        assert_eq!(v["preview"], "加密消息");
+        assert_eq!(v["preview"], "Encrypted message");
 
-        // 明文消息不带这个键：老客户端不用看见一个永远为 null 的字段。
+        // Plaintext messages omit this key, so old clients never see a permanently null field.
         let plain = ReplyView { sealed: None, ..sealed };
         assert!(serde_json::to_value(&plain).unwrap().get("sealed").is_none());
     }

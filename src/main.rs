@@ -1,12 +1,5 @@
-//! The command-line front end. See `src/lib.rs`: **both crate roots compile the same modules**, and
-//! this one does not depend on the library, so every item that only the GUI or the tests use is
-//! unreachable *here* — which is what `dead_code` reports, thirty times over, on a clean build.
-//!
-//! Silenced at the crate root rather than item by item, because the two targets are the same source:
-//! anything *genuinely* dead (a private function nobody calls) is still dead in the **library** build,
-//! which reports it. So the signal is not lost, it just moves to the target that can see it. The
-//! alternative — an `#[allow]` on each of the GUI-only APIs — needs a new one every time a GUI feature
-//! lands, and rots into a lie ("why is this allowed?").
+//! The command-line front end.
+//! Silenced at the crate root rather than item by item, because the two targets are the same source: anything...
 #![allow(dead_code)]
 
 mod bootstrap;
@@ -38,19 +31,12 @@ mod runtime;
 mod runtimes;
 mod sandbox;
 mod selftest;
-// The built-in command line (`shell`): the executor, the low-integrity helper entry, and the
-// integrity-level primitives. Declared here as well as in `lib.rs` because this bin compiles its
-// own copy of every module (see the trap note in TRAPS.md).
+// The built-in command line (`shell`): the executor, the low-integrity helper entry, and the integrity-level...
 mod shell;
-// The space registry's tree-building half (`group`, `Group`, the writers) exists for the GUI's
-// history panel; the CLI links the module for `Registry::load` alone (nothing here groups). Covered
-// by the crate-root `allow(dead_code)` above — the library build keeps the signal (see the note at
-// the top of `src/space.rs`).
+// The space registry's tree-building half (`group`, `Group`, the writers) exists for the GUI's history panel...
 mod space;
 mod store;
-// Task checkpoints (`src/task.rs`): the CLI has no surface that shows one, but the agent writes and
-// restores them regardless — "the task was interrupted, continue it" is exactly as true in a
-// terminal as it is in the GUI.
+// Task checkpoints (`src/task.rs`): the CLI has no surface that shows one, but the agent writes and restores them...
 mod task;
 mod tool;
 mod ui;
@@ -77,14 +63,13 @@ fn pause_before_exit() {
     let _ = std::io::stdin().read_line(&mut buf);
 }
 
-/// 当前进程的 stdin 是不是真终端。引导只对"人坐在前面"的情况开放——
-/// 在管道里问问题等于让脚本挂住。
+/// Whether stdin is a TTY; the wizard is only for a person present, since prompting a pipe would hang scripts.
 fn stdin_is_tty() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal()
 }
 
-/// 问一行，空输入取默认值。EOF 返回空串，调用方按"跳过"处理。
+/// Ask one line, empty input takes the default; EOF returns an empty string, which the caller treats as skip.
 fn ask(label: &str, default: &str) -> String {
     use std::io::Write as _;
     if default.is_empty() {
@@ -105,10 +90,7 @@ fn ask(label: &str, default: &str) -> String {
     }
 }
 
-/// 首次运行的引导：端点 / Key / 模型名 → `.aox/models.json`。
-///
-/// 写的是和 GUI「设置 → 模型」同一份文件，所以两边看到的是同一个模型；之后随时
-/// `/model` 可以换或加。Key 空 = 跳过，不拦着启动：本地命令和 `/remote` 都不需要模型。
+/// First-run wizard: endpoint/key/model to .aox/models.json (also GUI's); empty key skips, startup unblocked.
 fn first_run_setup(app_root: &Path) -> Result<()> {
     println!();
     println!(
@@ -170,13 +152,6 @@ fn first_run_setup(app_root: &Path) -> Result<()> {
 }
 
 /// Resolve the "application root".
-///
-/// Rule: from the exe's directory, walk upward to the nearest Cargo.toml; if found,
-/// use its directory (development mode), otherwise use the exe's directory
-/// (distribution mode). This way `cargo run` (exe under target/debug) and
-/// double-clicking the exe both normalize to the same root, eliminating the path
-/// confusion where target/debug/plugins/ and the source plugins/ coexist and the
-/// model sees two plugins directories in the filesystem.
 fn resolve_app_root(exe_dir: Option<&Path>) -> PathBuf {
     let Some(exe_dir) = exe_dir else {
         return PathBuf::from(".");
@@ -191,12 +166,7 @@ fn resolve_app_root(exe_dir: Option<&Path>) -> PathBuf {
     exe_dir.to_path_buf()
 }
 
-/// Migrate plugins from the old location (under the exe directory) to the canonical
-/// plugins directory, so historical plugins don't "vanish into thin air". Only fills
-/// in what's missing, never overwrites existing files; once everything migrates
-/// successfully, clean up the leftover build-artifact directory (one that contains a
-/// `target` path component), otherwise the next startup would "resurrect" plugins the
-/// user already deleted.
+/// Migrate plugins from the old location (under the exe directory) to the canonical plugins directory...
 fn migrate_plugins(from: &Path, to: &Path) {
     if from == to || !from.is_dir() {
         return;
@@ -259,9 +229,7 @@ fn is_writable_dir(dir: &Path) -> bool {
     }
 }
 
-/// Ensure the application root is writable. At runtime AOX writes config.toml and
-/// plugins/ under the root; if it's installed to a read-only location like Program
-/// Files, fall back to the user-writable %LOCALAPPDATA%\AOX.
+/// Ensure the application root is writable.
 fn ensure_writable_root(root: PathBuf) -> PathBuf {
     if is_writable_dir(&root) {
         return root;
@@ -279,10 +247,6 @@ fn ensure_writable_root(root: PathBuf) -> PathBuf {
 }
 
 /// The `/runtime` subcommand: inspect status / install a runtime.
-///
-/// Parsing and installation both live in `crate::runtimes`, with the CLI and GUI
-/// sharing one implementation and one set of wording; this only decides "where the
-/// progress and result get printed".
 async fn runtimes_command(rt: &Arc<Runtime>, line: &str) -> Result<String> {
     match runtimes::parse_cmd(line)? {
         runtimes::Cmd::Status => Ok(runtimes::status_report(&rt.root, &rt.config.runtimes)),
@@ -297,13 +261,6 @@ async fn runtimes_command(rt: &Arc<Runtime>, line: &str) -> Result<String> {
 }
 
 /// The `/history` subcommand: inspect / switch / delete historical conversations.
-///
-/// Parsing and wording both live in `crate::history`, with the CLI and GUI sharing one
-/// implementation. Data is always requested from the **storage seam**
-/// (`crate::store::Store`) — no file paths are assembled here anymore, so switching
-/// backends (e.g. one database holding all conversations) requires no change to this
-/// code. Only `open` needs the `Agent` — it swaps the context in place, the one
-/// subcommand that isn't a pure query.
 fn history_command(agent: &mut Agent, line: &str, store: &dyn store::Store) -> Result<String> {
     Ok(match history::parse_cmd(line)? {
         history::Cmd::List => history::list_text(
@@ -311,12 +268,7 @@ fn history_command(agent: &mut Agent, line: &str, store: &dyn store::Store) -> R
             store.location(),
             agent.history_id(),
         ),
-        // Say which backend is in use as well: once sqlite really exists, seeing this
-        // line tells the user whether their config change took effect, instead of
-        // having to guess.
-        //
-        // One directory holds every conversation of this install (2026-11-05): the path printed is
-        // the whole answer, with no "and also look over there".
+        // Say which backend is in use as well: once sqlite really exists, seeing this line tells the user whether...
         history::Cmd::Dir => crate::tf!(
             "{} (backend {}; every conversation of this install lives here)",
             store.location().display(),
@@ -350,8 +302,7 @@ fn history_command(agent: &mut Agent, line: &str, store: &dyn store::Store) -> R
     })
 }
 
-/// REPL 后台跑的远程服务。只有"怎么停"和"等它停"两件事——
-/// 具体协议、重连、心跳都在 `remote::serve_headless` 里，这里不重复。
+/// Handle to the REPL's background remote service (stop/wait only); details live in remote::serve_headless.
 struct RemoteJob {
     stop: Arc<std::sync::atomic::AtomicBool>,
     handle: tokio::task::JoinHandle<()>,
@@ -359,20 +310,14 @@ struct RemoteJob {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ---- hidden shell-helper entry: **must be first** ----
-    // The host spawns itself with `--aox-shell-exec` to run one command (see `src/shell/helper.rs`:
-    // lowering an integrity level only works from inside the process that owns the token). Nothing
-    // else may run before this — the helper must not touch the terminal, the config or the plugins.
+    // Hidden shell-helper entry: must be first ---- The host spawns itself with `--aox-shell-exec` to run one command...
     if let Some(code) = shell::helper::run_if_requested() {
         std::process::exit(code);
     }
     let args: Vec<String> = std::env::args().collect();
     ui::style::init(); // Probe terminal capabilities: enable ANSI colours + UTF-8
 
-    // Application root: `cargo run` locates the directory holding Cargo.toml;
-    // double-clicking the exe uses the exe directory.
-    // The plugins directory is fixed at <root>/plugins and can be overridden with
-    // `--plugins <path>`.
+    // Application root: `cargo run` locates the directory holding Cargo.toml; double-clicking the exe uses the exe...
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let app_root = ensure_writable_root(resolve_app_root(exe_dir.as_deref()));
     let plugins_dir = args
@@ -390,21 +335,14 @@ async fn main() -> Result<()> {
         return selftest::run(app_root, plugins_dir).await;
     }
 
-    // ---- Load config (anchored to the app root, so a different CWD can't make it
-    //      read/write an unexpected location; it previously used a CWD-relative path,
-    //      and the installed build would write config.toml to C:\ when double-clicked,
-    //      causing an "access denied" crash)
+    // Load config (anchored to the app root, so a different CWD can't make it read/write an unexpected location...
     let config_path = args
         .windows(2)
         .find(|w| w[0] == "--config")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(|| app_root.join("config.toml"));
 
-    // Composition manifest (phase 5): the config is composed from
-    // `profile → bundle → patch → config.toml`, and **config.toml is always the last
-    // layer**, so not one word of previously written config needs changing. When there
-    // is no aox.toml under the app root, the layer stack degrades to "just
-    // config.toml" — exactly equivalent to before.
+    // Composition manifest (phase 5): the config is composed from.
     let manifest_arg = args
         .windows(2)
         .find(|w| w[0] == "--manifest")
@@ -412,8 +350,6 @@ async fn main() -> Result<()> {
     let profile_arg = args.windows(2).find(|w| w[0] == "--profile").map(|w| w[1].clone());
 
     // `--dump-config`: just print the layer stack and the composed tree, then exit.
-    // Deliberately goes through `compose` (without parsing Config) — when the config
-    // is broken, that's exactly when this table is most needed.
     if args.iter().any(|a| a == "--dump-config") {
         match config::layer::compose(
             &app_root,
@@ -427,9 +363,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `--setup` 强制走一遍模型引导：换机器、换 key 时不必手改 JSON，也让自动化
-    // （管道喂三个值）能测到引导本身。放在最前面是因为首次运行的模板分支要用它：
-    // 非 TTY 时那个分支默认"说完就退"，但带了 --setup 就不该退。
+    // --setup forces the wizard (no JSON edits, automation-testable); placed first for the first-run branch.
     let force_setup = args.iter().any(|a| a == "--setup");
 
     let resolved = match config::layer::resolve(
@@ -447,13 +381,12 @@ async fn main() -> Result<()> {
                     Ok(()) => {
                         println!("{}", crate::tf!("No config file found; created a template for you: {}", config_path.display()));
                         if !stdin_is_tty() && !force_setup {
-                            // 脚本/管道：保持"不碰你的输入、说清楚下一步"的老行为。
+                            // For scripts and pipes, keep the old behavior: never touch the input, just state the next step clearly.
                             println!("{}", crate::i18n::t("Open it in an editor, fill in base_url and api_key (or api_key_env), then restart this program."));
                             pause_before_exit();
                             return Ok(());
                         }
-                        // 交互终端：不要让人去编辑器里改文件——模型本来就不在 config.toml 里，
-                        // 下面直接问端点 / Key / 模型名，写进 .aox/models.json。
+                        // Interactive terminal: ask endpoint/key/model into .aox/models.json, not an editor (not in config.toml).
                         println!("{}", crate::i18n::t("The template has no model section any more; let's fill one in here."));
                     }
                     Err(werr) => {
@@ -468,7 +401,7 @@ async fn main() -> Result<()> {
                 pause_before_exit();
                 return Ok(());
             }
-            // 模板刚写下去，重新解析一次（它一定是合法的；真坏了就按配置错误处理）。
+            // Re-parse right after writing the template (valid by construction; if not, handle it as a config error).
             match config::layer::resolve(
                 &app_root,
                 &config_path,
@@ -489,15 +422,7 @@ async fn main() -> Result<()> {
     let layer_summary = resolved.composed.layer_summary();
     let config = resolved.config;
 
-    // ---- First-run setup: ask for endpoint / key / model, write `.aox/models.json`
-    //
-    // The GUI pops an "add a model" dialog on first launch; the CLI used to answer "edit
-    // config.toml and restart", which post-2026-10-28 is wrong twice over: the template has no
-    // `[provider]` any more, and a double-clicked exe closes before anyone can edit anything.
-    //
-    // Triggers: no active record **and** no usable `[provider]` (old configs are left alone), or
-    // an explicit `--setup` (re-run it without hand-editing JSON). Non-interactive runs skip the
-    // questions — a piped script should be able to start the REPL without waiting on stdin.
+    // First-run setup: ask for endpoint / key / model, write `.aox/models.json`.
     if force_setup
         || (stdin_is_tty()
             && crate::modelbook::Book::load(&app_root).active_record().is_none()
@@ -506,10 +431,7 @@ async fn main() -> Result<()> {
         first_run_setup(&app_root)?;
     }
 
-    // ---- Assemble the runtime: meta tools + restore persisted plugins
-    // A wrong `[store] backend` fails here. Treated as a "config error": friendly
-    // message + wait for a keypress, the same path as a TOML parse failure above —
-    // so a user double-clicking the exe never sees only a flash.
+    // Assemble the runtime: meta tools + restore persisted plugins A wrong `store backend` fails here.
     let rt = match Runtime::new(config, app_root.clone(), plugins_dir) {
         Ok(rt) => rt,
         Err(e) => {
@@ -520,26 +442,19 @@ async fn main() -> Result<()> {
     };
     bootstrap::register_tools(&rt).await?;
 
-    // ---- `aox remote ...`: the host side of AOX Remote ----
-    // Placed **after** every tool is registered, so a remote turn has exactly the same tool set as
-    // a local one, and before the banner/REPL, which a daemon has no use for.
+    // `aox remote...`: the host side of AOX Remote ---- Placed after every tool is registered, so a remote turn has...
     if args.get(1).map(String::as_str) == Some("remote") {
         return crate::remote::cli(rt.clone(), app_root.clone(), &args[2..], true).await;
     }
 
     let mut ui = CliUi::new();
 
-    // Print the banner **before** restoring plugins. Restore is the one startup step that can
-    // block — up to `INIT_TIMEOUT` (20 s) per cold-or-broken plugin — and it stays silent on
-    // success, so running it first would leave the terminal blank for that whole wait. The REPL
-    // below does not open until after restore, so nothing is skipped by moving this up.
+    // Print the banner before restoring plugins.
     println!("\n{}", ui::style::logo());
     println!(
         "  {} {}",
         ui::style::dim(crate::i18n::t("Model")),
-        // The live provider, not `rt.config.provider`: since the model is chosen in
-        // `.aox/models.json`, the config snapshot in the runtime is only the fallback and is empty on
-        // a fresh install — which is how the banner came to print "Model" and nothing after it.
+        // The live provider, not `rt.config.provider`: since the model is chosen in `.aox/models.json`, the config...
         ui::style::bold(&rt.provider.cfg().model)
     );
     ui.emit(AgentEvent::Info(crate::tf!(
@@ -563,10 +478,7 @@ async fn main() -> Result<()> {
             ui.emit(AgentEvent::Warn(crate::tf!("plugin {} failed to load: {}", name, format!("{e:#}"))));
         }
     }
-    // Plugins whose fence isn't fitted must speak up — this is the classic "thinking
-    // there's protection when there isn't" scenario, the same class as "plugin failed
-    // to load": the user must know, but startup shouldn't be interrupted. The decision
-    // and wording come from `sandbox::unfenced` (the GUI shares the same copy).
+    // Plugins whose fence isn't fitted must speak up — this is the classic "thinking there's protection when there...
     let unfenced = sandbox::unfenced(&rt).await;
     if !unfenced.is_empty() {
         ui.emit(AgentEvent::Warn(format!(
@@ -575,10 +487,7 @@ async fn main() -> Result<()> {
         )));
     }
 
-    // The provider was built by `Runtime::new` and lives on the runtime (see `src/provider_live.rs`),
-    // so "not ready" is a state to report, not a value to construct here. A missing key is no longer
-    // fatal either: the session still runs (local commands, history, plugins), and `/model` or the
-    // GUI's Model tab can fill it in without a restart.
+    // The provider was built by `Runtime::new` and lives on the runtime (see `src/provider_live.rs`), so "not ready"...
     if let Some(reason) = rt.provider.error() {
         ui.emit(AgentEvent::Error(crate::tf!("LLM not ready: {}", reason)));
         ui.emit(AgentEvent::Info(
@@ -587,9 +496,7 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // The project rules file (RULES.md) is no longer read here: it is now the `rules`
-    // segment of the prompt, taken uniformly from `config.agent.rules_file` by
-    // `prompt::build` — the CLI and GUI share one implementation.
+    // The project rules file (RULES.md) is no longer read here: it is now the `rules` segment of the prompt, taken...
     let mut agent = Agent::new(rt.clone());
 
     // Runtime hint: only an extra line when Python is missing; when runtimes are
@@ -598,17 +505,10 @@ async fn main() -> Result<()> {
         ui.emit(AgentEvent::Warn(hint));
     }
 
-    // ---- REPL
-    //
-    // `pending` is the **command-line version of the pending-upload tray**: `/attach
-    // <path>` attaches, and the next message sends it along. It's the same path as the
-    // GUI's drag-and-drop (both go through `Attachment::probe`, then take shape via
-    // `Agent::run_turn`'s `files` argument), so the two ends agree exactly on "what can
-    // be attached, what gets blocked" — which is also why the decision was gathered
-    // into one implementation in `src/attach.rs` in the first place.
+    // REPL.
+    // `pending` is the command-line version of the pending-upload tray: `/attach <path>` attaches, and the next...
     let mut pending: Vec<PathBuf> = Vec::new();
-    // `/remote start` 起的后台服务。放在循环外：退出时要先请它自己断开，
-    // 直接 drop 掉任务等于掐线，服务端得等心跳超时才发现这台机器没了。
+    // Service from /remote start lives outside the loop so exit can ask it to disconnect; a raw drop cuts the line.
     let mut remote: Option<RemoteJob> = None;
     loop {
         let Some(line) = ui.read_user_input().await? else { break };
@@ -622,22 +522,20 @@ async fn main() -> Result<()> {
             attach_command(&mut pending, rest, &mut ui);
             continue;
         }
-        // 远程服务。子命令和 `aox remote` 完全一致，区别只有 start：在 REPL 里它是**后台**的
-        // （阻塞住就等于把终端交给守护进程，那是外部的 `aox remote serve`）。
+        // Subcommands match aox remote; only start is backgrounded in the REPL (blocking would surrender the terminal).
         if line == "/remote" || line.starts_with("/remote ") {
             let rest = line["/remote".len()..].trim();
             let args: Vec<String> = rest.split_whitespace().map(String::from).collect();
             match args.first().map(String::as_str) {
                 None | Some("status") => {
-                    // "在跑"要看任务本身：`remote` 是 Some 只说明起过，可能已经因为
-                    // 断网/被 GUI 取回控制权退出了。
+                    // Running comes from the task: Some only means started; it may have exited on network loss or GUI reclaim.
                     let running = remote.as_ref().is_some_and(|j| !j.handle.is_finished());
                     ui.emit(AgentEvent::Info(crate::remote::brief(&app_root, running).into()));
                 }
                 Some("start") | Some("serve") => {
                     if remote.as_ref().is_some_and(|j| !j.handle.is_finished()) {
                         ui.emit(AgentEvent::Info(
-                            "远程服务已经在跑了（先 /remote stop）".into(),
+                            "The remote service is already running (run /remote stop first)".into(),
                         ));
                     } else {
                         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -647,13 +545,13 @@ async fn main() -> Result<()> {
                             let stop = stop.clone();
                             async move {
                                 if let Err(e) = crate::remote::serve_headless(rt, root, stop).await {
-                                    eprintln!("{}", crate::tf!("远程服务退出：{}", format!("{e:#}")));
+                                    eprintln!("{}", crate::tf!("remote service exited: {}", format!("{e:#}")));
                                 }
                             }
                         });
                         remote = Some(RemoteJob { stop, handle });
                         ui.emit(AgentEvent::Info(
-                            "远程服务已启动（后台）。/remote stop 停止。".into(),
+                            "Remote service started in the background. /remote stop stops it.".into(),
                         ));
                     }
                 }
@@ -661,22 +559,22 @@ async fn main() -> Result<()> {
                     let live = remote.as_ref().is_some_and(|j| !j.handle.is_finished());
                     if !live {
                         remote = None;
-                        ui.emit(AgentEvent::Info("远程服务没在跑。".into()));
+                        ui.emit(AgentEvent::Info("The remote service is not running.".into()));
                     } else if let Some(job) = remote.take() {
                         job.stop.store(true, std::sync::atomic::Ordering::Relaxed);
                         ui.emit(AgentEvent::Info(
-                            "已请求停止（最多 5 秒内断开）".into(),
+                            "Stop requested (it disconnects within 5 seconds)".into(),
                         ));
                     }
                 }
-                // 配对的交互式追问要读 stdin，会和行编辑抢：在 REPL 里必须一次把参数给全。
+                // Pairing prompts read stdin and would fight the line editor, so the REPL must supply all args at once.
                 Some("pair") if args.len() < 3 => {
                     ui.emit(AgentEvent::Info(
-                        "在 REPL 里请一次给全：/remote pair <服务端地址> <配对码> [Agent 名称]"
+                        "In the REPL, give everything at once: /remote pair <server address> <pairing code> [agent name]"
                             .into(),
                     ));
                 }
-                // 其余子命令直接复用 `aox remote`：两处各写一遍只会慢慢走偏。
+                // All other subcommands reuse aox remote directly; duplicating them in two places would only drift apart.
                 Some(_) => {
                     if let Err(e) = crate::remote::cli(rt.clone(), app_root.clone(), &args, false).await {
                         ui.emit(AgentEvent::Error(format!("{e:#}")));
@@ -702,12 +600,7 @@ async fn main() -> Result<()> {
                 if slots.is_empty() {
                     ui.emit(AgentEvent::Info(crate::i18n::t("(no plugins loaded)").into()));
                 } else {
-                    // Each slot prints which of its two states it is in. **Dormant is normal**, not a
-                    // problem: the plugin's tools are registered and callable, it just has no process
-                    // yet. A live one also shows its **fence status** — `fence ✗` means that process
-                    // never entered a Job (the sandbox is off, or the outer Job doesn't allow
-                    // nesting). It isn't a fatal error, but "thinking there's protection when there
-                    // isn't" deserves a glance.
+                    // Each slot prints which of its two states it is in.
                     let mut running = 0usize;
                     let listed: Vec<String> = {
                         let mut v = Vec::new();
@@ -737,9 +630,7 @@ async fn main() -> Result<()> {
                         running,
                         mode
                     )));
-                    // Component contributions (phase 6 · 6b): only list those that **have
-                    // contributions** — old plugins that only provide tools don't reappear
-                    // here (the line above already mentioned them).
+                    // Component contributions (phase 6 · 6b): only list those that have contributions — old plugins that only provide...
                     let mut extra: Vec<String> = Vec::new();
                     for (n, h) in &slots {
                         let c = &h.contributes;
@@ -774,8 +665,6 @@ async fn main() -> Result<()> {
             }
             "/demo" => {
                 crate::ui::cli::print_demo();
-                // As a bonus demo: the waiting animation → the tool process gets
-                // collapsed → /expand expands it
                 ui.turn_start().await;
                 ui.set_status(crate::i18n::t("Thinking")).await;
                 tokio::time::sleep(std::time::Duration::from_millis(900)).await;
@@ -830,25 +719,17 @@ async fn main() -> Result<()> {
                 }
             }
             "/sandbox" => ui.emit(AgentEvent::Info(sandbox::report(&rt))),
-            // Workplace: `/workplace` shows the current state, `/workplace
-            // full|default|<dir>` switches tiers. Both decision and execution live in
-            // the `workplace` module (one implementation, shared by CLI and GUI).
+            // Workplace: `/workplace` shows the current state, `/workplace full|default|<dir>` switches tiers.
             _ if workplace::is_cmd(line) => match workplace::command(&rt, line) {
                 Ok(text) => {
                     ui.emit(AgentEvent::Info(text));
-                    // The tier must be recorded into this conversation's save too. The
-                    // "show current state" case also reaches here, but
-                    // `persist_workplace` compares for itself and writes nothing if
-                    // unchanged.
+                    // The tier must be recorded into this conversation's save too.
                     agent.persist_workplace();
                 }
                 Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
             },
             "/config" => ui.emit(AgentEvent::Info(layer_summary.clone())),
-            // `/model` — the saved models and switching between them. The file is
-            // `.aox/models.json` (the GUI's Model tab edits the same one), and the switch is the same
-            // path the GUI uses: mark the record active, then hand it to `LiveProvider::apply`. No
-            // restart, no new conversation.
+            // `/model` — the saved models and switching between them.
             _ if modelbook::is_cmd(line) => match modelbook::command(&rt, line) {
                 Ok(text) => ui.emit(AgentEvent::Info(text)),
                 Err(e) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
@@ -856,9 +737,7 @@ async fn main() -> Result<()> {
             "/shell" => ui.emit(AgentEvent::Info(tool::shell::report(&rt))),
             "/web" => ui.emit(AgentEvent::Info(tool::web::report(&rt))),
             "/new" => {
-                // The same path as the "+" button on the GUI top bar. The old
-                // conversation needs no save action — it has been appended to all
-                // along and is already lying in history/ by now.
+                // The same path as the "+" button on the GUI top bar.
                 agent.new_conversation();
                 ui.emit(AgentEvent::Info(
                     crate::i18n::t("Started a new conversation. The previous one has been saved under history/ (see /history).").into(),
@@ -983,15 +862,7 @@ async fn main() -> Result<()> {
                     // Clear on send (one-shot): the attachments have gone into the history with
                     // this message, and must not ride along a second time with the next one.
                     TurnOutcome::Done(_) => pending.clear(),
-                    // On interrupt this now hinges on a single fact: did this turn's user message
-                    // actually make it into the history? Rolling back to the last **legal** boundary
-                    // (`Agent::interrupt_rollback_point`) keeps it in every real case, so the
-                    // attachments are already in context and must be cleared too. The old code kept
-                    // them because its rollback went back to the *turn* start, which dropped the
-                    // message — a reason that no longer exists. The one case that still keeps them
-                    // is "interrupted before `run_turn` had pushed the message at all": nothing was
-                    // sent, and swallowing the attachments would only make the user attach them all
-                    // over again.
+                    // On interrupt this now hinges on a single fact: did this turn's user message actually make it into the history?...
                     TurnOutcome::Interrupted => {
                         if agent.messages_len() > mark {
                             pending.clear();
@@ -1003,10 +874,7 @@ async fn main() -> Result<()> {
                     TurnOutcome::Done(Err(e)) => ui.emit(AgentEvent::Error(format!("{e:#}"))),
                     TurnOutcome::Interrupted => {
                         ui.abort_turn().await;
-                        // Roll back to the last **legal** boundary, not to the start of the turn:
-                        // the user's instruction and every completed step stay in context, and only
-                        // the in-flight (unreplayable) step is dropped. The granularity decision
-                        // lives in `Agent::interrupt_rollback_point`, shared with the GUI.
+                        // Roll back to the last legal boundary, not to the start of the turn: the user's instruction and every completed...
                         agent.rollback_interrupted_turn(mark);
                         ui.emit(AgentEvent::Warn(
                             crate::i18n::t("Interrupted the current task (only the step that was still running was dropped; everything already done stays in context)").into(),
@@ -1017,18 +885,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 后台远程服务：先请它自己断开（心跳 5 秒一轮），最多等 6 秒。
-    // 超时就直接放弃——用户已经按了退出，不该被一条连接拖住。
+    // On shutdown ask the service to disconnect, wait at most 6s, then give up: the user already quit.
     if let Some(job) = remote.take() {
         job.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(6), job.handle).await;
     }
 
-    // ---- Shut down all plugin processes before exiting
-    //
-    // Only the slots that actually have a process do any work here — under lazy loading that is
-    // usually none of them, and `stop` decides that itself (the dormant case is a no-op rather than
-    // a branch to keep in sync in two front ends).
+    // Shut down all plugin processes before exiting.
     let handles: Vec<_> = rt.plugins.lock().await.values().cloned().collect();
     for h in handles {
         h.stop().await;
@@ -1037,17 +900,6 @@ async fn main() -> Result<()> {
 }
 
 /// `/attach` — the command-line version of the pending-upload tray.
-///
-/// | Form | Meaning |
-/// |---|---|
-/// | `/attach` | show what's attached right now |
-/// | `/attach clear` | detach everything |
-/// | `/attach <path> [more…]` | attach (sent along with the next message) |
-///
-/// Both the decision and the interception go through the one implementation in
-/// [`aox::attach`] (the same function the GUI drag-and-drop uses), so the reason a
-/// 40 MiB file is turned away from the command line is **the same sentence** as the
-/// reason it's turned away when dropped onto the UI.
 fn attach_command(pending: &mut Vec<PathBuf>, rest: &str, ui: &mut CliUi) {
     if rest.is_empty() {
         if pending.is_empty() {
@@ -1070,9 +922,7 @@ fn attach_command(pending: &mut Vec<PathBuf>, rest: &str, ui: &mut CliUi) {
         ui.emit(AgentEvent::Info(crate::i18n::t("The pending-upload tray has been cleared.").into()));
         return;
     }
-    // When the whole string is an existing path, treat it as **one** file (otherwise a
-    // path with spaces gets broken apart); otherwise split on whitespace (the most
-    // common form, `/attach a.png b.pdf`).
+    // When the whole string is an existing path, treat it as one file (otherwise a path with spaces gets broken...
     let raw: Vec<String> = if std::path::Path::new(rest).exists() {
         vec![rest.to_string()]
     } else {

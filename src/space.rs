@@ -1,36 +1,8 @@
-//! The **space registry**: which workspaces exist, what they are called, and which conversation
-//! lives in which one.
-//!
-//! Why a registry rather than "group by the conversation's own workspace record": the two answer
-//! different questions. `kind:"workplace"` in a `.jsonl` records **where writes are allowed** — a
-//! security boundary, decided by the tier. A space is a **place in the UI**, and the user may want a
-//! conversation to sit somewhere other than where its boundary points. Keeping them apart means
-//! re-organising the list never touches a permission boundary, and it means **the `.jsonl` format
-//! stays untouched** (design decision of 2026-10-14).
-//!
-//! The file lives at `<app root>/.aox/spaces.json` — deliberately in the app root and not per
-//! workspace: "which workspaces exist" cannot itself be scattered across those workspaces, or
-//! nothing could ever enumerate them.
-//!
-//! Three properties this module holds to:
-//!
-//! - **Reading never fails.** A missing / unreadable / half-written file yields the two built-ins
-//!   and nothing else. The history list must survive a broken registry the same way it survives a
-//!   broken config (see `store::default_store` for the same reasoning).
-//! - **An unknown version is rejected, not guessed at.** A newer layout read by an older build is
-//!   the hardest class of bug to trace, so the version is checked rather than ignored — the same
-//!   call as `store::backend` and `config`'s "unrecognised value errors out" rule.
-//! - **The two built-ins always exist.** `Default` (the app root) is the one place a conversation
-//!   lands without anybody choosing anything, so it can never be absent; `Full access` exists to
-//!   give the unrestricted tier somewhere to live (it has no root at all).
+//! The space registry: which workspaces exist, what they are called, and which conversation lives in which one.
+//! Why a registry rather than "group by the conversation's own workspace record": the two answer different...
+//! The file lives at `<app root>/.aox/spaces.json` — deliberately in the app root and not per workspace: "which...
 
-// Both halves now have consumers: the GUI's history overlay reads [`group`] and writes through
-// [`Registry::add_workspace`] / [`Registry::remove_workspace`].
-//
-// There is no `allow(dead_code)` in this file on purpose -- and the CLI binary has to silence this
-// module at its own `mod` declaration instead (see `src/main.rs`). The two targets genuinely differ:
-// the API exists for the GUI, and the CLI links this module only for `Registry::load`, so "never
-// used" there is a fact about the target, not about the code.
+// Both halves now have consumers: the GUI's history overlay reads group and writes through...
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::history::Summary;
 use crate::workplace::{AOX_DIR, WORKPLACE_DIR};
 
-/// The registry file's name, inside `<app root>/.aox/`.
+/// The registry file's name, inside `<app root>/.aox/`
 const FILE_NAME: &str = "spaces.json";
 
 /// The on-disk layout version. See the module docs: a mismatch is **rejected**, not migrated by guesswork.
@@ -60,8 +32,7 @@ const ID_FULL: &str = "builtin:full";
 pub enum Builtin {
     /// The app root — where a conversation lands when nobody picked anything.
     Default,
-    /// Conversations opened from the phone (AOXChat). No root: a group is all it is, and a remote
-    /// turn's workspace stays "the whole app root" (see `docs/会话与工作区重构设计.md`).
+    /// Phone-opened (AOXChat) conversations have no root; a remote turn's workspace is the whole app root.
     Remote,
     /// The unrestricted tier, which has no root: it cannot charitably be folded into any workspace,
     /// so it gets a group of its own (an explicit decision on 2026-10-14).
@@ -70,14 +41,9 @@ pub enum Builtin {
 
 impl Builtin {
     /// The name shown when the space has no name of its own.
-    ///
-    /// Goes through `t!` like every other user-visible string, so a translated build shows a
-    /// translated group name; a **user-named** space is shown verbatim and never translated.
     pub fn label(self) -> &'static str {
         match self {
-            // "Local" rather than "Default": after 2026-11-05 this group is not "the fallback",
-            // it is specifically *this machine's* conversations, and "Default" read like a setting
-            // value. A separate key so the old "Default" translations (used elsewhere) stay put.
+            // "Local" rather than "Default": after 2026-11-05 this group is not "the fallback", it is specifically *this...
             Builtin::Default => crate::i18n::t("Local"),
             Builtin::Remote => crate::i18n::t("Remote"),
             Builtin::Full => crate::i18n::t("Full access"),
@@ -102,11 +68,7 @@ pub struct Space {
     /// Unix seconds.
     #[serde(default)]
     pub created: u64,
-    /// Conversations **explicitly** placed here. A conversation that is not listed in any space
-    /// still shows up — it falls back to a group derived from its own workspace record (see [`group`]).
-    ///
-    /// Stored on the space rather than as a `conversation -> space` map so that "remove this space"
-    /// is one `retain`, with no second structure to keep in sync.
+    /// Conversations explicitly placed here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conversations: Vec<String>,
 }
@@ -132,12 +94,7 @@ struct Wire {
     version: u32,
     #[serde(default)]
     spaces: Vec<Space>,
-    /// Roots the user removed from AOX. While a root is here it is **neither listed nor scanned**.
-    ///
-    /// Without this the removal would undo itself: the fallback rule below creates a group for any
-    /// workspace root it meets, so a removed workspace would reappear on the very next refresh.
-    /// Keeping the mark instead means "add the same folder again" is a real, working undo — the
-    /// conversations are still on disk, and dropping the mark brings them all back.
+    /// Roots the user removed from AOX. While a root is here it is neither listed nor scanned.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     hidden: Vec<PathBuf>,
 }
@@ -163,16 +120,14 @@ impl Default for Registry {
 }
 
 impl Registry {
-    /// Read the registry. **Never fails** — see the module docs.
+    /// Read the registry. **Never fails** — see the module docs
     pub fn load(app_root: &Path) -> Self {
         let path = file_path(app_root);
         let Ok(text) = std::fs::read_to_string(&path) else {
             return Self::default();
         };
         let Ok(wire) = serde_json::from_str::<Wire>(&text) else {
-            // A corrupt file yields the built-ins rather than an error. Refusing to start (or
-            // refusing to list history) over a UI-organisation file would be a poor trade; the one
-            // thing we must not do is *write* over it half-read, and nothing does that.
+            // A corrupt file yields the built-ins rather than an error.
             return Self::default();
         };
         if wire.version != VERSION {
@@ -183,12 +138,7 @@ impl Registry {
         reg
     }
 
-    /// Write the registry back, **atomically**.
-    ///
-    /// Write-then-rename rather than truncate-then-write: the GUI can be killed at any moment, and a
-    /// half-written registry is a file the next launch silently discards — losing every grouping the
-    /// user had made, for a reason they cannot see. A rename is atomic on both Windows and Unix, so
-    /// the file on disk is only ever "the old one" or "the new one".
+    /// Write the registry back, atomically.
     pub fn save(&self, app_root: &Path) -> anyhow::Result<()> {
         let dir = app_root.join(AOX_DIR);
         std::fs::create_dir_all(&dir)?;
@@ -209,10 +159,7 @@ impl Registry {
         &self.hidden
     }
 
-    /// 这个注册表认识的所有**目录**（app root + 每个绑了目录的空间，去掉已移除的）。
-    ///
-    /// 2026-11-05 之前这是交给存储层的"要扫描哪些目录"；单一会话库之后它不再参与读写，
-    /// 只用来回答"这台机器上一共有哪些工作目录"（面板的目录树用它决定展开哪些行）。
+    /// All known directories (app root and bound spaces); now used only for the panel tree, not storage.
     pub fn roots(&self, app_root: &Path) -> Vec<PathBuf> {
         let mut out = vec![app_root.to_path_buf()];
         for s in &self.spaces {
@@ -232,12 +179,7 @@ impl Registry {
         self.hidden.iter().any(|h| path_key(h) == k)
     }
 
-    /// Remove a workspace from AOX: **the folder itself is left completely alone** — only the mark
-    /// goes in. See [`Wire::hidden`] for why the mark is needed at all.
-    ///
-    /// Returns the conversations that were registered under it, so the caller can offer to send them
-    /// to the recycle bin (the default is to keep them: they are still on disk, and re-adding the
-    /// folder brings them back).
+    /// Remove a workspace from AOX: the folder itself is left completely alone — only the mark goes in.
     pub fn remove_workspace(&mut self, root: &Path) -> Vec<String> {
         let k = path_key(root);
         let mut dropped = Vec::new();
@@ -264,15 +206,7 @@ impl Registry {
         self.spaces.push(space);
     }
 
-    /// Register a workspace root under a user-chosen name, and **undo a previous removal** of the
-    /// same folder in the same stroke. Returns the space's id, so the caller can unfold the new group
-    /// immediately instead of leaving the user to hunt for it.
-    ///
-    /// The re-add is matched **by root, not by name**: a folder the user removed and then brings back
-    /// is the same workspace, so it keeps its id rather than arriving as a second, empty twin beside
-    /// a still-hidden original. That is also why the id is derived from the root (see
-    /// [`path_key`]) — the identity has to survive the round trip through the registry file, and the
-    /// root is the only thing that does.
+    /// Register a workspace root under a user-chosen name, and undo a previous removal of the same folder...
     pub fn add_workspace(&mut self, root: &Path, name: Option<String>) -> String {
         self.unhide(root);
         // An empty or all-whitespace name is treated as "no name given" rather than stored as-is:
@@ -298,21 +232,7 @@ impl Registry {
         id
     }
 
-    /// Register a folder the user has **just chosen** (the directory picker's answer) as a
-    /// workspace. Returns the space's id when the registry actually changed, `None` when it did not.
-    ///
-    /// Two folders are deliberately left out:
-    ///
-    /// * **The app root.** [`Registry::roots`] always contains it, so it needs no row --
-    ///   and giving it one would be actively wrong: `group()` asks `find_root_space` *before* it
-    ///   asks `same_path(app_root)`, so a registered app root would pull every conversation that
-    ///   lands there "when nobody chose anything" out of `Default` and into a workspace of its own.
-    /// * **A folder already known.** [`Registry::add_workspace`] is idempotent, but re-saving the
-    ///   file for an edit that changes nothing is a write per click for no gain.
-    ///
-    /// A folder that was **removed** and is now picked again *is* adopted: it has no space row left
-    /// (`remove_workspace` drops it), so it reads as unknown here, and `add_workspace` clears the
-    /// `hidden` mark in the same stroke. That is the working undo the removal docs promise.
+    /// Register a folder the user has just chosen (the directory picker's answer) as a workspace.
     pub fn adopt_workspace(&mut self, root: &Path, app_root: &Path) -> Option<String> {
         if same_path(root, app_root) || self.find_root_space(root).is_some() {
             return None;
@@ -320,23 +240,7 @@ impl Registry {
         Some(self.add_workspace(root, None))
     }
 
-    /// Rename a workspace — **the label only**; the folder on disk is never touched.
-    ///
-    /// The registry has always kept the two apart (`Space::name` is what the tree shows, `root` is
-    /// the directory), and this is the operation that says so out loud. The alternative — renaming
-    /// the folder — cannot be done from here at all: a conversation records the folder it was
-    /// written to, so moving it would strand every conversation under a root the registry no longer
-    /// knows, and each one would come back as a brand-new auto group while this group sat there
-    /// empty. The label has no such reach.
-    ///
-    /// An empty name is **"go back to the folder name"**, not a refusal: `display_name` already falls
-    /// back to it, so clearing the field is the working way to undo a rename. A name that *equals*
-    /// the folder's own name is normalised to `None` for the same reason — `Some("notes")` and `None`
-    /// on a folder called `notes` are the same row, and only one of them keeps the file honest.
-    ///
-    /// Returns the space's id, so the caller can unfold the group it just renamed: an **auto** group
-    /// (a root the registry has never heard of) is registered by this call, and the tree has to show
-    /// that it happened.
+    /// Rename a workspace — the label only; the folder on disk is never touched.
     pub fn rename_workspace(&mut self, root: &Path, name: Option<String>) -> String {
         let name = name
             .map(|n| n.trim().to_string())
@@ -347,46 +251,19 @@ impl Registry {
                 self.spaces[i].name = name;
                 self.spaces[i].id.clone()
             }
-            // Never registered — an auto group the user is naming for the first time. Registering it
-            // is what makes the label survive a restart, and it is the same gesture `add_workspace`
-            // already performs, so it is delegated rather than written a second time.
+            // Never registered — an auto group the user is naming for the first time.
             None => self.add_workspace(root, name),
         }
     }
 
-    /// Re-file a conversation into another space — **a placement, not a move**.
-    ///
-    /// The conversation's file stays exactly where it is, and the `kind:"workplace"` record inside it
-    /// keeps describing where writes are allowed. What changes is only which group the tree draws it
-    /// under, which is precisely the split this module exists to keep (see the module docs): the
-    /// registry can say "show this over there" without the conversation's own permission boundary
-    /// moving an inch.
-    ///
-    /// One consequence follows from that split, and it is worth stating plainly: the store lists
-    /// conversations by **where the file is**, never by where it is placed. Placing a conversation that
-    /// lives in workspace A into workspace B therefore does not make it outlive A being removed from
-    /// AOX — only the file's own location does. That is the price of "placement ≠ boundary", and it is
-    /// the right price: the only alternative is rewriting the boundary, which is a security decision
-    /// nobody made by picking a row in a menu.
-    ///
-    /// The conversation is removed from **every** space's list before it is added to the target, so it
-    /// is placed in at most one space and the call is idempotent. Undo is therefore just another call
-    /// naming the original group — there is deliberately no separate "unplace".
-    ///
-    /// A target the registry has never heard of (an `auto:` group drawn for an unregistered root) is
-    /// **registered** by this call, the same gesture [`Registry::rename_workspace`] performs: an auto
-    /// group has no row to hold a placement, so the only way to place something in it is to make it a
-    /// real space. Returns the id the conversation ended up under — normally the target's own id,
-    /// except in that one case, where a fresh `s:<root>` id replaces the `auto:<root>` one.
+    /// Re-file a conversation into another space — a placement, not a move.
     pub fn place_conversation(
         &mut self,
         conv_id: &str,
         target_id: &str,
         target_root: Option<&Path>,
     ) -> String {
-        // Resolve the target **first**: draining the conversation from every other list is only safe
-        // once there is somewhere to put it back. An unresolvable target leaves the registry exactly
-        // as it was, rather than silently un-placing the conversation as a side effect.
+        // Resolve the target first: draining the conversation from every other list is only safe once there is somewhere...
         let id = match self.index_of(target_id) {
             Some(i) => self.spaces[i].id.clone(),
             None => match target_root {
@@ -443,33 +320,11 @@ pub struct Group {
     pub root: Option<PathBuf>,
     /// Newest first, same order the flat list used.
     pub items: Vec<Summary>,
-    /// Position of this group's newest item **in the flat source list**, used to order the groups.
-    ///
-    /// Not a timestamp: the source list is already newest-first, so its position *is* the recency
-    /// order — and `Summary::time` is a display string that must never be compared as one.
+    /// Position of this group's newest item in the flat source list, used to order the groups.
     newest: Option<usize>,
 }
 
 /// Group a flat, already-sorted list of conversations into spaces.
-///
-/// Three sources, in priority order:
-///
-/// 1. **An explicit placement** — the conversation id is listed in some space.
-/// 2. **The workspace record** — an unrestricted conversation goes to `Full access`; a conversation
-///    whose root is the app root, or sits under `<app root>/workplace/`, goes to `Default` (the
-///    dated `workplace/<timestamp>/` plots made before 2026-10-08 are folded in here on purpose:
-///    they were the *default* tier's own directories, not places the user chose).
-/// 3. **An auto group** — any other root the registry has never heard of becomes a space named after
-///    its folder. This is what makes the tree look right on first run: the workspaces the user
-///    genuinely works in are on disk already, so they must show up without being registered first.
-///
-/// Conversations under a **removed** root are dropped from the list while that mark is in place.
-///
-/// `Default` is always present even when empty (it is where a conversation lands when nobody chooses);
-/// so is every **registered** space, because the user naming a folder is the one statement that beats
-/// "an empty group is noise" — an empty one they did not ask for is dropped instead, along with
-/// `Full access` when nothing is in it (an empty group that can never be filled by the user is just
-/// noise).
 pub fn group(app_root: &Path, reg: &Registry, items: Vec<Summary>) -> Vec<Group> {
     // conversation id -> space index, built once from every space's list.
     let mut placed: HashMap<&str, usize> = HashMap::new();
@@ -521,11 +376,7 @@ pub fn group(app_root: &Path, reg: &Registry, items: Vec<Summary>) -> Vec<Group>
         let target: Option<Key> = if let Some(&si) = placed.get(s.id.as_str()) {
             Some(key_of(&reg.spaces[si]))
         } else if let Some(id) = s.space.as_deref().and_then(|id| reg.index_of(id)) {
-            // The header's own claim ("this was born in `builtin:remote`"). Sits **above** the
-            // workspace rules because it is the only thing a remote conversation has: those turns
-            // run with the app root as their workspace, which would otherwise drop every one of them
-            // into the local group. An id the registry no longer knows falls through instead of
-            // disappearing — a lost `builtin:remote` must not hide the conversations.
+            // The header's own claim ("this was born in `builtin:remote`").
             Some(key_of(&reg.spaces[id]))
         } else if s.ws_full {
             Some(key_of(&reg.spaces[full_idx.unwrap_or(default_idx)]))
@@ -535,20 +386,11 @@ pub fn group(app_root: &Path, reg: &Registry, items: Vec<Summary>) -> Vec<Group>
                 // conversation lands when nobody chose anything".
                 None => Some(key_of(&reg.spaces[default_idx])),
                 Some(r) => match reg.find_root_space(r) {
-                    // A removed workspace is dropped before anything else can claim it: the mark is
-                    // the authoritative "not listed", and letting a stale space row win here would
-                    // undo the removal on the very next refresh.
+                    // A removed workspace is dropped before anything else can claim it: the mark is the authoritative "not listed"...
                     _ if reg.is_hidden(r) => None,
-                    // A root the registry already knows keeps the name the user gave it, even when
-                    // the conversation in hand was never explicitly placed there. Checked **before**
-                    // the workplace rule below, which is what makes a workspace created through the
-                    // history panel's "new workspace" work at all: its root lives under
-                    // `<app root>/workplace/` by construction, so the dated-plot rule would otherwise
-                    // swallow it into Default the moment the tree was redrawn.
+                    // A root the registry already knows keeps the name the user gave it, even when the conversation in hand was never...
                     Some(i) => Some(key_of(&reg.spaces[i])),
-                    // The app root, and every unregistered plot under `workplace/`, fold into
-                    // Default: `workplace/<timestamp>/` directories made before 2026-10-08 were the
-                    // *default* tier's own plots, not places the user chose.
+                    // The app root, and every unregistered plot under `workplace/`, fold into Default: `workplace/<timestamp>/`...
                     None if same_path(r, app_root) || is_inside_workplace(r, app_root) => {
                         Some(key_of(&reg.spaces[default_idx]))
                     }
@@ -587,15 +429,7 @@ pub fn group(app_root: &Path, reg: &Registry, items: Vec<Summary>) -> Vec<Group>
         index.insert(g.id.clone(), i);
     }
 
-    // ...and then every **registered** space is put back by name. These are the spaces that exist
-    // because a person said so rather than because a conversation landed in them, which is exactly
-    // what the sweep above cannot tell apart from an empty stray. A workspace created through "new
-    // workspace" is empty by definition on the frame it is made, so without this it would be swept
-    // away immediately and the button would look broken.
-    //
-    // A root that is no longer on disk is skipped, so the row follows the disk: delete the folder
-    // outside AOX and the group stops being drawn (the registry entry simply goes dormant, and the
-    // folder coming back brings it back).
+    // ...and then every registered space is put back by name.
     for s in &reg.spaces {
         let Some(root) = s.root.as_ref() else { continue };
         if reg.is_hidden(root) || !root.is_dir() {
@@ -637,9 +471,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
     path_key(a) == path_key(b)
 }
 
-/// A comparison key for a directory: separators normalised, trailing separator dropped, and
-/// **case-folded on Windows only** — on Unix two paths differing in case are two different
-/// directories, and folding them there would silently merge two workspaces into one group.
+/// A comparison key for a directory: separators normalised, trailing separator dropped, and case-folded on Windows...
 fn path_key(p: &Path) -> String {
     let s = p.to_string_lossy().replace('\\', "/");
     let s = s.trim_end_matches('/').to_string();
@@ -753,17 +585,7 @@ mod tests {
         assert_eq!(ids(&groups[1]), vec!["a"]);
     }
 
-    /// Picking a folder in the directory list is what **makes** it a workspace: the registry is
-    /// where the group comes from, so a root nobody wrote down is drawn as an `auto:` fallback with
-    /// no name and no way to open a new conversation there. `adopt_workspace` is that write.
-    /// (Conversations are unaffected either way since 2026-11-05 — they all live in one store.)
-    ///
-    /// The two exclusions are the interesting part, and both are asserted here:
-    ///
-    /// * the app root is refused -- registering it would move every `Default` conversation into a
-    ///   new group, because `group()` asks `find_root_space` before `same_path(app_root)`;
-    /// * a known folder is a no-op -- otherwise every "switch to this workspace" click would rewrite
-    ///   the file.
+    /// Picking a folder in the directory list is what makes it a workspace: the registry is where the group comes...
     #[test]
     fn adopt_workspace_registers_a_picked_folder_but_not_the_app_root() {
         let app = PathBuf::from("E:/app");
@@ -809,30 +631,29 @@ mod tests {
     fn path_comparison_ignores_case_on_windows() {
         assert!(same_path(Path::new("E:/RustApp"), Path::new("e:\\rustapp")));
     }
-    /// 首行 meta 里的 `space` 决定分组：远端会话的工作区是 app root，但必须落在「远端」，
-    /// 不能混进「本机」。这条规则就是"远端对话不污染 Default"的全部实现。
+    /// First-line meta's space decides grouping: remote turns use the app root but belong to Remote, not Local.
     #[test]
     fn a_conversation_born_remote_groups_under_remote() {
         let app = std::env::temp_dir().join(format!("aox-space-remote-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&app);
         let store = crate::store::default_store(&app, 0);
 
-        // 本机的一条：默认出生信息。
+        // A local conversation: default birth metadata.
         {
             let mut log = store.create(None, &Default::default()).unwrap();
-            log.append(&crate::message::Message::user("本机的一段"), None);
+            log.append(&crate::message::Message::user("a local message"), None);
             log.append_workplace(&crate::workplace::Record {
                 mode: "default".into(),
                 root: Some(app.clone()),
                 own: None,
             });
         }
-        // 手机那一轮的一条：工作区同样是 app root，但出生在 builtin:remote。
+        // A phone-initiated conversation: same app-root workspace but born in builtin:remote.
         {
             let mut log = store
-                .create(None, &crate::store::Birth::remote("r_1", "前端组"))
+                .create(None, &crate::store::Birth::remote("r_1", "frontend"))
                 .unwrap();
-            log.append(&crate::message::Message::user("群里的一段"), None);
+            log.append(&crate::message::Message::user("a message from the room"), None);
             log.append_workplace(&crate::workplace::Record {
                 mode: "default".into(),
                 root: Some(app.clone()),
@@ -841,11 +662,11 @@ mod tests {
         }
 
         let items = store.list(10);
-        assert_eq!(items.len(), 2, "两条都在同一个会话库里");
+        assert_eq!(items.len(), 2, "both live in the same conversation store");
         assert_eq!(
             items.iter().filter(|s| s.origin == crate::history::Origin::Remote).count(),
             1,
-            "origin 从首行读出来"
+            "the origin is read from the first line"
         );
 
         let reg = Registry::default();
@@ -853,14 +674,14 @@ mod tests {
         let remote = groups
             .iter()
             .find(|g| g.builtin == Some(Builtin::Remote))
-            .expect("远端组必须存在");
-        assert_eq!(remote.items.len(), 1, "只有那条远端的");
-        assert_eq!(remote.items[0].room_name.as_deref(), Some("前端组"));
+            .expect("the remote group must exist");
+        assert_eq!(remote.items.len(), 1, "only the remote one");
+        assert_eq!(remote.items[0].room_name.as_deref(), Some("frontend"));
         let local = groups
             .iter()
             .find(|g| g.builtin == Some(Builtin::Default))
-            .expect("本机组必须存在");
-        assert_eq!(local.items.len(), 1, "本机组里只剩本机的");
+            .expect("the local group must exist");
+        assert_eq!(local.items.len(), 1, "only the local one is left in the local group");
 
         let _ = std::fs::remove_dir_all(&app);
     }
@@ -888,10 +709,7 @@ mod tests {
         ]);
     }
 
-    /// A workspace registered under `<app root>/workplace/` is **its own group**, not part of Default
-    /// — even though it sits exactly where the dated-plot rule folds things in. That placement is a
-    /// consequence of where "new workspace" puts a new folder, so if the fallback rule ran first the
-    /// space would be registered and then never be visible as anything but Default.
+    /// A workspace registered under `<app root>/workplace/` is its own group, not part of Default — even though...
     #[test]
     fn registered_root_under_workplace_is_its_own_group() {
         let base = std::env::temp_dir().join(format!("aox-space-ws-{}", std::process::id()));
@@ -915,9 +733,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A registered workspace is listed **before** it has a conversation in it: that is the frame the
-    /// "new workspace" button lands on, and without it the group would be swept out as "empty and
-    /// unwanted", so creating a workspace would look like it did nothing.
+    /// A registered workspace is listed before it has a conversation in it: that is the frame the "new workspace"...
     #[test]
     fn a_registered_space_shows_while_still_empty() {
         let base = std::env::temp_dir().join(format!("aox-space-empty-{}", std::process::id()));
@@ -930,20 +746,14 @@ mod tests {
         let names = |g: &[Group]| g.iter().map(|x| x.name.clone()).collect::<Vec<_>>();
         assert!(group(&app, &reg, Vec::new()).iter().any(|g| g.name == "Fresh"));
 
-        // ...but only while the folder is really there. A registered root deleted outside AOX stops
-        // being drawn rather than sitting there as a permanently empty row (the registry entry simply
-        // goes dormant, and the folder coming back brings it back).
+        // ...but only while the folder is really there.
         std::fs::remove_dir_all(&ws).unwrap();
         assert!(!group(&app, &reg, Vec::new()).iter().any(|g| g.name == "Fresh"), "{:?}", names(&group(&app, &reg, Vec::new())));
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Removing and re-adding a folder is **one workspace, not two**: it keeps its id, and the
-    /// removal mark is dropped so the conversations that stayed on disk reappear.
-    ///
-    /// The id surviving matters beyond tidiness: the two fold-state sets in the GUI are keyed by it,
-    /// so a group the user had unfolded stays unfolded across a remove and re-add.
+    /// Removing and re-adding a folder is one workspace, not two: it keeps its id, and the removal mark is dropped...
     #[test]
     fn add_workspace_revives_the_same_space() {
         let base = std::env::temp_dir().join(format!("aox-space-revive-{}", std::process::id()));
@@ -966,13 +776,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Renaming moves **the label, never the folder**: the root is left exactly where it was, so the
-    /// conversations that record it keep landing in the same group — which is the whole reason this
-    /// is not a directory move.
-    ///
-    /// It also has to give an unregistered root a home. A root the registry has never heard of is
-    /// drawn as an auto group, and nothing about that group can hold a name; renaming is what turns
-    /// it into a registered space, i.e. the only reason the new name is still there next launch.
+    /// Renaming moves the label, never the folder: the root is left exactly where it was, so the conversations...
     #[test]
     fn rename_moves_the_label_and_leaves_the_root_alone() {
         let base = std::env::temp_dir().join(format!("aox-space-rename-{}", std::process::id()));
@@ -1006,12 +810,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A conversation can be re-filed into another space, and it lands in **exactly one** place: the
-    /// call drains it from wherever it was first, so repeated moves never leave it listed twice.
-    ///
-    /// The placement also has to **outrank the conversation's own workspace record** — that is the
-    /// whole point of a separate registry — so the assertion is not just "it moved" but "it is drawn in
-    /// B while its file still says A".
+    /// A conversation can be re-filed into another space, and it lands in exactly one place: the call drains...
     #[test]
     fn place_conversation_moves_it_and_keeps_one_copy() {
         let app = PathBuf::from("E:/app");
@@ -1041,9 +840,7 @@ mod tests {
         assert!(named(g, "B").is_empty());
     }
 
-    /// Placing into a group the registry has never heard of — an `auto:` group drawn for an
-    /// unregistered root — **registers** that root, because an auto group carries no row to hold a
-    /// placement. The conversation then lives under the new `s:<root>` id.
+    /// Placing into a group the registry has never heard of — an `auto:` group drawn for an unregistered root —...
     #[test]
     fn place_conversation_registers_an_auto_group() {
         let app = PathBuf::from("E:/app");

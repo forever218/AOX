@@ -1,8 +1,6 @@
-//! 取消信号：手机点「停止」→ 服务端定向转发 → 这里的 oneshot 被唤醒。
-//!
-//! 「取消」在宿主侧就是 **drop 掉 `run_turn` 的 future**，再调 `recovery.abort_turn()`
-//! 把恢复用的轮次收尾——和 GUI 的停止按钮是同一条路径。工具执行到一半被丢掉时，
-//! 已经写出的字节不会回滚：这是可接受的不精确，但必须让人知道"停止"不是事务回滚。
+//! Cancellation signal: mobile Stop -> server forwards -> this oneshot fires.
+//! On the host, cancel drops the run_turn future and calls recovery.abort_turn(), same as the GUI stop button.
+//! Already-written bytes stay: stopping is not a transaction rollback, and that imprecision must be clear.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

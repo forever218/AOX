@@ -1,9 +1,5 @@
 //! Task-level file checkpoints and rollback.
-//!
-//! The manager is hosted on `Runtime`, not inside `run_turn`: the GUI aborts a turn by dropping its
-//! future, so a local transaction would never get a chance to write its post-images. Tools call the
-//! synchronous capture API while executing; `Agent::run_turn` opens and closes one transaction per
-//! user turn.
+//! The manager is hosted on `Runtime`, not inside `run_turn`: the GUI aborts a turn by dropping its future...
 
 pub mod command;
 pub mod gc;
@@ -31,10 +27,6 @@ use store::{FileLock, Journal, RecoveryStore};
 static TURN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Wall-clock ceiling for one workspace scan.
-///
-/// A safety valve, not a performance target: a source tree that takes longer than this to hash is
-/// either enormous or on a cold network drive, and in both cases refusing (strict) is better than
-/// silently attributing a 10-minute-old index to a command. Excluding the directory is the real fix.
 const SCAN_DEADLINE: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
@@ -125,7 +117,7 @@ struct TreeToken {
 
 #[derive(Clone, Debug, Default)]
 pub struct OpaqueSummary {
-    /// Workspace-relative paths whose content this command changed.
+    /// Workspace-relative paths whose content this command changed
     pub changed: Vec<String>,
     /// Why the coverage is not complete (truncated walk, unstored content, unreadable path).
     pub notes: Vec<String>,
@@ -144,10 +136,6 @@ impl OpaqueSummary {
 }
 
 /// One shell command's window: the before-image index, kept until the follow-up scan.
-///
-/// Dropping it without calling [`RecoveryManager::finish_opaque`] means the turn was aborted between
-/// the two scans (the GUI drops the future; a panic unwinds). The command's writes are then unknown,
-/// so the transaction is marked partial rather than allowed to look complete.
 pub struct OpaqueGuard {
     before: Option<scan::Scan>,
     active: Arc<ActiveTurn>,
@@ -156,9 +144,7 @@ pub struct OpaqueGuard {
     note: Option<String>,
 }
 
-/// Above this, the first before-image pass of a workspace is worth mentioning. A source tree is a few
-/// MiB; tens of MiB means the scan is copying something the user probably does not think of as source
-/// (a toolchain, a bundle, a media folder) and would want in `[recovery] exclude`.
+/// Above this, the first before-image pass of a workspace is worth mentioning.
 const BASELINE_WARN_BYTES: u64 = 8 * 1024 * 1024;
 
 impl Drop for OpaqueGuard {
@@ -617,11 +603,6 @@ impl RecoveryManager {
     }
 
     /// Open the window around one shell command: scan the workspace *before* it runs.
-    ///
-    /// Returns `Ok(None)` when nothing should be watched (no active turn, `shell_guard = "off"`).
-    /// `Err` means **the command must not run**: in strict mode a workspace whose scan hit a ceiling
-    /// cannot promise "restore to before this command", and running it anyway would quietly break the
-    /// guarantee the user thinks they have.
     pub fn begin_opaque(
         &self,
         root: &Path,
@@ -642,10 +623,7 @@ impl RecoveryManager {
             }
             let store = match self.ensure_store(&active, &mut st) {
                 Ok(s) => s,
-                // A store the host cannot open is a failure of *recovery*, not a reason to stop the
-                // user's work: `.aox/backup` can be full, read-only, or locked by another AOX. Run the
-                // command without a window and say so, rather than turning a bookkeeping problem into
-                // "the agent cannot run anything".
+                // A store the host cannot open is a failure of *recovery*, not a reason to stop the user's work: `.aox/backup`...
                 Err(e) => {
                     drop(st);
                     self.mark_partial(format!(
@@ -701,10 +679,6 @@ impl RecoveryManager {
     }
 
     /// Close the window: scan again, diff, and record what the command actually changed.
-    ///
-    /// The after-images are stored too, not just hashed: redo restores "the state you rolled back
-    /// from", which is this moment. Dedup makes that cheap — anything the before pass already stored
-    /// is a `stat`, not a copy.
     pub fn finish_opaque(&self, mut guard: OpaqueGuard) -> OpaqueSummary {
         let Some(before) = guard.before.take() else {
             return OpaqueSummary::default();
@@ -778,10 +752,7 @@ impl RecoveryManager {
             }
         }
 
-        // A command can also put a path *back*: `edit_file` writes, then the command runs `git
-        // checkout`. The diff has nothing to say about that path, but the op recorded earlier now
-        // describes a state the disk is no longer in. Rewrite every tracked path from the after scan
-        // so the node describes the disk, not the history.
+        // A command can also put a path *back*: `edit_file` writes, then the command runs `git checkout`. The diff has...
         let changed_set: BTreeMap<&str, ()> =
             summary.changed.iter().map(|p| (p.as_str(), ())).collect();
         let tracked: Vec<String> = st.ops.keys().cloned().collect();
@@ -807,9 +778,7 @@ impl RecoveryManager {
             }
         }
 
-        // The baseline is the next command's before-image cache. An incomplete walk must not replace
-        // a complete one: the missing entries would read as "never stored" and cost a re-read, but a
-        // baseline that *claims* files it never saw would be worse.
+        // The baseline is the next command's before-image cache.
         if after.complete() {
             if let Err(e) = store.save_baseline(&after.files) {
                 summary.notes.push(format!("the shell baseline could not be updated: {e}"));
@@ -859,12 +828,7 @@ impl RecoveryManager {
         st.partial.push(reason.into());
     }
 
-    /// A background job writes whenever it wants, so no scan bracket can contain it: the recovery
-    /// point is marked partial and says so.
-    ///
-    /// Deliberately not cleared when the job is stopped. A job that ran for two minutes could have
-    /// written at any point inside that window, and "it has been stopped now" is not evidence about
-    /// what it did. The user stops the job *before* asking for a rollback they can trust.
+    /// A background job writes whenever it wants, so no scan bracket can contain it: the recovery point is marked...
     pub fn note_background_job(&self, id: &str) {
         self.mark_partial(format!(
             "background job {id} is running, and its writes happen outside any scan, so files it changes are not covered; stop the job before relying on /rollback"
@@ -909,9 +873,7 @@ impl RecoveryManager {
                 reasons: st.partial.clone(),
             }
         };
-        // If a touched path was changed outside AOX since the previous checkpoint, record that
-        // change as its own `external` node before the task node. Rollback then restores the
-        // external state first instead of silently treating it as part of the task.
+        // If a touched path was changed outside AOX since the previous checkpoint, record that change as its own...
         let mut external_ops = Vec::new();
         for op in st.ops.values() {
             if op.is_noop() {
@@ -1003,10 +965,7 @@ impl RecoveryManager {
         if let Some(j) = st.journal.take() {
             j.remove();
         }
-        // Housekeeping runs **after** the commit and cannot fail it: the task's files are already on
-        // disk and its recovery point is already published, so "cleanup could not delete an old
-        // object" must not be reported as "the task failed to record". The workspace lock is still
-        // held here (it lives in `st`), which is exactly the condition GC requires.
+        // Housekeeping runs after the commit and cannot fail it: the task's files are already on disk and its recovery...
         warnings.extend(gc::maintain(&store, self.cfg.keep, self.cfg.max_total_mb));
         RecoveryFinish { point: Some(id), warnings, error: None }
     }
@@ -1190,7 +1149,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    // ─────────── W5: the shell window ───────────
+    // W5: the shell window
 
     #[test]
     fn a_shell_command_is_captured_by_the_before_and_after_scans() {

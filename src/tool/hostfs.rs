@@ -1,32 +1,6 @@
-//! The host's built-in **file tools** — the concrete form of sandbox approach ③.
-//!
-//! Why the host provides them itself instead of letting the model keep writing
-//! `fs` plugins:
-//!
-//! A file plugin the model wrote itself **can only be self-disciplined inside its
-//! own code**; the host cannot see what path it used to do what. These tools, by
-//! contrast, keep both parameters and implementation in the host's hands — so
-//! "the path must first pass the workplace check" **cannot be bypassed** (unless
-//! the model simply doesn't use them and writes its own plugin instead, which is
-//! a different class of risk; see the threat model in `docs/SANDBOX.md`).
-//!
-//! The check happens in two places, deliberately in depth:
-//! 1. `Agent::authorize_and_execute` — the single funnel for all tool calls,
-//!    **before authorization**. Intercepting there has the bonus of being able to
-//!    send the user a `Warn` (tools have no access to `Ui`).
-//! 2. The start of each tool's own `call` — guards against someone bypassing the
-//!    loop and calling `Runtime::execute` directly (`selftest` does exactly that).
-//!    Without this layer the check would be empty on that path.
-//!
-//! Both places go through the **same check** in the `workplace` module (reading
-//! uses `check_read`, writing/removing use `check`; the split is described in
-//! [`crate::workplace::Access`]) and the same wording
-//! ([`crate::workplace::Reject`]), so there is no "two sets of rules".
-//!
-//! **Reading is unrestricted, writing/removing are not** (semantics settled on
-//! 2026-10-04): `read_file` / `list_dir` / `attach_file` only normalize the path
-//! and open the file — the whole device is readable; only `write_file` / `remove`
-//! actually cross the workplace boundary.
+//! The host's built-in file tools — the concrete form of sandbox approach.
+//! Why the host provides them itself instead of letting the model keep writing `fs` plugins.
+//! A file plugin the model wrote itself can only be self-disciplined inside its own code; the host cannot see what...
 
 use std::sync::Arc;
 
@@ -45,10 +19,7 @@ use crate::runtime::Runtime;
 use crate::workplace::PATH_ARG;
 
 /// The host file tools.
-///
-/// Order matters: [`HOST_FILE_TOOLS`] is addressed by index (see the warning there), so new tools
-/// go **at the end**. `edit_file` is index 5 and `publish_file` index 6 for exactly that reason —
-/// appending leaves every existing index, and therefore the read/write split, where it was.
+/// Order matters: HOST_FILE_TOOLS is addressed by index (see the warning there), so new tools go at the end....
 pub fn host_file_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadFileTool),
@@ -61,9 +32,7 @@ pub fn host_file_tools() -> Vec<Arc<dyn Tool>> {
     ]
 }
 
-/// Per-call byte cap when reading a file. Beyond it, truncate and **say so
-/// explicitly** — silently truncating would make the model draw conclusions from
-/// partial content, the worst kind of "silent failure".
+/// Per-call byte cap when reading a file.
 const READ_LIMIT: usize = 200_000;
 /// Entry cap when listing a directory, for the same reason.
 const LIST_LIMIT: usize = 300;
@@ -74,14 +43,7 @@ pub(crate) fn guard(rt: &Arc<Runtime>, raw: &str) -> Result<std::path::PathBuf, 
     rt.workplace.check(raw).map_err(|r| ToolOutput::err(r.model_text()))
 }
 
-/// Check a `path` argument for a **read-only** operation (read file / list dir).
-///
-/// Per [`crate::workplace::Access::Read`], reading is **not restricted by the
-/// workplace**, so this never returns an error — it just normalizes the path and
-/// hands it back. **Deliberately written separately from [`guard`]**: it makes
-/// "read and write are not the same tier" visible at a glance at the call site —
-/// if the two shared one `guard`, the day someone puts a boundary on reads too,
-/// the code would show no change at all.
+/// Check a `path` argument for a read-only operation (read file / list dir).
 fn guard_read(rt: &Arc<Runtime>, raw: &str) -> std::path::PathBuf {
     // `check_read` is always `Ok` (reads are never refused); and even an unexpected
     // failure must not panic, so fall back to the raw path.
@@ -96,7 +58,7 @@ pub(crate) fn path_arg(args: &Value) -> Result<&str, ToolOutput> {
         .ok_or_else(|| ToolOutput::err(crate::tf!("missing parameter {} (must be a string path)", PATH_ARG)))
 }
 
-// ---------------------------------------------------------------- read_file
+// read_file
 
 pub(crate) struct ReadFileTool;
 
@@ -108,10 +70,7 @@ impl Tool for ReadFileTool {
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
-    /// Read / write are split by **name** (see `host_tool_access`) — these tools'
-    /// schemas are ones we wrote ourselves, so the split is decidable at a glance;
-    /// the plugin path cannot do that and must rely on the plugin's declaration
-    /// (see `Tool::access`).
+    /// Read / write are split by name (see `host_tool_access`) — these tools' schemas are ones we wrote ourselves...
     fn access(&self) -> crate::workplace::Access {
         host_tool_access(self.name())
     }
@@ -202,10 +161,7 @@ impl Tool for ReadFileTool {
             Err(e) => return e,
         };
 
-        // ── Header line ──
-        // A whole-file read keeps its old shape (path + byte count) plus two new fields; a slice
-        // spells out the range and how to continue, so the model knows to resume from `start_line`
-        // instead of starting over.
+        // ── Header line ── A whole-file read keeps its old shape (path + byte count) plus two new fields; a slice spells...
         let mut out = crate::tf!("{} ({} bytes, hash {})\n", path.display(), size, hash);
         if ranged {
             if slice.last == 0 {
@@ -249,10 +205,6 @@ impl Tool for ReadFileTool {
 }
 
 /// Is the first 8 KB of the file free of NUL bytes?
-///
-/// Only the head is inspected — the same rule the whole-file version used, kept deliberately: a NUL
-/// deep inside a file is usually legitimate data (a length prefix, a padded field), whereas a NUL in
-/// the first block means "this was never text".
 fn looks_binary(path: &std::path::Path) -> std::io::Result<bool> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
@@ -272,13 +224,7 @@ struct Slice {
     invalid_utf8: bool,
 }
 
-/// Read lines `[start, start+cap)` **by streaming** — memory never exceeds one line plus the byte cap.
-///
-/// This is the whole point of the range form: a 200 MB log can be read at line 180 000 without ever
-/// materialising the file. The full-file form goes through the same code with `start = 1`, `cap = None`,
-/// which is also what removes the old "read the entire file, then cut the output" behaviour.
-///
-/// `numbered` only controls the display (line numbers are added in range mode); the reader is the same.
+/// Read lines `[start, start+cap)` by streaming — memory never exceeds one line plus the byte cap.
 fn read_slice(
     path: &std::path::Path,
     start: usize,
@@ -344,10 +290,7 @@ fn read_slice(
         if complete {
             if text.ends_with('\n') {
                 text.pop();
-                // `\r` is stripped only in the line-numbered view: there it is part of the line
-                // terminator and would just show up as a stray control character. The plain form
-                // must stay **byte-for-byte** what is on disk (a CRLF file must read back as CRLF),
-                // so the `\r` is kept and the `\n` pushed back below restores the pair.
+                // `\r` is stripped only in the line-numbered view: there it is part of the line terminator and would just show up...
                 if numbered && text.ends_with('\r') {
                     text.pop();
                 }
@@ -392,7 +335,7 @@ fn read_slice(
     Ok(slice)
 }
 
-// ---------------------------------------------------------------- write_file
+// write_file
 
 pub(crate) struct WriteFileTool;
 
@@ -404,10 +347,7 @@ impl Tool for WriteFileTool {
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
-    /// Read / write are split by **name** (see `host_tool_access`) — these tools'
-    /// schemas are ones we wrote ourselves, so the split is decidable at a glance;
-    /// the plugin path cannot do that and must rely on the plugin's declaration
-    /// (see `Tool::access`).
+    /// Read / write are split by name (see `host_tool_access`) — these tools' schemas are ones we wrote ourselves...
     fn access(&self) -> crate::workplace::Access {
         host_tool_access(self.name())
     }
@@ -456,9 +396,7 @@ impl Tool for WriteFileTool {
                 }
             }
         }
-        // Recovery capture happens before parent-directory creation: if the previous contents cannot
-        // be saved, the original write must not happen, and we should not leave a new empty directory
-        // behind either.
+        // Recovery capture happens before parent-directory creation: if the previous contents cannot be saved...
         let capture = match rt.recovery.capture_before(&path) {
             Ok(c) => c,
             Err(b) => return ToolOutput::err(b.model),
@@ -479,10 +417,7 @@ impl Tool for WriteFileTool {
             }
         }
         let existed = path.exists();
-        // Read the previous version **before** overwriting it — this is the only moment both
-        // versions are in hand, and the "+N / −N" the UI shows comes from comparing them.
-        // A file that is missing starts from empty (everything counts as added); one that is not
-        // valid UTF-8 text yields `None`, and "no number" is the honest answer in that case.
+        // Read the previous version before overwriting it — this is the only moment both versions are in hand...
         let previous = if existed { std::fs::read_to_string(&path).ok() } else { Some(String::new()) };
         let written = std::fs::write(&path, content.as_bytes());
         let recovery_note = rt.recovery.capture_after(capture);
@@ -501,9 +436,7 @@ impl Tool for WriteFileTool {
                             .with_diff_detail(diff_text(old, content))
                             .with_path(path)
                     }
-                    // A previous version that was not UTF-8 text: no diff is possible, but the file
-                    // **was** written — so it still carries its path, and the workspace view lists
-                    // it as a changed file with no numbers rather than hiding it.
+                    // A previous version that was not UTF-8 text: no diff is possible, but the file was written — so it still carries...
                     None => out.with_path(path),
                 };
                 if let Some(note) = recovery_note {
@@ -524,15 +457,7 @@ impl Tool for WriteFileTool {
 /// Beyond this many (post-trim) lines the LCS table is skipped, see below.
 const DIFF_MAX_LINES: usize = 2000;
 
-/// Lines added / removed between `old` and `new`, as a **line-level** LCS — not a character diff.
-///
-/// Written by hand rather than pulled from a crate: this is the project's only diff, the inputs are
-/// source-code sized, and answering "how much did that write change" should not cost a dependency.
-/// A common head/tail is trimmed first (edits are usually local, and that is what keeps the table
-/// small in the normal case); the LCS itself uses two rolling rows, so memory stays `O(min(n, m))`
-/// instead of `O(n·m)`. Past `DIFF_MAX_LINES` the table is skipped entirely and a blunt line-by-line
-/// comparison is used — it never *under*-reports a change, which is the direction that matters for a
-/// number a human reads at a glance.
+/// Lines added / removed between `old` and `new`, as a line-level LCS — not a character diff.
 pub(crate) fn line_diff(old: &str, new: &str) -> (usize, usize) {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
@@ -581,15 +506,6 @@ const DIFF_TABLE_CELLS: usize = 250_000;
 const ELISION: &str = "⋯";
 
 /// Render the difference between two versions of a file, ready to be drawn line by line.
-///
-/// Each output line starts with `+` (added), `-` (removed) or a space (context); a line that is only
-/// `⋯` stands in for a stretch left out. That is the classic shape on purpose: a front end can tell
-/// what a line is from its first character alone, with no extra structure to pass around.
-///
-/// Alignment is the same head/tail trim + LCS as [`line_diff`], and is only attempted while the
-/// changed middles are small enough to hold a table; past [`DIFF_TABLE_CELLS`] the two middles are
-/// drawn as one block of removals followed by one block of additions. That fallback degrades the
-/// *interleaving*, never the information — and a file written from scratch is all additions anyway.
 pub(crate) fn diff_text(old: &str, new: &str) -> String {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
@@ -722,7 +638,7 @@ fn clip_line(s: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------- list_dir
+// list_dir
 
 pub(crate) struct ListDirTool;
 
@@ -734,10 +650,7 @@ impl Tool for ListDirTool {
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
-    /// Read / write are split by **name** (see `host_tool_access`) — these tools'
-    /// schemas are ones we wrote ourselves, so the split is decidable at a glance;
-    /// the plugin path cannot do that and must rely on the plugin's declaration
-    /// (see `Tool::access`).
+    /// Read / write are split by name (see `host_tool_access`) — these tools' schemas are ones we wrote ourselves...
     fn access(&self) -> crate::workplace::Access {
         host_tool_access(self.name())
     }
@@ -801,26 +714,9 @@ impl Tool for ListDirTool {
     }
 }
 
-// ---------------------------------------------------------------- attach_file
+// attach_file
 
-/// **Hand a local file to the model to look at** — an image really enters the
-/// next request and the model can see its content.
-///
-/// Why it is needed: `read_file` only reads text (binaries are refused outright),
-/// so the "screenshot → analyze" path would only ever carry a path and the model
-/// would be stuck with a string of characters. The only legal landing spot for an
-/// image is a `user` message (the endpoint returns 400 outright when it sees an
-/// image in system / assistant), whereas tool results travel under the `tool`
-/// role — so this tool **does not stuff the image into its return value**; it only
-/// reports the path, and the main loop spins up a separate user message to inject
-/// it (see the closing section of `agent_loop`, `crate::attach`).
-///
-/// The access intent is **read-only** (see `tool::host_tool_access`): attaching
-/// just hands the file out and writes nothing to disk, so there is no risk of
-/// "breaking something elsewhere" — the same tier as `read_file`, not restricted
-/// by the workplace. That too is deliberate: a plugin writing screenshots into the
-/// workplace is the norm, but a user wanting to hand the model a picture on their
-/// desktop should also work.
+/// Hand a local file to the model to look at — an image really enters the next request and the model can see...
 pub(crate) struct AttachFileTool;
 
 #[async_trait]
@@ -831,10 +727,7 @@ impl Tool for AttachFileTool {
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
-    /// Read / write are split by **name** (see `host_tool_access`) — these tools'
-    /// schemas are ones we wrote ourselves, so the split is decidable at a glance;
-    /// the plugin path cannot do that and must rely on the plugin's declaration
-    /// (see `Tool::access`).
+    /// Read / write are split by name (see `host_tool_access`) — these tools' schemas are ones we wrote ourselves...
     fn access(&self) -> crate::workplace::Access {
         host_tool_access(self.name())
     }
@@ -865,9 +758,7 @@ impl Tool for AttachFileTool {
                     Some(k) => crate::tf!("image ({})", k.mime()),
                     None => crate::i18n::t("file (not an image; the endpoint may not support this format)").to_string(),
                 };
-                // State truthfully in the result "what was attached and roughly how
-                // big": the model thus knows whether to expect "an image it can see"
-                // next or "possibly an unsupported-format error".
+                // State truthfully in the result "what was attached and roughly how big": the model thus knows whether to expect...
                 ToolOutput::ok(crate::tf!(
                     "Attached {}: {} ({} bytes). Its content will appear in your next request.",
                     what,
@@ -883,20 +774,9 @@ impl Tool for AttachFileTool {
     }
 }
 
-// ---------------------------------------------------------------- publish_file
+// publish_file
 
-/// Hand a file to the **room** rather than to the model.
-///
-/// Why this exists at all: the artifact channel is [`ToolOutput::path`], and only the two text
-/// tools (`write_file` / `edit_file`) ever filled it. So "compile an APK and send it to my phone"
-/// had no route — a build product is binary, `write_file` takes a `String`, and `attach_file`
-/// pushes bytes into the model's context (56 MB of APK would blow the request body apart). This
-/// tool is the missing third option: it declares "this existing file is an output of this turn",
-/// and the host's remote bridge uploads it to the room.
-///
-/// It is a **write** as far as the workplace boundary is concerned, even though it touches no
-/// bytes: publishing ships the file's content to everyone in the room, so "any path on this
-/// machine, no questions asked" is exactly the behaviour we must not have.
+/// Hand a file to the room rather than to the model.
 pub(crate) struct PublishFileTool;
 
 #[async_trait]
@@ -944,9 +824,7 @@ impl Tool for PublishFileTool {
         if meta.len() == 0 {
             return ToolOutput::err(crate::i18n::t("The file is empty, so there is nothing to publish."));
         }
-        // No size gate here on purpose: the one number that decides whether an upload is possible
-        // is the server's, and the remote bridge already checks it against the same constant. A
-        // second copy of the limit in the tool would be one more place to forget to change.
+        // No size gate here on purpose: the one number that decides whether an upload is possible is the server's...
         ToolOutput::ok(crate::tf!(
             "Published {} ({}) to the room. It will be uploaded as an artifact of this turn.",
             path.display(),
@@ -958,7 +836,7 @@ impl Tool for PublishFileTool {
     }
 }
 
-// ---------------------------------------------------------------- remove
+// remove
 
 pub(crate) struct RemoveTool;
 
@@ -970,10 +848,7 @@ impl Tool for RemoveTool {
     fn kind(&self) -> ToolKind {
         ToolKind::Host
     }
-    /// Read / write are split by **name** (see `host_tool_access`) — these tools'
-    /// schemas are ones we wrote ourselves, so the split is decidable at a glance;
-    /// the plugin path cannot do that and must rely on the plugin's declaration
-    /// (see `Tool::access`).
+    /// Read / write are split by name (see `host_tool_access`) — these tools' schemas are ones we wrote ourselves...
     fn access(&self) -> crate::workplace::Access {
         host_tool_access(self.name())
     }
@@ -1000,10 +875,7 @@ impl Tool for RemoveTool {
             Ok(p) => p,
             Err(e) => return e,
         };
-        // Don't delete the workplace root itself — that would leave every remaining
-        // file operation in this conversation with nowhere to go. This has nothing
-        // to do with permissions; it's purely a "delete it and you can't keep
-        // working" protection.
+        // Don't delete the workplace root itself — that would leave every remaining file operation in this conversation...
         if rt.workplace.active_root().as_deref() == Some(path.as_path()) {
             return ToolOutput::err(crate::tf!(
                 "{} is the current workspace root and cannot delete itself. To clean up its contents, delete the entries inside it.",
@@ -1014,9 +886,7 @@ impl Tool for RemoveTool {
             return ToolOutput::err(crate::tf!("{} does not exist", path.display()));
         }
         let recursive = args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
-        // A **non-empty directory** is the only case that has to ask permission out loud: it is the
-        // one shape of call that can send a whole tree to the bin on a single slip. A file, and an
-        // empty directory, go without a second thought.
+        // A non-empty directory is the only case that has to ask permission out loud: it is the one shape of call...
         if !recursive && path.is_dir() {
             let non_empty = std::fs::read_dir(&path).map(|mut it| it.next().is_some()).unwrap_or(false);
             if non_empty {
@@ -1026,9 +896,7 @@ impl Tool for RemoveTool {
                 ));
             }
         }
-        // Count **before** the move: once the shell has taken the files there is nothing left to
-        // walk, and the shell does not tell us how much it took (see `recycle::count_files`). That
-        // number is what the UI turns into "N files moved to the recycle bin".
+        // Count before the move: once the shell has taken the files there is nothing left to walk, and the shell does...
         let count = crate::recycle::count_files(&path);
         // Capture the whole tree before the recycle call. A failure here must abort the delete: a
         // half-backed-up directory is worse than a refused one.
@@ -1036,9 +904,7 @@ impl Tool for RemoveTool {
             Ok(c) => c,
             Err(b) => return ToolOutput::err(b.model),
         };
-        // The delete goes to the **recycle bin**, not to oblivion — see the module note in
-        // `crate::recycle` for why it is the shell's own delete rather than `remove_file`, and for
-        // the two cases where the shell can still erase outright.
+        // The delete goes to the recycle bin, not to oblivion — see the module note in `crate::recycle` for why...
         let recycled = crate::recycle::recycle(&path).await;
         let recovery_note = rt.recovery.finish_tree_after(capture);
         match recycled {
@@ -1089,7 +955,7 @@ mod tests {
     fn diff_text_marks_every_line_and_elides_the_unchanged() {
         // A file appearing from nothing is additions and nothing else.
         assert_eq!(diff_text("", "a\nb"), "+a\n+b");
-        // Nothing changed at all: no change lines to show.
+        // Nothing changed at all: no change lines to show
         assert_eq!(diff_text("a\nb\n", "a\nb\n"), " a\n b");
         // One edited line inside a long file: the change, three lines of context on each side, and an
         // elision marker wherever the rest of the file was left out.
@@ -1113,14 +979,7 @@ mod tests {
         assert!(d.ends_with(" more lines"), "{d}");
     }
 
-    /// Build a runtime with a "fixed workplace", to verify the tools really are
-    /// bound by the boundary.
-    ///
-    /// The tools must genuinely be registered: `Runtime::execute` looks people up
-    /// by registry, and bypassing the registry leaves nothing to test. This is
-    /// exactly the division of labour between this module and the `workplace`
-    /// unit tests — that side tests the decision, this side tests that "the
-    /// decision really is wired into the tool-call path".
+    /// Build a runtime with a "fixed workplace", to verify the tools really are bound by the boundary.
     async fn rt_with_ws(dir: &std::path::Path) -> Arc<Runtime> {
         let mut cfg = Config::dummy();
         cfg.workplace = WorkplaceConfig { mode: "fixed".into(), root: Some(dir.to_string_lossy().into()) };
@@ -1184,13 +1043,7 @@ mod tests {
         assert!(r.content.contains("héllo"), "the content should read back: {}", r.content);
     }
 
-    /// An out-of-bounds **write** must be blocked, and the copy handed to the
-    /// model must carry the three-part contract.
-    ///
-    /// Note it's "write": reads are not restricted by the workplace (see
-    /// `read_outside_is_allowed_but_remove_is_not`), so this can only hang off
-    /// `write_file` — hanging it off `read_file` would make it a permanently green
-    /// fake test.
+    /// An out-of-bounds write must be blocked, and the copy handed to the model must carry the three-part contract.
     #[tokio::test]
     async fn outside_write_is_refused_with_the_contract() {
         let d = tmp("outside");
@@ -1204,11 +1057,7 @@ mod tests {
         assert!(out.content.contains("relay this to the user"), "{}", out.content);
     }
 
-    /// `publish_file` is the only route a **binary build product** has to the room: `write_file`
-    /// takes a `String`, and `attach_file` would stuff the bytes into the model's request (56 MB of
-    /// APK would be rejected outright). Two things have to hold — it fills `path` (that field *is*
-    /// the artifact channel) and it stays inside the workspace, because publishing ships the bytes
-    /// to everyone in the room.
+    /// `publish_file` is the only route a binary build product has to the room: `write_file` takes a `String`...
     #[tokio::test]
     async fn publish_file_fills_the_artifact_channel_and_stays_inside_the_workspace() {
         let d = tmp("publish");
@@ -1257,12 +1106,7 @@ mod tests {
         assert!(m.path.is_none());
     }
 
-    /// New semantics (2026-10-04): **reading is not restricted by the workplace**
-    /// — out-of-bounds files are readable and out-of-bounds directories listable;
-    /// but **removal** is still restricted. Pin both together, so nobody later
-    /// "unifies" them back into one tier (pinning only one side means "read passed"
-    /// could just be that reading never went through the check at all — that's a
-    /// leak, not correct semantics).
+    /// New semantics: reading is not restricted by the workplace — out-of-bounds files are readable and out-of-bounds...
     #[tokio::test]
     async fn read_outside_is_allowed_but_remove_is_not() {
         let d = tmp("rdout");
@@ -1333,11 +1177,9 @@ mod tests {
         assert!(out.content.contains("a.txt"), "{}", out.content);
     }
 
-    // ───────────────────────── range reads ─────────────────────────
+    // range reads
 
-    /// Pull the fingerprint out of a read_file header — the exact string a model would copy into
-    /// `expected_hash`. Parsing it here (rather than recomputing it) is the point: it proves the
-    /// value printed is the value edit_file accepts.
+    /// Pull the fingerprint out of a read_file header — the exact string a model would copy into `expected_hash`....
     fn hash_in(content: &str) -> String {
         let head = content.lines().next().unwrap_or_default();
         let at = head.find("hash ").expect("the header must carry a hash");
@@ -1437,9 +1279,7 @@ mod tests {
         assert!(out.content.ends_with("alpha\nbeta\n"), "{:?}", out.content);
     }
 
-    /// The hash in the header must be **exactly** what `edit_file` accepts as `expected_hash` — the
-    /// only contract between the two tools. Let the algorithm or the formatting differ and every edit
-    /// the model makes with a hash gets rejected as "the file changed".
+    /// The hash in the header must be exactly what `edit_file` accepts as `expected_hash` — the only contract between...
     #[tokio::test]
     async fn the_hash_printed_by_read_is_accepted_by_edit() {
         let d = tmp("hash-loop");
@@ -1505,11 +1345,9 @@ mod tests {
         assert!(out.content.len() < 400, "the cap must actually bound the payload: {}", out.content.len());
     }
 
-    // ───────────────────────── the index table ─────────────────────────
+    // the index table
 
-    /// `HOST_FILE_TOOLS` is addressed **by index** (the read/write split, and every `[n]` above), so
-    /// the list and the table have to agree position by position. A future tool inserted in the middle
-    /// would silently point the read-only exemption at some other tool; this fails instead.
+    /// `HOST_FILE_TOOLS` is addressed by index (the read/write split, and every `n` above), so the list and the table...
     #[test]
     fn the_tool_list_matches_the_name_table_in_order() {
         let tools = host_file_tools();

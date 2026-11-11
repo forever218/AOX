@@ -1,18 +1,12 @@
 //! Syntax highlighting for code blocks.
-//!
-//! Deliberately **no regex, and no per-language parser**: one generic character scan plus a
-//! per-language config table (comment markers, string delimiters, keywords). That's plenty for
-//! "code blocks" where the goal is just to look pleasant, and pulling in regex would add a crate
-//! to this zero-heavy-dependency project — not worth it.
-//!
-//! The palette is a low-saturation warm set whose entries differ mainly in lightness — the UI's
-//! subject remains paper and ink, and highlighting only has to "scan well", not steal the show.
+//! Deliberately no regex, and no per-language parser: one generic character scan plus a per-language config table...
+//! The palette is a low-saturation warm set whose entries differ mainly in lightness — the UI's subject remains...
 
 use egui::Color32;
 
 use crate::theme::{self, Mode, P};
 
-// ────────────────────────────── Tokens ──────────────────────────────
+// Tokens
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tok {
@@ -55,11 +49,7 @@ impl Spec {
     }
 }
 
-/// On paper: ochre-red keywords, pine-green types, steel-blue functions, olive strings, plum numerals, warm-grey comments, amber meta.
-///
-/// `cmt` and `meta` are the two that are **not** hues but greys/ambers, so they are the two that
-/// can fall under the readability floor. Raised on 2026-10-22 with the rest of the text tiers: the
-/// old comment grey was 2.4:1 on the code well, i.e. the least readable text in the whole window.
+/// On paper: ochre-red keywords, pine-green types, steel-blue functions, olive strings, plum numerals, warm-grey...
 const LIGHT: Spec = Spec {
     kw: Color32::from_rgb(0xA3, 0x4A, 0x2A),
     ty: Color32::from_rgb(0x1F, 0x7A, 0x6B),
@@ -89,7 +79,7 @@ pub fn color(t: Tok) -> Color32 {
     }
 }
 
-// ────────────────────────────── Language config ──────────────────────────────
+// Language config
 
 struct Cfg {
     /// Line-comment prefixes
@@ -294,7 +284,6 @@ const MARKUP: Cfg = Cfg {
 /// Pick a config from the language hint after the fence; if unrecognized, fall back to "highlight only strings and numbers".
 fn detect(hint: &str) -> &'static Cfg {
     let lower = hint.trim().to_ascii_lowercase();
-    // ```rust,ignore / ```js:line-numbers —— take only the first segment
     let h = lower.split(&['=', ':', ',', ' '][..]).next().unwrap_or("");
     match h {
         "rust" | "rs" => &RUST,
@@ -312,7 +301,7 @@ fn detect(hint: &str) -> &'static Cfg {
     }
 }
 
-// ────────────────────────────── Scan ──────────────────────────────
+// Scan
 
 /// Cross-line state: block comments and triple-quoted strings must be remembered into the next line.
 #[derive(Clone, Copy, PartialEq)]
@@ -454,10 +443,7 @@ fn scan_line(cfg: &Cfg, state: &mut State, line: &str) -> Vec<(String, Tok)> {
                         i = b.len();
                     }
                 }
-                // This whole line belongs to that triple-quoted string; after cutting we must go
-                // back to the `while` and re-evaluate. Without this line, `i` would stop exactly at
-                // the end of the line (which is what happens when `"""doc` closes at the line end),
-                // and the `b[i]` below would go out of bounds and panic.
+                // This whole line belongs to that triple-quoted string; after cutting we must go back to the `while`...
                 continue;
             }
             State::Normal => {}

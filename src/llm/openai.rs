@@ -23,15 +23,9 @@ pub struct OpenAiProvider {
     model: String,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
-    /// Whether to request via SSE streaming. When on, the reasoning process can be
-    /// echoed live; if an endpoint doesn't accept stream/stream_options, set this
-    /// to false in config.toml to fall back.
+    /// Whether to request via SSE streaming.
     stream: bool,
-    /// How much thinking to ask for, and **which vendor's spelling** to say it in.
-    ///
-    /// Both are resolved once, when the provider is built (an `auto` wire becomes a concrete one from
-    /// the host). That is deliberate: rebuilding the provider is exactly what the GUI's model switch
-    /// does, so "the endpoint changed" and "the wire changed" are the same event.
+    /// How much thinking to ask for, and which vendor's spelling to say it in.
     thinking: crate::config::Thinking,
     wire: crate::config::ThinkingWire,
 }
@@ -39,11 +33,7 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(cfg: &ProviderConfig) -> Result<Self> {
         Ok(Self {
-            // No **total** deadline on the client any more: a streaming answer may legitimately take
-            // minutes (a thinking model writing 32k tokens), and a whole-request deadline kills it
-            // mid-sentence and, with retries on, pays for it twice. What replaces it is a silence
-            // watchdog inside `chat_stream`; the non-streaming path sets its own per-request
-            // deadline, where "the whole response" is the right unit.
+            // No total deadline on the client any more: a streaming answer may legitimately take minutes (a thinking model...
             client: super::endpoint_client(&cfg.base_url).build()?,
             url: cfg.chat_url(),
             api_key: cfg.resolve_key()?,
@@ -57,12 +47,6 @@ impl OpenAiProvider {
     }
 
     /// The `messages` array for the request body.
-    ///
-    /// The only change from "just serialise them" is `reasoning_content`: as long as a message with
-    /// tool calls exists, DeepSeek **requires** that field back and 400s without it, so it is always
-    /// sent when the wire is DeepSeek. Every other endpoint may treat an unknown message field as a
-    /// bad request, and "switched models mid-conversation and the next message 400s" is exactly the
-    /// failure that would come of sending it there — so on any other wire it is stripped.
     fn body_messages(&self, messages: &[Message]) -> Value {
         let mut v = json!(messages);
         if self.wire != crate::config::ThinkingWire::Deepseek {
@@ -116,7 +100,7 @@ impl OpenAiProvider {
             .send()
             .await?;
         let status = resp.status();
-        // Read the header **before** `text()` consumes the response.
+        // Read the header **before** `text()` consumes the response
         let retry_after = retry_after_of(&resp);
         let text = resp.text().await?;
         debug_dump(body, &text);
@@ -162,10 +146,7 @@ impl OpenAiProvider {
         let mut buf = String::new();
         let idle = Duration::from_secs(failure::STREAM_IDLE_SECS);
         loop {
-            // A **silence** deadline per chunk, not a deadline for the response as a whole: a model
-            // thinking for two minutes between two tokens is normal, a model that has said nothing
-            // for two minutes has died. `?` here keeps a transport error as a `reqwest::Error`, which
-            // the retry policy reads as "try again" (see `failure::retryable`).
+            // A silence deadline per chunk, not a deadline for the response as a whole: a model thinking for two minutes...
             let chunk = match tokio::time::timeout(idle, resp.chunk()).await {
                 Ok(next) => next?,
                 Err(_) => return Err(anyhow::Error::new(Stalled { idle_secs: failure::STREAM_IDLE_SECS })),
@@ -189,11 +170,7 @@ impl OpenAiProvider {
             push_raw(&mut raw, &line);
             acc.feed(&line, sink);
         }
-        // ── Did the model actually finish? ──
-        // Until 2026-10-23 this question was not asked, and a dropped connection (or a proxy cutting
-        // a long body) produced a **successful** reply holding half a sentence: it went into the
-        // conversation file and the turn ended as if the model had answered. A `finish_reason` chunk
-        // or `data: [DONE]` is the only proof that the model is done talking.
+        // ── Did the model actually finish? ── Until 2026-10-23 this question was not asked, and a dropped connection (or...
         if !finished(&acc) {
             debug_dump(body, &raw);
             return Err(anyhow::Error::new(StreamCut {
@@ -235,11 +212,7 @@ struct ToolCallAcc {
     arguments: String,
 }
 
-/// The incremental accumulator for a streaming response: assembles a series of
-/// SSE data chunks into a complete assistant message.
-///
-/// Kept as its own struct for easy offline regression testing (selftest feeds it
-/// synthetic chunks directly).
+/// The incremental accumulator for a streaming response: assembles a series of SSE data chunks into a complete...
 #[derive(Default)]
 pub struct StreamAcc {
     content: String,
@@ -280,8 +253,6 @@ impl StreamAcc {
 
     fn apply(&mut self, v: &Value, sink: Option<&(dyn StreamSink + Send + Sync)>) {
         // Usage: most endpoints send a usage-only chunk as the final frame.
-        // Only overwrite when it really carries numbers — otherwise it would wipe
-        // the earlier copy to empty.
         let u = Usage::parse(v);
         if !u.is_empty() {
             self.usage = u;
@@ -322,9 +293,7 @@ impl StreamAcc {
             for (fallback, tc) in arr.iter().enumerate() {
                 let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(fallback as u64);
                 let entry = self.tool_calls.entry(idx).or_default();
-                // What this fragment actually carried, to hand to the UI below. The name and the
-                // arguments are collected rather than sent one by one so a fragment that brings
-                // both produces a single callback.
+                // What this fragment actually carried, to hand to the UI below.
                 let mut name_delta: &str = "";
                 let mut arg_delta: &str = "";
                 if let Some(id) = tc.get("id").and_then(Value::as_str) {
@@ -344,10 +313,7 @@ impl StreamAcc {
                         arg_delta = a;
                     }
                 }
-                // Tell the UI a call is being **written right now**. This stretches before the tool
-                // ever runs — the loop only sees tool calls once the whole response has landed — and
-                // for `write_file` it is by far the longest part of the job, so it is the only place
-                // a live "how much has arrived" reading can come from.
+                // Tell the UI a call is being written right now.
                 if let Some(s) = sink {
                     if !name_delta.is_empty() || !arg_delta.is_empty() {
                         s.on_tool_call(idx, name_delta, arg_delta);
@@ -383,10 +349,6 @@ impl StreamAcc {
 }
 
 /// Did the model prove it finished talking?
-///
-/// Two signals, either is enough: the `data: [DONE]` sentinel, or a chunk carrying `finish_reason`.
-/// Endpoints vary — some send both, some only one — so "both missing" is the only reliable sign of a
-/// response that was cut, and it is exactly what a dropped TCP connection leaves behind.
 fn finished(acc: &StreamAcc) -> bool {
     acc.is_done() || acc.finish_reason.is_some()
 }
@@ -403,10 +365,7 @@ fn retry_after_of(resp: &reqwest::Response) -> Option<Duration> {
     resp.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok().and_then(failure::parse_retry_after)
 }
 
-/// A non-2xx response, as an error the retry policy can read ([`failure::retryable`]).
-///
-/// The status travels *inside* the error rather than in its message: telling `429` from `401` by
-/// parsing text would be the kind of thing that breaks the day an endpoint rewords its body.
+/// A non-2xx response, as an error the retry policy can read (failure::retryable).
 fn http_failure(status: reqwest::StatusCode, retry_after: Option<Duration>, body: &str) -> anyhow::Error {
     anyhow::Error::new(HttpFailure { status: status.as_u16(), retry_after, detail: api_error(body) })
 }

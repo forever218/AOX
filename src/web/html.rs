@@ -1,26 +1,6 @@
-//! HTML → readable Markdown, without a parser dependency.
-//!
-//! # Why hand-written
-//!
-//! The valuable half of "make a web page usable" is **choosing the main content**, which none of the
-//! HTML-to-Markdown crates do — they convert the whole page, navigation included. The other half
-//! (tokens → Markdown) is a few hundred lines and buys exact control over two things that matter
-//! here: **CJK spacing** (a Chinese paragraph must not come back as `你 好 世 界`) and **output size**
-//! (the tool's budget is the whole point). Same reasoning as `gui/src/markdown.rs`.
-//!
-//! # Tolerance, not correctness
-//!
-//! Real pages are malformed: unclosed `<p>`, a `<div>` closed by `</span>`, attributes without
-//! quotes. So the tokenizer never rejects anything — an unknown end tag is ignored, an unclosed
-//! element is closed at EOF, nesting deeper than [`MAX_DEPTH`] stops growing, and `script`/`style`
-//! bodies are skipped without being parsed. **No input may panic**; a test feeds it random bytes.
-//!
-//! # What it does not do
-//!
-//! No CSS, no `<base>`, no charset (that happened before the text got here), no JavaScript, no
-//! `<iframe>` contents, no form state. A page whose text only exists after script execution comes
-//! back thin; the tool is expected to say so in the result instead of pretending (`docs/WEB.md`
-//! D10 — a headless renderer was built, measured, and removed).
+//! Hand-written HTML-to-Markdown: choosing main content matters most, which converter crates never do.
+//! The tokenizer controls CJK spacing and output size; malformed HTML is tolerated and no input may ever panic.
+//! No CSS, base, charset, JS, iframe, or form state; script-only pages return thin text, and the tool says so.
 
 use std::collections::BTreeSet;
 
@@ -60,7 +40,7 @@ pub fn extract(html: &str, base: &Url) -> Extracted {
     Extracted { title, markdown: tidy(&md), links: collect_links(&root, base) }
 }
 
-// ───────────────────────────────── the tree ─────────────────────────────────
+// the tree
 
 #[derive(Debug)]
 struct Node {
@@ -105,7 +85,7 @@ fn push_text(stack: &mut Vec<Node>, root: &mut Node, text: &str) {
     }
 }
 
-// ─────────────────────────────── the tokenizer ───────────────────────────────
+// the tokenizer
 
 struct Parser<'a> {
     s: &'a str,
@@ -149,7 +129,7 @@ fn parse(html: &str) -> Node {
 
         let (name, end) = p.read_name(p.i + 1);
         if name.is_empty() {
-            // A stray `<` is text, not a tag.
+            // A stray `<` is text, not a tag
             p.i += 1;
             let one = p.slice(lt, lt + 1).to_string();
             push_text(&mut stack, &mut root, &one);
@@ -171,7 +151,7 @@ fn parse(html: &str) -> Node {
                     // script / style / textarea: the text is never rendered, so it is dropped here.
                 }
                 None => {
-                    // Unterminated raw element: everything left belongs to it.
+                    // Unterminated raw element: everything left belongs to it
                     if name == "title" {
                         let rest = p.slice(p.i, p.b.len()).to_string();
                         let mut node = Node { tag: name, attrs, children: Vec::new() };
@@ -373,7 +353,7 @@ fn is_raw(tag: &str) -> bool {
     matches!(tag, "script" | "style" | "title" | "textarea")
 }
 
-// ─────────────────────────────── picking content ───────────────────────────────
+// picking content
 
 #[derive(Default, Clone, Copy)]
 struct Stats {
@@ -416,7 +396,7 @@ fn accumulate(node: &Node, s: &mut Stats, inside_link: bool) {
     }
 }
 
-/// The `<body>` if there is one, else the document node.
+/// The `<body>` if there is one, else the document node
 fn body_of<'a>(root: &'a Node) -> &'a Node {
     find_tag(root, "body").unwrap_or(root)
 }
@@ -465,9 +445,7 @@ fn pick_body(root: &Node) -> &Node {
     let body_stats = stats(body);
     let body_density = density(body_stats);
 
-    // `(semantic, score)` compared lexicographically: `<article>` / `<main>` beat a class-hinted
-    // `<div>`, because they are what the page author *called* the content. Among equals, the higher
-    // score wins; the walk is parent-first, so a wrapper wins over the element it wraps.
+    // `(semantic, score)` compared lexicographically: `<article>` / `<main>` beat a class-hinted `<div>`, because...
     let mut best: Option<(&Node, i64, bool)> = None;
     visit(root, &mut |n| {
         if !is_candidate(n) || is_chrome(n) {
@@ -525,7 +503,7 @@ fn visit<'a>(node: &'a Node, f: &mut impl FnMut(&'a Node)) {
     }
 }
 
-// ─────────────────────────────── rendering ───────────────────────────────
+// rendering
 
 fn is_block(tag: &str) -> bool {
     matches!(
@@ -593,12 +571,7 @@ fn is_dropped(tag: &str) -> bool {
     )
 }
 
-/// Page furniture that is not the article and not a link list: menus, search boxes, share bars,
-/// cookie banners, sidebars, "related" rails.
-///
-/// Matched on **tokens** of `id`/`class`, never on substrings: `research` must not match `search`,
-/// and `protocol` must not match `toc`. A blanket rule is what makes readability-style extractors
-/// drop a page's actual content because its wrapper is called `comment-content`.
+/// Page furniture that is not the article and not a link list: menus, search boxes, share bars, cookie banners...
 fn is_chrome(node: &Node) -> bool {
     const TOKENS: [&str; 24] = [
         "menu",
@@ -881,7 +854,7 @@ fn collect_rows(node: &Node, rows: &mut Vec<Vec<String>>, base: &Url) {
     }
 }
 
-// ─────────────────────────────── inline text ───────────────────────────────
+// inline text
 
 fn inline_text(node: &Node, base: &Url) -> String {
     let mut s = String::new();
@@ -995,12 +968,9 @@ fn plain_text(node: &Node) -> String {
     s
 }
 
-// ─────────────────────────────── text hygiene ───────────────────────────────
+// text hygiene
 
-/// Collapse whitespace and remove the spaces that Chinese typesetting never had.
-///
-/// "你 好" → "你好" when both sides are CJK, but "中文 English" keeps its space. Without this, every
-/// page that wraps a sentence in a `<span>` comes back with holes in it.
+/// Collapse whitespace and drop spaces CJK never had: join adjacent CJK, but keep spaces before Latin text.
 fn normalize_inline(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut pending_space = false;
@@ -1037,7 +1007,7 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
-/// `&amp;` / `&#233;` / `&#xE9;` → the character. Unknown names are left alone (`&foo;` stays).
+/// `&amp;` / `&#233;` / `&#xE9;` → the character. Unknown names are left alone (`&foo;` stays)
 fn decode_entities(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
@@ -1047,9 +1017,7 @@ fn decode_entities(s: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         let tail = &rest[at..];
-        // Entity names are short and ASCII, so only the first 32 **bytes** are worth searching —
-        // but that cut can land inside a multi-byte character, and `&[..32]` on a `str` panics
-        // when it does. Walk back to a boundary instead (no `floor_char_boundary` on stable).
+        // Entity names are short and ASCII, so only the first 32 bytes are worth searching — but that cut can land inside...
         let mut cut = tail.len().min(32);
         while cut > 0 && !tail.is_char_boundary(cut) {
             cut -= 1;
@@ -1159,7 +1127,7 @@ fn tidy(md: &str) -> String {
     out.trim_end().to_string()
 }
 
-// ─────────────────────────────── links & title ───────────────────────────────
+// links & title
 
 fn title_of(root: &Node) -> Option<String> {
     let t = find_tag(root, "title").map(|n| normalize_inline(&plain_text(n)))?;

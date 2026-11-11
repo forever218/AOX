@@ -1,28 +1,6 @@
 //! The `bash` tool: a POSIX shell for the model, with `shell` as the fallback.
-//!
-//! # Why it exists separately from `shell`
-//!
-//! Measured on this machine: `bash -c true` costs ~180 ms over a native-process floor, while
-//! `powershell -NoProfile -Command exit` costs ~1100 ms. So a POSIX shell is the cheap option *and* the
-//! dense one — one line of `find … | xargs … | sed …` replaces three tool round trips, and every round
-//! trip is a model request.
-//!
-//! It is a **separate tool name** rather than a value of `shell`'s `shell` argument because the model
-//! picks its syntax from the tool's name: behind `shell` it reaches for `cmd`, while a tool called
-//! `bash` gets POSIX. The cost is one extra schema in the request.
-//!
-//! # Where the boundary is
-//!
-//! Identical to `shell`: the same `cwd` check, the same command scan, the same Job Object, the same
-//! timeout and output handling — this file is a thin front door onto
-//! [`crate::tool::shell::run_shell`]. That is deliberate: a second execution path would be a second
-//! boundary to keep correct.
-//!
-//! # Registration
-//!
-//! [`bash_tools`] returns **nothing** when no bash is found: a tool that can only fail would cost the
-//! model a round trip to learn what `[shell] bash` already knows. The lookup is a handful of file
-//! stats — the `uname -s` validation happens on the first real call instead (see `shell::bash`).
+//! # Why it exists separately from `shell`.
+//! Measured on this machine: `bash -c true` costs ~180 ms over a native-process floor, while `powershell...
 
 use std::sync::Arc;
 

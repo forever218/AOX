@@ -1194,7 +1194,7 @@
 "Deleted {} model(s)." = "已删除 {} 个模型。"
 "The model in force was not deleted — switch to another one first." = "当前在用的模型没有被删除 —— 请先切换到别的模型。"
 "Deleted {} model(s); the one in force was left alone." = "已删除 {} 个模型；正在使用的那个没有动。"
-"「使用」switches to a model; the switch on the right only decides whether it appears in the input box's list." = "「使用」= 切换到它；行尾的开关只决定它是否出现在输入框的模型列表里。"
+"Use switches to a model; the switch on the right only decides whether it appears in the input box's list." = "「使用」= 切换到它；行尾的开关只决定它是否出现在输入框的模型列表里。"
 "Configure models…" = "配置自定义模型…"
 # ── 回滚 / 还原点窗口（2026-10-28，此前整窗未本地化）──
 "Recovery points" = "还原点"
@@ -1371,6 +1371,6 @@
 "Set as current" = "设为当前"
 "No computer is paired yet. Generate a code on the phone, then add it here." = "还没有配对的电脑。先在手机上生成配对码，再在这里添加。"
 "On the phone: Settings → Add computer. Type the 8-character code here within five minutes." = "手机上：设置 → 添加电脑，五分钟内把 8 位配对码填到这里。"
-"删除「{}」？只删本机凭证，服务器上的记录还在。" = "删除「{}」？只删本机凭证，服务器上的记录还在。"
+"Delete {}? This only removes the local credential; the server record stays." = "删除「{}」？只删本机凭证，服务器上的记录还在。"
 "wants to drive your agent" = "想调用你的智能体"
 "Allow for 1h" = "1 小时内允许"

@@ -1,35 +1,6 @@
-//! The on-disk **metadata cache** for a plugin slot (`plugins/<name>/plugin.cache.json`).
-//!
-//! # Why this file exists
-//!
-//! A plugin's tool list only exists inside the plugin process: the host cannot know it without
-//! starting the process and completing the `initialize` handshake. That single fact is what forced
-//! the old behaviour of "start every plugin at boot and leave it running" — and it is exactly the
-//! cost being removed here.
-//!
-//! Everything else about a plugin is already static: `plugin.toml` declares the name, language,
-//! entry, and (since stage 6·6b) the whole `[contributes]` block. So the only thing worth caching is
-//! the `initialize` answer itself, written next to the plugin and read back at startup.
-//!
-//! # What is cached, and what that costs
-//!
-//! `tools` / `contributes` / prompt-segment bodies / theme patch, plus a **fingerprint** of the
-//! files the answer was derived from. A cache entry is used only when the fingerprint still
-//! matches, so editing a plugin's source invalidates its own cache and nothing else.
-//!
-//! The fingerprint deliberately **does not include the host's own version**. A development build is
-//! relinked many times a day, and folding the host in would re-probe every plugin on every rebuild
-//! for no information gain — the answer comes from the plugin's files, not from the host. Bump
-//! [`CACHE_FORMAT`] instead when the meaning of the stored data changes.
-//!
-//! # Staleness is self-correcting
-//!
-//! A cache read is a **prediction**, and a wrong prediction is survivable: every real start
-//! re-reads the live `initialize` answer, re-registers any tool that changed and rewrites the
-//! cache. The tool schema list is rebuilt on every agent round (`Runtime::tool_schemas`), so the
-//! model sees the corrected table on the very next step. Worst case: one wasted call.
-//!
-//! Deleting `plugin.cache.json` by hand is the manual version of the same thing.
+//! The on-disk metadata cache for a plugin slot (`plugins/<name>/plugin.cache.json`).
+//! # Why this file exists.
+//! A plugin's tool list only exists inside the plugin process: the host cannot know it without starting...
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -42,24 +13,12 @@ use crate::plugin::{Contributes, ToolDef};
 use crate::workplace::Access;
 
 /// The cache file's name inside a plugin's directory.
-///
-/// It lives **inside** the plugin directory on purpose: removing the plugin removes its cache in
-/// the same `remove_dir_all`, so there is no second place that could go stale against it.
 pub const CACHE_FILE: &str = "plugin.cache.json";
 
 /// The layout version of the file.
-///
-/// Bumping this invalidates every cache in one move (an old file simply fails to match and is
-/// rewritten on the next start). It is the lever for "the shape of what we store changed", as
-/// opposed to "this plugin changed" — which is what the fingerprint covers.
 const CACHE_FORMAT: u32 = 1;
 
 /// Which files the cached answer was derived from.
-///
-/// Content hashes, not mtimes: an mtime is a proxy that lies under `git checkout`, a copy that
-/// preserves timestamps, or a file rewritten within the same filesystem tick. These files are a few
-/// KB at most, so hashing them costs nothing measurable — and it is the difference between "the
-/// cache is right" and "the cache is usually right".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprint {
     /// `plugin.toml` (name / language / entry / `[contributes]`)
@@ -79,11 +38,7 @@ fn hash64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Hash a file; a **missing** file hashes to 0 rather than erroring.
-///
-/// "The entry is gone" is a real state — a ghost plugin directory left behind by a half-finished
-/// creation, which `load_all` must still report as one broken plugin rather than dying on. It also
-/// has to yield a *different* fingerprint from "the entry is there", and it does.
+/// Hash a file; a missing file hashes to 0 rather than erroring.
 fn hash_file(p: &Path) -> u64 {
     std::fs::read(p).map(|b| hash64(&b)).unwrap_or(0)
 }
@@ -94,11 +49,6 @@ pub fn fingerprint(dir: &Path, entry: &str) -> Fingerprint {
 }
 
 /// One cached tool declaration.
-///
-/// Field-for-field the shape of [`ToolDef`], flattened to what survives a JSON round trip: `access`
-/// is stored as the literal word `"read"` / `"write"` rather than as an enum, so the file stays
-/// legible and hand-editable, and so renaming a Rust variant can never silently redefine what the
-/// words mean.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedTool {
     pub name: String,
@@ -143,10 +93,7 @@ pub struct Cached {
     pub tools: Vec<CachedTool>,
     #[serde(default)]
     pub contributes: Contributes,
-    /// Prompt-segment id → body, as fetched by `prompt/segment` at activation.
-    ///
-    /// `BTreeMap` so the file is written in a stable order: a rewrite that changed nothing but the
-    /// key order would show up as a diff every time.
+    /// `BTreeMap` so the file is written in a stable order: a rewrite that changed nothing but the key order would...
     #[serde(default)]
     pub prompt_segments: BTreeMap<String, String>,
     /// The `theme/patch` result, kept as raw JSON (validated into `ThemeConfig` when it is read
@@ -182,11 +129,6 @@ impl Cached {
 }
 
 /// Read the cache for a plugin directory.
-///
-/// `None` covers all the boring cases at once — no file, unreadable, malformed JSON, a different
-/// [`CACHE_FORMAT`], or a fingerprint that no longer matches. They all mean the same thing to the
-/// caller ("we don't have a trustworthy prediction; go ask the process"), so they are not
-/// distinguished here.
 pub fn load(dir: &Path, entry: &str) -> Option<Cached> {
     let text = std::fs::read_to_string(dir.join(CACHE_FILE)).ok()?;
     let c: Cached = serde_json::from_str(&text).ok()?;
@@ -197,9 +139,6 @@ pub fn load(dir: &Path, entry: &str) -> Option<Cached> {
 }
 
 /// Write the cache for a plugin directory.
-///
-/// A failure here is never fatal: the cache is an optimisation, and the plugin it describes works
-/// either way. The caller turns this into a warning, not an error.
 pub fn save(dir: &Path, c: &Cached) -> Result<()> {
     let text = serde_json::to_string_pretty(c)
         .context(crate::i18n::t("failed to serialize the plugin metadata cache"))?;
@@ -227,9 +166,7 @@ mod tests {
         ToolDef { name: name.into(), description: format!("{name} does things"), parameters: json!({"type": "object"}), access }
     }
 
-    /// The cache round-trips, including the `access` bit — losing that bit would silently downgrade
-    /// every read-only plugin tool to the write tier, which is "one extra block on every call" in
-    /// the best case and a wrong boundary report in the worst.
+    /// The cache round-trips, including the `access` bit — losing that bit would silently downgrade every read-only...
     #[test]
     fn cache_round_trips_tools_and_contributes() {
         let dir = scratch("roundtrip");
@@ -303,9 +240,7 @@ mod tests {
         assert!(load(&dir, "main.py").is_none());
     }
 
-    /// The stale-detection is about the tool's **shape**, not just its name: a tool that kept its
-    /// name but changed its parameters is exactly the case that would make the model send the wrong
-    /// arguments, so it must count as "the cache is out of date".
+    /// The stale-detection is about the tool's shape, not just its name: a tool that kept its name but changed...
     #[test]
     fn a_redefined_tool_counts_as_stale() {
         let dir = scratch("stale");
@@ -334,9 +269,7 @@ mod tests {
         );
     }
 
-    /// A declared read survives the file; anything else falls to write. Same asymmetry as the live
-    /// path (`plugin::parse_access`): under-recognising costs one extra block, over-recognising lets
-    /// an out-of-bounds write through.
+    /// A declared read survives the file; anything else falls to write.
     #[test]
     fn access_text_is_read_only_when_it_says_so() {
         let make = |s: &str| CachedTool { name: "t".into(), description: String::new(), parameters: json!({}), access: s.into() };

@@ -1,19 +1,10 @@
-//! Shared logic tied to "where the host process runs": the app root directory, writability, plugin
-//! migration, and so on.
-//!
-//! The CLI (`src/main.rs`) and the GUI (`gui/`) both need this rule set: normalise the app root to a
-//! single location, so that `cargo run` (whose exe is under target/debug) and a double-clicked exe
-//! don't end up with two `plugins/` directories, and so that `config.toml` isn't written somewhere
-//! unwritable and crash the app.
-//!
+//! Shared logic tied to "where the host process runs": the app root directory, writability, plugin migration...
+//! The CLI (`src/main.rs`) and the GUI (`gui/`) both need this rule set: normalise the app root to a single...
 //! This is the same implementation extracted from `src/main.rs`, with identical behaviour.
 
 use std::path::{Path, PathBuf};
 
 /// Resolve the "app root directory".
-///
-/// The rule: walk up from the exe's directory to the nearest Cargo.toml; if one is found use its
-/// directory (development mode), otherwise use the exe's directory (distribution mode).
 pub fn resolve_app_root(exe_dir: Option<&Path>) -> PathBuf {
     let Some(exe_dir) = exe_dir else {
         return PathBuf::from(".");
@@ -49,10 +40,7 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Migrate plugins from the old location (under the exe directory) into the canonical plugin
-/// directory, so historical plugins don't "vanish into thin air". Only missing ones are added, and
-/// existing files are never overwritten; once everything has migrated successfully the leftover
-/// build-artifact directory is cleaned up.
+/// Migrate plugins from the old location (under the exe directory) into the canonical plugin directory...
 pub fn migrate_plugins(from: &Path, to: &Path) {
     if from == to || !from.is_dir() {
         return;
@@ -97,9 +85,7 @@ pub fn is_writable_dir(dir: &Path) -> bool {
     }
 }
 
-/// Guarantee the app root is writable. AOX needs to write `config.toml` and `plugins/` under its
-/// root at runtime; if it has been installed somewhere read-only like Program Files, fall back to
-/// the user-writable `%LOCALAPPDATA%\AOX`.
+/// Guarantee the app root is writable.
 pub fn ensure_writable_root(root: PathBuf) -> PathBuf {
     if is_writable_dir(&root) {
         return root;
@@ -116,10 +102,6 @@ pub fn ensure_writable_root(root: PathBuf) -> PathBuf {
 }
 
 /// Resolve only the "writable app root", without migrating plugins.
-///
-/// Plugin migration is a side effect of `resolve_workplace`; a caller that only wants to ask "where
-/// is the root" (for instance the GUI main thread needs to read `[theme]` from `config.toml` first)
-/// uses this, to avoid triggering migration a second time alongside the background thread.
 pub fn app_root() -> PathBuf {
     ensure_writable_root(resolve_app_root(exe_dir().as_deref()))
 }
@@ -135,11 +117,7 @@ pub fn resolve_workplace() -> (PathBuf, PathBuf) {
     (root, plugins)
 }
 
-/// Resolve the config file path: `--config <path>` takes priority, otherwise `config.toml` under the
-/// app root.
-///
-/// The CLI, the GUI main thread and the GUI background driver thread all read the same one — the
-/// rule is gathered here rather than scattered across three copies.
+/// Resolve the config file path: `--config <path>` takes priority, otherwise `config.toml` under the app root.
 pub fn resolve_config_path(args: &[String]) -> PathBuf {
     match arg_value(args, "--config") {
         Some(p) => PathBuf::from(p),
@@ -152,14 +130,7 @@ pub fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
 
-/// Resolve the composition-manifest path: an **explicit** override via `--manifest <path>`,
-/// returning `None` when it isn't given.
-///
-/// `None` does not mean "the file doesn't exist" — the former means "not specified, go look for the
-/// default `aox.toml` under the app root", while the latter is decided by `config::layer` itself (if
-/// there is none at the default location it degrades to "only the config.toml layer"). But
-/// specifying it explicitly and having it not exist is **an error**: writing `--manifest` and having
-/// it not take effect is more confusing than having no manifest at all.
+/// Resolve the composition-manifest path: an explicit override via `--manifest <path>`, returning `None`...
 pub fn resolve_manifest_path(args: &[String]) -> Option<PathBuf> {
     arg_value(args, "--manifest").map(PathBuf::from)
 }
